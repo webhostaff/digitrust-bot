@@ -5,6 +5,11 @@ const session = require('./session');
 const { mainMenuKb, backKb, languagePickerKb } = require('../utils/keyboard');
 const { t } = require('../utils/i18n');
 const { formatReward } = require('../utils/format');
+// `logger` was used on line 53 but never required, so every referral attempt
+// while the referral system was switched off threw
+//   ReferenceError: logger is not defined
+// which surfaced 15+ times as an unhandled rejection in production.
+const logger = require('../utils/logger');
 
 async function sendMainMenu(bot, chatId, userName = '', userId = null) {
   const storeName = db.getSetting('store_name', 'DIGITRUST Store');

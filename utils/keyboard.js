@@ -195,6 +195,8 @@ const adminMainKb = () => mk([
   [btn('🎫 Tickets',         'admin_tickets'),        btn('💸 Refund',       'admin_refund')],
   [btn('📢 Announcement',    'admin_announcement'),   btn('⚙️ Settings',     'admin_settings')],
   [btn('🎨 Emoji Library',   'admin_emojis'),         btn('🚧 Maintenance',  'admin_maintenance')],
+  [btn('🔔 Notifications',   'admin_notifications'), btn('📦 Manual Delivery', 'admin_md_list_pending_0')],
+  [btn('🛡 Deposit Review',  'admin_deposits')],
   [btn('🔄 Refund Requests', 'admin_refund_requests')],
   [btn('🛡️ Deposit Cutoff',  'admin_cutoff')],
   [btn('👑 VIP Broadcast',    'admin_vip_toggle')],
@@ -337,6 +339,10 @@ const adminProductEditFieldsKb = (productId) =>
     [btn('📋 Instruction',    `admin_edit_field_${productId}_instruction`)],
     [btn('💎 Premium Emoji',  `admin_edit_field_${productId}_premium_emoji_id`)],
     [btn('🗂 Set Category',    `admin_assigncat_${productId}`)],
+    // ── V2: per-product behaviour toggles ─────────────────────────────
+    [btn('🔄 Refund Eligibility',  `admin_toggle_refund_${productId}`)],
+    [btn('🚚 Delivery Method',     `admin_toggle_delivery_${productId}`)],
+    [btn('🔔 Low-Stock Threshold', `admin_lowstock_${productId}`)],
     [btn('🤖 Toggle ChatGPT Business Mode', `admin_toggle_cgb_${productId}`)],
     [btn('🏪 Wholesale Price', `admin_edit_field_${productId}_wholesale_price`)],
     [btn('🖼 Change Image',    `admin_edit_field_${productId}_image_file_id`)],
@@ -408,6 +414,7 @@ const adminUserActionsKb = (userId, isBanned) => mk([
   [btn('📦 View Purchases', `admin_user_orders_${userId}`)],
   [btn('💳 Top-Up History', `admin_user_topups_${userId}`)],
   [btn('🔄 Reset Wallet to $0', `admin_user_resetwallet_${userId}`)],
+  [btn('🚨 Fraud: cancel all orders', `admin_fraud_${userId}`)],
   [btn(isBanned ? '✅ Unban' : '🚫 Ban', `admin_toggle_ban_${userId}`)],
   [btn('🔙 Back', 'admin_users')],
 ]);
@@ -506,6 +513,10 @@ const adminSettingsKb = () => mk([
   [btn('🎁 Referral Cashback', 'admin_setting_referral_cashback_enabled'), btn('💸 Cashback %', 'admin_setting_referral_cashback_pct')],
   [btn('💰 Min Order for Cashback', 'admin_setting_referral_min_order')],
   [btn('💤 Stale Product Reminders', 'admin_setting_stale_product_reminder_enabled'), btn('📅 Stale After (days)', 'admin_setting_stale_product_threshold_days')],
+  [btn('🔔 Default Low-Stock Alert', 'admin_setting_low_stock_threshold_default'), btn('📡 Admin Alert Chat ID', 'admin_setting_admin_notify_chat_id')],
+  [btn('⏰ Deposit Window (min)', 'admin_setting_deposit_max_age_minutes'), btn('🛡 Strict Deposit Mode', 'admin_setting_deposit_strict_mode')],
+  [btn('⌛ Reservation TTL (min)', 'admin_setting_deposit_intent_ttl_minutes'), btn('🚧 Deposit Cutoff (ms)', 'admin_setting_deposit_cutoff_ms')],
+  [btn('🔕 Admin Alerts On/Off', 'admin_setting_admin_notify_enabled'), btn('💬 Support Welcome Msg', 'admin_setting_support_welcome_message')],
   [btn('🔙 Back', 'admin_panel')],
 ]);
 

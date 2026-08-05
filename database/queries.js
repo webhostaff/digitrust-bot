@@ -733,6 +733,514 @@ const rs_getOrders = db.prepare(`
 `);
 const rs_setProductWholesale = db.prepare(`UPDATE products SET wholesale_price = ? WHERE id = ?`);
 
+// ═══════════════════════════════════════════════════════════════════════════
+// V2 — ORDER HISTORY WITH DATE FILTERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Full history, newest first, no LIMIT. Pagination happens in the keyboard
+// layer so nothing is ever silently dropped by the query itself.
+const getUserOrdersAll = db.prepare(`
+  SELECT o.*, p.title AS product_title, p.delivery_type,
+         md.status AS manual_status
+  FROM orders o
+  LEFT JOIN products p          ON o.product_id = p.id
+  LEFT JOIN manual_deliveries md ON md.order_id = o.id
+  WHERE o.user_id = ?
+  ORDER BY datetime(o.created_at) DESC, o.id DESC
+`);
+
+// Same, restricted to a window. `sinceExpr`/`untilExpr` are SQLite datetime
+// modifiers supplied by the caller from a fixed whitelist (never user input).
+function getUserOrdersFiltered(userId, filter = 'all') {
+  const all = getUserOrdersAll.all(userId);
+  if (filter === 'all') return all;
+
+  const now = new Date();
+  let from = null;
+  let to   = null;
+
+  if (filter === '7d') {
+    from = new Date(now.getTime() - 7 * 24 * 3600 * 1000);
+  } else if (filter === '30d') {
+    from = new Date(now.getTime() - 30 * 24 * 3600 * 1000);
+  } else if (filter === 'this_month') {
+    from = new Date(now.getFullYear(), now.getMonth(), 1);
+  } else if (filter === 'last_month') {
+    from = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    to   = new Date(now.getFullYear(), now.getMonth(), 1);
+  } else {
+    return all;
+  }
+
+  return all.filter((o) => {
+    // created_at is stored as UTC "YYYY-MM-DD HH:MM:SS"
+    const raw = String(o.created_at || '').replace(' ', 'T');
+    const d = new Date(raw.endsWith('Z') ? raw : raw + 'Z');
+    if (isNaN(d.getTime())) return true; // never hide a row we can't parse
+    if (from && d < from) return false;
+    if (to   && d >= to)  return false;
+    return true;
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V2 — REFUND ELIGIBILITY
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Authoritative server-side check. Used by both the listing and the submit
+// handler, so a crafted callback can never open a request for a blocked item.
+function isProductRefundable(productId) {
+  const row = db.prepare('SELECT refund_enabled FROM products WHERE id = ?').get(productId);
+  if (!row) return false;
+  return Number(row.refund_enabled) === 1;
+}
+
+function isOrderRefundable(orderId) {
+  const row = db.prepare(`
+    SELECT o.status, o.product_id, p.refund_enabled
+    FROM orders o LEFT JOIN products p ON p.id = o.product_id
+    WHERE o.id = ?
+  `).get(orderId);
+  if (!row) return { ok: false, reason: 'not_found' };
+  if (row.status !== 'delivered') return { ok: false, reason: 'not_delivered' };
+  if (Number(row.refund_enabled) !== 1) return { ok: false, reason: 'not_eligible' };
+  return { ok: true };
+}
+
+// Delivered orders the customer is actually allowed to open a refund for.
+const getRefundableUserOrders = db.prepare(`
+  SELECT o.*, p.title AS product_title
+  FROM orders o
+  JOIN products p ON p.id = o.product_id
+  WHERE o.user_id = ?
+    AND o.status = 'delivered'
+    AND p.refund_enabled = 1
+  ORDER BY datetime(o.created_at) DESC, o.id DESC
+`);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V2 — MANUAL DELIVERY
+// ═══════════════════════════════════════════════════════════════════════════
+
+const md_insert = db.prepare(`
+  INSERT OR IGNORE INTO manual_deliveries
+    (order_id, user_id, product_id, quantity, email, total_paid, payment_method)
+  VALUES (@orderId, @userId, @productId, @quantity, @email, @totalPaid, @paymentMethod)
+`);
+const md_getByOrder = db.prepare('SELECT * FROM manual_deliveries WHERE order_id = ?');
+const md_getById    = db.prepare(`
+  SELECT md.*, p.title AS product_title, u.username, u.first_name
+  FROM manual_deliveries md
+  LEFT JOIN products p ON p.id = md.product_id
+  LEFT JOIN users u    ON u.telegram_id = md.user_id
+  WHERE md.id = ?
+`);
+const md_listAll = db.prepare(`
+  SELECT md.*, p.title AS product_title, u.username, u.first_name
+  FROM manual_deliveries md
+  LEFT JOIN products p ON p.id = md.product_id
+  LEFT JOIN users u    ON u.telegram_id = md.user_id
+  ORDER BY md.id DESC
+`);
+const md_countByStatus = db.prepare(`
+  SELECT status, COUNT(*) AS n FROM manual_deliveries GROUP BY status
+`);
+const md_setStatus = db.prepare(`
+  UPDATE manual_deliveries
+  SET status = ?, admin_note = COALESCE(?, admin_note), updated_at = datetime('now')
+  WHERE id = ?
+`);
+const md_markDelivered = db.prepare(`
+  UPDATE manual_deliveries
+  SET status = 'delivered', delivered_content = COALESCE(?, delivered_content),
+      delivered_at = datetime('now'), updated_at = datetime('now')
+  WHERE id = ? AND status != 'delivered'
+`);
+const md_markNotified = db.prepare(`
+  UPDATE manual_deliveries SET notified_at = datetime('now') WHERE id = ? AND notified_at IS NULL
+`);
+const md_markSeen = db.prepare(`
+  UPDATE manual_deliveries SET seen_at = datetime('now') WHERE id = ? AND seen_at IS NULL
+`);
+const md_userList = db.prepare(`
+  SELECT md.*, p.title AS product_title
+  FROM manual_deliveries md
+  LEFT JOIN products p ON p.id = md.product_id
+  WHERE md.user_id = ?
+  ORDER BY md.id DESC
+`);
+
+/**
+ * Atomically charge the wallet and open a manual-delivery task.
+ *
+ * Mirrors deliverOrderAndChargeWallet but deliberately does NOT touch
+ * product_items: manual products have no digital stock to hand out. Stock
+ * quantity is still decremented so the storefront count stays honest.
+ *
+ * Returns { result: 'ok' | 'already_processed' | 'insufficient_balance' }.
+ */
+function chargeWalletForManualOrder(orderId, productId, quantity, userId, price) {
+  return db.transaction(() => {
+    const orderCheck = db.prepare('SELECT status FROM orders WHERE id = ?').get(orderId);
+    if (!orderCheck || orderCheck.status !== 'pending') return { result: 'already_processed' };
+
+    const userRow = db.prepare('SELECT balance FROM users WHERE telegram_id = ?').get(userId);
+    const balance = userRow ? Number(userRow.balance) : 0;
+    const priceN  = Number(price);
+    if (balance < priceN - 0.001) return { result: 'insufficient_balance', balance };
+
+    const res = db.prepare(`
+      UPDATE orders
+      SET status = 'awaiting_delivery', payment_method = 'wallet', paid_at = datetime('now')
+      WHERE id = ? AND status = 'pending'
+    `).run(orderId);
+    if (res.changes === 0) return { result: 'already_processed' };
+
+    updateBalance.run(-priceN, userId);
+    incrementSoldCount.run(quantity, productId);
+    incrementSalesCount.run(quantity, productId);
+    adjustStockQuantity.run(-quantity, productId);
+    markProductSoldNow.run(productId);
+    return { result: 'ok' };
+  })();
+}
+
+/**
+ * Same thing for externally-settled payments (USDT / Binance Pay / CryptoBot),
+ * where the money has already arrived and only the order state must move.
+ */
+function settleManualOrderExternal(orderId, productId, quantity, paymentMethod) {
+  return db.transaction(() => {
+    const orderCheck = db.prepare('SELECT status FROM orders WHERE id = ?').get(orderId);
+    if (!orderCheck || orderCheck.status !== 'pending') return { result: 'already_processed' };
+
+    const res = db.prepare(`
+      UPDATE orders
+      SET status = 'awaiting_delivery', payment_method = ?, paid_at = datetime('now')
+      WHERE id = ? AND status = 'pending'
+    `).run(paymentMethod, orderId);
+    if (res.changes === 0) return { result: 'already_processed' };
+
+    incrementSoldCount.run(quantity, productId);
+    incrementSalesCount.run(quantity, productId);
+    adjustStockQuantity.run(-quantity, productId);
+    markProductSoldNow.run(productId);
+    return { result: 'ok' };
+  })();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V2 — STOCK ALERT LATCHES
+// ═══════════════════════════════════════════════════════════════════════════
+
+const stock_setOosNotified = db.prepare('UPDATE products SET oos_notified = ? WHERE id = ?');
+const stock_setLowNotified = db.prepare('UPDATE products SET low_notified = ? WHERE id = ?');
+const stock_resetFlags     = db.prepare('UPDATE products SET oos_notified = 0, low_notified = 0 WHERE id = ?');
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V2 — SUPPORT THREADS (✓ / ✓✓ state + one-time welcome)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const th_ensure = db.prepare('INSERT OR IGNORE INTO support_threads (user_id) VALUES (?)');
+const th_get    = db.prepare('SELECT * FROM support_threads WHERE user_id = ?');
+const th_setWelcomed = db.prepare('UPDATE support_threads SET welcomed = 1 WHERE user_id = ?');
+const th_setStatusMsg = db.prepare(`
+  UPDATE support_threads
+  SET status_msg_id = ?, status_state = ?, pending_count = ?,
+      last_customer_msg_at = datetime('now')
+  WHERE user_id = ?
+`);
+const th_markRead = db.prepare(`
+  UPDATE support_threads
+  SET status_state = 'read', pending_count = 0, last_read_at = datetime('now')
+  WHERE user_id = ?
+`);
+
+const sm_markRead = db.prepare(`
+  UPDATE support_messages
+  SET is_read = 1, read_at = datetime('now')
+  WHERE user_id = ? AND direction = 'in' AND is_read = 0
+`);
+const sm_unreadTotal = db.prepare(`
+  SELECT COUNT(DISTINCT user_id) AS n FROM support_messages WHERE direction = 'in' AND is_read = 0
+`);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V2 — ADMIN NOTIFICATION CENTRE
+// ═══════════════════════════════════════════════════════════════════════════
+
+// INSERT OR IGNORE + UNIQUE(dedupe_key) = the same event is stored exactly once,
+// no matter how many times the producing code path runs.
+const an_insert = db.prepare(`
+  INSERT OR IGNORE INTO admin_notifications (type, title, body, ref_type, ref_id, dedupe_key)
+  VALUES (@type, @title, @body, @refType, @refId, @dedupeKey)
+`);
+const an_list = db.prepare(`
+  SELECT * FROM admin_notifications ORDER BY id DESC LIMIT ? OFFSET ?
+`);
+const an_listUnread = db.prepare(`
+  SELECT * FROM admin_notifications WHERE is_read = 0 ORDER BY id DESC LIMIT ? OFFSET ?
+`);
+const an_countAll    = db.prepare('SELECT COUNT(*) AS n FROM admin_notifications');
+const an_countUnread = db.prepare('SELECT COUNT(*) AS n FROM admin_notifications WHERE is_read = 0');
+const an_get         = db.prepare('SELECT * FROM admin_notifications WHERE id = ?');
+const an_markRead    = db.prepare("UPDATE admin_notifications SET is_read = 1, read_at = datetime('now') WHERE id = ?");
+const an_markAllRead = db.prepare("UPDATE admin_notifications SET is_read = 1, read_at = datetime('now') WHERE is_read = 0");
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V3 — DEPOSIT INTENTS (amount reservation)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const nodeCrypto = require('crypto');
+
+const di_insert = db.prepare(`
+  INSERT INTO deposit_intents (user_id, network, base_amount, unique_amount, created_ms, expires_ms)
+  VALUES (?, ?, ?, ?, ?, ?)
+`);
+const di_expireStale = db.prepare(`
+  UPDATE deposit_intents SET status = 'expired'
+  WHERE status = 'open' AND expires_ms < ?
+`);
+const di_openForUser = db.prepare(`
+  SELECT * FROM deposit_intents
+  WHERE user_id = ? AND status = 'open' AND expires_ms >= ?
+  ORDER BY id DESC
+`);
+const di_findOpenByAmount = db.prepare(`
+  SELECT * FROM deposit_intents
+  WHERE status = 'open' AND network = ? AND expires_ms >= ?
+    AND ABS(unique_amount - ?) < 0.0000021
+  ORDER BY id ASC LIMIT 1
+`);
+const di_claim = db.prepare(`
+  UPDATE deposit_intents
+  SET status = 'claimed', claimed_txid = ?, claimed_at = datetime('now')
+  WHERE id = ? AND status = 'open'
+`);
+const di_cancel = db.prepare(`
+  UPDATE deposit_intents SET status = 'cancelled' WHERE id = ? AND status = 'open'
+`);
+const di_get = db.prepare('SELECT * FROM deposit_intents WHERE id = ?');
+
+/**
+ * Reserve a unique deposit amount for a user.
+ *
+ * The suffix is drawn with crypto.randomInt so it cannot be guessed, and the
+ * partial UNIQUE index on (network, unique_amount) WHERE status='open'
+ * guarantees no two live reservations ever collide. On collision we simply
+ * draw again.
+ *
+ * @returns {object|null} the created intent row
+ */
+function createDepositIntent(userId, network, baseAmount, ttlMinutes) {
+  const now = Date.now();
+  di_expireStale.run(now); // housekeeping: retire anything past its deadline
+
+  const ttl = (Number(ttlMinutes) > 0 ? Number(ttlMinutes) : 60) * 60 * 1000;
+  const base = Number(Number(baseAmount).toFixed(2));
+
+  for (let attempt = 0; attempt < 80; attempt++) {
+    // 0.000100 .. 0.009999 — about one cent at most, and USDT keeps 6 decimals
+    // on both TRC20 and BEP20, so the exact figure survives the transfer.
+    const suffix = (100 + nodeCrypto.randomInt(0, 9900)) / 1e6;
+    const unique = Number((base + suffix).toFixed(6));
+    try {
+      const res = di_insert.run(userId, network, base, unique, now, now + ttl);
+      return di_get.get(res.lastInsertRowid);
+    } catch (e) {
+      if (String(e.message).includes('UNIQUE')) continue; // collision, redraw
+      throw e;
+    }
+  }
+  return null; // astronomically unlikely
+}
+
+/** Live reservations belonging to a user. */
+function getOpenIntents(userId) {
+  const now = Date.now();
+  di_expireStale.run(now);
+  return di_openForUser.all(userId, now);
+}
+
+/** Find the live reservation an incoming deposit belongs to, if any. */
+function findIntentForDeposit(network, amount) {
+  const now = Date.now();
+  di_expireStale.run(now);
+  return di_findOpenByAmount.get(network, now, Number(amount));
+}
+
+const claimDepositIntent  = (id, txid) => di_claim.run(txid, id).changes > 0;
+const cancelDepositIntent = (id) => di_cancel.run(id).changes > 0;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V3 — DEPOSIT REVIEW QUEUE (unmatched deposits, admin-approved only)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const dr_insert = db.prepare(`
+  INSERT OR IGNORE INTO deposit_reviews
+    (txid, user_id, amount, network, address, insert_time, reason)
+  VALUES (@txid, @userId, @amount, @network, @address, @insertTime, @reason)
+`);
+const dr_get      = db.prepare('SELECT * FROM deposit_reviews WHERE id = ?');
+const dr_byTxid   = db.prepare('SELECT * FROM deposit_reviews WHERE txid = ? COLLATE NOCASE');
+const dr_list     = db.prepare("SELECT * FROM deposit_reviews WHERE status = ? ORDER BY id DESC LIMIT ? OFFSET ?");
+const dr_count    = db.prepare('SELECT COUNT(*) AS n FROM deposit_reviews WHERE status = ?');
+const dr_resolve  = db.prepare(`
+  UPDATE deposit_reviews
+  SET status = ?, admin_note = ?, admin_id = ?, resolved_at = datetime('now')
+  WHERE id = ? AND status = 'pending'
+`);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V3 — BALANCE REVERSAL (claw back a fraudulent credit)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const rev_insert = db.prepare(`
+  INSERT INTO balance_reversals
+    (user_id, amount, txid, reason, admin_id, balance_before, balance_after)
+  VALUES (?, ?, ?, ?, ?, ?, ?)
+`);
+const rev_list = db.prepare('SELECT * FROM balance_reversals ORDER BY id DESC LIMIT ?');
+
+/**
+ * Remove a credited amount from a user's wallet and record it.
+ *
+ * The balance is allowed to go negative on purpose: if the thief already spent
+ * the money, the debt stays visible instead of silently vanishing.
+ */
+function reverseDeposit({ userId, amount, txid = null, reason = '', adminId = null }) {
+  return db.transaction(() => {
+    const before = Number(db.prepare('SELECT balance FROM users WHERE telegram_id = ?').get(userId)?.balance || 0);
+    const amt = Number(amount);
+    db.prepare('UPDATE users SET balance = balance - ? WHERE telegram_id = ?').run(amt, userId);
+    const after = Number(db.prepare('SELECT balance FROM users WHERE telegram_id = ?').get(userId)?.balance || 0);
+
+    db.prepare(`
+      INSERT INTO transactions (user_id, type, amount, description, ref_id)
+      VALUES (?, 'reversal', ?, ?, ?)
+    `).run(userId, -amt, `Deposit reversed: ${reason || 'fraud'}`, txid);
+
+    rev_insert.run(userId, amt, txid, reason, adminId, before, after);
+    return { before, after, amount: amt };
+  })();
+}
+
+/**
+ * Cancel every open order belonging to one user, in a single transaction.
+ *
+ * Used as a fraud response. Two things make this different from a normal
+ * per-order cancel:
+ *
+ *  • `refund` defaults to FALSE. Money taken from a fraudster's wallet is not
+ *    handed back — the funds were stolen to begin with.
+ *  • Stock is genuinely restored. A paid manual order had `stock_quantity`
+ *    decremented and the sold/sales counters incremented; all three are undone,
+ *    otherwise a fraud wave silently destroys the inventory numbers.
+ *
+ * Orders already `delivered` are left untouched — the goods are gone and
+ * rewriting history would corrupt the accounting. They are counted and
+ * reported so the admin knows the real exposure.
+ *
+ * @returns {object} summary of what happened
+ */
+function cancelAllUserOrders(userId, { refund = false } = {}) {
+  return db.transaction(() => {
+    const orders = db.prepare(`
+      SELECT o.*, p.title AS ptitle
+      FROM orders o LEFT JOIN products p ON p.id = o.product_id
+      WHERE o.user_id = ?
+    `).all(userId);
+
+    const out = {
+      cancelledPending: 0,
+      cancelledPaid:    0,
+      manualCancelled:  0,
+      refunded:         0,
+      stockRestored:    0,
+      delivered:        0,
+      preordersFreed:   0,
+    };
+
+    for (const o of orders) {
+      if (o.status === 'delivered') { out.delivered++; continue; }
+      if (o.status === 'cancelled')  continue;
+
+      // 'awaiting_delivery' means the customer already paid but nothing was
+      // handed over, so the inventory reservation has to be given back.
+      const wasPaid = o.status === 'awaiting_delivery';
+
+      db.prepare("UPDATE orders SET status = 'cancelled' WHERE id = ?").run(o.id);
+
+      if (wasPaid) {
+        out.cancelledPaid++;
+        adjustStockQuantity.run(o.quantity, o.product_id);      // give stock back
+        db.prepare('UPDATE products SET sold_count = MAX(0, sold_count - ?) WHERE id = ?')
+          .run(o.quantity, o.product_id);
+        db.prepare('UPDATE products SET sales_count = MAX(0, sales_count - ?) WHERE id = ?')
+          .run(o.quantity, o.product_id);
+        out.stockRestored += o.quantity;
+
+        if (refund) {
+          updateBalance.run(Number(o.total_price), userId);
+          out.refunded += Number(o.total_price);
+        }
+      } else {
+        out.cancelledPending++;
+      }
+
+      // Close any manual-delivery task attached to the order.
+      const upd = db.prepare(`
+        UPDATE manual_deliveries
+        SET status = 'cancelled',
+            admin_note = 'Cancelled — fraud response',
+            updated_at = datetime('now')
+        WHERE order_id = ? AND status NOT IN ('delivered', 'cancelled')
+      `).run(o.id);
+      if (upd.changes > 0) out.manualCancelled++;
+    }
+
+    // Reject the user's outstanding refund requests: a fraudster must not be
+    // able to cash stolen credit out to an external wallet.
+    const ref = db.prepare(`
+      UPDATE refund_requests
+      SET status = 'rejected',
+          admin_note = 'Rejected — fraud response',
+          resolved_at = datetime('now')
+      WHERE user_id = ? AND status = 'pending'
+    `).run(userId);
+    out.refundRequestsRejected = ref.changes;
+
+    // Release any deposit reservations they are holding.
+    const di = db.prepare(`
+      UPDATE deposit_intents SET status = 'cancelled' WHERE user_id = ? AND status = 'open'
+    `).run(userId);
+    out.reservationsReleased = di.changes;
+
+    out.total = orders.length;
+    return out;
+  })();
+}
+
+/** Preview the effect of cancelAllUserOrders without changing anything. */
+function previewCancelAllUserOrders(userId) {
+  const rows = db.prepare(`
+    SELECT status, COUNT(*) AS n, COALESCE(SUM(total_price), 0) AS sum
+    FROM orders WHERE user_id = ? GROUP BY status
+  `).all(userId);
+  const out = { pending: 0, awaiting: 0, delivered: 0, cancelled: 0, paidValue: 0, total: 0 };
+  for (const r of rows) {
+    if (r.status === 'pending')            out.pending   = r.n;
+    else if (r.status === 'awaiting_delivery') { out.awaiting = r.n; out.paidValue = r.sum; }
+    else if (r.status === 'delivered')     out.delivered = r.n;
+    else if (r.status === 'cancelled')     out.cancelled = r.n;
+    out.total += r.n;
+  }
+  out.pendingRefunds = db.prepare(
+    "SELECT COUNT(*) AS n FROM refund_requests WHERE user_id = ? AND status = 'pending'"
+  ).get(userId).n;
+  return out;
+}
+
 // ── Atomic preorder: balance check + deduction in one transaction ─────────────
 function chargeWalletForPreorder(userId, amount) {
   return db.transaction(() => {
@@ -884,6 +1392,8 @@ module.exports = {
       'bulk_tier2_qty','bulk_tier2_price',
       'bulk_tier3_qty','bulk_tier3_price',
       'wholesale_price','category_id',
+      // V2
+      'refund_enabled','delivery_type','low_stock_threshold',
     ];
     if (!allowed.includes(field)) throw new Error(`Field ${field} not allowed`);
     db.prepare(`UPDATE products SET ${field} = ? WHERE id = ?`).run(value, id);
@@ -1074,6 +1584,107 @@ module.exports = {
   // Delete single stock item by id
   deleteStockItem: (stockId) => db.prepare('DELETE FROM stock WHERE id = ?').run(stockId),
   getStockItemById: (stockId) => db.prepare('SELECT * FROM stock WHERE id = ?').get(stockId),
+
+  // ═══ V2: order history ═══
+  getUserOrdersAll:      (userId)          => getUserOrdersAll.all(userId),
+  getUserOrdersFiltered,
+
+  // ═══ V2: refund eligibility ═══
+  isProductRefundable,
+  isOrderRefundable,
+  getRefundableUserOrders: (userId) => getRefundableUserOrders.all(userId),
+
+  // ═══ V2: manual delivery ═══
+  createManualDelivery: (data) => {
+    const res = md_insert.run({
+      email:         null,
+      paymentMethod: null,
+      ...data,
+    });
+    // changes === 0 → a task for this order already existed (duplicate guard)
+    return { created: res.changes > 0, row: md_getByOrder.get(data.orderId) };
+  },
+  getManualDeliveryByOrder: (orderId) => md_getByOrder.get(orderId),
+  getManualDelivery:        (id)      => md_getById.get(id),
+  getAllManualDeliveries:   ()        => md_listAll.all(),
+  getUserManualDeliveries:  (userId)  => md_userList.all(userId),
+  getManualDeliveryCounts:  () => {
+    const out = { pending: 0, processing: 0, delivered: 0, cancelled: 0, total: 0, unseen: 0 };
+    for (const r of md_countByStatus.all()) {
+      if (out[r.status] !== undefined) out[r.status] = r.n;
+      out.total += r.n;
+    }
+    out.unseen = db.prepare(
+      "SELECT COUNT(*) AS n FROM manual_deliveries WHERE seen_at IS NULL AND status = 'pending'"
+    ).get().n;
+    return out;
+  },
+  setManualDeliveryStatus:  (id, status, note = null) => md_setStatus.run(status, note, id),
+  markManualDelivered:      (id, content = null) => md_markDelivered.run(content, id).changes > 0,
+  markManualNotified:       (id) => md_markNotified.run(id).changes > 0,
+  markManualSeen:           (id) => md_markSeen.run(id),
+  chargeWalletForManualOrder,
+  settleManualOrderExternal,
+
+  // ═══ V2: stock alert latches ═══
+  setOosNotified: (id, v) => stock_setOosNotified.run(v ? 1 : 0, id),
+  setLowNotified: (id, v) => stock_setLowNotified.run(v ? 1 : 0, id),
+  resetStockAlertFlags: (id) => stock_resetFlags.run(id),
+
+  // ═══ V2: support threads ═══
+  ensureSupportThread: (userId) => { th_ensure.run(userId); return th_get.get(userId); },
+  getSupportThread:    (userId) => th_get.get(userId),
+  markSupportWelcomed: (userId) => th_setWelcomed.run(userId),
+  setSupportStatusMsg: (userId, msgId, state, pending) =>
+    th_setStatusMsg.run(msgId, state, pending, userId),
+  markSupportThreadRead: (userId) => {
+    sm_markRead.run(userId);
+    th_markRead.run(userId);
+  },
+  getSupportUnreadThreads: () => sm_unreadTotal.get().n,
+
+  // ═══ V2: admin notification centre ═══
+  addAdminNotification: (data) => {
+    const res = an_insert.run({
+      body:    null,
+      refType: null,
+      refId:   null,
+      ...data,
+    });
+    return res.changes > 0; // false → duplicate, already recorded
+  },
+  getAdminNotifications: (limit, offset, unreadOnly = false) =>
+    (unreadOnly ? an_listUnread : an_list).all(limit, offset),
+  getAdminNotification:      (id) => an_get.get(id),
+  countAdminNotifications:   ()   => an_countAll.get().n,
+  countUnreadNotifications:  ()   => an_countUnread.get().n,
+  markNotificationRead:      (id) => an_markRead.run(id),
+  markAllNotificationsRead:  ()   => an_markAllRead.run().changes,
+
+  cancelAllUserOrders,
+  previewCancelAllUserOrders,
+
+  // ═══ V3: deposit security ═══
+  createDepositIntent,
+  getOpenIntents,
+  findIntentForDeposit,
+  claimDepositIntent,
+  cancelDepositIntent,
+  getDepositIntent: (id) => di_get.get(id),
+
+  addDepositReview: (data) => {
+    const res = dr_insert.run({ address: null, insertTime: null, reason: null, ...data });
+    return { created: res.changes > 0, row: dr_byTxid.get(data.txid) };
+  },
+  getDepositReview:        (id) => dr_get.get(id),
+  getDepositReviewByTxid:  (txid) => dr_byTxid.get(txid),
+  listDepositReviews:      (status, limit, offset) => dr_list.all(status, limit, offset),
+  countDepositReviews:     (status) => dr_count.get(status).n,
+  resolveDepositReview:    (id, status, note, adminId) =>
+    dr_resolve.run(status, note, adminId, id).changes > 0,
+
+  reverseDeposit,
+  listReversals: (limit = 20) => rev_list.all(limit),
 
   // Raw db
   db,

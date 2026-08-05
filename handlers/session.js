@@ -91,6 +91,12 @@ const States = {
   ADMIN_EMOJI_ADD: 'ADMIN_EMOJI_ADD',
   BUY_PREORDER_QTY: 'BUY_PREORDER_QTY',
   BUY_PREORDER_EMAIL: 'BUY_PREORDER_EMAIL',
+
+  // ── V2 ──────────────────────────────────────────────────────────
+  WALLET_TOPUP_USDT_AMOUNT: 'WALLET_TOPUP_USDT_AMOUNT', // reserve a unique deposit amount
+  ADMIN_DEP_REVERSE:        'ADMIN_DEP_REVERSE',        // reverse a fraudulent deposit
+  ADMIN_LOW_STOCK:  'ADMIN_LOW_STOCK',   // per-product low-stock threshold
+  ADMIN_MD_CONTENT: 'ADMIN_MD_CONTENT',  // content for a manual-delivery task
 };
 
 function get(userId) {

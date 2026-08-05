@@ -271,6 +271,16 @@ async function showProductDetail(bot, chatId, productId, messageId = null) {
     ? `<tg-emoji emoji-id="${product.premium_emoji_id}">🛍</tg-emoji> <b>${expandPremiumEmojis(product.title)}</b>`
     : `<b>${expandPremiumEmojis(product.title)}</b>`;
 
+  // Manual products are fulfilled by a human — say so up-front so the buyer
+  // is not surprised when nothing arrives instantly.
+  const deliveryLine = product.delivery_type === 'manual'
+    ? `\n🖐 <b>Delivery:</b> Manual — sent by our team after payment`
+    : '';
+  // Non-refundable products are flagged before purchase, not after.
+  const refundLine = Number(product.refund_enabled) === 1
+    ? ''
+    : `\n🚫 <b>Refunds:</b> Not available for this product`;
+
   const text =
     `${titleHtml}\n\n` +
     `📝 ${product.description || 'No description.'}\n\n` +
@@ -278,6 +288,7 @@ async function showProductDetail(bot, chatId, productId, messageId = null) {
     `💵 <b>Price:</b> ${formatPrice(product.price)}\n` +
     `${stockLine}\n` +
     `📈 <b>Sold:</b> ${product.sales_count || product.sold_count || 0}` +
+    deliveryLine + refundLine +
     bulkLine;
 
   const preorderInfo = {

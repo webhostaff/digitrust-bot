@@ -589,4 +589,239 @@ try {
   }
 } catch (e) { console.error('[SEED] Error:', e.message); }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// V2 MIGRATIONS — support read-receipts, refund eligibility, manual delivery,
+// stock alerts and the admin notification centre.
+//
+// Every statement below is additive and idempotent: new columns are only added
+// when missing and new tables use CREATE TABLE IF NOT EXISTS, so running this
+// against an existing production database never drops or rewrites data.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── products: refund eligibility, delivery mode, stock alert config ──────────
+{
+  const cols = db.prepare('PRAGMA table_info(products)').all().map((c) => c.name);
+
+  // Refund eligibility. Default 1 (=eligible) keeps the current behaviour for
+  // every product that already exists; the admin opts individual items out.
+  if (!cols.includes('refund_enabled')) {
+    db.exec('ALTER TABLE products ADD COLUMN refund_enabled INTEGER DEFAULT 1');
+  }
+  // 'auto'   → stock is consumed and delivered instantly (existing behaviour)
+  // 'manual' → payment is taken, then a manual-delivery task is opened for admin
+  if (!cols.includes('delivery_type')) {
+    db.exec("ALTER TABLE products ADD COLUMN delivery_type TEXT DEFAULT 'auto'");
+  }
+  // Per-product low-stock alert threshold. 0/NULL → fall back to the global setting.
+  if (!cols.includes('low_stock_threshold')) {
+    db.exec('ALTER TABLE products ADD COLUMN low_stock_threshold INTEGER DEFAULT 0');
+  }
+  // Latch flags so the same alert is never repeated while stock stays low/empty.
+  // Both are reset to 0 the moment stock is replenished above the threshold.
+  if (!cols.includes('oos_notified')) {
+    db.exec('ALTER TABLE products ADD COLUMN oos_notified INTEGER DEFAULT 0');
+  }
+  if (!cols.includes('low_notified')) {
+    db.exec('ALTER TABLE products ADD COLUMN low_notified INTEGER DEFAULT 0');
+  }
+}
+
+// ── support_messages ─────────────────────────────────────────────────────────
+// Created here (not only inside support-bot.js) so the main bot can read the
+// unread counter even when SUPPORT_BOT_TOKEN is not configured.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS support_messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
+    username    TEXT,
+    first_name  TEXT,
+    direction   TEXT NOT NULL,
+    content     TEXT,
+    media_type  TEXT,
+    file_id     TEXT,
+    created_at  TEXT DEFAULT (datetime('now')),
+    is_read     INTEGER DEFAULT 0
+  );
+  CREATE INDEX IF NOT EXISTS idx_support_msgs_user ON support_messages(user_id, id);
+`);
+{
+  const cols = db.prepare('PRAGMA table_info(support_messages)').all().map((c) => c.name);
+  // Exact moment support opened the message — powers the ✓✓ timestamp.
+  if (!cols.includes('read_at')) {
+    db.exec('ALTER TABLE support_messages ADD COLUMN read_at TEXT DEFAULT NULL');
+  }
+}
+
+// ── support_threads ──────────────────────────────────────────────────────────
+// One row per customer. Holds the delivery/read indicator state so ✓ → ✓✓
+// survives a bot restart, and remembers whether the one-time welcome was sent.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS support_threads (
+    user_id              INTEGER PRIMARY KEY,
+    welcomed             INTEGER DEFAULT 0,
+    status_msg_id        INTEGER,
+    status_state         TEXT    DEFAULT 'none',
+    pending_count        INTEGER DEFAULT 0,
+    last_customer_msg_at TEXT,
+    last_read_at         TEXT,
+    created_at           TEXT    DEFAULT (datetime('now'))
+  );
+`);
+
+// ── manual_deliveries ────────────────────────────────────────────────────────
+// A paid order that needs a human to hand over the product.
+// UNIQUE(order_id) is the duplicate guard: an order can never open two tasks.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS manual_deliveries (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id          INTEGER NOT NULL UNIQUE,
+    user_id           INTEGER NOT NULL,
+    product_id        INTEGER NOT NULL,
+    quantity          INTEGER NOT NULL,
+    email             TEXT,
+    total_paid        REAL    NOT NULL,
+    payment_method    TEXT,
+    status            TEXT    DEFAULT 'pending',
+    admin_note        TEXT,
+    delivered_content TEXT,
+    notified_at       TEXT,
+    seen_at           TEXT,
+    created_at        TEXT    DEFAULT (datetime('now')),
+    updated_at        TEXT    DEFAULT (datetime('now')),
+    delivered_at      TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_manual_status ON manual_deliveries(status, id);
+  CREATE INDEX IF NOT EXISTS idx_manual_user   ON manual_deliveries(user_id);
+`);
+
+// ── admin_notifications ──────────────────────────────────────────────────────
+// Persistent inbox for the admin. dedupe_key is UNIQUE, so INSERT OR IGNORE
+// makes every notification write idempotent — the same event can fire twice
+// (webhook retry, double click) and only one row is ever stored.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS admin_notifications (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    type        TEXT    NOT NULL,
+    title       TEXT    NOT NULL,
+    body        TEXT,
+    ref_type    TEXT,
+    ref_id      TEXT,
+    dedupe_key  TEXT    UNIQUE,
+    is_read     INTEGER DEFAULT 0,
+    created_at  TEXT    DEFAULT (datetime('now')),
+    read_at     TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_admin_notif_unread ON admin_notifications(is_read, id);
+`);
+
+// ── Default settings for the new features ────────────────────────────────────
+try {
+  const ins = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)');
+  ins.run('low_stock_threshold_default', '5');   // used when a product has none of its own
+  ins.run('admin_notify_enabled',        '1');   // master switch for admin push messages
+  ins.run('admin_notify_chat_id',        '');    // optional private admin channel/group
+  ins.run('support_welcome_message',
+    '👋 Welcome to Customer Support!\n\n' +
+    'Send your question or issue here and our team will reply as soon as possible.\n\n' +
+    'You can send text, photos or voice messages.');
+} catch (e) {
+  console.error('[MIGRATION V2] settings seed error:', e.message);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// V3 SECURITY MIGRATIONS — deposit ownership binding
+//
+// Background: the USDT deposit address is a single SHARED address. Every
+// transaction sent to it is publicly visible on BscScan / Tronscan, including
+// its TxID, amount and timestamp. Treating "knows the TxID" as proof of
+// ownership is therefore not authentication at all — anyone can read the
+// explorer and claim any transfer that has not been claimed yet.
+//
+// The fix is amount reservation: before transferring, a user reserves a UNIQUE
+// amount (base + random 6-decimal suffix) for a limited time. A deposit is then
+// matched to that reservation by (network + exact amount + time window), so a
+// stolen TxID no longer proves anything — the thief's own reservation will not
+// match the amount they are trying to claim.
+// ══════════════════════════════════════════════════════════════════════════════
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS deposit_intents (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id       INTEGER NOT NULL,
+    network       TEXT    NOT NULL,
+    base_amount   REAL    NOT NULL,
+    unique_amount REAL    NOT NULL,
+    status        TEXT    DEFAULT 'open',
+    created_ms    INTEGER NOT NULL,
+    expires_ms    INTEGER NOT NULL,
+    claimed_txid  TEXT,
+    claimed_at    TEXT,
+    created_at    TEXT    DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_intent_lookup ON deposit_intents(status, network, unique_amount);
+  CREATE INDEX IF NOT EXISTS idx_intent_user   ON deposit_intents(user_id, status);
+`);
+
+// Two people must never be able to hold the same reservation at the same time.
+// A partial UNIQUE index enforces that only among rows that are still open.
+try {
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_intent_open_unique
+    ON deposit_intents(network, unique_amount) WHERE status = 'open';
+  `);
+} catch (e) {
+  console.error('[MIGRATION V3] partial index error:', e.message);
+}
+
+// Deposits that arrived but match no reservation. They are NEVER auto-credited;
+// the admin reviews each one and approves it to the rightful owner.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS deposit_reviews (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    txid        TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+    user_id     INTEGER NOT NULL,
+    amount      REAL    NOT NULL,
+    network     TEXT,
+    address     TEXT,
+    insert_time INTEGER,
+    reason      TEXT,
+    status      TEXT    DEFAULT 'pending',
+    admin_note  TEXT,
+    admin_id    INTEGER,
+    created_at  TEXT    DEFAULT (datetime('now')),
+    resolved_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_dep_review_status ON deposit_reviews(status, id);
+`);
+
+// Audit trail for every balance reversal an admin performs.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS balance_reversals (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id        INTEGER NOT NULL,
+    amount         REAL    NOT NULL,
+    txid           TEXT,
+    reason         TEXT,
+    admin_id       INTEGER,
+    balance_before REAL,
+    balance_after  REAL,
+    created_at     TEXT    DEFAULT (datetime('now'))
+  );
+`);
+
+try {
+  const ins = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)');
+  // How old an on-chain deposit may be when its TxID is submitted.
+  // Deliberately tight. A transfer older than this can no longer be claimed
+  // automatically — this is the control that stops harvested TxIDs. Legitimate
+  // stragglers are NOT lost: they fall through to the manual review queue.
+  ins.run('deposit_max_age_minutes', '15');
+  // 1 = require a matching reservation (SECURE). 0 = legacy behaviour (UNSAFE).
+  ins.run('deposit_strict_mode', '1');
+  // How long a reserved amount stays valid.
+  ins.run('deposit_intent_ttl_minutes', '30');
+} catch (e) {
+  console.error('[MIGRATION V3] settings seed error:', e.message);
+}
+
 module.exports = db;

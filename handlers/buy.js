@@ -11,6 +11,8 @@ const {
 const { formatPrice, formatReward, calcOrderPrice, PAYMENT_CONFIRM_VALIDITY_MIN, checkPaymentWindow } = require('../utils/format');
 const cryptobot = require('../services/cryptobot');
 const { checkAndNotifyStockLevel } = require('../services/notifications');
+const { evaluateStock } = require('../services/stockAlerts');
+const manualDelivery = require('./manualDelivery');
 const {
   verifyDepositByTxId, verifyBinancePayOrder, TXID_RE,
 } = require('../services/binance');
@@ -226,13 +228,29 @@ async function confirmOrder(bot, chatId, userId, messageId) {
     }
   }
 
+  // Guard against a stale session. If the user taps "confirm" on an old
+  // message after their session expired (or after a bot restart), data.quantity
+  // is undefined and the INSERT dies with
+  //   SqliteError: NOT NULL constraint failed: orders.quantity
+  // which surfaced as an unhandled rejection in production.
+  const qty = parseInt(data.quantity, 10);
+  if (!data.productId || !Number.isFinite(qty) || qty < 1 || !Number.isFinite(Number(data.total))) {
+    session.clear(userId);
+    await bot.editMessageText(
+      '⏳ <b>This order session has expired.</b>\n\nPlease start again from the product page.',
+      { chat_id: chatId, message_id: messageId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🛍 Browse Products', callback_data: 'menu_products' }]] } }
+    ).catch(() => {});
+    return;
+  }
+
   // ✅ Create the order NOW (only when user actively confirms)
   ORDER_COOLDOWN.set(userId, Date.now());
   const userLang = db.getUserLanguage ? db.getUserLanguage(userId) : 'en';
   const orderId = db.createOrder({
     userId,
     productId:  data.productId,
-    quantity:   data.quantity,
+    quantity:   qty,
     email:      data.email || null,
     totalPrice: data.total,
   });
@@ -281,6 +299,58 @@ async function payWithWallet(bot, chatId, userId, orderId, messageId) {
   // Stock check + balance check are both INSIDE the atomic transaction (deliverOrderAndChargeWallet)
   // Capture stock BEFORE to detect low/out-of-stock crossings for notifications
   const stockBefore = db.getProduct(order.product_id)?.stock_quantity || 0;
+
+  // ── MANUAL DELIVERY BRANCH ────────────────────────────────────────────────
+  // Products marked delivery_type='manual' have nothing to hand out
+  // automatically. Charge the wallet atomically, move the order to
+  // 'awaiting_delivery', then open a task for the admin. The manual task is
+  // only ever created AFTER the charge succeeds, so an unpaid order can never
+  // produce a delivery request.
+  const _mdProduct = db.getProduct(order.product_id);
+  if (_mdProduct && _mdProduct.delivery_type === 'manual') {
+    const manualResult = db.chargeWalletForManualOrder(
+      order.id, order.product_id, order.quantity, userId, order.total_price
+    );
+
+    if (manualResult.result === 'already_processed') {
+      await bot.editMessageText('❌ This order has already been processed.',
+        { chat_id: chatId, message_id: messageId }).catch(() => {});
+      return;
+    }
+    if (manualResult.result === 'insufficient_balance') {
+      await bot.editMessageText(
+        `❌ <b>Insufficient balance!</b>\n\n` +
+        `💰 Balance: <b>${formatPrice(manualResult.balance)}</b>\n` +
+        `💵 Required: <b>${formatPrice(order.total_price)}</b>\n\nPlease top up your wallet first.`,
+        { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: backKb('menu_wallet') }
+      ).catch(() => {});
+      return;
+    }
+
+    db.addTransaction({
+      userId, type: 'purchase', amount: -order.total_price,
+      description: `Order #${orderId}: ${order.product_title}`,
+      refId: null, orderId,
+    });
+
+    const freshOrder = db.getOrder(orderId);
+    await manualDelivery.openManualDelivery(bot, freshOrder, 'wallet');
+    await handleReferralReward(bot, userId);
+
+    await bot.editMessageText(
+      `✅ <b>Payment Confirmed</b>\n\n` +
+      `🆔 Order #${orderId} — ${formatPrice(order.total_price)}\n\n` +
+      `🖐 This product is delivered manually. Our team has been notified ` +
+      `and will send it to you here shortly.`,
+      { chat_id: chatId, message_id: messageId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '📦 My Orders', callback_data: 'menu_orders' }]] } }
+    ).catch(() => {});
+
+    const stockAfterM = db.getProduct(order.product_id)?.stock_quantity || 0;
+    await checkAndNotifyStockLevel(bot, db, order.product_id, stockBefore, stockAfterM);
+    await evaluateStock(bot, order.product_id);
+    return;
+  }
 
   // ── ATOMIC: deliver + deduct balance in ONE SQLite transaction ──
   const walletResult = db.deliverOrderAndChargeWallet(
@@ -352,6 +422,7 @@ async function payWithWallet(bot, chatId, userId, orderId, messageId) {
     const updated    = db.getProduct(order.product_id);
     const stockAfter = updated?.stock_quantity || 0;
     await checkAndNotifyStockLevel(bot, db, order.product_id, stockBefore, stockAfter);
+    await evaluateStock(bot, order.product_id);
 
     if (stockAfter === 0) {
       logger.info(`Product #${order.product_id} stock reached 0 after order #${orderId}`);
@@ -679,6 +750,39 @@ async function settleDirectPayment(bot, chatId, userId, info) {
 
   // Try to deliver (atomic — stock is checked + decremented in one transaction)
   const stockBefore = db.getProduct(order.product_id)?.stock_quantity || 0;
+
+  // ── MANUAL DELIVERY BRANCH (external payment already verified above) ──────
+  const _mdProd = db.getProduct(order.product_id);
+  if (_mdProd && _mdProd.delivery_type === 'manual') {
+    const settled = db.settleManualOrderExternal(
+      order.id, order.product_id, order.quantity, method
+    );
+    if (settled.result === 'already_processed') {
+      await bot.sendMessage(chatId, '❌ This order has already been processed.');
+      return;
+    }
+
+    db.addTransaction({
+      userId, type: 'purchase', amount: -required,
+      description: `Order #${order.id}: ${order.product_title}`,
+      refId: identifier, orderId: order.id,
+    });
+
+    session.clear(userId);
+    const freshManualOrder = db.getOrder(order.id);
+    await manualDelivery.openManualDelivery(bot, freshManualOrder, method);
+    await handleReferralReward(bot, userId);
+
+    const stockAfterMd = db.getProduct(order.product_id)?.stock_quantity || 0;
+    await checkAndNotifyStockLevel(bot, db, order.product_id, stockBefore, stockAfterMd);
+    await evaluateStock(bot, order.product_id);
+
+    const freshUser = db.getUser(userId);
+    await notifyAdminsDirect(bot, userId, order, paid, method, identifier,
+      'exact', freshUser?.balance || 0);
+    return;
+  }
+
   const delivered   = db.deliverOrder(order.id, order.product_id, order.quantity, method, userId);
 
   if (!delivered) {
@@ -730,6 +834,7 @@ async function settleDirectPayment(bot, chatId, userId, info) {
   // Stock-level notifications
   const stockAfter = db.getProduct(order.product_id)?.stock_quantity || 0;
   await checkAndNotifyStockLevel(bot, db, order.product_id, stockBefore, stockAfter);
+  await evaluateStock(bot, order.product_id);
 
   // Admin notification
   const fresh = db.getUser(userId);
@@ -901,9 +1006,13 @@ async function sendDelivery(bot, chatId, order, content, messageId = null) {
 
   // ── VIP unlock check: did this purchase qualify the referrer for VIP? ──
   try {
-    const me = db.getUser(userId);
-    // Find who referred this user (the one who buys)
-    const referrerRow = db.prepare('SELECT referrer_id FROM referrals WHERE referred_id = ?').get(userId);
+    // NOTE: this block used to call db.prepare() (which does not exist on the
+    // queries module) and referenced an undefined `userId`, so it silently
+    // threw on every delivery and VIP was never unlocked. Both are fixed here.
+    const buyerId = order.user_id;
+    const referrerRow = dbRaw
+      .prepare('SELECT referrer_id FROM referrals WHERE referred_id = ?')
+      .get(buyerId);
     if (referrerRow && referrerRow.referrer_id) {
       const refId = referrerRow.referrer_id;
       const isVipAlready = db.isVIP(refId);
@@ -1033,6 +1142,25 @@ async function deliverCryptobotOrder(bot, invoiceId, paidAmount, payloadStr) {
   const order = db.getOrder(orderId);
   if (!order) return false;
   if (order.status !== 'pending') return false;
+
+  // ── MANUAL DELIVERY BRANCH ───────────────────────────────────────────────
+  const mdProduct = db.getProduct(order.product_id);
+  if (mdProduct && mdProduct.delivery_type === 'manual') {
+    const settled = db.settleManualOrderExternal(orderId, order.product_id, order.quantity, 'cryptobot');
+    if (settled.result !== 'ok') return true; // webhook retry — already handled
+
+    db.addTransaction({
+      userId, type: 'purchase', amount: -order.total_price,
+      description: `Order #${orderId}: ${order.product_title}`,
+      refId: `cryptobot:${invoiceId}`, orderId,
+    });
+
+    const freshManual = db.getOrder(orderId);
+    await manualDelivery.openManualDelivery(bot, freshManual, 'cryptobot');
+    await handleReferralReward(bot, userId);
+    await evaluateStock(bot, order.product_id);
+    return true;
+  }
 
   const content = db.deliverOrder(orderId, order.product_id, order.quantity, 'cryptobot', userId);
   if (!content) {

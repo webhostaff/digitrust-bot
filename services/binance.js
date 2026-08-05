@@ -80,7 +80,14 @@ async function fetchDepositHistory({ coin = 'USDT', startTime, endTime } = {}) {
 /**
  * Verify a single USDT deposit by TxID against Binance deposit history.
  */
-async function verifyDepositByTxId(rawTxid) {
+async function verifyDepositByTxId(rawTxid, opts = {}) {
+  // opts.maxAgeMinutes — reject deposits whose on-chain arrival is older than
+  //                      this. The TxID of a shared deposit address is public,
+  //                      so an unbounded window means every historical transfer
+  //                      is claimable forever by whoever reads the explorer.
+  const maxAgeMinutes = Number(opts.maxAgeMinutes) > 0 ? Number(opts.maxAgeMinutes) : 0;
+  let tooOld = false;
+  let tooOldMinutes = 0;
   // 1. Config check
   if (!config.binanceApiKey || !config.binanceApiSecret) {
     logger.error('Binance API key/secret not configured.');
@@ -181,6 +188,33 @@ async function verifyDepositByTxId(rawTxid) {
     logger.warn(`Cutoff check error: ${e.message}`);
   }
 
+  // ── FRAUD PROTECTION: deposit age window ────────────────────────────────
+  // This is what stops harvested TxIDs. A transfer that landed hours or weeks
+  // ago can no longer be claimed, no matter who submits it.
+  if (maxAgeMinutes > 0 && match.insertTime) {
+    const ageMs = Date.now() - Number(match.insertTime);
+    const maxMs = maxAgeMinutes * 60 * 1000;
+    if (ageMs > maxMs) {
+      // SOFT fail on purpose. The caller decides what to do, because the answer
+      // depends on something this layer cannot see: whether a valid reservation
+      // owned by the submitter exists.
+      //   • reservation matches  → send to manual review (nobody loses money)
+      //   • no reservation       → hard reject (this is the harvesting attack)
+      // Hard-failing here would punish honest users who were a minute late.
+      tooOld = true;
+      tooOldMinutes = Math.round(ageMs / 60000);
+      logger.warn(`[VERIFY] deposit ${txid} is ${tooOldMinutes} min old (limit ${maxAgeMinutes}) — flagged`);
+    }
+    // A timestamp in the future means clock skew or a manipulated value.
+    if (ageMs < -5 * 60 * 1000) {
+      logger.warn(`[VERIFY] REJECTED — deposit ${txid} has a future timestamp`);
+      return {
+        found: false, reason: 'bad_timestamp',
+        message: '❌ Could not validate this deposit. Please contact support.',
+      };
+    }
+  }
+
   // 5. Status: 1 = success
   const status = Number(match.status);
   if (status !== 1) {
@@ -247,6 +281,10 @@ async function verifyDepositByTxId(rawTxid) {
     asset:   'USDT',
     address: match.address,
     txid:    match.txId,
+    insertTime: Number(match.insertTime) || null,
+    tooOld,
+    tooOldMinutes,
+    maxAgeMinutes,
   };
 }
 

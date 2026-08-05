@@ -58,25 +58,108 @@ async function showTopupMethods(bot, chatId, userId, messageId) {
 
 // ── Method 1: External USDT (TRC20/BEP20) — TxID ──────────────────────────────
 
+/**
+ * STEP 1 — choose the network.
+ *
+ * The old flow jumped straight to "send us a TxID". Because the deposit
+ * address is shared and every transfer to it is public on the block explorer,
+ * that made any unclaimed TxID free money for whoever pasted it first. The
+ * flow is now: pick network → reserve a unique amount → transfer exactly that
+ * amount → submit the TxID. The reservation is what proves ownership.
+ */
 async function startUsdtTopup(bot, chatId, userId, messageId) {
-  const lang = db.getUserLanguage ? db.getUserLanguage(userId) : 'en';
-  session.set(userId, States.WALLET_TOPUP_USDT_TX, { startedAt: Date.now() });
+  session.clear(userId);
 
-  const trc20 = config.usdtTrc20Address || '—';
-  const bep20 = config.usdtBep20Address || '—';
+  const rows = [];
+  if (config.usdtTrc20Address) rows.push([{ text: '🔴 USDT — TRC20 (TRON)', callback_data: 'topup_net_TRC20' }]);
+  if (config.usdtBep20Address) rows.push([{ text: '🟡 USDT — BEP20 (BSC)',  callback_data: 'topup_net_BEP20' }]);
+  rows.push([{ text: '🔙 Back', callback_data: 'wallet_topup' }]);
+
+  if (rows.length === 1) {
+    await bot.editMessageText(
+      '❌ <b>USDT deposits are not configured.</b>\n\nPlease contact support.',
+      { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: backKb('wallet_topup') }
+    ).catch(() => {});
+    return;
+  }
 
   await bot.editMessageText(
     `💎 <b>Top Up via USDT</b>\n\n` +
-    `🔹 <b>TRC20 (USDT):</b> <code>${trc20}</code>\n` +
-    `🔹 <b>BEP20 (USDT):</b> <code>${bep20}</code>\n\n` +
-    `📌 After sending the payment, send the bot the <b>TxID</b> (transaction hash) of your transfer.\n\n` +
-    `⏰ Valid for ${PAYMENT_CONFIRM_VALIDITY_MIN} minutes and can only be used once.\n\n` +
-    `<i>Example TxID:</i>\n` +
-    `<code>0x1234...abcd</code> (64 chars)\n\n` +
-    `💵 Minimum deposit: <b>${MIN_DEPOSIT} USDT</b>`,
+    `Choose the network you will send from:\n\n` +
+    `🔴 <b>TRC20</b> — TRON network\n` +
+    `🟡 <b>BEP20</b> — BNB Smart Chain\n\n` +
+    `⚠️ <i>Send only USDT on the network you pick. Anything else is lost.</i>`,
+    { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }
+  ).catch(() => {});
+}
+
+/**
+ * STEP 2 — ask for the amount.
+ */
+async function startUsdtAmount(bot, chatId, userId, messageId, network) {
+  const net = network === 'TRC20' ? 'TRC20' : 'BEP20';
+  session.set(userId, States.WALLET_TOPUP_USDT_AMOUNT, { network: net, startedAt: Date.now() });
+
+  await bot.editMessageText(
+    `💎 <b>USDT — ${net}</b>\n\n` +
+    `1️⃣ Enter the amount you want to deposit, in USDT.\n` +
+    `   Example: <code>10</code>\n\n` +
+    `2️⃣ We will give you an <b>exact amount</b> to send.\n` +
+    `3️⃣ You must send that exact figure — it is what identifies your deposit.\n\n` +
+    `💵 Minimum: <b>${MIN_DEPOSIT} USDT</b>`,
+    { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: cancelKb('wallet_topup') }
+  ).catch(() => {});
+}
+
+/**
+ * STEP 3 — reserve a unique amount and show the payment instructions.
+ */
+async function handleUsdtAmount(bot, msg) {
+  const userId = msg.from.id;
+  const chatId = msg.chat.id;
+  const sess   = session.get(userId);
+  const net    = (sess.data && sess.data.network) === 'TRC20' ? 'TRC20' : 'BEP20';
+
+  const base = parseFloat(String(msg.text || '').replace(',', '.').trim());
+  if (isNaN(base) || base < MIN_DEPOSIT) {
+    await bot.sendMessage(chatId, `❌ Enter a valid amount (minimum <b>${MIN_DEPOSIT} USDT</b>).`, { parse_mode: 'HTML' });
+    return;
+  }
+  if (base > 10000) {
+    await bot.sendMessage(chatId, '❌ Single top-up cannot exceed 10,000 USDT. Contact support for larger amounts.');
+    return;
+  }
+
+  const ttl = parseInt(db.getSetting('deposit_intent_ttl_minutes', '60'), 10) || 60;
+  const intent = db.createDepositIntent(userId, net, base, ttl);
+  if (!intent) {
+    await bot.sendMessage(chatId, '❌ Could not reserve an amount right now. Please try again.');
+    return;
+  }
+
+  const address = net === 'TRC20' ? config.usdtTrc20Address : config.usdtBep20Address;
+  session.set(userId, States.WALLET_TOPUP_USDT_TX, {
+    network: net, intentId: intent.id, startedAt: Date.now(),
+  });
+
+  await bot.sendMessage(
+    chatId,
+    `💎 <b>Send exactly this amount</b>\n\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `💵 <b>Amount:</b>\n<code>${intent.unique_amount.toFixed(6)}</code>\n\n` +
+    `📥 <b>${net} address:</b>\n<code>${address}</code>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `⚠️ <b>The amount must match to the last decimal.</b>\n` +
+    `That exact figure is reserved for you — it is how we know the deposit is yours. ` +
+    `A different amount cannot be credited automatically.\n\n` +
+    `⏰ Reserved for <b>${ttl} minutes</b>.\n\n` +
+    `After sending, paste the <b>TxID</b> (transaction hash) here.`,
     {
-      chat_id: chatId, message_id: messageId,
-      parse_mode: 'HTML', reply_markup: cancelKb('wallet_topup'),
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: '❌ Cancel reservation', callback_data: `topup_cancel_${intent.id}` }],
+        [{ text: '🔙 Wallet', callback_data: 'menu_wallet' }],
+      ] },
     }
   );
 }
@@ -180,10 +263,11 @@ async function handleUsdtTxId(bot, msg) {
     waitMsgId = wait.message_id;
 
     const VERIFY_TIMEOUT = 35000;
+    const maxAge = parseInt(db.getSetting('deposit_max_age_minutes', '15'), 10) || 15;
     let result;
     try {
       result = await Promise.race([
-        verifyDepositByTxId(txid),
+        verifyDepositByTxId(txid, { maxAgeMinutes: maxAge }),
         new Promise((_, rej) => setTimeout(() => rej(new Error('TIMEOUT')), VERIFY_TIMEOUT))
       ]);
     } catch (err) {
@@ -201,11 +285,130 @@ async function handleUsdtTxId(bot, msg) {
     }
 
     if (!result.found) {
+      // Note: an out-of-window transfer does NOT arrive here. binance.js
+      // soft-fails it as found:true + tooOld, because whether it may still be
+      // credited depends on the reservation — which is checked below.
       await bot.sendMessage(chatId, result.message, { parse_mode: 'HTML' });
       return;
     }
 
-      await creditFromVerifiedDeposit(bot, chatId, userId, {
+    // ══════════════════════════════════════════════════════════════════
+    // OWNERSHIP GATE
+    //
+    // Binance has confirmed the transfer is real, recent and went to our
+    // address. None of that says WHO sent it — the TxID is public. The
+    // deposit is only credited when it matches a live reservation that
+    // belongs to this user.
+    // ══════════════════════════════════════════════════════════════════
+    const strict = db.getSetting('deposit_strict_mode', '1') === '1';
+
+    // A stale transfer with no reservation behind it is the harvesting attack:
+    // refuse it outright and never write it to the review queue, so it cannot
+    // be approved by accident later.
+    if (result.tooOld && !strict) {
+      await bot.sendMessage(chatId,
+        `⏰ <b>This deposit is outside the claim window.</b>\n\n` +
+        `It arrived <b>${result.tooOldMinutes} minutes</b> ago; the limit is ` +
+        `<b>${result.maxAgeMinutes} minutes</b>.`,
+        { parse_mode: 'HTML', reply_markup: backKb('menu_wallet') });
+      return;
+    }
+
+    if (strict) {
+      const intent = db.findIntentForDeposit(result.network, result.amount);
+
+      // (a) No reservation at all → never auto-credit. Park it for the admin.
+      if (!intent) {
+        if (result.tooOld) {
+          logger.warn(`[SECURITY] Stale unmatched deposit ${txid} (${result.tooOldMinutes} min) refused for ${userId}`);
+          await bot.sendMessage(chatId,
+            `❌ <b>This deposit cannot be claimed.</b>\n\n` +
+            `The transfer is <b>${result.tooOldMinutes} minutes</b> old and matches no ` +
+            `active reservation.\n\n` +
+            `Deposits must be reserved before sending, and the TxID submitted within ` +
+            `<b>${result.maxAgeMinutes} minutes</b>.`,
+            { parse_mode: 'HTML', reply_markup: backKb('menu_wallet') });
+          return;
+        }
+        db.addDepositReview({
+          txid, userId, amount: result.amount, network: result.network,
+          address: result.address, insertTime: result.insertTime,
+          reason: 'no_matching_reservation',
+        });
+        logger.warn(`[SECURITY] Unmatched deposit ${txid} (${result.amount} ${result.network}) claimed by ${userId}`);
+        await notifyDepositReview(bot, userId, txid, result, 'No matching reservation');
+        await bot.sendMessage(chatId,
+          `⚠️ <b>Amount does not match any reservation</b>\n\n` +
+          `💵 Received: <b>${Number(result.amount).toFixed(6)} USDT</b>\n\n` +
+          `Deposits are matched by the exact reserved amount. Since this one ` +
+          `matches no active reservation, it has been sent to our team for manual review.\n\n` +
+          `<i>You will be credited once an admin confirms it. This usually takes a short while.</i>`,
+          { parse_mode: 'HTML', reply_markup: backKb('menu_wallet') });
+        return;
+      }
+
+      // (b) The reservation belongs to somebody else → theft attempt.
+      if (Number(intent.user_id) !== Number(userId)) {
+        logger.warn(
+          `[SECURITY] THEFT ATTEMPT — user ${userId} submitted TxID ${txid} ` +
+          `matching reservation #${intent.id} owned by ${intent.user_id}`
+        );
+        await notifyDepositReview(bot, userId, txid, result,
+          `Belongs to reservation #${intent.id} of user ${intent.user_id}`);
+        await bot.sendMessage(chatId,
+          `❌ <b>This deposit is not yours.</b>\n\n` +
+          `The amount matches a reservation created by another account. ` +
+          `Repeated attempts will result in a permanent ban.`,
+          { parse_mode: 'HTML', reply_markup: backKb('menu_wallet') });
+        return;
+      }
+
+      // (b2) Reservation is valid and genuinely theirs, but the TxID arrived
+      //      late. Nobody loses money: it goes to manual review.
+      if (result.tooOld) {
+        db.addDepositReview({
+          txid, userId, amount: result.amount, network: result.network,
+          address: result.address, insertTime: result.insertTime,
+          reason: 'outside_window',
+        });
+        await notifyDepositReview(bot, userId, txid, result,
+          `Late TxID (${result.tooOldMinutes} min) but reservation #${intent.id} is valid`);
+        await bot.sendMessage(chatId,
+          `⏰ <b>Submitted a little late</b>\n\n` +
+          `Your reservation is valid, but the TxID arrived ${result.tooOldMinutes} minutes ` +
+          `after the transfer (limit ${result.maxAgeMinutes}).\n\n` +
+          `✅ Nothing is lost — our team will credit it shortly.`,
+          { parse_mode: 'HTML', reply_markup: backKb('menu_wallet') });
+        return;
+      }
+
+      // (c) The transfer must post-date the reservation. A deposit made
+      //     BEFORE the user asked for an amount cannot belong to it.
+      if (result.insertTime && result.insertTime < Number(intent.created_ms) - 120000) {
+        db.addDepositReview({
+          txid, userId, amount: result.amount, network: result.network,
+          address: result.address, insertTime: result.insertTime,
+          reason: 'predates_reservation',
+        });
+        logger.warn(`[SECURITY] Deposit ${txid} predates reservation #${intent.id}`);
+        await notifyDepositReview(bot, userId, txid, result, 'Transfer predates the reservation');
+        await bot.sendMessage(chatId,
+          `⚠️ <b>This transfer is older than your reservation.</b>\n\n` +
+          `It has been sent to our team for manual review.`,
+          { parse_mode: 'HTML', reply_markup: backKb('menu_wallet') });
+        return;
+      }
+
+      // (d) Consume the reservation atomically — it can never be reused.
+      if (!db.claimDepositIntent(intent.id, txid)) {
+        await bot.sendMessage(chatId, '⚠️ This reservation was already used. Please start a new top-up.',
+          { parse_mode: 'HTML', reply_markup: backKb('menu_wallet') });
+        return;
+      }
+      logger.info(`Deposit ${txid} matched reservation #${intent.id} for user ${userId}`);
+    }
+
+    await creditFromVerifiedDeposit(bot, chatId, userId, {
       identifier: txid,
       amount: result.amount,
       network: result.network,
@@ -384,6 +587,39 @@ async function handleCryptobotAmount(bot, msg) {
   );
 }
 
+/**
+ * Tell the admin about a deposit that could not be auto-credited.
+ * Deduped on the TxID, so retries by the same user do not spam.
+ */
+async function notifyDepositReview(bot, userId, txid, result, reason) {
+  try {
+    const { notifyAdmin } = require('../services/adminNotify');
+    const review = db.getDepositReviewByTxid(txid);
+    const user   = db.getUser(userId);
+    const who    = user?.username ? `@${user.username}` : (user?.first_name || `User ${userId}`);
+
+    await notifyAdmin(bot, {
+      type:  'refund_request', // reuses the existing notification centre channel
+      title: 'Deposit needs manual review',
+      body:
+        `⚠️ <b>Reason:</b> ${reason}\n\n` +
+        `👤 <b>Submitted by:</b> ${who}\n` +
+        `🆔 <code>${userId}</code>\n` +
+        `💵 <b>Amount:</b> ${Number(result.amount).toFixed(6)} USDT\n` +
+        `🌐 <b>Network:</b> ${result.network}\n` +
+        `🔗 <b>TxID:</b> <code>${txid}</code>`,
+      dedupeKey: `deposit_review:${txid}`,
+      refType:   'deposit_review',
+      refId:     review ? review.id : null,
+      buttons: review
+        ? [[{ text: '🔍 Review deposit', callback_data: `admin_dep_view_${review.id}` }]]
+        : null,
+    });
+  } catch (e) {
+    logger.warn(`notifyDepositReview failed: ${e.message}`);
+  }
+}
+
 // ── Shared crediting helper for Binance-verified deposits ─────────────────────
 
 async function creditFromVerifiedDeposit(bot, chatId, userId, info) {
@@ -557,6 +793,9 @@ async function showTransactions(bot, chatId, userId, messageId) {
 }
 
 module.exports = {
+  startUsdtAmount,
+  handleUsdtAmount,
+
   showWallet,
   showTopupMethods,
   startUsdtTopup,

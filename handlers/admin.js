@@ -26,6 +26,7 @@ const {
   buildLowStockText, buildOutOfStockText, buildPriceDropText,
 } = require('../services/notifications');
 const { notifyBackInStockSubscribers } = require('./buy');
+const { evaluateStock } = require('../services/stockAlerts');
 const logger = require('../utils/logger');
 
 // Pending notification context per admin user
@@ -127,6 +128,163 @@ async function handleAdminText(bot, msg) {
   const sess   = session.get(userId);
   const s      = sess.state;
   const d      = sess.data;
+
+  // ═══════════════════════════════════════════════════════════════════
+  // V2 TEXT STATES
+  // ═══════════════════════════════════════════════════════════════════
+
+  // ── Per-product low-stock threshold ──────────────────────────────
+  // ── Reverse a fraudulent deposit ─────────────────────────────────
+  if (s === States.ADMIN_DEP_REVERSE) {
+    const parts    = String(text).trim().split(/\s+/);
+    const targetId = parseInt(parts[0], 10);
+    const amount   = parseFloat(String(parts[1] || '').replace(',', '.'));
+    const reason   = parts.slice(2).join(' ') || 'Fraudulent deposit';
+
+    if (!Number.isFinite(targetId) || !Number.isFinite(amount) || amount <= 0) {
+      await bot.sendMessage(chatId, '❌ Format: <code>USER_ID AMOUNT [reason]</code>', { parse_mode: 'HTML' });
+      return;
+    }
+    const target = db.getUser(targetId);
+    if (!target) {
+      session.clear(userId);
+      await bot.sendMessage(chatId, '❌ User not found.');
+      return;
+    }
+
+    session.clear(userId);
+    const res = db.reverseDeposit({ userId: targetId, amount, reason, adminId: userId });
+    logger.warn(`Admin ${userId} REVERSED ${amount} from user ${targetId}: ${reason}`);
+
+    await bot.sendMessage(
+      chatId,
+      `↩️ <b>Deposit Reversed</b>\n\n` +
+      `👤 <code>${targetId}</code>\n` +
+      `💵 Removed: <b>${formatPrice(amount)}</b>\n` +
+      `💰 Balance: ${formatPrice(res.before)} → <b>${formatPrice(res.after)}</b>\n` +
+      `📝 <i>${escapeHtml(reason)}</i>` +
+      (res.after < 0 ? `\n\n⚠️ <b>Balance is negative — the money had already been spent.</b>` : ''),
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: '🚫 Ban this user', callback_data: `admin_toggle_ban_${targetId}` }],
+          [{ text: '🛡 Deposit Review', callback_data: 'admin_deposits' }],
+        ] } }
+    );
+    return;
+  }
+
+  if (s === States.ADMIN_LOW_STOCK) {
+    const n = parseInt(text, 10);
+    if (isNaN(n) || n < 0) {
+      await bot.sendMessage(chatId, '❌ Enter a non-negative number (0 = use the global default).');
+      return;
+    }
+    const productId = d.lowStockProductId;
+    require('../database/db').prepare('UPDATE products SET low_stock_threshold = ? WHERE id = ?')
+      .run(n, productId);
+    // Re-arm the alert latches so the new threshold is evaluated cleanly.
+    db.resetStockAlertFlags(productId);
+    session.clear(userId);
+
+    const product = db.getProduct(productId);
+    const globalDefault = db.getSetting('low_stock_threshold_default', '5');
+    await bot.sendMessage(
+      chatId,
+      `✅ <b>Low-stock threshold updated</b>\n\n` +
+      `📦 ${escapeHtml(product?.title || '')}\n` +
+      `🔔 Alert when stock reaches: <b>${n > 0 ? n : `${globalDefault} (global default)`}</b>\n` +
+      `📊 Current stock: <b>${product?.stock_quantity || 0}</b>`,
+      { parse_mode: 'HTML', reply_markup: backToProductEditKb(productId) }
+    );
+    return;
+  }
+
+  // ── Content for a manual-delivery task ───────────────────────────
+  if (s === States.ADMIN_MD_CONTENT) {
+    const taskId = d.mdTaskId;
+    const content = (text || '').trim();
+    if (!content) {
+      await bot.sendMessage(chatId, '❌ Content cannot be empty.');
+      return;
+    }
+    session.clear(userId);
+    const manualDelivery = require('./manualDelivery');
+    const res = await manualDelivery.completeManualDelivery(bot, taskId, content);
+    await bot.sendMessage(
+      chatId,
+      res.ok
+        ? `✅ <b>Task #${taskId} delivered.</b>` +
+          (res.notified ? '' : '\n⚠️ The customer could not be messaged — the content is saved on the task.')
+        : `⚠️ Could not deliver: <b>${res.reason}</b>`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '📦 Manual Delivery', callback_data: 'admin_md_list_pending_0' }]] } }
+    );
+    return;
+  }
+
+  // ── Create a reseller (this handler was missing entirely: the state was
+  //    registered in index.js but nothing consumed it, so "Add New Reseller"
+  //    silently did nothing) ───────────────────────────────────────
+  if (s === 'ADMIN_RESELLER_NEW_NAME') {
+    session.clear(userId);
+    const name = (text || '').trim();
+    if (name.length < 2 || name.length > 60) {
+      await bot.sendMessage(chatId, '❌ Name must be between 2 and 60 characters.');
+      return;
+    }
+    const apiKey = 'rk_' + require('crypto').randomBytes(24).toString('hex');
+    try {
+      db.createReseller(name, apiKey);
+      await bot.sendMessage(
+        chatId,
+        `✅ <b>Reseller created</b>\n\n` +
+        `🏪 <b>Name:</b> ${escapeHtml(name)}\n` +
+        `🔑 <b>API key</b> (tap to copy):\n<code>${apiKey}</code>\n\n` +
+        `⚠️ <i>Share this key only with the reseller. Add balance before they can order.</i>`,
+        { parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '🏪 Resellers', callback_data: 'admin_resellers' }]] } }
+      );
+      logger.info(`Admin ${userId} created reseller "${name}"`);
+    } catch (e) {
+      await bot.sendMessage(chatId, `❌ Could not create reseller: ${e.message}`);
+    }
+    return;
+  }
+
+  // ── Adjust reseller balance (same missing-handler problem) ───────
+  if (s === 'ADMIN_RESELLER_BALANCE') {
+    const { resellerId } = d;
+    const amount = parseFloat(String(text).replace('$', '').replace(',', '.'));
+    if (isNaN(amount) || amount === 0) {
+      await bot.sendMessage(chatId, '❌ Enter a non-zero amount, e.g. <code>10</code> or <code>-5</code>.', { parse_mode: 'HTML' });
+      return;
+    }
+    const r = db.getResellerById(resellerId);
+    if (!r) {
+      session.clear(userId);
+      await bot.sendMessage(chatId, '❌ Reseller not found.');
+      return;
+    }
+    if (amount < 0 && Math.abs(amount) > Number(r.balance) + 1e-9) {
+      await bot.sendMessage(chatId,
+        `❌ Cannot subtract ${formatPrice(Math.abs(amount))} — balance is only ${formatPrice(r.balance)}.`,
+        { parse_mode: 'HTML' });
+      return;
+    }
+    db.addResellerBalance(resellerId, amount);
+    session.clear(userId);
+    const updated = db.getResellerById(resellerId);
+    await bot.sendMessage(
+      chatId,
+      `✅ <b>Balance updated</b>\n\n` +
+      `🏪 ${escapeHtml(updated.name)}\n` +
+      `${amount > 0 ? '➕' : '➖'} ${formatPrice(Math.abs(amount))}\n` +
+      `💰 New balance: <b>${formatPrice(updated.balance)}</b>`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🏪 Back to reseller', callback_data: `admin_reseller_${resellerId}` }]] } }
+    );
+    return;
+  }
 
   // ── Product wizard ───────────────────────────────────────────────
   if (s === States.ADMIN_ADD_TITLE) {
@@ -518,6 +676,8 @@ async function handleAdminText(bot, msg) {
         `📊 New stock: <b>${prevStock + count}</b>`,
         { parse_mode: 'HTML', reply_markup: adminStockManageKb(productId) });
 
+      await evaluateStock(bot, productId);
+
       // Notify back-in-stock subscribers if stock was zero
       if (prevStock === 0 && count > 0) {
         const notified = await notifyBackInStockSubscribers(bot, productId);
@@ -685,6 +845,8 @@ async function handleAdminText(bot, msg) {
       { parse_mode: 'HTML', reply_markup: adminBackKb() }
     );
 
+    await evaluateStock(bot, productId);
+
     // Fire back-in-stock notifications if was 0 before
     if (wasZero && result.after > 0) {
       const notified = await notifyBackInStockSubscribers(bot, productId);
@@ -723,6 +885,7 @@ async function handleAdminText(bot, msg) {
       `📊 New stock: <b>${result.after}</b>`,
       { parse_mode: 'HTML', reply_markup: backToProductEditKb(productId) }
     );
+    await evaluateStock(bot, productId);
     return;
   }
 
@@ -744,6 +907,8 @@ async function handleAdminText(bot, msg) {
       `✅ <b>Stock Set!</b>\n\n📦 ${product.title}\n📊 Stock quantity: <b>${newQty}</b>`,
       { parse_mode: 'HTML', reply_markup: backToProductEditKb(productId) }
     );
+
+    await evaluateStock(bot, productId);
 
     if (wasZero && newQty > 0) {
       const notified = await notifyBackInStockSubscribers(bot, productId);
@@ -1537,6 +1702,504 @@ async function handleAdminCallback(bot, query) {
 
   await answer();
 
+  // ═══════════════════════════════════════════════════════════════════
+  // V2 CALLBACKS — refund eligibility, delivery mode, stock alerts,
+  // notification centre and manual-delivery management.
+  // Placed first so they are matched before the older generic patterns.
+  // ═══════════════════════════════════════════════════════════════════
+
+  // ═══════════════════════════════════════════════════════════════════
+  // V3 — DEPOSIT SECURITY: manual review queue + reversals
+  // ═══════════════════════════════════════════════════════════════════
+
+  if (data === 'admin_deposits' || /^admin_dep_list_[a-z]+_\d+$/.test(data)) {
+    let status = 'pending', page = 0;
+    if (data !== 'admin_deposits') {
+      const parts = data.split('_');
+      page   = parseInt(parts.pop(), 10) || 0;
+      status = parts.slice(3).join('_');
+    }
+    const TABS = { pending: '🕐 Pending', approved: '✅ Approved', rejected: '❌ Rejected' };
+    const safe = Object.prototype.hasOwnProperty.call(TABS, status) ? status : 'pending';
+
+    const PER   = 8;
+    const total = db.countDepositReviews(safe);
+    const pages = Math.max(1, Math.ceil(total / PER));
+    const pg    = Math.max(0, Math.min(page, pages - 1));
+    const rows  = db.listDepositReviews(safe, PER, pg * PER);
+
+    const txt =
+      `🛡 <b>Deposit Review</b>\n\n` +
+      `Deposits that could not be matched to a reservation are held here. ` +
+      `They are <b>never</b> credited automatically.\n\n` +
+      `🕐 Pending: <b>${db.countDepositReviews('pending')}</b>   ` +
+      `✅ Approved: <b>${db.countDepositReviews('approved')}</b>   ` +
+      `❌ Rejected: <b>${db.countDepositReviews('rejected')}</b>\n\n` +
+      `<b>Showing:</b> ${TABS[safe]} — ${total} item(s)` +
+      (rows.length ? '' : '\n\n<i>Nothing here.</i>');
+
+    const kb = [Object.keys(TABS).map((k) => ({
+      text: (k === safe ? '✓ ' : '') + TABS[k], callback_data: `admin_dep_list_${k}_0`,
+    }))];
+    for (const r of rows) {
+      kb.push([{
+        text: `#${r.id} · ${Number(r.amount).toFixed(2)} ${r.network || ''} · ${r.user_id}`,
+        callback_data: `admin_dep_view_${r.id}`,
+      }]);
+    }
+    if (pages > 1) {
+      const nav = [];
+      if (pg > 0)         nav.push({ text: '◀️ Prev', callback_data: `admin_dep_list_${safe}_${pg - 1}` });
+      nav.push({ text: `${pg + 1}/${pages}`, callback_data: 'noop' });
+      if (pg < pages - 1) nav.push({ text: 'Next ▶️', callback_data: `admin_dep_list_${safe}_${pg + 1}` });
+      kb.push(nav);
+    }
+    kb.push([{ text: '↩️ Reverse a deposit', callback_data: 'admin_dep_reverse' }]);
+    kb.push([{ text: '🔙 Back', callback_data: 'admin_panel' }]);
+
+    try {
+      await bot.editMessageText(txt, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+    } catch (e) {
+      await bot.sendMessage(chatId, txt, { parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+    }
+    return;
+  }
+
+  if (/^admin_dep_view_\d+$/.test(data)) {
+    const id = parseInt(data.split('_').pop(), 10);
+    const r  = db.getDepositReview(id);
+    if (!r) { await answer('❌ Not found'); return; }
+
+    const u   = db.getUser(r.user_id);
+    const who = u?.username ? `@${u.username}` : (u?.first_name || `User ${r.user_id}`);
+    const when = r.insert_time
+      ? new Date(Number(r.insert_time)).toISOString().replace('T', ' ').slice(0, 16)
+      : 'unknown';
+    const ageMin = r.insert_time ? Math.round((Date.now() - Number(r.insert_time)) / 60000) : null;
+
+    const REASONS = {
+      no_matching_reservation: 'No reservation matched this amount',
+      predates_reservation:    'Transfer is older than the reservation',
+    };
+
+    const txt =
+      `🛡 <b>Deposit Review #${r.id}</b>\n\n` +
+      `<b>Status:</b> ${String(r.status).toUpperCase()}\n` +
+      `⚠️ <b>Reason:</b> ${REASONS[r.reason] || r.reason || 'n/a'}\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `💵 <b>Amount:</b> ${Number(r.amount).toFixed(6)} USDT\n` +
+      `🌐 <b>Network:</b> ${r.network || 'n/a'}\n` +
+      `🔗 <b>TxID:</b>\n<code>${escapeHtml(r.txid)}</code>\n` +
+      `📅 <b>On chain:</b> ${when} UTC` +
+      (ageMin !== null ? ` (${ageMin} min ago)` : '') + `\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `👤 <b>Claimed by:</b> ${escapeHtml(who)}\n` +
+      `🆔 <code>${r.user_id}</code>\n` +
+      (u ? `💰 <b>Balance:</b> ${formatPrice(u.balance || 0)}\n` : '') +
+      `📝 <b>Submitted:</b> ${String(r.created_at || '').slice(0, 16)}\n` +
+      (r.admin_note ? `\n📌 <i>${escapeHtml(r.admin_note)}</i>\n` : '') +
+      `\n<i>Approve only if you are sure this transfer really belongs to this user.</i>`;
+
+    const kb = [];
+    if (r.status === 'pending') {
+      kb.push([{ text: '✅ Approve & credit', callback_data: `admin_dep_ok_${r.id}` }]);
+      kb.push([{ text: '❌ Reject',           callback_data: `admin_dep_no_${r.id}` }]);
+    }
+    kb.push([{ text: '🔙 Back', callback_data: 'admin_deposits' }]);
+
+    try {
+      await bot.editMessageText(txt, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+    } catch (e) {
+      await bot.sendMessage(chatId, txt, { parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+    }
+    return;
+  }
+
+  if (/^admin_dep_ok_\d+$/.test(data)) {
+    const id = parseInt(data.split('_').pop(), 10);
+    const r  = db.getDepositReview(id);
+    if (!r || r.status !== 'pending') { await answer('❌ Already handled'); return; }
+
+    // saveUsedTxid throws on a duplicate — that is the replay guard.
+    try {
+      db.saveUsedTxid({
+        txid: r.txid, userId: r.user_id, amount: r.amount,
+        network: r.network, asset: 'USDT', address: r.address || null,
+      });
+    } catch (e) {
+      db.resolveDepositReview(id, 'rejected', 'TxID already credited', userId);
+      await answer('❌ This TxID was already credited');
+      return await handleAdminCallback(bot, { ...query, data: `admin_dep_view_${id}` });
+    }
+
+    db.updateBalance(r.user_id, Number(r.amount));
+    db.addTransaction({
+      userId: r.user_id, type: 'deposit', amount: Number(r.amount),
+      description: `USDT ${r.network} top-up (manually approved)`,
+      refId: r.txid, orderId: null,
+    });
+    db.resolveDepositReview(id, 'approved', `Approved by admin ${userId}`, userId);
+    logger.info(`Admin ${userId} APPROVED deposit review #${id} — ${r.amount} to user ${r.user_id}`);
+
+    try {
+      const fresh = db.getUser(r.user_id);
+      await bot.sendMessage(r.user_id,
+        `✅ <b>Deposit Credited</b>\n\n` +
+        `💵 <b>${Number(r.amount).toFixed(6)} USDT</b> has been added to your wallet after review.\n` +
+        `💰 <b>New balance:</b> ${formatPrice(fresh?.balance || 0)}`,
+        { parse_mode: 'HTML' });
+    } catch (e) { /* user may have blocked the bot */ }
+
+    await answer('✅ Credited');
+    return await handleAdminCallback(bot, { ...query, data: `admin_dep_view_${id}` });
+  }
+
+  if (/^admin_dep_no_\d+$/.test(data)) {
+    const id = parseInt(data.split('_').pop(), 10);
+    db.resolveDepositReview(id, 'rejected', `Rejected by admin ${userId}`, userId);
+    logger.info(`Admin ${userId} REJECTED deposit review #${id}`);
+    await answer('❌ Rejected');
+    return await handleAdminCallback(bot, { ...query, data: `admin_dep_view_${id}` });
+  }
+
+  if (data === 'admin_dep_reverse') {
+    session.set(userId, States.ADMIN_DEP_REVERSE, {});
+    await bot.editMessageText(
+      `↩️ <b>Reverse a Deposit</b>\n\n` +
+      `Send: <code>USER_ID AMOUNT [reason]</code>\n\n` +
+      `Example:\n<code>354712964 1117.7303 stolen TxID</code>\n\n` +
+      `The amount is removed from the wallet and written to the audit log. ` +
+      `The balance may go negative — if the money was already spent, the debt ` +
+      `stays visible instead of disappearing.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Cancel', callback_data: 'admin_deposits' }]] } }
+    ).catch(() => {});
+    return;
+  }
+
+  // ── Toggle refund eligibility for a product ───────────────────────
+  if (/^admin_toggle_refund_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product   = db.getProduct(productId);
+    if (!product) { await answer('❌ Product not found'); return; }
+    const newVal = Number(product.refund_enabled) === 1 ? 0 : 1;
+    db.updateProduct(productId, 'refund_enabled', newVal);
+    logger.info(`Admin ${userId} set refund_enabled=${newVal} on product #${productId}`);
+
+    await bot.editMessageText(
+      `🔄 <b>Refund Eligibility</b>\n\n` +
+      `📦 ${escapeHtml(product.title || '')}\n\n` +
+      `Status: ${newVal ? '✅ <b>ELIGIBLE</b> — customers can request a refund'
+                        : '🚫 <b>NOT ELIGIBLE</b> — refund requests are blocked'}\n\n` +
+      `<i>Blocked products are hidden from the customer's refund list, and the ` +
+      `server rejects any request for them even if the button is forged.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: newVal ? '🚫 Disable refunds' : '✅ Enable refunds', callback_data: `admin_toggle_refund_${productId}` }],
+          [{ text: '🔙 Back to product', callback_data: `admin_edit_p_${productId}` }],
+        ] } }
+    ).catch(() => {});
+    return;
+  }
+
+  // ── Toggle automatic / manual delivery ────────────────────────────
+  if (/^admin_toggle_delivery_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product   = db.getProduct(productId);
+    if (!product) { await answer('❌ Product not found'); return; }
+    const isManual = product.delivery_type === 'manual';
+    const newVal   = isManual ? 'auto' : 'manual';
+    require('../database/db').prepare('UPDATE products SET delivery_type = ? WHERE id = ?')
+      .run(newVal, productId);
+    logger.info(`Admin ${userId} set delivery_type=${newVal} on product #${productId}`);
+
+    await bot.editMessageText(
+      `🚚 <b>Delivery Method</b>\n\n` +
+      `📦 ${escapeHtml(product.title || '')}\n\n` +
+      (newVal === 'manual'
+        ? `Mode: 🖐 <b>MANUAL</b>\n\n` +
+          `After a successful payment the stock is NOT handed out automatically. ` +
+          `A task is opened under 📦 Manual Delivery and you deliver it yourself. ` +
+          `The customer is told their order is queued.`
+        : `Mode: ⚡ <b>AUTOMATIC</b>\n\n` +
+          `Stock items are delivered instantly the moment payment succeeds.`),
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: newVal === 'manual' ? '⚡ Switch to automatic' : '🖐 Switch to manual',
+             callback_data: `admin_toggle_delivery_${productId}` }],
+          [{ text: '🔙 Back to product', callback_data: `admin_edit_p_${productId}` }],
+        ] } }
+    ).catch(() => {});
+    return;
+  }
+
+  // ── Per-product low-stock threshold ───────────────────────────────
+  if (/^admin_lowstock_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product   = db.getProduct(productId);
+    if (!product) { await answer('❌ Product not found'); return; }
+    const globalDefault = db.getSetting('low_stock_threshold_default', '5');
+    session.set(userId, States.ADMIN_LOW_STOCK, { lowStockProductId: productId });
+
+    await bot.editMessageText(
+      `🔔 <b>Low-Stock Alert Threshold</b>\n\n` +
+      `📦 ${escapeHtml(product.title || '')}\n` +
+      `📊 Current stock: <b>${product.stock_quantity || 0}</b>\n\n` +
+      `Current threshold: <b>${Number(product.low_stock_threshold) > 0
+        ? product.low_stock_threshold
+        : `${globalDefault} (global default)`}</b>\n\n` +
+      `Send the number of units at which you want to be warned.\n` +
+      `Send <code>0</code> to fall back to the global default.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Cancel', callback_data: `admin_edit_p_${productId}` }]] } }
+    ).catch(() => {});
+    return;
+  }
+
+  // ── Notification centre ───────────────────────────────────────────
+  if (data === 'admin_notifications' || /^admin_notif_(all|unread)_\d+$/.test(data)) {
+    let mode = 'unread';
+    let page = 0;
+    if (/^admin_notif_(all|unread)_\d+$/.test(data)) {
+      const parts = data.split('_');
+      page = parseInt(parts.pop(), 10) || 0;
+      mode = parts[2];
+    }
+
+    const PER = 8;
+    const unreadOnly = mode === 'unread';
+    const total  = unreadOnly ? db.countUnreadNotifications() : db.countAdminNotifications();
+    const totalPages = Math.max(1, Math.ceil(total / PER));
+    const safePage   = Math.max(0, Math.min(page, totalPages - 1));
+    const rows = db.getAdminNotifications(PER, safePage * PER, unreadOnly);
+
+    const unreadCount = db.countUnreadNotifications();
+    const icons = { manual_delivery: '📦', stock_out: '🔴', stock_low: '🟠',
+                    refund_request: '🔄', support_message: '💬' };
+
+    let txt =
+      `🔔 <b>Notifications</b>\n\n` +
+      `🔴 Unread: <b>${unreadCount}</b>   📋 Total: <b>${db.countAdminNotifications()}</b>\n` +
+      `<b>Showing:</b> ${unreadOnly ? '🔴 Unread only' : '📋 All'} — ${total} item(s)\n`;
+
+    if (!rows.length) txt += `\n<i>Nothing here.</i>`;
+
+    const kb = [[
+      { text: (unreadOnly ? '✓ ' : '') + '🔴 Unread', callback_data: 'admin_notif_unread_0' },
+      { text: (!unreadOnly ? '✓ ' : '') + '📋 All',   callback_data: 'admin_notif_all_0' },
+    ]];
+
+    for (const n of rows) {
+      const dot = n.is_read ? '' : '🔴 ';
+      const when = String(n.created_at || '').slice(5, 16).replace('-', '/');
+      kb.push([{
+        text: `${dot}${icons[n.type] || '🔔'} ${String(n.title).slice(0, 30)} · ${when}`,
+        callback_data: `admin_notif_view_${n.id}`,
+      }]);
+    }
+
+    if (totalPages > 1) {
+      const nav = [];
+      if (safePage > 0)              nav.push({ text: '◀️ Prev', callback_data: `admin_notif_${mode}_${safePage - 1}` });
+      nav.push({ text: `${safePage + 1}/${totalPages}`, callback_data: 'noop' });
+      if (safePage < totalPages - 1) nav.push({ text: 'Next ▶️', callback_data: `admin_notif_${mode}_${safePage + 1}` });
+      kb.push(nav);
+    }
+
+    if (unreadCount > 0) kb.push([{ text: '✅ Mark all as read', callback_data: 'admin_notif_readall' }]);
+    kb.push([{ text: '🔙 Back', callback_data: 'admin_panel' }]);
+
+    try {
+      await bot.editMessageText(txt, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+    } catch (e) {
+      await bot.sendMessage(chatId, txt, { parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+    }
+    return;
+  }
+
+  if (/^admin_notif_view_\d+$/.test(data)) {
+    const id = parseInt(data.split('_').pop(), 10);
+    const n  = db.getAdminNotification(id);
+    if (!n) { await answer('❌ Not found'); return; }
+
+    // Opening a notification is what marks it read.
+    db.markNotificationRead(id);
+
+    const icons = { manual_delivery: '📦', stock_out: '🔴', stock_low: '🟠',
+                    refund_request: '🔄', support_message: '💬' };
+
+    // Deep link back to whatever the notification is about.
+    const jump = [];
+    if (n.ref_type === 'manual_delivery') jump.push([{ text: '📦 Open task',    callback_data: `admin_md_view_${n.ref_id}` }]);
+    if (n.ref_type === 'refund_request')  jump.push([{ text: '🔄 Open request', callback_data: `admin_refund_view_${n.ref_id}` }]);
+    if (n.ref_type === 'product')         jump.push([{ text: '📦 Manage stock', callback_data: `admin_stock_select_p_${n.ref_id}` }]);
+
+    const txt =
+      `${icons[n.type] || '🔔'} <b>${escapeHtml(n.title)}</b>\n` +
+      `🕒 ${String(n.created_at || '').slice(0, 16)}\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `${n.body || '<i>(no details)</i>'}`;
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [...jump, [{ text: '🔙 Notifications', callback_data: 'admin_notifications' }]] },
+    }).catch(async () => {
+      await bot.sendMessage(chatId, txt, { parse_mode: 'HTML' });
+    });
+    return;
+  }
+
+  if (data === 'admin_notif_readall') {
+    const n = db.markAllNotificationsRead();
+    await answer(`✅ ${n} marked as read`);
+    return await handleAdminCallback(bot, { ...query, data: 'admin_notifications' });
+  }
+
+  // ── Manual delivery management (mirrors the Support Bot panel) ─────
+  if (/^admin_md_list_[a-z]+_\d+$/.test(data)) {
+    const parts  = data.split('_');
+    const page   = parseInt(parts.pop(), 10) || 0;
+    const status = parts.slice(3).join('_');
+    const TABS = { pending: '🕐 Waiting', processing: '⚙️ In progress',
+                   delivered: '✅ Delivered', cancelled: '❌ Cancelled', all: '📋 All' };
+    const safeStatus = Object.prototype.hasOwnProperty.call(TABS, status) ? status : 'pending';
+
+    const counts = db.getManualDeliveryCounts();
+    let rows = db.getAllManualDeliveries();
+    if (safeStatus !== 'all') rows = rows.filter((r) => r.status === safeStatus);
+
+    const PER = 8;
+    const totalPages = Math.max(1, Math.ceil(rows.length / PER));
+    const safePage   = Math.max(0, Math.min(page, totalPages - 1));
+    const slice = rows.slice(safePage * PER, (safePage + 1) * PER);
+
+    const txt =
+      `📦 <b>Manual Delivery Requests</b>\n\n` +
+      `🕐 Waiting: <b>${counts.pending}</b>   ⚙️ In progress: <b>${counts.processing}</b>\n` +
+      `✅ Delivered: <b>${counts.delivered}</b>   ❌ Cancelled: <b>${counts.cancelled}</b>\n` +
+      (counts.unseen ? `\n🆕 <b>${counts.unseen}</b> new request(s)\n` : '') +
+      `\n<b>Showing:</b> ${TABS[safeStatus]} — ${rows.length} result(s)`;
+
+    const kb = [];
+    const chip = (k) => ({ text: (k === safeStatus ? '✓ ' : '') + TABS[k], callback_data: `admin_md_list_${k}_0` });
+    kb.push(['pending', 'processing'].map(chip));
+    kb.push(['delivered', 'cancelled'].map(chip));
+    kb.push([chip('all')]);
+
+    for (const r of slice) {
+      const isNew = (!r.seen_at && r.status === 'pending') ? '🆕 ' : '';
+      const who = r.username ? `@${r.username}` : (r.first_name || `User ${r.user_id}`);
+      const title = String(r.product_title || '').replace(/\[emoji:\d+\]/g, '').trim().slice(0, 16);
+      kb.push([{ text: `${isNew}#${r.id} · ${who.slice(0, 12)} · ${title} ×${r.quantity}`,
+                 callback_data: `admin_md_view_${r.id}` }]);
+    }
+
+    if (totalPages > 1) {
+      const nav = [];
+      if (safePage > 0)              nav.push({ text: '◀️ Prev', callback_data: `admin_md_list_${safeStatus}_${safePage - 1}` });
+      nav.push({ text: `${safePage + 1}/${totalPages}`, callback_data: 'noop' });
+      if (safePage < totalPages - 1) nav.push({ text: 'Next ▶️', callback_data: `admin_md_list_${safeStatus}_${safePage + 1}` });
+      kb.push(nav);
+    }
+    kb.push([{ text: '🔙 Back', callback_data: 'admin_panel' }]);
+
+    try {
+      await bot.editMessageText(txt, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+    } catch (e) {
+      await bot.sendMessage(chatId, txt, { parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+    }
+    return;
+  }
+
+  if (/^admin_md_view_\d+$/.test(data)) {
+    const id = parseInt(data.split('_').pop(), 10);
+    const t  = db.getManualDelivery(id);
+    if (!t) { await answer('❌ Not found'); return; }
+    db.markManualSeen(id);
+
+    const manualDelivery = require('./manualDelivery');
+    const who  = t.username ? `@${t.username}` : (t.first_name || `User ${t.user_id}`);
+    const user = db.getUser(t.user_id);
+
+    const txt =
+      `📦 <b>Manual Delivery #${t.id}</b>\n\n` +
+      `<b>Status:</b> ${manualDelivery.STATUS_LABEL[t.status] || t.status}\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `🆔 <b>Order:</b> #${t.order_id}\n` +
+      `🛒 <b>Product:</b> ${manualDelivery.cleanTitle(t.product_title)}\n` +
+      `🔢 <b>Quantity:</b> ${t.quantity}\n` +
+      (t.email ? `📧 <b>Email:</b> <code>${escapeHtml(t.email)}</code>\n` : '') +
+      `💵 <b>Paid:</b> ${formatPrice(t.total_paid)}\n` +
+      `💳 <b>Method:</b> ${escapeHtml(t.payment_method || 'n/a')}\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `👤 <b>Customer:</b> ${escapeHtml(who)}\n` +
+      `🆔 <code>${t.user_id}</code>\n` +
+      (user ? `💰 <b>Wallet:</b> ${formatPrice(user.balance || 0)}\n` : '') +
+      `📅 <b>Created:</b> ${String(t.created_at || '').slice(0, 16)}\n` +
+      (t.delivered_at ? `✅ <b>Delivered:</b> ${String(t.delivered_at).slice(0, 16)}\n` : '') +
+      (t.admin_note ? `\n📝 <i>${escapeHtml(t.admin_note)}</i>\n` : '') +
+      (t.delivered_content
+        ? `\n🎁 <b>Content sent:</b>\n<code>${escapeHtml(String(t.delivered_content).slice(0, 500))}</code>\n`
+        : '');
+
+    const kb = [];
+    if (t.status === 'pending' || t.status === 'processing') {
+      if (t.status === 'pending') kb.push([{ text: '⚙️ Mark as in progress', callback_data: `admin_md_proc_${t.id}` }]);
+      kb.push([{ text: '✅ Deliver now (send content)', callback_data: `admin_md_deliver_${t.id}` }]);
+      kb.push([{ text: '☑️ Mark delivered (no content)', callback_data: `admin_md_done_${t.id}` }]);
+      kb.push([{ text: '❌ Cancel & refund', callback_data: `admin_md_cancel_${t.id}` }]);
+    }
+    kb.push([{ text: '🔙 Back to list', callback_data: `admin_md_list_${t.status}_0` }]);
+
+    try {
+      await bot.editMessageText(txt, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+    } catch (e) {
+      await bot.sendMessage(chatId, txt, { parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+    }
+    return;
+  }
+
+  if (/^admin_md_proc_\d+$/.test(data)) {
+    const id = parseInt(data.split('_').pop(), 10);
+    db.setManualDeliveryStatus(id, 'processing', 'Marked in progress');
+    await answer('⚙️ In progress');
+    return await handleAdminCallback(bot, { ...query, data: `admin_md_view_${id}` });
+  }
+
+  if (/^admin_md_deliver_\d+$/.test(data)) {
+    const id = parseInt(data.split('_').pop(), 10);
+    const t  = db.getManualDelivery(id);
+    if (!t) { await answer('❌ Not found'); return; }
+    session.set(userId, States.ADMIN_MD_CONTENT, { mdTaskId: id });
+    await bot.editMessageText(
+      `✍️ <b>Deliver Task #${id}</b>\n\n` +
+      `👤 <code>${t.user_id}</code>\n` +
+      `📦 ${escapeHtml(String(t.product_title || ''))} ×${t.quantity}\n` +
+      (t.email ? `📧 <code>${escapeHtml(t.email)}</code>\n` : '') +
+      `\nSend the content to deliver to the customer.\n` +
+      `<i>Your next message is forwarded to them and the task is closed.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Cancel', callback_data: `admin_md_view_${id}` }]] } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_md_done_\d+$/.test(data)) {
+    const id = parseInt(data.split('_').pop(), 10);
+    const manualDelivery = require('./manualDelivery');
+    const res = await manualDelivery.completeManualDelivery(bot, id, null);
+    await answer(res.ok ? '✅ Delivered' : `⚠️ ${res.reason}`);
+    return await handleAdminCallback(bot, { ...query, data: `admin_md_view_${id}` });
+  }
+
+  if (/^admin_md_cancel_\d+$/.test(data)) {
+    const id = parseInt(data.split('_').pop(), 10);
+    const manualDelivery = require('./manualDelivery');
+    const res = await manualDelivery.cancelManualDelivery(bot, id, 'Cancelled by admin');
+    await answer(res.ok ? '❌ Cancelled & refunded' : `⚠️ ${res.reason}`);
+    return await handleAdminCallback(bot, { ...query, data: `admin_md_view_${id}` });
+  }
+
   // ── Requires-email step ───────────────────────────────────────────
   if (data === 'req_email_yes' || data === 'req_email_no') {
     session.update(userId, { requiresEmail: data === 'req_email_yes' ? 1 : 0 });
@@ -1576,10 +2239,20 @@ async function handleAdminCallback(bot, query) {
     const bulkInfo  = (product?.bulk_min_qty > 0 && product?.bulk_discount > 0)
       ? `🎁 <b>Bulk:</b> ${product.bulk_min_qty}+ → ${product.bulk_discount}% off\n`
       : `🎁 <b>Bulk:</b> Disabled\n`;
+    const refundInfo   = Number(product?.refund_enabled) === 1
+      ? '🔄 <b>Refunds:</b> ✅ Allowed\n'
+      : '🔄 <b>Refunds:</b> 🚫 Blocked\n';
+    const deliveryInfo = product?.delivery_type === 'manual'
+      ? '🚚 <b>Delivery:</b> 🖐 Manual\n'
+      : '🚚 <b>Delivery:</b> ⚡ Automatic\n';
+    const lowInfo = `🔔 <b>Low-stock alert at:</b> ${
+      Number(product?.low_stock_threshold) > 0
+        ? product.low_stock_threshold
+        : db.getSetting('low_stock_threshold_default', '5') + ' (default)'}\n`;
     await bot.editMessageText(
       `✏️ <b>Edit Product:</b> ${product?.title}\n\n` +
       `📦 <b>Stock qty:</b> ${stockQty}   📈 <b>Sales:</b> ${product?.sales_count || 0}\n` +
-      bulkInfo +
+      bulkInfo + refundInfo + deliveryInfo + lowInfo +
       `${statusLine}\n\n` +
       `Select a field to edit or manage stock:`,
       { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminProductEditFieldsKb(productId) }
@@ -1923,6 +2596,7 @@ async function handleAdminCallback(bot, query) {
       `✅ <b>Stock set to 0.</b>\n\n<b>${product.title}</b> is now ❌ <b>OUT OF STOCK</b>.`,
       { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: backToProductEditKb(productId) }
     );
+    await evaluateStock(bot, productId);
     return;
   }
 
@@ -2050,6 +2724,7 @@ async function handleAdminCallback(bot, query) {
       `📊 Stock quantity reset to 0.`,
       { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: backToProductEditKb(productId) }
     );
+    await evaluateStock(bot, productId);
     return;
   }
 
@@ -2061,6 +2736,95 @@ async function handleAdminCallback(bot, query) {
     });
     return;
   }
+  // ═══════════════════════════════════════════════════════════════════
+  // FRAUD RESPONSE — cancel every open order of one user
+  // ═══════════════════════════════════════════════════════════════════
+
+  if (/^admin_fraud_\d+$/.test(data)) {
+    const targetId = parseInt(data.split('_').pop(), 10);
+    const user = db.getUser(targetId);
+    if (!user) { await answer('❌ User not found'); return; }
+
+    const pv = db.previewCancelAllUserOrders(targetId);
+    const name = user.username ? `@${user.username}` : (user.first_name || `User ${targetId}`);
+
+    const txt =
+      `🚨 <b>Fraud Response</b>\n\n` +
+      `👤 ${escapeHtml(name)}\n` +
+      `🆔 <code>${targetId}</code>\n` +
+      `💰 Balance: <b>${formatPrice(user.balance || 0)}</b>\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `<b>Will be cancelled:</b>\n` +
+      `⏳ Pending orders: <b>${pv.pending}</b>\n` +
+      `🕐 Paid, awaiting delivery: <b>${pv.awaiting}</b> (${formatPrice(pv.paidValue)})\n` +
+      `🔄 Pending refund requests: <b>${pv.pendingRefunds}</b>\n\n` +
+      `<b>Will NOT be touched:</b>\n` +
+      `✅ Already delivered: <b>${pv.delivered}</b> — the goods are gone, history stays intact\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `Stock is returned to inventory and the sold/sales counters are corrected. ` +
+      `Outstanding refund requests are rejected so stolen credit cannot be cashed out.\n\n` +
+      `Choose whether the money goes back to their wallet:`;
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: '🚨 Cancel all — NO refund', callback_data: `admin_fraud_go_${targetId}_0` }],
+        [{ text: '↩️ Cancel all + refund wallet', callback_data: `admin_fraud_go_${targetId}_1` }],
+        [{ text: '🔙 Back to user', callback_data: `admin_user_${targetId}` }],
+      ] },
+    }).catch(() => {});
+    return;
+  }
+
+  if (/^admin_fraud_go_\d+_[01]$/.test(data)) {
+    const parts    = data.split('_');
+    const refund   = parts.pop() === '1';
+    const targetId = parseInt(parts.pop(), 10);
+    const user     = db.getUser(targetId);
+    if (!user) { await answer('❌ User not found'); return; }
+
+    const r = db.cancelAllUserOrders(targetId, { refund });
+    logger.warn(
+      `Admin ${userId} FRAUD-CANCELLED all orders for user ${targetId} ` +
+      `(refund=${refund}): ${JSON.stringify(r)}`
+    );
+
+    const name = user.username ? `@${user.username}` : (user.first_name || `User ${targetId}`);
+    const fresh = db.getUser(targetId);
+
+    const txt =
+      `✅ <b>Fraud Response Applied</b>\n\n` +
+      `👤 ${escapeHtml(name)} — <code>${targetId}</code>\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `❌ Pending orders cancelled: <b>${r.cancelledPending}</b>\n` +
+      `❌ Paid orders cancelled: <b>${r.cancelledPaid}</b>\n` +
+      `📦 Manual delivery tasks closed: <b>${r.manualCancelled}</b>\n` +
+      `📊 Stock returned: <b>${r.stockRestored}</b> unit(s)\n` +
+      `🔄 Refund requests rejected: <b>${r.refundRequestsRejected}</b>\n` +
+      `🎫 Reservations released: <b>${r.reservationsReleased}</b>\n` +
+      (refund
+        ? `↩️ Refunded to wallet: <b>${formatPrice(r.refunded)}</b>\n`
+        : `🚫 <b>No refund issued.</b>\n`) +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `✅ Left untouched (delivered): <b>${r.delivered}</b>\n` +
+      `💰 Balance now: <b>${formatPrice(fresh?.balance || 0)}</b>\n\n` +
+      (r.delivered > 0
+        ? `⚠️ <i>${r.delivered} order(s) were already delivered. Those products cannot be recalled — ` +
+          `review them manually if they were bought with stolen credit.</i>\n\n`
+        : '') +
+      `<i>Next: ban the account, and reverse the fraudulent deposit if you have not yet.</i>`;
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: user.is_banned ? '✅ Unban' : '🚫 Ban this user', callback_data: `admin_toggle_ban_${targetId}` }],
+        [{ text: '↩️ Reverse a deposit', callback_data: 'admin_dep_reverse' }],
+        [{ text: '🔙 Back to user', callback_data: `admin_user_${targetId}` }],
+      ] },
+    }).catch(() => {});
+    return;
+  }
+
   if (/^admin_user_\d+$/.test(data)) {
     const targetId = parseInt(data.split('_').pop(), 10);
     const user     = db.getUser(targetId);
@@ -2180,6 +2944,8 @@ async function handleAdminCallback(bot, query) {
       { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
         reply_markup: backToProductEditKb(stockProductId) }
     );
+
+    await evaluateStock(bot, stockProductId);
 
     // ── BROADCAST to channel & group ───────────────────────────────
     try {
@@ -2710,7 +3476,7 @@ async function handleAdminCallback(bot, query) {
             [{ text: '🔙 Back to Orders', callback_data: 'admin_orders' }],
           ] } }
       ).catch(() => {});
-      logger.info(`Admin ${userId} DELETED order #${orderId}, recovered ${recovered} items`);
+      logger.info(`Admin ${userId} DELETED order #${orderId}`);
     } catch (e) {
       logger.error(`Cancel order failed: ${e.message}`);
       await answer(`❌ ${e.message}`);
@@ -4262,7 +5028,7 @@ async function handleAdminCallback(bot, query) {
     const catId = parseInt(data.split('_').pop(), 10);
     db.deleteCategory(catId);
     await answer('🗑 Category deleted');
-    return await handleAdminCallback(bot, { ...query, data: { ...query.data, data: 'admin_categories' } });
+    return await handleAdminCallback(bot, { ...query, data: 'admin_categories' });
   }
 
   // Edit product → assign category
@@ -4277,7 +5043,7 @@ async function handleAdminCallback(bot, query) {
       callback_data: `admin_setcat_${productId}_${c.id}`,
     }]);
     rows.push([{ text: '❌ Remove from category', callback_data: `admin_setcat_${productId}_0` }]);
-    rows.push([{ text: '🔙 Back', callback_data: `admin_product_${productId}` }]);
+    rows.push([{ text: '🔙 Back', callback_data: `admin_edit_p_${productId}` }]);
     await bot.editMessageText(txt, {
       chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
       reply_markup: { inline_keyboard: rows },
@@ -4291,7 +5057,7 @@ async function handleAdminCallback(bot, query) {
     const catId = parseInt(parts[3], 10);
     db.setProductCategory(productId, catId);
     await answer('✅ Category set');
-    return await handleAdminCallback(bot, { ...query, data: { ...query.data, data: `admin_product_${productId}` } });
+    return await handleAdminCallback(bot, { ...query, data: `admin_edit_p_${productId}` });
   }
 
 
@@ -4304,7 +5070,7 @@ async function handleAdminCallback(bot, query) {
     const dbRaw = require('../database/db');
     dbRaw.prepare('UPDATE products SET is_chatgpt_business=? WHERE id=?').run(newVal, productId);
     await answer(newVal ? '✅ ChatGPT Business Mode ON' : '❌ Mode OFF', true);
-    return await handleAdminCallback(bot, { ...query, data: { ...query.data, data: `admin_product_${productId}` } });
+    return await handleAdminCallback(bot, { ...query, data: `admin_edit_p_${productId}` });
   }
 
   // ── ChatGPT Business main panel ──
@@ -4428,7 +5194,7 @@ async function handleAdminCallback(bot, query) {
     const cycleId = parseInt(data.split('_').pop(), 10);
     db.removeBillingCycle(cycleId);
     await answer('🗑 Deleted', true);
-    return await handleAdminCallback(bot, { ...query, data: { ...query.data, data: 'admin_cgb_cycles' } });
+    return await handleAdminCallback(bot, { ...query, data: 'admin_cgb_cycles' });
   }
 
   // ── Active Subscriptions ──
@@ -4531,14 +5297,14 @@ async function handleAdminCallback(bot, query) {
     if (!r) return;
     db.toggleReseller(id, r.is_active ? 0 : 1);
     await answer(r.is_active ? '🚫 Deactivated' : '✅ Activated', true);
-    return await handleAdminCallback(bot, { ...query, data: { ...query.data, data: `admin_reseller_${id}` } });
+    return await handleAdminCallback(bot, { ...query, data: `admin_reseller_${id}` });
   }
 
   if (/^admin_reseller_delete_\d+$/.test(data)) {
     const id = parseInt(data.split('_').pop(), 10);
     db.deleteReseller(id);
     await answer('🗑 Deleted', true);
-    return await handleAdminCallback(bot, { ...query, data: { ...query.data, data: 'admin_resellers' } });
+    return await handleAdminCallback(bot, { ...query, data: 'admin_resellers' });
   }
 
   if (/^admin_reseller_orders_\d+$/.test(data)) {
@@ -4681,7 +5447,7 @@ async function handleAdminCallback(bot, query) {
     const current = db.getSetting('referral_enabled', '1') === '1';
     db.setSetting('referral_enabled', current ? '0' : '1');
     await answer(current ? '🔴 Referral DISABLED' : '🟢 Referral ENABLED');
-    return await handleAdminCallback(bot, { ...query, data: { ...query.data, data: 'admin_vip_toggle' } });
+    return await handleAdminCallback(bot, { ...query, data: 'admin_vip_toggle' });
   }
 
   // ── Toggle VIP new-only mode ─────────────────────────────────────
@@ -4689,7 +5455,7 @@ async function handleAdminCallback(bot, query) {
     const current = db.getSetting('vip_new_only', '0') === '1';
     db.setSetting('vip_new_only', current ? '0' : '1');
     await answer(current ? '👥 All can earn VIP' : '🆕 Only NEW customers');
-    return await handleAdminCallback(bot, { ...query, data: { ...query.data, data: 'admin_vip_toggle' } });
+    return await handleAdminCallback(bot, { ...query, data: 'admin_vip_toggle' });
   }
 
   // ── VIP Earnings Statistics ──────────────────────────────────────
@@ -4745,7 +5511,7 @@ async function handleAdminCallback(bot, query) {
     db.setSetting('vip_auto_broadcast', '1');
     await answer('🟢 Auto broadcast ON');
     // Simulate refresh by re-calling
-    return await handleAdminCallback(bot, { ...query, data: { ...query.data, data: 'admin_vip_toggle' } });
+    return await handleAdminCallback(bot, { ...query, data: 'admin_vip_toggle' });
   }
   if (data === 'admin_vip_off') {
     db.setSetting('vip_auto_broadcast', '0');

@@ -28,6 +28,8 @@ const session        = require('./handlers/session');
 const { States }     = require('./handlers/session');
 const { ensureUser, checkJoinGate, isMember } = require('./middlewares/auth');
 const { mainMenuKb, backKb } = require('./utils/keyboard');
+const { escapeHtml } = require('./utils/format');
+const { notifyAdmin } = require('./services/adminNotify');
 const db = require('./database/queries');
 
 // ── Seed demo products: DISABLED ──────────────────────────────────────────────
@@ -426,7 +428,7 @@ bot.on('message', async (msg) => {
       // Only reply if it's a text message (not commands like /start which were already handled)
       if (msg.text && !msg.text.startsWith('/')) {
         await bot.sendMessage(msg.chat.id,
-          `🚧 <b>Maintenance Mode</b>\n\n${escapeHtml ? escapeHtml(maintMsg) : maintMsg}`,
+          `🚧 <b>Maintenance Mode</b>\n\n${escapeHtml(maintMsg)}`,
           { parse_mode: 'HTML' }
         ).catch(() => {});
       }
@@ -482,6 +484,7 @@ bot.on('message', async (msg) => {
       'ADMIN_CAT_NEW_NAME', 'ADMIN_CAT_RENAME',
       'ADMIN_CGB_PRICE', 'ADMIN_CGB_ADDCYCLE',
       'ADMIN_RESELLER_NEW_NAME', 'ADMIN_RESELLER_BALANCE',
+      States.ADMIN_LOW_STOCK, States.ADMIN_MD_CONTENT,
       'ADMIN_SEARCH_ORDER',
     ];
     if (adminStates.includes(state)) {
@@ -497,6 +500,7 @@ bot.on('message', async (msg) => {
   else if (state === States.BUY_PREORDER_EMAIL)    await buyHandler.handlePreorderEmail(bot, msg);
   else if (state === States.BUY_BINANCE_ORDER_ID)  await buyHandler.handleBinanceOrderId(bot, msg);
   else if (state === States.BUY_USDT_TXID)         await buyHandler.handleUsdtTxIdForOrder(bot, msg);
+  else if (state === States.WALLET_TOPUP_USDT_AMOUNT)      await walletHandler.handleUsdtAmount(bot, msg);
   else if (state === States.WALLET_TOPUP_USDT_TX)          await walletHandler.handleUsdtTxId(bot, msg);
   else if (state === States.WALLET_TOPUP_BINANCE_ID)        await walletHandler.handleBinancePayOrderId(bot, msg);
   else if (state === States.WALLET_TOPUP_CRYPTOBOT_AMOUNT)  await walletHandler.handleCryptobotAmount(bot, msg);
@@ -572,6 +576,18 @@ bot.on('message', async (msg) => {
       session.clear(userId);
       return;
     }
+    // Final eligibility re-check: the admin may have disabled refunds for this
+    // product while the customer was filling in the form.
+    const finalCheck = db.isOrderRefundable(d.refundOrderId);
+    if (!finalCheck.ok) {
+      session.clear(userId);
+      await bot.sendMessage(chatId,
+        '🚫 <b>Not Eligible for Refund</b>\n\n' +
+        'This product does not support refund requests. Please contact support if you need help.',
+        { parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '🔙 My Orders', callback_data: 'menu_orders' }]] } });
+      return;
+    }
     db.addRefundRequest({
       userId,
       orderId: d.refundOrderId,
@@ -594,14 +610,24 @@ bot.on('message', async (msg) => {
       { parse_mode: 'HTML',
         reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Orders', callback_data: 'menu_orders' }]] } }
     );
-    // Notify admin
-    const ADMIN_ID = parseInt(process.env.ADMIN_ID || '5626665035', 10);
+    // Notify admin through the notification centre (stored + pushed, deduped)
     try {
-      await bot.sendMessage(ADMIN_ID,
-        `🔄 <b>New Refund Request</b>\n\n👤 <code>${userId}</code>\n🆔 Order #${d.refundOrderId}\n\nReview at /admin → 🔄 Refund Requests`,
-        { parse_mode: 'HTML' }
-      );
-    } catch (e) {}
+      const pending = db.getPendingRefundForOrder(d.refundOrderId);
+      await notifyAdmin(bot, {
+        type:  'refund_request',
+        title: 'New refund request',
+        body:
+          `🆔 <b>Order:</b> #${d.refundOrderId}\n` +
+          `👤 <b>User:</b> <code>${userId}</code>\n` +
+          `💵 <b>Order total:</b> ${order.total_price}$\n` +
+          `💳 <b>Method:</b> ${escapeHtml(d.refundMethod || 'n/a')}` +
+          (d.refundNetwork ? ` (${escapeHtml(d.refundNetwork)})` : ''),
+        dedupeKey: `refund_request:${pending ? pending.id : d.refundOrderId}`,
+        refType: 'refund_request',
+        refId:   pending ? pending.id : d.refundOrderId,
+        buttons: pending ? [[{ text: '🔄 Review request', callback_data: `admin_refund_view_${pending.id}` }]] : null,
+      });
+    } catch (e) { logger.warn(`refund notify failed: ${e.message}`); }
   }
 });
 
@@ -671,7 +697,7 @@ bot.on('callback_query', async (query) => {
   // intercept the next message.
   const navCallbacks = new Set([
     'back_main', 'menu_refresh', 'refresh_products', 'menu_products', 'menu_preorders', 'menu_wallet', 'menu_orders', 'menu_language', 'set_lang_en', 'set_lang_ar', 'set_lang_vi', 'set_lang_es',
-    'menu_support', 'menu_referral', 'wallet_transactions',
+    'menu_support', 'menu_referral', 'wallet_transactions', 'menu_notifications',
     'admin_panel',
   ]);
   if (navCallbacks.has(data)) {
@@ -852,16 +878,42 @@ bot.on('callback_query', async (query) => {
   // ── Wallet ───────────────────────────────────────────────────────
   if (data === 'menu_wallet')          { await answer(); await walletHandler.showWallet(bot, chatId, userId, msgId); return; }
   if (data === 'wallet_topup')         { await answer(); await walletHandler.showTopupMethods(bot, chatId, userId, msgId); return; }
+  // ── V3: USDT network choice + reservation cancel ──────────────────
+  if (/^topup_net_(TRC20|BEP20)$/.test(data)) {
+    await answer();
+    await walletHandler.startUsdtAmount(bot, chatId, userId, msgId, data.split('_').pop());
+    return;
+  }
+  if (/^topup_cancel_\d+$/.test(data)) {
+    await answer('Reservation cancelled');
+    db.cancelDepositIntent(parseInt(data.split('_').pop(), 10));
+    session.clear(userId);
+    await walletHandler.showWallet(bot, chatId, userId, msgId);
+    return;
+  }
   if (data === 'wallet_topup_usdt')    { await answer(); await walletHandler.startUsdtTopup(bot, chatId, userId, msgId); return; }
   if (data === 'wallet_topup_binance') { await answer(); await walletHandler.startBinancePayTopup(bot, chatId, userId, msgId); return; }
   if (data === 'wallet_topup_cryptobot'){ await answer(); await walletHandler.startCryptobotTopup(bot, chatId, userId, msgId); return; }
   if (data === 'wallet_transactions')  { await answer(); await walletHandler.showTransactions(bot, chatId, userId, msgId); return; }
 
   // ── Orders ───────────────────────────────────────────────────────
-  if (data === 'menu_orders') { await answer(); await showOrders(bot, chatId, userId, msgId); return; }
+  if (data === 'menu_orders') {
+    await answer();
+    await showOrders(bot, chatId, userId, msgId, 'all', 0);
+    return;
+  }
+  // orders_f_<filter>_<page>  — date filter + pagination
+  if (/^orders_f_[a-z_0-9]+_\d+$/.test(data)) {
+    await answer();
+    const parts  = data.split('_');
+    const page   = parseInt(parts.pop(), 10) || 0;
+    const filter = parts.slice(2).join('_');
+    await showOrders(bot, chatId, userId, msgId, filter, page);
+    return;
+  }
   if (/^order_detail_\d+$/.test(data)) {
     await answer();
-    await showOrderDetail(bot, chatId, userId, parseInt(data.split('_').pop(), 10), msgId);
+    await showOrderDetail(bot, chatId, userId, parseInt(data.split('_').pop(), 10), msgId, query.id);
     return;
   }
 
@@ -871,8 +923,12 @@ bot.on('callback_query', async (query) => {
   if (data === 'refund_request_start') {
     const db = require('./database/queries');
     const userId = query.from.id;
-    const orders = db.getUserOrders ? db.getUserOrders(userId) : [];
-    const eligibleOrders = orders.filter(o => o.status === 'delivered');
+    // Server-side eligibility: getRefundableUserOrders joins products and
+    // filters on p.refund_enabled = 1, so a product the admin marked as
+    // non-refundable can never appear in this list.
+    const eligibleOrders = db.getRefundableUserOrders(userId);
+    const allDelivered   = (db.getUserOrdersAll(userId) || []).filter(o => o.status === 'delivered');
+    const blockedCount   = Math.max(0, allDelivered.length - eligibleOrders.length);
     const userRefunds = db.getUserRefundRequests ? db.getUserRefundRequests(userId) : [];
 
     let txt = `🔄 <b>Refund Request</b>\n\n`;
@@ -885,9 +941,16 @@ bot.on('callback_query', async (query) => {
       txt += `\n`;
     }
     if (eligibleOrders.length === 0) {
-      txt += `📭 You have no delivered orders to refund.`;
+      txt += blockedCount > 0
+        ? `📭 None of your orders are eligible for a refund.\n\n` +
+          `<i>${blockedCount} delivered order(s) are for products that do not ` +
+          `support refunds. Contact support if you need help.</i>`
+        : `📭 You have no delivered orders to refund.`;
     } else {
       txt += `📦 <b>Select an order to refund:</b>`;
+      if (blockedCount > 0) {
+        txt += `\n\n<i>ℹ️ ${blockedCount} of your order(s) are for non-refundable products and are not listed.</i>`;
+      }
     }
 
     const rows = eligibleOrders.slice(0, 10).map(o => {
@@ -950,6 +1013,19 @@ bot.on('callback_query', async (query) => {
       await answer('❌ Order not found');
       return;
     }
+    // ── SERVER-SIDE ELIGIBILITY GATE ──────────────────────────────────────
+    // Re-checked here, not just when building the list, so a hand-crafted
+    // callback for a non-refundable product is rejected.
+    const eligibility = db.isOrderRefundable(orderId);
+    if (!eligibility.ok) {
+      const msg = {
+        not_found:     '❌ Order not found.',
+        not_delivered: '❌ Only delivered orders can be refunded.',
+        not_eligible:  '🚫 This product is not eligible for refunds.',
+      }[eligibility.reason] || '❌ This order cannot be refunded.';
+      await bot.answerCallbackQuery(query.id, { text: msg, show_alert: true }).catch(() => {});
+      return;
+    }
     if (db.getPendingRefundForOrder(orderId)) {
       await answer('⏳ You already have a pending refund request for this order');
       return;
@@ -976,6 +1052,16 @@ bot.on('callback_query', async (query) => {
     const d = session.get(userId).data;
     const order = db.getOrder(d.refundOrderId);
     if (!order) { await bot.sendMessage(chatId, '❌ Order not found.'); session.clear(userId); return; }
+    const walletCheck = db.isOrderRefundable(d.refundOrderId);
+    if (!walletCheck.ok) {
+      session.clear(userId);
+      await bot.sendMessage(chatId,
+        '🚫 <b>Not Eligible for Refund</b>\n\n' +
+        'This product does not support refund requests. Please contact support if you need help.',
+        { parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '🔙 My Orders', callback_data: 'menu_orders' }]] } });
+      return;
+    }
     db.addRefundRequest({
       userId, orderId: d.refundOrderId, reason: d.refundReason, amount: 0,
       affectedAccount: d.refundAccount, photoFileId: d.refundPhoto,
@@ -991,8 +1077,22 @@ bot.on('callback_query', async (query) => {
       { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
         reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Orders', callback_data: 'menu_orders' }]] } }
     );
-    const ADMIN_ID = parseInt(process.env.ADMIN_ID || '5626665035', 10);
-    try { await bot.sendMessage(ADMIN_ID, `🔄 <b>New Refund Request</b>\n👤 <code>${userId}</code>\n🆔 Order #${d.refundOrderId}\n💳 Wallet`, { parse_mode: 'HTML' }); } catch (e) {}
+    try {
+      const pendingW = db.getPendingRefundForOrder(d.refundOrderId);
+      await notifyAdmin(bot, {
+        type:  'refund_request',
+        title: 'New refund request',
+        body:
+          `🆔 <b>Order:</b> #${d.refundOrderId}\n` +
+          `👤 <b>User:</b> <code>${userId}</code>\n` +
+          `💵 <b>Order total:</b> ${order.total_price}$\n` +
+          `💳 <b>Method:</b> Wallet`,
+        dedupeKey: `refund_request:${pendingW ? pendingW.id : d.refundOrderId}`,
+        refType: 'refund_request',
+        refId:   pendingW ? pendingW.id : d.refundOrderId,
+        buttons: pendingW ? [[{ text: '🔄 Review request', callback_data: `admin_refund_view_${pendingW.id}` }]] : null,
+      });
+    } catch (e) { logger.warn(`refund notify failed: ${e.message}`); }
     return;
   }
   if (data === 'refund_method_binance') {
@@ -1266,7 +1366,17 @@ bot.onText(/\/recover_items\s+(\d+)\s+(\d+)/, async (msg, match) => {
 
 bot.on('polling_error', (err) => logger.error(`Polling error: ${err.message}`));
 bot.on('error',         (err) => logger.error(`Bot error: ${err.message}`));
-process.on('unhandledRejection', (err) => logger.error(`Unhandled rejection: ${err}`));
+process.on('unhandledRejection', (err) => {
+  // These Telegram errors are races, not bugs: the user tapped a button twice,
+  // or the message was already gone. They were flooding the production logs.
+  const m = String((err && err.message) || err || '');
+  if (m.includes('message is not modified') ||
+      m.includes('message to edit not found') ||
+      m.includes('query is too old')) {
+    return;
+  }
+  logger.error(`Unhandled rejection: ${m}`);
+});
 
 // ── Express health server ─────────────────────────────────────────────────────
 // Keeps Railway happy (HTTP port) and exposes /health + /cryptobot/webhook.
