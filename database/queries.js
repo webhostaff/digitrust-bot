@@ -492,7 +492,7 @@ function deliverOrderAndChargeWallet(orderId, productId, quantity, userId, price
     const userRow = db.prepare("SELECT balance FROM users WHERE telegram_id = ?").get(userId);
     const balance = userRow ? Number(userRow.balance) : 0;
     const priceN  = Number(price);
-    if (balance < priceN - 0.001) return { result: 'insufficient_balance', balance };
+    if (!hasEnough(balance, priceN)) return { result: 'insufficient_balance', balance };
 
     // ── Deliver items using RAW statements (no nested transaction) ──
     // deliverItemRaw runs getAvailableItem + markItemSold directly inside THIS transaction
@@ -887,7 +887,7 @@ function chargeWalletForManualOrder(orderId, productId, quantity, userId, price)
     const userRow = db.prepare('SELECT balance FROM users WHERE telegram_id = ?').get(userId);
     const balance = userRow ? Number(userRow.balance) : 0;
     const priceN  = Number(price);
-    if (balance < priceN - 0.001) return { result: 'insufficient_balance', balance };
+    if (!hasEnough(balance, priceN)) return { result: 'insufficient_balance', balance };
 
     const res = db.prepare(`
       UPDATE orders
@@ -1030,6 +1030,8 @@ const di_get = db.prepare('SELECT * FROM deposit_intents WHERE id = ?');
  * guarantees no two live reservations ever collide. On collision we simply
  * draw again.
  *
+ * The suffix costs the customer at most 0.000999 USDT — a tenth of a cent.
+ *
  * @returns {object|null} the created intent row
  */
 function createDepositIntent(userId, network, baseAmount, ttlMinutes) {
@@ -1042,7 +1044,18 @@ function createDepositIntent(userId, network, baseAmount, ttlMinutes) {
   for (let attempt = 0; attempt < 80; attempt++) {
     // 0.000100 .. 0.009999 — about one cent at most, and USDT keeps 6 decimals
     // on both TRC20 and BEP20, so the exact figure survives the transfer.
-    const suffix = (100 + nodeCrypto.randomInt(0, 9900)) / 1e6;
+    // 0.000101 .. 0.000999 — at most a TENTH of a cent on top of what the
+    // customer asked to deposit, so the identifier is effectively free.
+    //
+    // Note this is not a fee and nothing is lost to the network: BEP20 gas is
+    // paid in BNB and TRC20 in TRX/Energy, never in USDT, so the exact figure
+    // sent is the exact figure Binance receives.
+    //
+    // 899 possible values per base amount. A collision only matters between
+    // two reservations that are open at the same time for the same base, and
+    // the loop simply redraws; the partial UNIQUE index is what guarantees
+    // correctness, not the size of the range.
+    const suffix = (101 + nodeCrypto.randomInt(0, 899)) / 1e6;
     const unique = Number((base + suffix).toFixed(6));
     try {
       const res = di_insert.run(userId, network, base, unique, now, now + ttl);
@@ -1241,12 +1254,85 @@ function previewCancelAllUserOrders(userId) {
   return out;
 }
 
+/**
+ * Compare money the way the user sees it.
+ *
+ * Balances are shown rounded to cents, but the old check was
+ * `balance < price - 0.001`. A stored balance of 0.9989 displays as $1.00 yet
+ * fails against a $1.00 price, so the customer reads "Balance: $1.00 /
+ * Required: $1.00 — Insufficient balance" and cannot buy anything.
+ *
+ * Comparing whole cents restores the invariant the interface promises:
+ * if the two displayed figures are equal, the purchase goes through.
+ */
+function hasEnough(balance, price) {
+  return Math.round(Number(balance) * 100) >= Math.round(Number(price) * 100);
+}
+
+/**
+ * Erase what a customer can still SEE of their past purchases.
+ *
+ * Cancelling orders does not stop a fraudster re-opening "My Orders" and
+ * reading the keys that were already delivered to them. This wipes
+ * `delivered_content` so the product details are gone from their side.
+ *
+ * The order rows themselves are kept by default: they are your sales record,
+ * and deleting them would silently distort revenue and stock statistics.
+ * Pass `hardDelete: true` only if you truly want no trace at all.
+ *
+ * @returns {object} what was removed
+ */
+function purgeUserOrderData(userId, { hardDelete = false } = {}) {
+  return db.transaction(() => {
+    const out = { contentWiped: 0, ordersDeleted: 0, manualWiped: 0, kept: 0 };
+
+    const withContent = db.prepare(`
+      SELECT COUNT(*) AS n FROM orders
+      WHERE user_id = ? AND delivered_content IS NOT NULL AND delivered_content != ''
+    `).get(userId).n;
+
+    db.prepare(`
+      UPDATE orders SET delivered_content = NULL
+      WHERE user_id = ? AND delivered_content IS NOT NULL
+    `).run(userId);
+    out.contentWiped = withContent;
+
+    // The same content is mirrored on manual-delivery tasks.
+    const md = db.prepare(`
+      UPDATE manual_deliveries SET delivered_content = NULL
+      WHERE user_id = ? AND delivered_content IS NOT NULL
+    `).run(userId);
+    out.manualWiped = md.changes;
+
+    if (hardDelete) {
+      // Detach the tasks first so nothing points at a row that is about to go.
+      db.prepare('DELETE FROM manual_deliveries WHERE user_id = ?').run(userId);
+      const del = db.prepare('DELETE FROM orders WHERE user_id = ?').run(userId);
+      out.ordersDeleted = del.changes;
+    } else {
+      out.kept = db.prepare('SELECT COUNT(*) AS n FROM orders WHERE user_id = ?').get(userId).n;
+    }
+
+    return out;
+  })();
+}
+
+/** Preview for the purge screen. */
+function previewPurge(userId) {
+  const total = db.prepare('SELECT COUNT(*) AS n FROM orders WHERE user_id = ?').get(userId).n;
+  const withContent = db.prepare(`
+    SELECT COUNT(*) AS n FROM orders
+    WHERE user_id = ? AND delivered_content IS NOT NULL AND delivered_content != ''
+  `).get(userId).n;
+  return { total, withContent };
+}
+
 // ── Atomic preorder: balance check + deduction in one transaction ─────────────
 function chargeWalletForPreorder(userId, amount) {
   return db.transaction(() => {
     const userRow = db.prepare("SELECT balance FROM users WHERE telegram_id = ?").get(userId);
     const balance = userRow ? Number(userRow.balance) : 0;
-    if (balance < amount - 0.001) return { ok: false, balance };
+    if (!hasEnough(balance, amount)) return { ok: false, balance };
     updateBalance.run(-amount, userId);
     return { ok: true };
   })();
@@ -1656,6 +1742,21 @@ module.exports = {
   getAdminNotifications: (limit, offset, unreadOnly = false) =>
     (unreadOnly ? an_listUnread : an_list).all(limit, offset),
   getAdminNotification:      (id) => an_get.get(id),
+  // Filter the inbox by type — used by the Support Bot's Stock Alerts section.
+  // The type list is built by the caller from a fixed whitelist, never input.
+  getNotificationsByType: (types, limit, offset) => {
+    const marks = types.map(() => '?').join(',');
+    return db.prepare(
+      `SELECT * FROM admin_notifications WHERE type IN (${marks}) ORDER BY id DESC LIMIT ? OFFSET ?`
+    ).all(...types, limit, offset);
+  },
+  countNotificationsByType: (types, unreadOnly = false) => {
+    const marks = types.map(() => '?').join(',');
+    return db.prepare(
+      `SELECT COUNT(*) AS n FROM admin_notifications WHERE type IN (${marks})` +
+      (unreadOnly ? ' AND is_read = 0' : '')
+    ).get(...types).n;
+  },
   countAdminNotifications:   ()   => an_countAll.get().n,
   countUnreadNotifications:  ()   => an_countUnread.get().n,
   markNotificationRead:      (id) => an_markRead.run(id),
@@ -1663,6 +1764,8 @@ module.exports = {
 
   cancelAllUserOrders,
   previewCancelAllUserOrders,
+  purgeUserOrderData,
+  previewPurge,
 
   // ═══ V3: deposit security ═══
   createDepositIntent,

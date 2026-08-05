@@ -2740,6 +2740,61 @@ async function handleAdminCallback(bot, query) {
   // FRAUD RESPONSE — cancel every open order of one user
   // ═══════════════════════════════════════════════════════════════════
 
+  if (/^admin_purge_\d+$/.test(data)) {
+    const targetId = parseInt(data.split('_').pop(), 10);
+    const user = db.getUser(targetId);
+    if (!user) { await answer('❌ User not found'); return; }
+    const pv = db.previewPurge(targetId);
+    const name = user.username ? `@${user.username}` : (user.first_name || `User ${targetId}`);
+
+    await bot.editMessageText(
+      `🧹 <b>Erase Order Data</b>\n\n` +
+      `👤 ${escapeHtml(name)} — <code>${targetId}</code>\n` +
+      `📦 Orders on record: <b>${pv.total}</b>\n` +
+      `🔑 Of those, still showing product keys: <b>${pv.withContent}</b>\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `<b>🧽 Wipe delivered content</b>\n` +
+      `Removes the keys/accounts from their "My Orders" so they can no longer ` +
+      `read what was delivered. The order rows stay, so your sales and stock ` +
+      `figures remain correct. <b>This is what you normally want.</b>\n\n` +
+      `<b>🗑 Delete everything</b>\n` +
+      `Removes the order rows entirely — no trace at all. Your revenue and ` +
+      `sales statistics will change, because those purchases disappear from ` +
+      `the record. Irreversible.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: '🧽 Wipe delivered content', callback_data: `admin_purge_go_${targetId}_0` }],
+          [{ text: '🗑 Delete everything (irreversible)', callback_data: `admin_purge_go_${targetId}_1` }],
+          [{ text: '🔙 Back to user', callback_data: `admin_user_${targetId}` }],
+        ] } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_purge_go_\d+_[01]$/.test(data)) {
+    const parts = data.split('_');
+    const hard  = parts.pop() === '1';
+    const targetId = parseInt(parts.pop(), 10);
+
+    const r = db.purgeUserOrderData(targetId, { hardDelete: hard });
+    logger.warn(`Admin ${userId} PURGED order data for user ${targetId} (hardDelete=${hard}): ${JSON.stringify(r)}`);
+
+    await bot.editMessageText(
+      `✅ <b>Order Data Erased</b>\n\n` +
+      `👤 <code>${targetId}</code>\n` +
+      `🔑 Delivered content wiped: <b>${r.contentWiped}</b> order(s)\n` +
+      `📦 Manual task content wiped: <b>${r.manualWiped}</b>\n` +
+      (hard
+        ? `🗑 Order rows deleted: <b>${r.ordersDeleted}</b>\n\n` +
+          `⚠️ <i>Sales and revenue statistics have changed — those purchases no longer exist.</i>`
+        : `📊 Order rows kept: <b>${r.kept}</b>\n\n` +
+          `<i>Your statistics are untouched. The customer can see the orders exist but not what was inside.</i>`),
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back to user', callback_data: `admin_user_${targetId}` }]] } }
+    ).catch(() => {});
+    return;
+  }
+
   if (/^admin_fraud_\d+$/.test(data)) {
     const targetId = parseInt(data.split('_').pop(), 10);
     const user = db.getUser(targetId);
@@ -2818,6 +2873,7 @@ async function handleAdminCallback(bot, query) {
       chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
       reply_markup: { inline_keyboard: [
         [{ text: user.is_banned ? '✅ Unban' : '🚫 Ban this user', callback_data: `admin_toggle_ban_${targetId}` }],
+        [{ text: '🧹 Erase their order data', callback_data: `admin_purge_${targetId}` }],
         [{ text: '↩️ Reverse a deposit', callback_data: 'admin_dep_reverse' }],
         [{ text: '🔙 Back to user', callback_data: `admin_user_${targetId}` }],
       ] },

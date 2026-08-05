@@ -262,6 +262,7 @@ async function showInbox(chatId, messageId = null, page = 0) {
       (mdCounts.pending ? `\n\n📦 <b>${mdCounts.pending}</b> manual delivery request(s) waiting.` : '');
     await send(chatId, messageId, text, { inline_keyboard: [
       [{ text: `📦 Manual Delivery (${mdCounts.pending})`, callback_data: 'md_list_pending_0' }],
+      [{ text: '🔔 Stock Alerts', callback_data: 'stock_list_all_0' }],
       [{ text: '🔄 Refresh', callback_data: 'inbox' }],
     ] });
     return;
@@ -298,9 +299,14 @@ async function showInbox(chatId, messageId = null, page = 0) {
     rows.push(nav);
   }
 
+  const stockUnread = queries.countNotificationsByType(['stock_out', 'stock_low'], true);
   rows.push([{
     text: `📦 Manual Delivery${mdCounts.pending ? ` (${mdCounts.pending})` : ''}`,
     callback_data: 'md_list_pending_0',
+  }]);
+  rows.push([{
+    text: `🔔 Stock Alerts${stockUnread ? ` (${stockUnread})` : ''}`,
+    callback_data: 'stock_list_all_0',
   }]);
   rows.push([
     { text: '🔍 Search customer', callback_data: 'cust_search' },
@@ -598,6 +604,97 @@ async function showManualDetail(chatId, messageId, taskId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// STOCK ALERTS
+//
+// Reads the shared `admin_notifications` table, so an alert raised by the main
+// bot shows up here with the same read state — marking it read in one place
+// marks it read everywhere.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const STOCK_TYPES = ['stock_out', 'stock_low'];
+const STOCK_TABS = {
+  all:       '📋 All',
+  stock_out: '🔴 Out of stock',
+  stock_low: '🟠 Running low',
+};
+const STOCK_PER_PAGE = 8;
+
+async function showStockAlerts(chatId, messageId, tab = 'all', page = 0) {
+  const safeTab = Object.prototype.hasOwnProperty.call(STOCK_TABS, tab) ? tab : 'all';
+  const types   = safeTab === 'all' ? STOCK_TYPES : [safeTab];
+
+  const total = queries.countNotificationsByType(types);
+  const pages = Math.max(1, Math.ceil(total / STOCK_PER_PAGE));
+  const pg    = Math.max(0, Math.min(page, pages - 1));
+  const rows  = queries.getNotificationsByType(types, STOCK_PER_PAGE, pg * STOCK_PER_PAGE);
+
+  const outCount = queries.countNotificationsByType(['stock_out'], true);
+  const lowCount = queries.countNotificationsByType(['stock_low'], true);
+
+  const txt =
+    `🔔 <b>Stock Alerts</b>\n\n` +
+    `🔴 Out of stock (unread): <b>${outCount}</b>\n` +
+    `🟠 Running low (unread): <b>${lowCount}</b>\n\n` +
+    `<b>Showing:</b> ${STOCK_TABS[safeTab]} — ${total} alert(s)` +
+    (rows.length ? '' : '\n\n<i>No alerts yet.</i>');
+
+  const kb = [Object.keys(STOCK_TABS).map((k) => ({
+    text: (k === safeTab ? '✓ ' : '') + STOCK_TABS[k],
+    callback_data: `stock_list_${k}_0`,
+  }))];
+
+  for (const n of rows) {
+    const dot  = n.is_read ? '' : '🔴 ';
+    const icon = n.type === 'stock_out' ? '🔴' : '🟠';
+    const when = formatTime(n.created_at);
+    kb.push([{
+      text: `${dot}${icon} ${String(n.title).slice(0, 26)} · ${when}`,
+      callback_data: `stock_view_${n.id}`,
+    }]);
+  }
+
+  if (pages > 1) {
+    const nav = [];
+    if (pg > 0)         nav.push({ text: '◀️ Prev', callback_data: `stock_list_${safeTab}_${pg - 1}` });
+    nav.push({ text: `${pg + 1}/${pages}`, callback_data: 'noop' });
+    if (pg < pages - 1) nav.push({ text: 'Next ▶️', callback_data: `stock_list_${safeTab}_${pg + 1}` });
+    kb.push(nav);
+  }
+
+  if (outCount + lowCount > 0) {
+    kb.push([{ text: '✅ Mark all as read', callback_data: `stock_readall_${safeTab}` }]);
+  }
+  kb.push([{ text: '🔙 Inbox', callback_data: 'inbox' }]);
+
+  await send(chatId, messageId, txt, { inline_keyboard: kb });
+}
+
+async function showStockAlert(chatId, messageId, id) {
+  const n = queries.getAdminNotification(id);
+  if (!n) {
+    await bot.sendMessage(chatId, '❌ Alert not found.');
+    return;
+  }
+  // Opening it is what marks it read.
+  queries.markNotificationRead(id);
+
+  const icon = n.type === 'stock_out' ? '🔴' : '🟠';
+  const txt =
+    `${icon} <b>${escapeHtml(n.title)}</b>\n` +
+    `🕒 ${formatFull(n.created_at)}\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `${n.body || '<i>(no details)</i>'}`;
+
+  const kb = [];
+  if (n.ref_type === 'product' && n.ref_id) {
+    kb.push([{ text: '📦 Product ID ' + n.ref_id, callback_data: 'noop' }]);
+  }
+  kb.push([{ text: '🔙 Stock Alerts', callback_data: 'stock_list_all_0' }]);
+
+  await send(chatId, messageId, txt, { inline_keyboard: kb });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // COMMANDS
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -632,6 +729,10 @@ bot.onText(/^\/inbox/, async (msg) => {
 
 bot.onText(/^\/manual/, async (msg) => {
   if (isStaff(msg.from.id)) await showManualList(msg.chat.id, null, 'pending', 0);
+});
+
+bot.onText(/^\/alerts/, async (msg) => {
+  if (isStaff(msg.from.id)) await showStockAlerts(msg.chat.id, null, 'all', 0);
 });
 
 bot.onText(/^\/close/, async (msg) => {
@@ -683,6 +784,25 @@ bot.on('callback_query', async (q) => {
     if (data === 'cust_search') {
       queries.setSetting(`support_state_${chatId}`, 'AWAIT_CUSTOMER_SEARCH');
       await bot.sendMessage(chatId, '🔍 Send a user ID, @username or name to search for:');
+      return;
+    }
+
+    // ── Stock alerts ──────────────────────────────────────────────────────
+    if (/^stock_list_[a-z_]+_\d+$/.test(data)) {
+      const parts = data.split('_');
+      const page  = parseInt(parts.pop(), 10);
+      const tab   = parts.slice(2).join('_');
+      await showStockAlerts(chatId, msgId, tab, page);
+      return;
+    }
+    if (/^stock_view_\d+$/.test(data)) {
+      await showStockAlert(chatId, msgId, parseInt(data.split('_').pop(), 10));
+      return;
+    }
+    if (/^stock_readall_[a-z_]+$/.test(data)) {
+      const cleared = queries.markAllNotificationsRead();
+      await bot.sendMessage(chatId, `✅ ${cleared} notification(s) marked as read.`);
+      await showStockAlerts(chatId, msgId, data.split('_').slice(2).join('_'), 0);
       return;
     }
 

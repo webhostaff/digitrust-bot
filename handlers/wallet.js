@@ -152,6 +152,8 @@ async function handleUsdtAmount(bot, msg) {
     `⚠️ <b>The amount must match to the last decimal.</b>\n` +
     `That exact figure is reserved for you — it is how we know the deposit is yours. ` +
     `A different amount cannot be credited automatically.\n\n` +
+    `<i>The few extra decimals cost you less than a tenth of a cent, and they are ` +
+    `credited to your wallet in full.</i>\n\n` +
     `⏰ Reserved for <b>${ttl} minutes</b>.\n\n` +
     `After sending, paste the <b>TxID</b> (transaction hash) here.`,
     {

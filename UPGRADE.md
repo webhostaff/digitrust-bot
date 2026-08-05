@@ -342,3 +342,78 @@ collisions, and reversal leaving a negative-balance debt trail.
 - [ ] Drop a product's stock to 0 → one alert, no repeats; restock → alert re-arms
 - [ ] Wallet → USDT → asks for network, then amount, then gives a unique figure
 - [ ] `logger is not defined` no longer appears in the log
+
+---
+
+# Part 10 — Later fixes
+
+## Balance comparison bug
+
+A customer with `$1.00` shown against a `$1.00` price was told
+**"Insufficient balance"** and could not buy.
+
+Cause: the check was `balance < price - 0.001`, while the interface rounds to
+cents. A stored balance of `0.9989` displays as `$1.00` but fails that test.
+
+Fix: `hasEnough()` compares whole cents, restoring the invariant the interface
+promises — *if the two displayed figures are equal, the purchase goes through*.
+Applied to all three call sites (wallet purchase, manual-delivery purchase,
+preorder).
+
+| Balance | Displayed | Price | Old | New |
+|---|---|---|---|---|
+| 0.9989 | $1.00 | $1.00 | refused | **passes** |
+| 0.9951 | $1.00 | $1.00 | refused | **passes** |
+| 0.9940 | $0.99 | $1.00 | refused | refused |
+| 5.0000 | $5.00 | $5.01 | refused | refused |
+
+## Erase a customer's order data
+
+`🚨 Fraud → 🧹 Erase their order data`, with two levels:
+
+* **🧽 Wipe delivered content** — clears `delivered_content` on their orders and
+  manual tasks, so they can no longer read the keys from "My Orders". The rows
+  stay, so sales and stock figures remain correct. This is the normal choice.
+* **🗑 Delete everything** — removes the order rows entirely. Irreversible, and
+  revenue/sales statistics change because those purchases disappear.
+
+Other customers' data is never touched.
+
+## Stock alerts inside the Support Bot
+
+New section: `/alerts`, or the `🔔 Stock Alerts` button in the inbox.
+
+Tabs (All / 🔴 Out of stock / 🟠 Running low), unread counters, pagination, and
+mark-all-as-read. It reads the shared `admin_notifications` table, so an alert
+raised by the main bot appears here with the same read state — marking it read
+in one place marks it read everywhere. Manual-delivery and support-message
+notifications are filtered out of this section.
+
+## Reduced the unique-amount suffix
+
+The reservation suffix was `0.000100–0.009999` (up to one cent). It is now
+`0.000101–0.000999` — **at most a tenth of a cent**, averaging 0.055 of a cent.
+
+| | Old | New |
+|---|---|---|
+| Range | 0.000100 – 0.009999 | 0.000101 – 0.000999 |
+| Average cost | 0.505 of a cent | **0.055 of a cent** |
+| Values per base amount | 9900 | 899 |
+
+The smaller range does not weaken anything: correctness comes from the partial
+UNIQUE index on open reservations, not from the size of the range. A collision
+simply causes a redraw.
+
+### The suffix is not a fee
+
+Network fees never touch the USDT amount: BEP20 gas is paid in BNB and TRC20 in
+TRX/Energy. The exact figure the customer sends is the exact figure Binance
+receives, and the whole of it is credited to their wallet. This is visible in
+the production log, where amounts like `35.12544802` and `18.12959494` arrived
+with full six-decimal precision.
+
+### Separate: the CryptoBot fee
+
+`handlers/wallet.js` adds a fixed fee on top of CryptoBot top-ups, controlled by
+the `cryptobot_fee_fixed` setting (default `0.01`). That one **is** a real charge
+to the customer. Set it to `0` in `/admin → ⚙️ Settings` if you do not want it.
