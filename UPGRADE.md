@@ -417,3 +417,58 @@ with full six-decimal precision.
 `handlers/wallet.js` adds a fixed fee on top of CryptoBot top-ups, controlled by
 the `cryptobot_fee_fixed` setting (default `0.01`). That one **is** a real charge
 to the customer. Set it to `0` in `/admin → ⚙️ Settings` if you do not want it.
+
+---
+
+# Part 11 — Support console rework
+
+## The problem
+
+Inline keyboards live on one specific message. Once a few notifications arrive,
+the message carrying the buttons has scrolled away and there is no route back to
+the inbox — the console becomes unusable exactly when it is busiest.
+
+## Persistent navigation bar
+
+Staff now get a **ReplyKeyboard** pinned to the bottom of the chat:
+
+```
+[ 📥 Inbox    ] [ 💳 Payments ]
+[ 📦 Delivery ] [ 🔔 Stock    ]
+```
+
+It never scrolls away. Every section is one tap from anywhere.
+
+Taps arrive as ordinary text, so they are intercepted **before** the reply
+forwarding logic — otherwise tapping `📥 Inbox` during a conversation would send
+the literal words "📥 Inbox" to the customer. A tap also abandons any
+half-finished input, which is what a person expects from a navigation button.
+
+New commands: `/menu` (show the console), `/payments`. `/close` now returns to
+the console instead of printing a bare line.
+
+The send confirmation now names the recipient — `✅ Sent to @username` — so it is
+never ambiguous who received a reply.
+
+## 💳 Payments section
+
+Two different problems, clearly separated:
+
+| Tab | Meaning | Action needed |
+|---|---|---|
+| ⏳ **Awaiting Binance** | The transfer exists on-chain but Binance has not credited it (`status != 1`) | None — it clears on its own |
+| 🛡 **Needs review** | The deposit matched no reservation | A human decision, taken in the main bot |
+
+### Pending deposit tracking
+
+New table `pending_deposits`. When `verifyDepositByTxId` reports `status != 1`,
+the attempt is recorded with the amount, network, on-chain age and a retry
+counter. `ON CONFLICT(txid) DO UPDATE` means repeated attempts bump the counter
+instead of creating duplicates, and the row is deleted the moment the deposit
+clears.
+
+Support is notified **once per deposit**, not on every retry.
+
+The customer-facing message was also improved: it now shows the amount and
+network, and states that support can already see the deposit — so they stop
+opening support tickets about it, which is what the tangled log showed happening.

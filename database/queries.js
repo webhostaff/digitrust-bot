@@ -1767,6 +1767,31 @@ module.exports = {
   purgeUserOrderData,
   previewPurge,
 
+  // ═══ Pending (uncredited) deposits ═══
+  recordPendingDeposit: (d) => db.prepare(`
+    INSERT INTO pending_deposits (txid, user_id, amount, network, insert_time)
+    VALUES (@txid, @userId, @amount, @network, @insertTime)
+    ON CONFLICT(txid) DO UPDATE SET
+      attempts  = attempts + 1,
+      last_seen = datetime('now')
+  `).run({ amount: null, network: null, insertTime: null, ...d }),
+
+  clearPendingDeposit: (txid) =>
+    db.prepare('DELETE FROM pending_deposits WHERE txid = ? COLLATE NOCASE').run(txid),
+
+  listPendingDeposits: () => db.prepare(`
+    SELECT pd.*, u.username, u.first_name
+    FROM pending_deposits pd
+    LEFT JOIN users u ON u.telegram_id = pd.user_id
+    ORDER BY pd.last_seen DESC
+  `).all(),
+
+  countPendingDeposits: () =>
+    db.prepare('SELECT COUNT(*) AS n FROM pending_deposits').get().n,
+
+  getPendingDeposit: (txid) =>
+    db.prepare('SELECT * FROM pending_deposits WHERE txid = ? COLLATE NOCASE').get(txid),
+
   // ═══ V3: deposit security ═══
   createDepositIntent,
   getOpenIntents,

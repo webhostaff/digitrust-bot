@@ -177,6 +177,144 @@ async function send(chatId, messageId, text, keyboard) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// PERSISTENT STAFF KEYBOARD
+//
+// Inline keyboards live on one specific message. As soon as a few notification
+// messages arrive, the message carrying the buttons is scrolled away and there
+// is no way back to the inbox — which is exactly the "everything is tangled"
+// problem. A ReplyKeyboard sits at the bottom of the chat permanently, so every
+// section is one tap away no matter how many notifications land.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const BTN = {
+  INBOX:    '📥 Inbox',
+  PAYMENTS: '💳 Payments',
+  DELIVERY: '📦 Delivery',
+  STOCK:    '🔔 Stock',
+};
+
+function staffKeyboard() {
+  return {
+    keyboard: [
+      [{ text: BTN.INBOX }, { text: BTN.PAYMENTS }],
+      [{ text: BTN.DELIVERY }, { text: BTN.STOCK }],
+    ],
+    resize_keyboard: true,
+    is_persistent: true,
+  };
+}
+
+/** Show the bar and a short status line. Used on /start and after /close. */
+async function showStaffHome(chatId) {
+  const unread   = queries.getSupportUnreadThreads();
+  const md       = queries.getManualDeliveryCounts();
+  const payments = queries.countDepositReviews('pending') + queries.countPendingDeposits();
+  const stock    = queries.countNotificationsByType(['stock_out', 'stock_low'], true);
+
+  await bot.sendMessage(
+    chatId,
+    `🎛 <b>Support Console</b>\n\n` +
+    `📥 Unread conversations: <b>${unread}</b>\n` +
+    `💳 Payments needing attention: <b>${payments}</b>\n` +
+    `📦 Deliveries waiting: <b>${md.pending}</b>\n` +
+    `🔔 Unread stock alerts: <b>${stock}</b>\n\n` +
+    `<i>The bar below stays put — tap any section at any time.</i>`,
+    { parse_mode: 'HTML', reply_markup: staffKeyboard() }
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PENDING PAYMENTS
+//
+// Two different problems land here:
+//   • awaiting  — Binance sees the transfer but has not credited it (status 0).
+//                 Nothing to do but wait; the customer is told the same.
+//   • review    — the deposit could not be matched to a reservation and needs
+//                 a human decision before any money moves.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const PAY_TABS = { all: '📋 All', awaiting: '⏳ Awaiting Binance', review: '🛡 Needs review' };
+const PAY_PER_PAGE = 8;
+
+async function showPayments(chatId, messageId, tab = 'all', page = 0) {
+  const safeTab = Object.prototype.hasOwnProperty.call(PAY_TABS, tab) ? tab : 'all';
+
+  const awaiting = queries.listPendingDeposits().map((r) => ({ ...r, _kind: 'awaiting' }));
+  const review   = queries.listDepositReviews('pending', 200, 0).map((r) => ({ ...r, _kind: 'review' }));
+
+  let rows;
+  if (safeTab === 'awaiting')    rows = awaiting;
+  else if (safeTab === 'review') rows = review;
+  else                           rows = [...review, ...awaiting]; // decisions first
+
+  const pages = Math.max(1, Math.ceil(rows.length / PAY_PER_PAGE));
+  const pg    = Math.max(0, Math.min(page, pages - 1));
+  const slice = rows.slice(pg * PAY_PER_PAGE, (pg + 1) * PAY_PER_PAGE);
+
+  const txt =
+    `💳 <b>Payments</b>\n\n` +
+    `⏳ Awaiting Binance: <b>${awaiting.length}</b>\n` +
+    `🛡 Needs your decision: <b>${review.length}</b>\n\n` +
+    `<b>Showing:</b> ${PAY_TABS[safeTab]} — ${rows.length} item(s)` +
+    (rows.length ? '' : '\n\n<i>Nothing pending. </i>');
+
+  const kb = [Object.keys(PAY_TABS).map((k) => ({
+    text: (k === safeTab ? '✓ ' : '') + PAY_TABS[k],
+    callback_data: `pay_list_${k}_0`,
+  }))];
+
+  for (const r of slice) {
+    const who  = displayName(r.username, r.first_name, r.user_id);
+    const amt  = Number(r.amount || 0).toFixed(2);
+    const icon = r._kind === 'review' ? '🛡' : '⏳';
+    kb.push([{
+      text: `${icon} ${who.slice(0, 13)} · $${amt} ${r.network || ''}`,
+      callback_data: r._kind === 'review' ? `pay_review_${r.id}` : `pay_wait_${r.txid.slice(0, 40)}`,
+    }]);
+  }
+
+  if (pages > 1) {
+    const nav = [];
+    if (pg > 0)         nav.push({ text: '◀️ Prev', callback_data: `pay_list_${safeTab}_${pg - 1}` });
+    nav.push({ text: `${pg + 1}/${pages}`, callback_data: 'noop' });
+    if (pg < pages - 1) nav.push({ text: 'Next ▶️', callback_data: `pay_list_${safeTab}_${pg + 1}` });
+    kb.push(nav);
+  }
+  kb.push([{ text: '🔄 Refresh', callback_data: `pay_list_${safeTab}_${pg}` }]);
+
+  await send(chatId, messageId, txt, { inline_keyboard: kb });
+}
+
+async function showAwaitingDeposit(chatId, messageId, txidPrefix) {
+  const row = queries.listPendingDeposits().find((r) => r.txid.startsWith(txidPrefix));
+  if (!row) {
+    await bot.sendMessage(chatId, 'ℹ️ This deposit already cleared and was credited.');
+    return;
+  }
+  const who = displayName(row.username, row.first_name, row.user_id);
+  const waited = row.insert_time
+    ? Math.round((Date.now() - Number(row.insert_time)) / 60000) : null;
+
+  await send(chatId, messageId,
+    `⏳ <b>Awaiting Binance Confirmation</b>\n\n` +
+    `👤 ${escapeHtml(who)}\n` +
+    `🆔 <code>${row.user_id}</code>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `💵 <b>Amount:</b> ${Number(row.amount || 0).toFixed(6)} USDT\n` +
+    `🌐 <b>Network:</b> ${row.network || 'n/a'}\n` +
+    `🔗 <code>${escapeHtml(row.txid)}</code>\n` +
+    (waited !== null ? `⌛ <b>On chain:</b> ${waited} min ago\n` : '') +
+    `🔁 <b>Customer retries:</b> ${row.attempts}\n` +
+    `📅 <b>First seen:</b> ${formatFull(row.first_seen)}\n\n` +
+    `<i>Binance has not credited this yet. It clears on its own — the customer ` +
+    `just needs to resend the TxID once it does. Nothing to do here.</i>`,
+    { inline_keyboard: [
+      [{ text: '💬 Message customer', callback_data: `chat_${row.user_id}` }],
+      [{ text: '🔙 Payments', callback_data: 'pay_list_all_0' }],
+    ] });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // CUSTOMER-FACING RECEIPT INDICATOR  (✓ / ✓✓)
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -702,6 +840,7 @@ bot.onText(/^\/start/, async (msg) => {
   const userId = msg.from.id;
 
   if (isStaff(userId)) {
+    await showStaffHome(msg.chat.id);
     await showInbox(msg.chat.id);
     return;
   }
@@ -731,6 +870,14 @@ bot.onText(/^\/manual/, async (msg) => {
   if (isStaff(msg.from.id)) await showManualList(msg.chat.id, null, 'pending', 0);
 });
 
+bot.onText(/^\/payments/, async (msg) => {
+  if (isStaff(msg.from.id)) await showPayments(msg.chat.id, null, 'all', 0);
+});
+
+bot.onText(/^\/menu/, async (msg) => {
+  if (isStaff(msg.from.id)) await showStaffHome(msg.chat.id);
+});
+
 bot.onText(/^\/alerts/, async (msg) => {
   if (isStaff(msg.from.id)) await showStockAlerts(msg.chat.id, null, 'all', 0);
 });
@@ -738,7 +885,8 @@ bot.onText(/^\/alerts/, async (msg) => {
 bot.onText(/^\/close/, async (msg) => {
   if (!isStaff(msg.from.id)) return;
   clearActiveChat(msg.chat.id);
-  await bot.sendMessage(msg.chat.id, '✅ Reply mode closed. Use /inbox to pick another conversation.');
+  queries.setSetting(`support_state_${msg.chat.id}`, '');
+  await showStaffHome(msg.chat.id);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -784,6 +932,36 @@ bot.on('callback_query', async (q) => {
     if (data === 'cust_search') {
       queries.setSetting(`support_state_${chatId}`, 'AWAIT_CUSTOMER_SEARCH');
       await bot.sendMessage(chatId, '🔍 Send a user ID, @username or name to search for:');
+      return;
+    }
+
+    // ── Payments ──────────────────────────────────────────────────────────
+    if (/^pay_list_[a-z]+_\d+$/.test(data)) {
+      const parts = data.split('_');
+      const page  = parseInt(parts.pop(), 10);
+      await showPayments(chatId, msgId, parts.slice(2).join('_'), page);
+      return;
+    }
+    if (/^pay_wait_/.test(data)) {
+      await showAwaitingDeposit(chatId, msgId, data.replace('pay_wait_', ''));
+      return;
+    }
+    if (/^pay_review_\d+$/.test(data)) {
+      const r = queries.getDepositReview(parseInt(data.split('_').pop(), 10));
+      if (!r) { await bot.sendMessage(chatId, '❌ Not found.'); return; }
+      const who = displayName(null, null, r.user_id);
+      await send(chatId, msgId,
+        `🛡 <b>Deposit Needs Review #${r.id}</b>\n\n` +
+        `👤 <code>${r.user_id}</code>\n` +
+        `💵 ${Number(r.amount).toFixed(6)} USDT (${r.network || 'n/a'})\n` +
+        `🔗 <code>${escapeHtml(r.txid)}</code>\n` +
+        `⚠️ ${escapeHtml(r.reason || '')}\n\n` +
+        `<i>Approving moves real money. Do it from the main bot: ` +
+        `/admin → 🛡 Deposit Review.</i>`,
+        { inline_keyboard: [
+          [{ text: '💬 Message customer', callback_data: `chat_${r.user_id}` }],
+          [{ text: '🔙 Payments', callback_data: 'pay_list_all_0' }],
+        ] });
       return;
     }
 
@@ -891,6 +1069,27 @@ bot.on('message', async (msg) => {
     const state = queries.getSetting(`support_state_${chatId}`, '');
     const text  = (msg.text || '').trim();
 
+    // ── Navigation bar taps come in as ordinary text ──────────────────────
+    // They MUST be handled before anything else. Without this, tapping
+    // "📥 Inbox" while a conversation is open would send the literal words
+    // "📥 Inbox" to the customer. Any half-finished input is abandoned, which
+    // is what a person expects when they tap a navigation button.
+    if (text === BTN.INBOX || text === BTN.PAYMENTS ||
+        text === BTN.DELIVERY || text === BTN.STOCK) {
+      queries.setSetting(`support_state_${chatId}`, '');
+      if (text === BTN.INBOX) {
+        clearActiveChat(chatId);
+        await showInbox(chatId);
+      } else if (text === BTN.PAYMENTS) {
+        await showPayments(chatId, null, 'all', 0);
+      } else if (text === BTN.DELIVERY) {
+        await showManualList(chatId, null, 'pending', 0);
+      } else {
+        await showStockAlerts(chatId, null, 'all', 0);
+      }
+      return;
+    }
+
     // Content for a manual-delivery task
     if (state.startsWith('AWAIT_MD_CONTENT:')) {
       const taskId = parseInt(state.split(':')[1], 10);
@@ -978,7 +1177,10 @@ bot.on('message', async (msg) => {
       }
 
       insertMsg.run(targetUserId, null, null, 'out', contentText, mediaType, fileId);
-      await bot.sendMessage(chatId, '✅ Sent.', {
+      const rcpt = queries.getUser(targetUserId);
+      const rcptName = displayName(rcpt?.username, rcpt?.first_name, targetUserId);
+      await bot.sendMessage(chatId, `✅ Sent to <b>${escapeHtml(rcptName)}</b>`, {
+        parse_mode: 'HTML',
         reply_markup: { inline_keyboard: [[
           { text: '💬 Open chat', callback_data: `chat_${targetUserId}` },
           { text: '🔙 Inbox',     callback_data: 'inbox' },

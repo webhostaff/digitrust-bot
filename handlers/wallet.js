@@ -287,6 +287,21 @@ async function handleUsdtTxId(bot, msg) {
     }
 
     if (!result.found) {
+      // Binance can see the transfer but has not credited it yet. Log it so
+      // support has visibility, and notify them once — not on every retry.
+      if (result.reason === 'pending') {
+        const already = db.getPendingDeposit(txid);
+        db.recordPendingDeposit({
+          txid, userId,
+          amount:     result.amount,
+          network:    result.network,
+          insertTime: result.insertTime,
+        });
+        if (!already) {
+          await notifyDepositReview(bot, userId, txid, result,
+            'Awaiting Binance confirmation (not yet credited)');
+        }
+      }
       // Note: an out-of-window transfer does NOT arrive here. binance.js
       // soft-fails it as found:true + tooOld, because whether it may still be
       // credited depends on the reservation — which is checked below.
@@ -409,6 +424,9 @@ async function handleUsdtTxId(bot, msg) {
       }
       logger.info(`Deposit ${txid} matched reservation #${intent.id} for user ${userId}`);
     }
+
+    // It cleared — remove it from the "waiting" list support is watching.
+    db.clearPendingDeposit(txid);
 
     await creditFromVerifiedDeposit(bot, chatId, userId, {
       identifier: txid,

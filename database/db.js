@@ -824,4 +824,21 @@ try {
   console.error('[MIGRATION V3] settings seed error:', e.message);
 }
 
+// Deposits Binance has seen but not yet credited (status != 1). Recorded so
+// support can see who is waiting, instead of finding out from a complaint.
+// The row is removed as soon as the deposit clears.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS pending_deposits (
+    txid        TEXT PRIMARY KEY COLLATE NOCASE,
+    user_id     INTEGER NOT NULL,
+    amount      REAL,
+    network     TEXT,
+    insert_time INTEGER,
+    attempts    INTEGER DEFAULT 1,
+    first_seen  TEXT DEFAULT (datetime('now')),
+    last_seen   TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_pending_dep_user ON pending_deposits(user_id);
+`);
+
 module.exports = db;

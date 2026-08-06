@@ -218,11 +218,21 @@ async function verifyDepositByTxId(rawTxid, opts = {}) {
   // 5. Status: 1 = success
   const status = Number(match.status);
   if (status !== 1) {
+    // The transfer exists on-chain but Binance has not credited it yet. Report
+    // the details so the caller can log it — support then sees who is waiting
+    // instead of only hearing about it when the customer complains.
     return {
       found: false, reason: 'pending',
+      amount:     Number(match.amount),
+      network:    ALLOWED_NETWORKS[String(match.network || '').toUpperCase()] || String(match.network || ''),
+      insertTime: Number(match.insertTime) || null,
+      txid:       match.txId,
       message:
-        `⏳ Deposit found but not yet credited (status=${status}).\n` +
-        'Please wait until Binance confirms the deposit, then resend the TxID.',
+        `⏳ <b>Deposit found — waiting for Binance to confirm it.</b>\n\n` +
+        `💵 Amount: <b>${Number(match.amount)} USDT</b>\n` +
+        `🌐 Network: ${String(match.network || '').toUpperCase()}\n\n` +
+        `This usually takes a few minutes. Send the TxID again shortly.\n` +
+        `<i>Our team can already see your deposit — you do not need to contact support.</i>`,
     };
   }
 
