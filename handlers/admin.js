@@ -1990,10 +1990,10 @@ async function handleAdminCallback(bot, query) {
     ]];
 
     for (const n of rows) {
-      const dot = n.is_read ? '' : '🔴 ';
+      const dot = n.is_read ? '' : '🆕 ';
       const when = String(n.created_at || '').slice(5, 16).replace('-', '/');
       kb.push([{
-        text: `${dot}${icons[n.type] || '🔔'} ${String(n.title).slice(0, 30)} · ${when}`,
+        text: `${dot}${icons[n.type] || '🔔'} ${String(n.title).slice(0, 42)} · ${when}`,
         callback_data: `admin_notif_view_${n.id}`,
       }]);
     }

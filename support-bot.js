@@ -782,11 +782,14 @@ async function showStockAlerts(chatId, messageId, tab = 'all', page = 0) {
   }))];
 
   for (const n of rows) {
-    const dot  = n.is_read ? '' : '🔴 ';
+    // The unread marker used to be 🔴, the same glyph as the out-of-stock icon,
+    // so every unread out-of-stock row read "🔴 🔴". 🆕 keeps the two meanings
+    // visually distinct.
+    const dot  = n.is_read ? '' : '🆕 ';
     const icon = n.type === 'stock_out' ? '🔴' : '🟠';
     const when = formatTime(n.created_at);
     kb.push([{
-      text: `${dot}${icon} ${String(n.title).slice(0, 26)} · ${when}`,
+      text: `${dot}${icon} ${String(n.title).slice(0, 42)} · ${when}`,
       callback_data: `stock_view_${n.id}`,
     }]);
   }

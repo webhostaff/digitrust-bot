@@ -472,3 +472,33 @@ Support is notified **once per deposit**, not on every retry.
 The customer-facing message was also improved: it now shows the amount and
 network, and states that support can already see the deposit — so they stop
 opening support tickets about it, which is what the tangled log showed happening.
+
+## Stock alerts now name the product
+
+The alert list showed eight identical rows reading "Product is running low"
+with only a timestamp to tell them apart — useless when several products are
+low at once.
+
+Cause: the product name was written into the notification `body`, but the list
+screens render the `title`, which was a fixed string.
+
+Fixed in `services/stockAlerts.js`:
+
+| Before | After |
+|---|---|
+| `Product is out of stock` | `Out of stock — Netflix Premium 1 Month` |
+| `Product is running low` | `Low stock (3 left) — CapCut Pro Team 1 Month` |
+
+The low-stock title also carries the remaining quantity, so you can triage
+without opening anything.
+
+### Existing alerts are rewritten too
+
+A one-off backfill in `database/db.js` lifts the product name out of the body of
+alerts already stored, so the 17 rows currently in the list become readable
+rather than only new ones. Notifications of other types are untouched.
+
+### Duplicate icon fixed
+
+The unread marker was 🔴, the same glyph as the out-of-stock icon, so unread
+rows read `🔴 🔴 Product is out of stock`. The marker is now 🆕.

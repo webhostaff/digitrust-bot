@@ -841,4 +841,34 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_pending_dep_user ON pending_deposits(user_id);
 `);
 
+// One-off backfill: older stock alerts were stored with a generic title
+// ("Product is out of stock"), so every row in the notification list looked
+// identical. The product name has always been present in the body — this
+// lifts it into the title so historical alerts become readable too.
+try {
+  const stale = db.prepare(`
+    SELECT id, type, body FROM admin_notifications
+    WHERE type IN ('stock_out','stock_low')
+      AND (title = 'Product is out of stock' OR title = 'Product is running low')
+  `).all();
+
+  const setTitle = db.prepare('UPDATE admin_notifications SET title = ? WHERE id = ?');
+  for (const row of stale) {
+    // body starts with: "📦 <b>Product:</b> NAME\n"
+    const m = String(row.body || '').match(/<b>Product:<\/b>\s*([^\n<]+)/);
+    const name = m ? m[1].trim() : '';
+    if (!name) continue;
+    const qm = String(row.body || '').match(/<b>Remaining:<\/b>\s*<b>(\d+)<\/b>/);
+    setTitle.run(
+      row.type === 'stock_out'
+        ? `Out of stock — ${name.slice(0, 40)}`
+        : `Low stock (${qm ? qm[1] : '?'} left) — ${name.slice(0, 34)}`,
+      row.id
+    );
+  }
+  if (stale.length) console.log(`[MIGRATION] Rewrote ${stale.length} stock alert title(s)`);
+} catch (e) {
+  console.error('[MIGRATION] stock alert title backfill:', e.message);
+}
+
 module.exports = db;

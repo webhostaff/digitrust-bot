@@ -73,7 +73,10 @@ async function evaluateStock(bot, productId) {
 
     await notifyAdmin(bot, {
       type:  'stock_out',
-      title: 'Product is out of stock',
+      // The product name belongs in the title, not only in the body: the
+      // notification LISTS render titles, so a generic title left every row
+      // reading "Product is out of stock" with no way to tell them apart.
+      title: `Out of stock — ${titleClean.slice(0, 40)}`,
       body:
         `📦 <b>Product:</b> ${titleClean}\n` +
         `🆔 <b>ID:</b> <code>${product.id}</code>\n` +
@@ -95,7 +98,7 @@ async function evaluateStock(bot, productId) {
 
   await notifyAdmin(bot, {
     type:  'stock_low',
-    title: 'Product is running low',
+    title: `Low stock (${qty} left) — ${titleClean.slice(0, 34)}`,
     body:
       `📦 <b>Product:</b> ${titleClean}\n` +
       `🆔 <b>ID:</b> <code>${product.id}</code>\n` +
