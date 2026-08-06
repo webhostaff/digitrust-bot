@@ -502,3 +502,41 @@ rather than only new ones. Notifications of other types are untouched.
 
 The unread marker was 🔴, the same glyph as the out-of-stock icon, so unread
 rows read `🔴 🔴 Product is out of stock`. The marker is now 🆕.
+
+## Stock alerts: live list, not a log
+
+Previously the section accumulated every alert ever raised — 17 rows, mostly
+"running low", including products that had long since been restocked. It had
+become a history nobody could act on.
+
+It is now a **live status list** answering one question: *what is out of stock
+right now?*
+
+### What changed
+
+| | Before | After |
+|---|---|---|
+| Low-stock alerts | Always on | **Off by default** (`stock_low_alerts_enabled`) |
+| After restocking | Alert stayed forever | **Alert is deleted** |
+| Tabs | All / Out of stock / Running low | None — one list |
+| Empty state | Blank | "✅ Everything is in stock" |
+
+`evaluateStock` now deletes a product's alerts as soon as `stock_quantity > 0`,
+and re-arms the latch so a future sell-out raises a fresh one. A product that
+sells out → is restocked → sells out again produces exactly two alerts, and only
+ever one row in the list at a time.
+
+### Existing rows are cleaned up
+
+A one-off migration removes:
+
+* every `stock_low` alert (the feature is off now)
+* `stock_out` alerts for products currently back in stock
+* orphaned alerts whose product was deleted
+
+and re-arms the latches on everything currently in stock.
+
+### Bringing low-stock alerts back
+
+`/admin → ⚙️ Settings → 🟠 Low-Stock Alerts On/Off`, or set
+`stock_low_alerts_enabled` to `1`.

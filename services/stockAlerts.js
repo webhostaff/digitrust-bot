@@ -1,19 +1,20 @@
 'use strict';
 
 /**
- * Stock alerts for the admin (out-of-stock + low-stock).
+ * Out-of-stock alerts.
  *
- * Repetition is prevented with two latch flags stored on the product row:
- *   products.oos_notified  — set to 1 once the "sold out" alert has been sent
- *   products.low_notified  — set to 1 once the "running low" alert has been sent
+ * This is a LIVE STATUS LIST, not an event log. The list answers one question:
+ * "what is out of stock right now?" As soon as a product is restocked its alert
+ * is deleted, so no historical rows accumulate.
  *
- * Both flags are cleared by `resetStockAlertFlags()` as soon as stock rises
- * back above the threshold. That is what gives the behaviour the spec asks for:
- * a product that sells out, gets restocked and sells out again produces exactly
- * two alerts — never a stream of them while it sits at zero.
+ * Low-stock ("running low") alerts are OFF by default — they buried the
+ * out-of-stock rows that actually need action. They can be switched back on
+ * with the `stock_low_alerts_enabled` setting.
  *
- * The threshold is per product (`products.low_stock_threshold`), falling back
- * to the global `low_stock_threshold_default` setting when the product has none.
+ * Repetition is prevented by a latch on the product row (`oos_notified`),
+ * cleared the moment stock returns. A product that sells out, is restocked and
+ * sells out again therefore produces exactly two alerts — never a stream of
+ * them while it sits at zero.
  */
 
 const db     = require('../database/queries');
@@ -28,9 +29,14 @@ function thresholdFor(product) {
   return Number.isFinite(global) && global > 0 ? global : 5;
 }
 
+/** Are "running low" alerts switched on? Off unless explicitly enabled. */
+function lowAlertsEnabled() {
+  return db.getSetting('stock_low_alerts_enabled', '0') === '1';
+}
+
 /**
- * Evaluate a product's stock level and fire admin alerts when a boundary is
- * crossed. Safe to call after every stock mutation — it is idempotent.
+ * Evaluate a product's stock level and keep the alert list in sync with
+ * reality. Safe to call after every stock mutation — it is idempotent.
  *
  * @param {TelegramBot} bot
  * @param {number} productId
@@ -45,70 +51,71 @@ async function evaluateStock(bot, productId) {
   }
   if (!product) return;
 
-  const qty       = Number(product.stock_quantity) || 0;
-  const threshold = thresholdFor(product);
-  const botInfo   = await bot.getMe().catch(() => ({ username: '' }));
+  const qty = Number(product.stock_quantity) || 0;
 
-  const openBtn = botInfo.username
-    ? [[{ text: '🛒 View product', url: `https://t.me/${botInfo.username}?start=p_${product.id}` }],
-       [{ text: '📦 Manage stock', callback_data: `admin_stock_select_p_${product.id}` }]]
-    : [[{ text: '📦 Manage stock', callback_data: `admin_stock_select_p_${product.id}` }]];
-
-  const titleClean = escapeHtml(String(product.title || '').replace(/\[emoji:\d+\]/g, '').trim());
-
-  // ── Restocked above the threshold → clear both latches ────────────────────
-  if (qty > threshold) {
-    if (product.oos_notified || product.low_notified) {
+  // ── Back in stock → the alert is no longer true, so remove it ────────────
+  if (qty > 0) {
+    const removed = db.deleteStockNotifications(product.id);
+    if (removed > 0 || product.oos_notified || product.low_notified) {
       db.resetStockAlertFlags(product.id);
-      logger.info(`Stock alerts re-armed for product #${product.id} (qty ${qty} > ${threshold})`);
+      if (removed > 0) {
+        logger.info(`Cleared ${removed} stock alert(s) for product #${product.id} — restocked to ${qty}`);
+      }
+    }
+
+    // Optional low-stock warning, only if the admin turned it back on.
+    if (lowAlertsEnabled()) {
+      const threshold = thresholdFor(product);
+      if (qty <= threshold && !product.low_notified) {
+        db.setLowNotified(product.id, true);
+        await sendAlert(bot, product, 'stock_low', qty, threshold);
+      }
     }
     return;
   }
 
-  // ── Out of stock ──────────────────────────────────────────────────────────
-  if (qty === 0) {
-    if (product.oos_notified) return; // already alerted, stay quiet
-    db.setOosNotified(product.id, true);
-    db.setLowNotified(product.id, true); // suppress a redundant low alert too
+  // ── Out of stock ─────────────────────────────────────────────────────────
+  if (product.oos_notified) return; // already listed, stay quiet
+  db.setOosNotified(product.id, true);
+  await sendAlert(bot, product, 'stock_out', 0, 0);
+}
 
-    await notifyAdmin(bot, {
-      type:  'stock_out',
-      // The product name belongs in the title, not only in the body: the
-      // notification LISTS render titles, so a generic title left every row
-      // reading "Product is out of stock" with no way to tell them apart.
-      title: `Out of stock — ${titleClean.slice(0, 40)}`,
-      body:
-        `📦 <b>Product:</b> ${titleClean}\n` +
-        `🆔 <b>ID:</b> <code>${product.id}</code>\n` +
-        `💵 <b>Price:</b> $${Number(product.price || 0).toFixed(2)}\n` +
-        `📊 <b>Stock:</b> <b>0</b>\n\n` +
-        `<i>Restock the product to resume sales.</i>`,
-      // Includes the current stock cycle so a later sell-out produces a new key.
-      dedupeKey: `stock_out:${product.id}:${product.sales_count || 0}`,
-      refType: 'product',
-      refId:   product.id,
-      buttons: openBtn,
-    });
-    return;
-  }
+/** Build and dispatch the alert. */
+async function sendAlert(bot, product, type, qty, threshold) {
+  const botInfo = await bot.getMe().catch(() => ({ username: '' }));
+  const titleClean = escapeHtml(
+    String(product.title || '').replace(/\[emoji:\d+\]/g, '').trim()
+  );
 
-  // ── Running low (0 < qty <= threshold) ────────────────────────────────────
-  if (product.low_notified) return;
-  db.setLowNotified(product.id, true);
+  const buttons = botInfo.username
+    ? [[{ text: '🛒 View product', url: `https://t.me/${botInfo.username}?start=p_${product.id}` }],
+       [{ text: '📦 Manage stock', callback_data: `admin_stock_select_p_${product.id}` }]]
+    : [[{ text: '📦 Manage stock', callback_data: `admin_stock_select_p_${product.id}` }]];
+
+  const isOut = type === 'stock_out';
 
   await notifyAdmin(bot, {
-    type:  'stock_low',
-    title: `Low stock (${qty} left) — ${titleClean.slice(0, 34)}`,
+    type,
+    // The product name goes in the TITLE: the notification lists render titles,
+    // so a fixed string would leave every row looking identical.
+    title: isOut
+      ? `Out of stock — ${titleClean.slice(0, 40)}`
+      : `Low stock (${qty} left) — ${titleClean.slice(0, 34)}`,
     body:
       `📦 <b>Product:</b> ${titleClean}\n` +
       `🆔 <b>ID:</b> <code>${product.id}</code>\n` +
       `💵 <b>Price:</b> $${Number(product.price || 0).toFixed(2)}\n` +
-      `📊 <b>Remaining:</b> <b>${qty}</b> (alert threshold: ${threshold})`,
-    dedupeKey: `stock_low:${product.id}:${product.sales_count || 0}`,
+      (isOut
+        ? `📊 <b>Stock:</b> <b>0</b>\n\n<i>Restock the product to resume sales. ` +
+          `This alert disappears from the list automatically once you do.</i>`
+        : `📊 <b>Remaining:</b> <b>${qty}</b> (alert threshold: ${threshold})`),
+    // The sales counter is part of the key, so a later sell-out after a restock
+    // is treated as a new event rather than a duplicate.
+    dedupeKey: `${type}:${product.id}:${product.sales_count || 0}`,
     refType: 'product',
     refId:   product.id,
-    buttons: openBtn,
+    buttons,
   });
 }
 
-module.exports = { evaluateStock, thresholdFor };
+module.exports = { evaluateStock, thresholdFor, lowAlertsEnabled };

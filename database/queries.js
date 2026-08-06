@@ -1713,6 +1713,11 @@ module.exports = {
   settleManualOrderExternal,
 
   // ═══ V2: stock alert latches ═══
+  deleteStockNotifications: (productId) => db.prepare(`
+    DELETE FROM admin_notifications
+    WHERE type IN ('stock_out','stock_low') AND ref_type = 'product' AND ref_id = ?
+  `).run(String(productId)).changes,
+
   setOosNotified: (id, v) => stock_setOosNotified.run(v ? 1 : 0, id),
   setLowNotified: (id, v) => stock_setLowNotified.run(v ? 1 : 0, id),
   resetStockAlertFlags: (id) => stock_resetFlags.run(id),

@@ -820,6 +820,9 @@ try {
   ins.run('deposit_strict_mode', '1');
   // How long a reserved amount stays valid.
   ins.run('deposit_intent_ttl_minutes', '30');
+  // "Running low" alerts are off by default — they bury the out-of-stock rows
+  // that actually need action. Set to '1' to bring them back.
+  ins.run('stock_low_alerts_enabled', '0');
 } catch (e) {
   console.error('[MIGRATION V3] settings seed error:', e.message);
 }
@@ -869,6 +872,43 @@ try {
   if (stale.length) console.log(`[MIGRATION] Rewrote ${stale.length} stock alert title(s)`);
 } catch (e) {
   console.error('[MIGRATION] stock alert title backfill:', e.message);
+}
+
+// ── Stock alerts become a LIVE list, not a log ───────────────────────────────
+// Two clean-ups, both one-off and safe to re-run:
+//   1. Drop every "running low" alert — that feature is off by default now.
+//   2. Drop "out of stock" alerts for products that are back in stock, since
+//      the row no longer describes reality.
+// From here on, restocking deletes the alert automatically (services/stockAlerts.js).
+try {
+  const lowGone = db.prepare("DELETE FROM admin_notifications WHERE type = 'stock_low'").run().changes;
+
+  const staleOut = db.prepare(`
+    DELETE FROM admin_notifications
+    WHERE type = 'stock_out'
+      AND ref_type = 'product'
+      AND CAST(ref_id AS INTEGER) IN (
+        SELECT id FROM products WHERE COALESCE(stock_quantity, 0) > 0
+      )
+  `).run().changes;
+
+  // Alerts whose product was deleted outright are meaningless too.
+  const orphans = db.prepare(`
+    DELETE FROM admin_notifications
+    WHERE type IN ('stock_out','stock_low')
+      AND ref_type = 'product'
+      AND CAST(ref_id AS INTEGER) NOT IN (SELECT id FROM products)
+  `).run().changes;
+
+  if (lowGone || staleOut || orphans) {
+    console.log(`[MIGRATION] Stock alerts cleaned: ${lowGone} low, ${staleOut} restocked, ${orphans} orphaned`);
+  }
+
+  // Re-arm the latches for anything currently in stock, so a future sell-out
+  // still raises a fresh alert.
+  db.prepare('UPDATE products SET oos_notified = 0, low_notified = 0 WHERE COALESCE(stock_quantity,0) > 0').run();
+} catch (e) {
+  console.error('[MIGRATION] stock alert cleanup:', e.message);
 }
 
 module.exports = db;

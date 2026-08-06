@@ -190,7 +190,7 @@ const BTN = {
   INBOX:    '📥 Inbox',
   PAYMENTS: '💳 Payments',
   DELIVERY: '📦 Delivery',
-  STOCK:    '🔔 Stock',
+  STOCK:    '🔴 Out of Stock',
 };
 
 function staffKeyboard() {
@@ -750,62 +750,50 @@ async function showManualDetail(chatId, messageId, taskId) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 const STOCK_TYPES = ['stock_out', 'stock_low'];
-const STOCK_TABS = {
-  all:       '📋 All',
-  stock_out: '🔴 Out of stock',
-  stock_low: '🟠 Running low',
-};
 const STOCK_PER_PAGE = 8;
 
-async function showStockAlerts(chatId, messageId, tab = 'all', page = 0) {
-  const safeTab = Object.prototype.hasOwnProperty.call(STOCK_TABS, tab) ? tab : 'all';
-  const types   = safeTab === 'all' ? STOCK_TYPES : [safeTab];
-
-  const total = queries.countNotificationsByType(types);
+/**
+ * Live out-of-stock list.
+ *
+ * Deliberately has no tabs and no history: a row exists only while the product
+ * is actually out of stock. Restocking deletes it (services/stockAlerts.js), so
+ * what you see is always the current situation.
+ */
+async function showStockAlerts(chatId, messageId, _tab = 'all', page = 0) {
+  const total = queries.countNotificationsByType(STOCK_TYPES);
   const pages = Math.max(1, Math.ceil(total / STOCK_PER_PAGE));
   const pg    = Math.max(0, Math.min(page, pages - 1));
-  const rows  = queries.getNotificationsByType(types, STOCK_PER_PAGE, pg * STOCK_PER_PAGE);
+  const rows  = queries.getNotificationsByType(STOCK_TYPES, STOCK_PER_PAGE, pg * STOCK_PER_PAGE);
+  const unread = queries.countNotificationsByType(STOCK_TYPES, true);
 
-  const outCount = queries.countNotificationsByType(['stock_out'], true);
-  const lowCount = queries.countNotificationsByType(['stock_low'], true);
+  const txt = total
+    ? `🔔 <b>Out of Stock</b>\n\n` +
+      `📦 Products needing restock: <b>${total}</b>\n` +
+      (unread ? `🆕 Not yet seen: <b>${unread}</b>\n` : '') +
+      `\n<i>A product disappears from this list the moment you restock it.</i>`
+    : `🔔 <b>Out of Stock</b>\n\n` +
+      `✅ <b>Everything is in stock.</b>\n\n` +
+      `<i>Products appear here when they run out, and disappear once restocked.</i>`;
 
-  const txt =
-    `🔔 <b>Stock Alerts</b>\n\n` +
-    `🔴 Out of stock (unread): <b>${outCount}</b>\n` +
-    `🟠 Running low (unread): <b>${lowCount}</b>\n\n` +
-    `<b>Showing:</b> ${STOCK_TABS[safeTab]} — ${total} alert(s)` +
-    (rows.length ? '' : '\n\n<i>No alerts yet.</i>');
-
-  const kb = [Object.keys(STOCK_TABS).map((k) => ({
-    text: (k === safeTab ? '✓ ' : '') + STOCK_TABS[k],
-    callback_data: `stock_list_${k}_0`,
-  }))];
-
+  const kb = [];
   for (const n of rows) {
-    // The unread marker used to be 🔴, the same glyph as the out-of-stock icon,
-    // so every unread out-of-stock row read "🔴 🔴". 🆕 keeps the two meanings
-    // visually distinct.
-    const dot  = n.is_read ? '' : '🆕 ';
-    const icon = n.type === 'stock_out' ? '🔴' : '🟠';
-    const when = formatTime(n.created_at);
+    const dot = n.is_read ? '' : '🆕 ';
     kb.push([{
-      text: `${dot}${icon} ${String(n.title).slice(0, 42)} · ${when}`,
+      text: `${dot}🔴 ${String(n.title).replace(/^Out of stock — /, '').slice(0, 40)} · ${formatTime(n.created_at)}`,
       callback_data: `stock_view_${n.id}`,
     }]);
   }
 
   if (pages > 1) {
     const nav = [];
-    if (pg > 0)         nav.push({ text: '◀️ Prev', callback_data: `stock_list_${safeTab}_${pg - 1}` });
+    if (pg > 0)         nav.push({ text: '◀️ Prev', callback_data: `stock_list_all_${pg - 1}` });
     nav.push({ text: `${pg + 1}/${pages}`, callback_data: 'noop' });
-    if (pg < pages - 1) nav.push({ text: 'Next ▶️', callback_data: `stock_list_${safeTab}_${pg + 1}` });
+    if (pg < pages - 1) nav.push({ text: 'Next ▶️', callback_data: `stock_list_all_${pg + 1}` });
     kb.push(nav);
   }
 
-  if (outCount + lowCount > 0) {
-    kb.push([{ text: '✅ Mark all as read', callback_data: `stock_readall_${safeTab}` }]);
-  }
-  kb.push([{ text: '🔙 Inbox', callback_data: 'inbox' }]);
+  if (unread > 0) kb.push([{ text: '✅ Mark all as seen', callback_data: 'stock_readall_all' }]);
+  kb.push([{ text: '🔄 Refresh', callback_data: `stock_list_all_${pg}` }]);
 
   await send(chatId, messageId, txt, { inline_keyboard: kb });
 }
@@ -828,9 +816,9 @@ async function showStockAlert(chatId, messageId, id) {
 
   const kb = [];
   if (n.ref_type === 'product' && n.ref_id) {
-    kb.push([{ text: '📦 Product ID ' + n.ref_id, callback_data: 'noop' }]);
+    kb.push([{ text: `📦 Product ID ${n.ref_id}`, callback_data: 'noop' }]);
   }
-  kb.push([{ text: '🔙 Stock Alerts', callback_data: 'stock_list_all_0' }]);
+  kb.push([{ text: '🔙 Out of Stock', callback_data: 'stock_list_all_0' }]);
 
   await send(chatId, messageId, txt, { inline_keyboard: kb });
 }
