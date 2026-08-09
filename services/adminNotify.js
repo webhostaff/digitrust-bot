@@ -22,6 +22,18 @@ const db     = require('../database/queries');
 const config = require('../config');
 const logger = require('../utils/logger');
 
+/**
+ * The Support Bot instance, registered by support-bot.js on startup.
+ *
+ * Events are raised all over the codebase by whichever bot happens to be
+ * running the code path — a purchase raises a stock alert through the MAIN
+ * bot, for example. Pushing through that bot scatters notifications across two
+ * chats. Registering the support bot here lets every alert land in one place:
+ * the support console.
+ */
+let supportBot = null;
+function setSupportBot(instance) { supportBot = instance; }
+
 const escapeHtml = (s) =>
   String(s == null ? '' : s)
     .replace(/&/g, '&amp;')
@@ -77,6 +89,10 @@ async function notifyAdmin(bot, opts) {
   const {
     type, title, body = '', dedupeKey,
     refType = null, refId = null, buttons = null,
+    // Buttons whose callback_data the SUPPORT bot understands. The `buttons`
+    // above carry admin_* callbacks that only the main bot handles, so sending
+    // them through the support bot would produce dead buttons.
+    supportButtons = null,
   } = opts;
 
   // ── 1. Persist (this is also the duplicate check) ──────────────────────────
@@ -105,16 +121,32 @@ async function notifyAdmin(bot, opts) {
     `🕒 ${stamp()}\n` +
     (body ? `\n${body}` : '');
 
-  const markup = buttons && buttons.length ? { inline_keyboard: buttons } : undefined;
+  // Prefer the support console: one place to watch instead of two.
+  const pushBot = supportBot || bot;
+  const useSupport = pushBot === supportBot;
+  const chosen = useSupport ? supportButtons : buttons;
+  const markup = chosen && chosen.length ? { inline_keyboard: chosen } : undefined;
 
   for (const target of adminTargets()) {
     try {
-      await bot.sendMessage(target, text, {
+      await pushBot.sendMessage(target, text, {
         parse_mode: 'HTML',
         reply_markup: markup,
         disable_web_page_preview: true,
       });
     } catch (e) {
+      // A staff member who never opened the support bot cannot receive from it.
+      // Fall back to the bot that raised the event so the alert is not lost.
+      if (useSupport) {
+        try {
+          await bot.sendMessage(target, text, {
+            parse_mode: 'HTML',
+            reply_markup: buttons && buttons.length ? { inline_keyboard: buttons } : undefined,
+            disable_web_page_preview: true,
+          });
+          continue;
+        } catch (e2) { /* fall through to the warning */ }
+      }
       logger.warn(`notifyAdmin: push to ${target} failed: ${e.message}`);
     }
   }
@@ -122,4 +154,4 @@ async function notifyAdmin(bot, opts) {
   return true;
 }
 
-module.exports = { notifyAdmin, stamp, escapeHtml, adminTargets, TYPE_ICON };
+module.exports = { notifyAdmin, setSupportBot, stamp, escapeHtml, adminTargets, TYPE_ICON };

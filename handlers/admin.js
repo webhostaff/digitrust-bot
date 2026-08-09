@@ -20,7 +20,7 @@ const {
   adminEmojiLibraryKb,
 } = require('../utils/keyboard');
 const items = require('../database/items');
-const { formatPrice, escapeHtml, expandPremiumEmojis, scaleTiersProportionally } = require('../utils/format');
+const { formatPrice, formatPriceExact, escapeHtml, expandPremiumEmojis, scaleTiersProportionally } = require('../utils/format');
 const {
   publishToChannel, publishToGroup, broadcastToUsers, autoPublish, autoPublishWithPhoto,
   buildNewProductText, buildStockUpdateText,
@@ -166,10 +166,17 @@ async function handleAdminText(bot, msg) {
       `✅ <b>Special Price Set</b>\n\n` +
       `👤 Customer: <code>${targetId}</code>\n` +
       `📦 ${escapeHtml(String(product.title || ''))}\n` +
-      `💵 Public: ${formatPrice(product.price)}\n` +
-      `💲 This customer pays: <b>${formatPrice(price)}</b>\n` +
-      (diff > 0 ? `📉 Discount: ${formatPrice(diff)} per unit\n`
-                : diff < 0 ? `📈 Markup: ${formatPrice(-diff)} per unit\n` : '') +
+      `💵 Public: ${formatPriceExact(product.price)}\n` +
+      `💲 This customer pays: <b>${formatPriceExact(price)}</b>\n` +
+      (diff > 0 ? `📉 Discount: ${formatPriceExact(diff)} per unit\n`
+                : diff < 0 ? `📈 Markup: ${formatPriceExact(-diff)} per unit\n` : '') +
+      // Prices are displayed to customers rounded to cents, so anything finer
+      // than that shows one figure and charges another. Say so plainly.
+      (Math.abs(price - Number(price.toFixed(2))) > 1e-9
+        ? `\n⚠️ <b>Sub-cent price.</b> The customer will see ` +
+          `<b>${formatPrice(price)}</b> but be charged <b>${formatPriceExact(price)}</b>. ` +
+          `Use 2 decimals to keep them identical.\n`
+        : '') +
       (note ? `📝 <i>${escapeHtml(note)}</i>\n` : '') +
       `\n<i>Applies immediately, on every screen and at checkout. Bulk tiers no ` +
       `longer apply to this customer for this product.</i>`,
@@ -344,7 +351,7 @@ async function handleAdminText(bot, msg) {
     return;
   }
   if (s === States.ADMIN_ADD_PRICE) {
-    const price = parseFloat(text.replace('$', ''));
+    const price = parseFloat(String(text).replace('$', '').replace(',', '.'));
     if (isNaN(price) || price <= 0) {
       await bot.sendMessage(chatId, '❌ Enter a valid price, e.g. <code>14.09</code>', { parse_mode: 'HTML' });
       return;
@@ -458,7 +465,7 @@ async function handleAdminText(bot, msg) {
   // ── ChatGPT Business: Set monthly price ──
   if (s === 'ADMIN_CGB_PRICE') {
     session.clear(userId);
-    const price = parseFloat(text);
+    const price = parseFloat(String(text).replace('$', '').replace(',', '.'));
     if (isNaN(price) || price <= 0) { await bot.sendMessage(chatId, '❌ Invalid price'); return; }
     const dbRaw = require('../database/db');
     dbRaw.prepare(`
@@ -513,7 +520,7 @@ async function handleAdminText(bot, msg) {
     let value = text;
 
     if (editField === 'price') {
-      value = parseFloat(text.replace('$', ''));
+      value = parseFloat(String(text).replace('$', '').replace(',', '.'));
       if (isNaN(value)) { await bot.sendMessage(chatId, '❌ Invalid price.'); return; }
     } else if (['requires_email', 'is_active'].includes(editField)) {
       value = text === '1' ? 1 : 0;
@@ -527,16 +534,16 @@ async function handleAdminText(bot, msg) {
       value = parseInt(text, 10);
       if (isNaN(value) || value < 0) { await bot.sendMessage(chatId, '❌ Enter a valid non-negative integer. Use <code>0</code> to disable bulk discount.', { parse_mode: 'HTML' }); return; }
     } else if (editField === 'bulk_discount') {
-      value = parseFloat(text.replace('%', ''));
+      value = parseFloat(String(text).replace('%', '').replace(',', '.'));
       if (isNaN(value) || value < 0 || value > 100) { await bot.sendMessage(chatId, '❌ Enter a percentage between <b>0</b> and <b>100</b>. Use <code>0</code> to disable.', { parse_mode: 'HTML' }); return; }
     } else if (editField === 'wholesale_price') {
-      value = parseFloat(text.replace('$', ''));
+      value = parseFloat(String(text).replace('$', '').replace(',', '.'));
       if (isNaN(value) || value < 0) { await bot.sendMessage(chatId, '❌ Enter a valid price (use <code>0</code> to disable)', { parse_mode: 'HTML' }); return; }
     } else if (['bulk_tier1_qty', 'bulk_tier2_qty', 'bulk_tier3_qty'].includes(editField)) {
       value = parseInt(text, 10);
       if (isNaN(value) || value < 0) { await bot.sendMessage(chatId, '❌ Enter a valid non-negative integer. Use <code>0</code> to disable this tier.', { parse_mode: 'HTML' }); return; }
     } else if (['bulk_tier1_price', 'bulk_tier2_price', 'bulk_tier3_price'].includes(editField)) {
-      value = parseFloat(text.replace('$', ''));
+      value = parseFloat(String(text).replace('$', '').replace(',', '.'));
       if (isNaN(value) || value < 0) { await bot.sendMessage(chatId, '❌ Enter a valid non-negative price. Use <code>0</code> to disable.', { parse_mode: 'HTML' }); return; }
     }
 
@@ -2807,7 +2814,7 @@ async function handleAdminCallback(bot, query) {
       for (const cp of list) {
         const t = String(cp.title || '').replace(/\[emoji:\d+\]/g, '').trim().slice(0, 30);
         txt += `\n📦 ${escapeHtml(t)}\n` +
-               `   ${formatPrice(cp.public_price)} → <b>${formatPrice(cp.price)}</b>` +
+               `   ${formatPriceExact(cp.public_price)} → <b>${formatPriceExact(cp.price)}</b>` +
                (cp.note ? `  <i>(${escapeHtml(cp.note)})</i>` : '') + `\n`;
       }
       txt += `\n<i>A special price replaces the public price and ignores bulk tiers.</i>`;
@@ -2887,8 +2894,8 @@ async function handleAdminCallback(bot, query) {
       `📦 ${escapeHtml(String(product.title || ''))}\n` +
       `🆔 Product ID: <code>${product.id}</code>\n` +
       `━━━━━━━━━━━━━━━━━━━━\n` +
-      `💵 Public price: <b>${formatPrice(product.price)}</b>\n` +
-      (existing ? `💲 Current special: <b>${formatPrice(existing.price)}</b>\n` : '') +
+      `💵 Public price: <b>${formatPriceExact(product.price)}</b>\n` +
+      (existing ? `💲 Current special: <b>${formatPriceExact(existing.price)}</b>\n` : '') +
       `\n<b>Send the price for this customer.</b>\n` +
       `Example: <code>3.50</code>  or  <code>3.50 wholesale deal</code>\n\n` +
       `<i>Bulk tiers stop applying to this customer for this product.</i>`,

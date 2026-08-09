@@ -634,6 +634,7 @@ async function notifyDepositReview(bot, userId, txid, result, reason) {
       buttons: review
         ? [[{ text: '🔍 Review deposit', callback_data: `admin_dep_view_${review.id}` }]]
         : null,
+      supportButtons: [[{ text: '💳 Payments', callback_data: 'pay_list_all_0' }]],
     });
   } catch (e) {
     logger.warn(`notifyDepositReview failed: ${e.message}`);

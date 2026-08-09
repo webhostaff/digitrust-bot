@@ -115,6 +115,9 @@ async function sendAlert(bot, product, type, qty, threshold) {
     refType: 'product',
     refId:   product.id,
     buttons,
+    // Support console equivalent — the admin_* callbacks above are only
+    // understood by the main bot.
+    supportButtons: [[{ text: '🔴 Out of Stock list', callback_data: 'stock_list_all_0' }]],
   });
 }
 

@@ -116,6 +116,10 @@ async function openManualDelivery(bot, order, paymentMethod) {
       [{ text: '📦 Open task', callback_data: `admin_md_view_${row.id}` }],
       [{ text: '✅ Mark delivered', callback_data: `admin_md_deliver_${row.id}` }],
     ],
+    supportButtons: [
+      [{ text: '📦 Open task', callback_data: `md_view_${row.id}` }],
+      [{ text: '✅ Deliver now', callback_data: `md_deliver_${row.id}` }],
+    ],
   });
 
   db.markManualNotified(row.id);

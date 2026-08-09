@@ -630,6 +630,7 @@ bot.on('message', async (msg) => {
         refType: 'refund_request',
         refId:   pending ? pending.id : d.refundOrderId,
         buttons: pending ? [[{ text: '🔄 Review request', callback_data: `admin_refund_view_${pending.id}` }]] : null,
+        supportButtons: [[{ text: '🔄 Refund list', callback_data: 'ref_list_0' }]],
       });
     } catch (e) { logger.warn(`refund notify failed: ${e.message}`); }
   }
@@ -1095,6 +1096,7 @@ bot.on('callback_query', async (query) => {
         refType: 'refund_request',
         refId:   pendingW ? pendingW.id : d.refundOrderId,
         buttons: pendingW ? [[{ text: '🔄 Review request', callback_data: `admin_refund_view_${pendingW.id}` }]] : null,
+        supportButtons: [[{ text: '🔄 Refund list', callback_data: 'ref_list_0' }]],
       });
     } catch (e) { logger.warn(`refund notify failed: ${e.message}`); }
     return;

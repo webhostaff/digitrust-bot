@@ -26,6 +26,21 @@ function checkPaymentWindow(startedAtMs) {
 const formatPrice = (amount) => `$${Number(amount).toFixed(2)}`;
 
 /**
+ * Price shown to an ADMIN, with the real precision.
+ *
+ * formatPrice always rounds to cents, so a stored price of 0.385 reads as
+ * "$0.39" — the admin then cannot tell what was actually saved, and the figure
+ * shown differs from the figure charged. This keeps up to four decimals and
+ * drops trailing zeros, so $3.00 stays "$3.00" while 0.385 reads "$0.385".
+ */
+const formatPriceExact = (amount) => {
+  const n = Number(amount) || 0;
+  const cents = n.toFixed(2);
+  if (Math.abs(n - Number(cents)) < 1e-9) return `$${cents}`;
+  return `$${n.toFixed(4).replace(/0+$/, '')}`;
+};
+
+/**
  * Given a product's old/new base price, returns the new prices for any
  * bulk tiers that have a price set, scaled by the same percentage change
  * as the base price. Tiers with no price set (0) are left untouched.
@@ -201,7 +216,7 @@ function formatBulkTiersDisplay(product) {
 }
 
 module.exports = {
-  expandPremiumEmojis, formatPrice, calcOrderPrice, formatBulkTiersDisplay, formatReward, statusEmoji, escapeHtml, truncate,
+  expandPremiumEmojis, formatPrice, formatPriceExact, calcOrderPrice, formatBulkTiersDisplay, formatReward, statusEmoji, escapeHtml, truncate,
   PAYMENT_CONFIRM_VALIDITY_MIN, PAYMENT_CONFIRM_VALIDITY_MS, checkPaymentWindow,
   scaleTiersProportionally,
 };

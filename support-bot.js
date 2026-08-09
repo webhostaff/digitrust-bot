@@ -100,6 +100,10 @@ const getFirstUnread = rawDb.prepare(`
 const bot = new TelegramBot(SUPPORT_BOT_TOKEN, { polling: true });
 logger.info('🎫 Support Bot V4 started (read receipts + history + manual delivery)');
 
+// Route every admin notification raised anywhere in the codebase into this
+// console, so there is a single place to watch.
+require('./services/adminNotify').setSupportBot(bot);
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function escapeHtml(s) {
@@ -194,16 +198,49 @@ const BTN = {
   REFUNDS:  '🔄 Refunds',
 };
 
+/**
+ * Build the bar with live counts baked into the labels.
+ *
+ * Telegram cannot edit a ReplyKeyboard in place — the only way to refresh the
+ * numbers is to send a message carrying a new keyboard. So the bar is rebuilt
+ * and attached to every message the console sends to staff, which keeps the
+ * counts current without any extra chatter.
+ */
 function staffKeyboard() {
+  const n = {
+    inbox:    queries.getSupportUnreadThreads(),
+    payments: queries.countDepositReviews('pending') + queries.countPendingDeposits(),
+    delivery: queries.getManualDeliveryCounts().pending,
+    stock:    queries.countOutOfStockProducts(),
+    refunds:  queries.countPendingRefundRequests(),
+  };
+  const lbl = (base, count) => (count > 0 ? `${base} (${count})` : base);
+
   return {
     keyboard: [
-      [{ text: BTN.INBOX }, { text: BTN.PAYMENTS }],
-      [{ text: BTN.DELIVERY }, { text: BTN.STOCK }],
-      [{ text: BTN.REFUNDS }],
+      [{ text: lbl(BTN.INBOX, n.inbox) },       { text: lbl(BTN.PAYMENTS, n.payments) }],
+      [{ text: lbl(BTN.DELIVERY, n.delivery) }, { text: lbl(BTN.STOCK, n.stock) }],
+      [{ text: lbl(BTN.REFUNDS, n.refunds) }],
     ],
     resize_keyboard: true,
     is_persistent: true,
   };
+}
+
+/**
+ * Which section a tap refers to.
+ *
+ * The labels now carry counts ("📥 Inbox (12)"), so an equality check against
+ * the bare label would no longer match and the tap would be forwarded to the
+ * customer as a literal message. Matching on the prefix keeps that from
+ * happening however the count changes.
+ */
+function matchBarButton(text) {
+  const t = String(text || '').trim();
+  for (const [key, base] of Object.entries(BTN)) {
+    if (t === base || t.startsWith(base + ' (')) return key;
+  }
+  return null;
 }
 
 /** Show the bar and a short status line. Used on /start and after /close. */
@@ -225,7 +262,8 @@ async function showStaffHome(chatId) {
         `${md.pending ? '📦' : '✅'} Deliveries waiting: <b>${md.pending}</b>\n` +
         `${refunds  ? '🔄' : '✅'} Refund requests: <b>${refunds}</b>\n` +
         `${stock    ? '🔴' : '✅'} Out of stock: <b>${stock}</b>\n`) +
-    `\n<i>The bar below stays put — tap any section at any time.</i>`,
+    `\n<i>The bar below stays put — tap any section at any time.</i>\n` +
+    `<i>Send /menu to refresh the numbers on it.</i>`,
     { parse_mode: 'HTML', reply_markup: staffKeyboard() }
   );
 }
@@ -1146,17 +1184,17 @@ bot.on('message', async (msg) => {
     // "📥 Inbox" while a conversation is open would send the literal words
     // "📥 Inbox" to the customer. Any half-finished input is abandoned, which
     // is what a person expects when they tap a navigation button.
-    if (text === BTN.INBOX || text === BTN.PAYMENTS ||
-        text === BTN.DELIVERY || text === BTN.STOCK || text === BTN.REFUNDS) {
+    const barKey = matchBarButton(text);
+    if (barKey) {
       queries.setSetting(`support_state_${chatId}`, '');
-      if (text === BTN.INBOX) {
+      if (barKey === 'INBOX') {
         clearActiveChat(chatId);
         await showInbox(chatId);
-      } else if (text === BTN.PAYMENTS) {
+      } else if (barKey === 'PAYMENTS') {
         await showPayments(chatId, null, 'all', 0);
-      } else if (text === BTN.DELIVERY) {
+      } else if (barKey === 'DELIVERY') {
         await showManualList(chatId, null, 'pending', 0);
-      } else if (text === BTN.STOCK) {
+      } else if (barKey === 'STOCK') {
         await showStockAlerts(chatId, null, 'all', 0);
       } else {
         await showRefunds(chatId, null, 0);
