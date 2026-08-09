@@ -137,19 +137,22 @@ async function handleAdminText(bot, msg) {
   // ── Per-product low-stock threshold ──────────────────────────────
   // ── Set a negotiated price for one customer ──────────────────────
   if (s === States.ADMIN_CUST_PRICE) {
+    // The product was chosen by tapping, so only a price is expected here.
     const parts = String(text).trim().split(/\s+/);
-    const productId = parseInt(parts[0], 10);
-    const price     = parseFloat(String(parts[1] || '').replace(',', '.'));
-    const note      = parts.slice(2).join(' ') || null;
+    const price = parseFloat(String(parts[0] || '').replace(',', '.'));
+    const note  = parts.slice(1).join(' ') || null;
     const targetId  = d.cpUserId;
+    const productId = d.cpProductId;
 
-    if (!Number.isFinite(productId) || !Number.isFinite(price) || price < 0) {
-      await bot.sendMessage(chatId, '❌ Format: <code>PRODUCT_ID PRICE [note]</code>', { parse_mode: 'HTML' });
+    if (!Number.isFinite(price) || price < 0) {
+      await bot.sendMessage(chatId,
+        '❌ Send just the price, e.g. <code>3.50</code>', { parse_mode: 'HTML' });
       return;
     }
     const product = db.getProduct(productId);
     if (!product) {
-      await bot.sendMessage(chatId, `❌ No product with id <code>${productId}</code>.`, { parse_mode: 'HTML' });
+      session.clear(userId);
+      await bot.sendMessage(chatId, '❌ That product no longer exists.');
       return;
     }
 
@@ -2292,7 +2295,8 @@ async function handleAdminCallback(bot, query) {
         ? product.low_stock_threshold
         : db.getSetting('low_stock_threshold_default', '5') + ' (default)'}\n`;
     await bot.editMessageText(
-      `✏️ <b>Edit Product:</b> ${product?.title}\n\n` +
+      `✏️ <b>Edit Product:</b> ${product?.title}\n` +
+      `🆔 <b>Product ID:</b> <code>${productId}</code>\n\n` +
       `📦 <b>Stock qty:</b> ${stockQty}   📈 <b>Sales:</b> ${product?.sales_count || 0}\n` +
       bulkInfo + refundInfo + deliveryInfo + lowInfo +
       `${statusLine}\n\n` +
@@ -2824,16 +2828,70 @@ async function handleAdminCallback(bot, query) {
     return;
   }
 
-  if (/^admin_cprice_add_\d+$/.test(data)) {
-    const targetId = parseInt(data.split('_').pop(), 10);
-    session.set(userId, States.ADMIN_CUST_PRICE, { cpUserId: targetId });
+  // Pick the product from a list rather than typing an id.
+  // The ordering screen shows POSITION numbers (#11 = eleventh in the list),
+  // which are not product ids — asking for a typed id invited setting the
+  // price on the wrong product. Tapping removes the ambiguity entirely.
+  if (/^admin_cprice_add_\d+(_\d+)?$/.test(data)) {
+    const parts = data.split('_');
+    const page = parts.length === 5 ? parseInt(parts.pop(), 10) : 0;
+    const targetId = parseInt(parts.pop(), 10);
+
+    const all = db.getAllProductsBrief();
+    const PER = 8;
+    const pages = Math.max(1, Math.ceil(all.length / PER));
+    const pg = Math.max(0, Math.min(page, pages - 1));
+    const slice = all.slice(pg * PER, (pg + 1) * PER);
+
+    const kb = slice.map((pr) => {
+      const t = String(pr.title || '').replace(/\[emoji:\d+\]/g, '').trim().slice(0, 28);
+      return [{
+        text: `${pr.is_active ? '🟢' : '🔴'} ${t} · ${formatPrice(pr.price)}`,
+        callback_data: `admin_cprice_pick_${targetId}_${pr.id}`,
+      }];
+    });
+
+    if (pages > 1) {
+      const nav = [];
+      if (pg > 0)         nav.push({ text: '◀️ Prev', callback_data: `admin_cprice_add_${targetId}_${pg - 1}` });
+      nav.push({ text: `${pg + 1}/${pages}`, callback_data: 'noop' });
+      if (pg < pages - 1) nav.push({ text: 'Next ▶️', callback_data: `admin_cprice_add_${targetId}_${pg + 1}` });
+      kb.push(nav);
+    }
+    kb.push([{ text: '🔙 Cancel', callback_data: `admin_cprices_${targetId}` }]);
+
     await bot.editMessageText(
       `💲 <b>Set a Special Price</b>\n\n` +
-      `👤 Customer: <code>${targetId}</code>\n\n` +
-      `Send: <code>PRODUCT_ID PRICE [note]</code>\n\n` +
-      `Example:\n<code>10 3.50 wholesale deal</code>\n\n` +
-      `<i>Find the product id in 📦 Products. The special price replaces the ` +
-      `public price for this customer only, and bulk tiers no longer apply to them.</i>`,
+      `👤 Customer: <code>${targetId}</code>\n` +
+      `📄 Page ${pg + 1} of ${pages}\n\n` +
+      `<b>Pick the product:</b>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } }
+    ).catch(() => {});
+    return;
+  }
+
+  // Product chosen — now only the price is needed.
+  if (/^admin_cprice_pick_\d+_\d+$/.test(data)) {
+    const parts = data.split('_');
+    const productId = parseInt(parts.pop(), 10);
+    const targetId  = parseInt(parts.pop(), 10);
+    const product = db.getProduct(productId);
+    if (!product) { await answer('❌ Product not found'); return; }
+
+    const existing = db.listCustomerPrices(targetId).find((x) => x.product_id === productId);
+    session.set(userId, States.ADMIN_CUST_PRICE, { cpUserId: targetId, cpProductId: productId });
+
+    await bot.editMessageText(
+      `💲 <b>Set a Special Price</b>\n\n` +
+      `👤 Customer: <code>${targetId}</code>\n` +
+      `📦 ${escapeHtml(String(product.title || ''))}\n` +
+      `🆔 Product ID: <code>${product.id}</code>\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `💵 Public price: <b>${formatPrice(product.price)}</b>\n` +
+      (existing ? `💲 Current special: <b>${formatPrice(existing.price)}</b>\n` : '') +
+      `\n<b>Send the price for this customer.</b>\n` +
+      `Example: <code>3.50</code>  or  <code>3.50 wholesale deal</code>\n\n` +
+      `<i>Bulk tiers stop applying to this customer for this product.</i>`,
       { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
         reply_markup: { inline_keyboard: [[{ text: '🔙 Cancel', callback_data: `admin_cprices_${targetId}` }]] } }
     ).catch(() => {});

@@ -587,7 +587,15 @@ are excluded.
 
 `/admin → 👥 Users → [user] → 💲 Special Prices`
 
-Set with `PRODUCT_ID PRICE [note]`, e.g. `10 3.50 wholesale deal`.
+You **pick the product from a list** and then type only the price, e.g.
+`3.50` or `3.50 wholesale deal`.
+
+Typing a product id was the first design and it was a trap: the ordering screen
+shows POSITION numbers (`#11` = eleventh in the list), not product ids, so it
+was easy to price the wrong product. Tapping removes the ambiguity.
+
+The product id is now also shown on the edit screen (`🆔 Product ID`) for the
+times you do need it.
 
 Implemented as a single choke point, `productForCustomer(userId, product)`,
 which swaps `product.price` before anything reads it. Because every screen and

@@ -1436,6 +1436,15 @@ module.exports = {
   setProductCategory:  (productId, catId)       => cat_setProduct.run(catId, productId),
   getAllProductsForSorting: () => getAllProductsForSorting.all(),
 
+  // Same ordering, but carrying the fields a picker needs. getAllProductsForSorting
+  // returns only (id, title, display_order, is_active) — no price — so a picker
+  // built on it would show $0.00 for every product.
+  getAllProductsBrief: () => db.prepare(`
+    SELECT id, title, price, is_active, stock_quantity
+    FROM products
+    ORDER BY display_order ASC, id ASC
+  `).all(),
+
   // Preorders
   // Emoji Library
   addEmoji: (name, emojiId, fallback = '🎁') => {
