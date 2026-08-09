@@ -23,7 +23,10 @@ const escapeHtml = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').rep
 // ── Initiate buy ──────────────────────────────────────────────────────────────
 
 async function initiateBuy(bot, chatId, userId, productId, callbackQueryId) {
-  const product = db.getProduct(productId);
+  let product = db.getProduct(productId);
+  // A negotiated price for this customer replaces the public one, so the
+  // quoted price and the charged price can never diverge.
+  product = db.productForCustomer(userId, product);
 
   // Use stock_quantity for purchase eligibility
   const stockQty = product?.stock_quantity || 0;
@@ -79,7 +82,10 @@ async function handleQuantity(bot, msg) {
   const sess   = session.get(userId);
 
   // Re-check live stock before proceeding
-  const product  = db.getProduct(sess.data.productId);
+  let product  = db.getProduct(sess.data.productId);
+  // A negotiated price for this customer replaces the public one, so the
+  // quoted price and the charged price can never diverge.
+  product = db.productForCustomer(userId, product);
   const stockQty = product?.stock_quantity || 0;
   const raw      = (msg.text || '').trim();
   const qty      = parseInt(raw, 10);
@@ -136,7 +142,10 @@ const MAX_QTY_PER_ORDER = 50;  // Hard cap
 
 async function createAndShowSummary(bot, chatId, userId, email) {
   const data    = session.get(userId).data;
-  const product = db.getProduct(data.productId);
+  let product = db.getProduct(data.productId);
+  // A negotiated price for this customer replaces the public one, so the
+  // quoted price and the charged price can never diverge.
+  product = db.productForCustomer(userId, product);
 
   // 1) Cooldown check (skip for admin)
   if (!require('./admin').isAdmin(userId)) {
@@ -196,7 +205,10 @@ async function confirmOrder(bot, chatId, userId, messageId) {
   }
 
   const data    = sess.data;
-  const product = db.getProduct(data.productId);
+  let product = db.getProduct(data.productId);
+  // A negotiated price for this customer replaces the public one, so the
+  // quoted price and the charged price can never diverge.
+  product = db.productForCustomer(userId, product);
 
   // Stock check (live) before creating order
   if (!product || (product.stock_quantity || 0) < data.quantity) {

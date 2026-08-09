@@ -253,24 +253,50 @@ const adminPreorderDetailKb = (preorderId, status) => {
   return mk(rows);
 };
 
-// Sort products keyboard - clean numbered list with up/down arrows
-const adminSortProductsKb = (products) => {
-  const rows = products.map((p, idx) => {
+/**
+ * Product ordering list.
+ *
+ * The old layout packed four buttons into every row
+ * (`#N | name | ▲ | ▼`), which squeezed the name into ~22 characters —
+ * "⭐Gemin", "☀️Accou", "✳️claude" — and rendered the whole screen useless
+ * with 25 products. One product per row gives the name the full width, and
+ * paging keeps the screen short enough to actually read.
+ */
+const SORT_PAGE_SIZE = 10;
+
+const adminSortProductsKb = (products, page = 0) => {
+  const totalPages = Math.max(1, Math.ceil(products.length / SORT_PAGE_SIZE));
+  const pg = Math.max(0, Math.min(page, totalPages - 1));
+  const slice = products.slice(pg * SORT_PAGE_SIZE, (pg + 1) * SORT_PAGE_SIZE);
+
+  const rows = slice.map((p, i) => {
+    const pos = pg * SORT_PAGE_SIZE + i + 1;
     const status = p.is_active ? '🟢' : '🔴';
-    const title = (p.title || '').slice(0, 22);
-    const pos = idx + 1; // visual position 1-based
-    return [
-      btn(`#${pos}`, `admin_setorder_${p.id}`),
-      btn(`${status} ${title}`, `admin_setorder_${p.id}`),
-      btn('▲', `admin_moveup_${p.id}`),
-      btn('▼', `admin_movedown_${p.id}`),
-    ];
+    const title = String(p.title || '').replace(/\[emoji:\d+\]/g, '').trim().slice(0, 34);
+    return [btn(`#${pos}  ${status} ${title}`, `admin_sortitem_${p.id}`)];
   });
-  rows.push([btn('🔢 Set Position by Number', 'admin_sortbynum')]);
+
+  if (totalPages > 1) {
+    const nav = [];
+    if (pg > 0)              nav.push(btn('◀️ Prev', `admin_sort_p_${pg - 1}`));
+    nav.push(btn(`${pg + 1}/${totalPages}`, 'noop'));
+    if (pg < totalPages - 1) nav.push(btn('Next ▶️', `admin_sort_p_${pg + 1}`));
+    rows.push(nav);
+  }
+
+  rows.push([btn('🔢 Jump to Position', 'admin_sortbynum')]);
   rows.push([btn('🔄 Auto-Renumber (1,2,3...)', 'admin_resetorder')]);
   rows.push([btn('🔙 Back', 'admin_panel')]);
   return mk(rows);
 };
+
+/** Single-product screen: move it, or set an exact position. */
+const adminSortItemKb = (productId, page = 0) => mk([
+  [btn('⬆️ Move Up', `admin_moveup_${productId}`), btn('⬇️ Move Down', `admin_movedown_${productId}`)],
+  [btn('🔢 Set Exact Position', `admin_setorder_${productId}`)],
+  [btn('✏️ Edit This Product', `admin_edit_p_${productId}`)],
+  [btn('🔙 Back to List', `admin_sort_p_${page}`)],
+]);
 
 const adminProfitsKb = () => mk([
   [btn('📅 Today',         'admin_profit_today')],
@@ -414,6 +440,7 @@ const adminUserActionsKb = (userId, isBanned) => mk([
   [btn('📦 View Purchases', `admin_user_orders_${userId}`)],
   [btn('💳 Top-Up History', `admin_user_topups_${userId}`)],
   [btn('🔄 Reset Wallet to $0', `admin_user_resetwallet_${userId}`)],
+  [btn('💲 Special Prices', `admin_cprices_${userId}`)],
   [btn('🚨 Fraud: cancel all orders', `admin_fraud_${userId}`)],
   [btn(isBanned ? '✅ Unban' : '🚫 Ban', `admin_toggle_ban_${userId}`)],
   [btn('🔙 Back', 'admin_users')],
@@ -576,6 +603,7 @@ module.exports = {
   confirmZeroStockKb, backToProductEditKb,
   adminProfitsKb, adminRefundConfirmKb, deleteStockItemKb,
   adminSortProductsKb,
+  adminSortItemKb,
   adminPreordersMainKb, adminPreorderProductsKb, adminPreorderSetupKb,
   adminPreordersListKb, adminPreorderDetailKb,
   preorderProductsKb, preorderDetailKb,

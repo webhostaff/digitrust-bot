@@ -911,4 +911,22 @@ try {
   console.error('[MIGRATION] stock alert cleanup:', e.message);
 }
 
+// Per-customer pricing: one agreed price for one customer on one product.
+// UNIQUE(user_id, product_id) means re-setting a price updates it rather than
+// stacking duplicates, so there is never ambiguity about which price applies.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS customer_prices (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    product_id INTEGER NOT NULL,
+    price      REAL    NOT NULL,
+    note       TEXT,
+    created_by INTEGER,
+    created_at TEXT    DEFAULT (datetime('now')),
+    updated_at TEXT    DEFAULT (datetime('now')),
+    UNIQUE(user_id, product_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_cust_price_user ON customer_prices(user_id);
+`);
+
 module.exports = db;

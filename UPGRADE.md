@@ -540,3 +540,82 @@ and re-arms the latches on everything currently in stock.
 
 `/admin → ⚙️ Settings → 🟠 Low-Stock Alerts On/Off`, or set
 `stock_low_alerts_enabled` to `1`.
+
+---
+
+# Part 12 — Console counters, live stock, per-customer pricing
+
+## Support bot: every section shows its own count
+
+The inbox and the console now carry live numbers, so you can see where the work
+is without opening anything:
+
+```
+🔴 Unread conversations: 12
+💳 Payments to handle: 3
+📦 Deliveries waiting: 2
+🔄 Refund requests: 1
+🔴 Out of stock: 8
+```
+
+When everything is clear it simply says **"Nothing needs attention."**
+
+## Refund Requests in the support bot
+
+New section (`/refunds`, or the `🔄 Refunds` bar button) listing pending
+requests with customer, order, amount, method and reason.
+
+Deliberately **read-only**: approving a refund moves real money, so the decision
+stays in the main admin panel. This screen is for triage, with a shortcut to
+message the customer.
+
+## Out-of-stock list now reads the products table
+
+Previously it listed stored notification rows, which had to be cleaned up to
+stay accurate. It is now a live query:
+
+```sql
+SELECT ... FROM products
+WHERE COALESCE(stock_quantity,0) <= 0 AND is_active = 1
+```
+
+The list therefore **cannot** drift. The moment stock is added the product stops
+matching and disappears — no cleanup step, nothing to go wrong. Hidden products
+are excluded.
+
+## Per-customer pricing
+
+`/admin → 👥 Users → [user] → 💲 Special Prices`
+
+Set with `PRODUCT_ID PRICE [note]`, e.g. `10 3.50 wholesale deal`.
+
+Implemented as a single choke point, `productForCustomer(userId, product)`,
+which swaps `product.price` before anything reads it. Because every screen and
+the checkout all read that one field, the quoted price and the charged price
+cannot diverge. Applied at six sites: four in the buy flow, two in the product
+displays.
+
+A negotiated price also **switches off the bulk tiers** for that customer on
+that product — the agreed figure is the agreed figure, whatever the quantity.
+Other customers keep their tier pricing.
+
+`UNIQUE(user_id, product_id)` means re-setting a price updates it instead of
+stacking duplicates.
+
+## Product ordering screen made readable
+
+The old layout packed four buttons into each row (`#N | name | ▲ | ▼`), which
+squeezed names into ~22 characters — `⭐Gemin`, `☀️Accou`, `✳️claude` — and with
+25 products the screen was unusable.
+
+Now: one product per row at full width, 10 per page, with paging and a header
+showing totals. Tapping a product opens a small screen with move up/down, set
+exact position, and edit. After a move the list returns to the page that product
+is now on, instead of bouncing back to page 1.
+
+## Two more pre-existing bugs fixed
+
+| Bug | Impact |
+|---|---|
+| `ADMIN_REFUND_AMOUNT` was handled in `admin.js` but never listed in `index.js` | The admin's typed refund amount never reached the handler — refund-by-amount silently did nothing |
+| `refreshSortView()` was called with an undefined `productId` in `admin_resetorder` | Introduced during this work and caught before shipping |

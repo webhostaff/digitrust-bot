@@ -11,6 +11,7 @@ const {
   announcementTargetKb, adminConfirmKb, adminBackKb, confirmZeroStockKb,
   backToProductEditKb, adminProfitsKb, adminRefundConfirmKb, deleteStockItemKb,
   adminSortProductsKb,
+  adminSortItemKb,
   adminPreordersMainKb, adminPreorderProductsKb, adminPreorderSetupKb,
   adminPreordersListKb, adminPreorderDetailKb,
   adminUserOrdersKb, adminUserOrderDetailKb,
@@ -134,6 +135,47 @@ async function handleAdminText(bot, msg) {
   // ═══════════════════════════════════════════════════════════════════
 
   // ── Per-product low-stock threshold ──────────────────────────────
+  // ── Set a negotiated price for one customer ──────────────────────
+  if (s === States.ADMIN_CUST_PRICE) {
+    const parts = String(text).trim().split(/\s+/);
+    const productId = parseInt(parts[0], 10);
+    const price     = parseFloat(String(parts[1] || '').replace(',', '.'));
+    const note      = parts.slice(2).join(' ') || null;
+    const targetId  = d.cpUserId;
+
+    if (!Number.isFinite(productId) || !Number.isFinite(price) || price < 0) {
+      await bot.sendMessage(chatId, '❌ Format: <code>PRODUCT_ID PRICE [note]</code>', { parse_mode: 'HTML' });
+      return;
+    }
+    const product = db.getProduct(productId);
+    if (!product) {
+      await bot.sendMessage(chatId, `❌ No product with id <code>${productId}</code>.`, { parse_mode: 'HTML' });
+      return;
+    }
+
+    session.clear(userId);
+    db.setCustomerPrice({ userId: targetId, productId, price, note, adminId: userId });
+    logger.info(`Admin ${userId} set special price ${price} for user ${targetId} on product ${productId}`);
+
+    const diff = Number(product.price) - price;
+    await bot.sendMessage(
+      chatId,
+      `✅ <b>Special Price Set</b>\n\n` +
+      `👤 Customer: <code>${targetId}</code>\n` +
+      `📦 ${escapeHtml(String(product.title || ''))}\n` +
+      `💵 Public: ${formatPrice(product.price)}\n` +
+      `💲 This customer pays: <b>${formatPrice(price)}</b>\n` +
+      (diff > 0 ? `📉 Discount: ${formatPrice(diff)} per unit\n`
+                : diff < 0 ? `📈 Markup: ${formatPrice(-diff)} per unit\n` : '') +
+      (note ? `📝 <i>${escapeHtml(note)}</i>\n` : '') +
+      `\n<i>Applies immediately, on every screen and at checkout. Bulk tiers no ` +
+      `longer apply to this customer for this product.</i>`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '💲 Special Prices', callback_data: `admin_cprices_${targetId}` }]] } }
+    );
+    return;
+  }
+
   // ── Reverse a fraudulent deposit ─────────────────────────────────
   if (s === States.ADMIN_DEP_REVERSE) {
     const parts    = String(text).trim().split(/\s+/);
@@ -2740,6 +2782,74 @@ async function handleAdminCallback(bot, query) {
   // FRAUD RESPONSE — cancel every open order of one user
   // ═══════════════════════════════════════════════════════════════════
 
+  // ═══════════════════════════════════════════════════════════════════
+  // PER-CUSTOMER PRICING
+  // ═══════════════════════════════════════════════════════════════════
+
+  if (/^admin_cprices_\d+$/.test(data)) {
+    const targetId = parseInt(data.split('_').pop(), 10);
+    const user = db.getUser(targetId);
+    if (!user) { await answer('❌ User not found'); return; }
+    const list = db.listCustomerPrices(targetId);
+    const name = user.username ? `@${user.username}` : (user.first_name || `User ${targetId}`);
+
+    let txt =
+      `💲 <b>Special Prices</b>\n\n` +
+      `👤 ${escapeHtml(name)} — <code>${targetId}</code>\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n`;
+    if (!list.length) {
+      txt += `\n<i>No special prices. This customer pays the public price.</i>`;
+    } else {
+      for (const cp of list) {
+        const t = String(cp.title || '').replace(/\[emoji:\d+\]/g, '').trim().slice(0, 30);
+        txt += `\n📦 ${escapeHtml(t)}\n` +
+               `   ${formatPrice(cp.public_price)} → <b>${formatPrice(cp.price)}</b>` +
+               (cp.note ? `  <i>(${escapeHtml(cp.note)})</i>` : '') + `\n`;
+      }
+      txt += `\n<i>A special price replaces the public price and ignores bulk tiers.</i>`;
+    }
+
+    const kb = [[{ text: '➕ Set a special price', callback_data: `admin_cprice_add_${targetId}` }]];
+    for (const cp of list.slice(0, 8)) {
+      const t = String(cp.title || '').replace(/\[emoji:\d+\]/g, '').trim().slice(0, 22);
+      kb.push([{ text: `🗑 Remove — ${t}`, callback_data: `admin_cprice_del_${targetId}_${cp.product_id}` }]);
+    }
+    kb.push([{ text: '🔙 Back to user', callback_data: `admin_user_${targetId}` }]);
+
+    try {
+      await bot.editMessageText(txt, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+    } catch (e) {
+      await bot.sendMessage(chatId, txt, { parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+    }
+    return;
+  }
+
+  if (/^admin_cprice_add_\d+$/.test(data)) {
+    const targetId = parseInt(data.split('_').pop(), 10);
+    session.set(userId, States.ADMIN_CUST_PRICE, { cpUserId: targetId });
+    await bot.editMessageText(
+      `💲 <b>Set a Special Price</b>\n\n` +
+      `👤 Customer: <code>${targetId}</code>\n\n` +
+      `Send: <code>PRODUCT_ID PRICE [note]</code>\n\n` +
+      `Example:\n<code>10 3.50 wholesale deal</code>\n\n` +
+      `<i>Find the product id in 📦 Products. The special price replaces the ` +
+      `public price for this customer only, and bulk tiers no longer apply to them.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Cancel', callback_data: `admin_cprices_${targetId}` }]] } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_cprice_del_\d+_\d+$/.test(data)) {
+    const parts = data.split('_');
+    const productId = parseInt(parts.pop(), 10);
+    const targetId  = parseInt(parts.pop(), 10);
+    db.removeCustomerPrice(targetId, productId);
+    logger.info(`Admin ${userId} removed special price: user ${targetId}, product ${productId}`);
+    await answer('🗑 Removed');
+    return await handleAdminCallback(bot, { ...query, data: `admin_cprices_${targetId}` });
+  }
+
   if (/^admin_purge_\d+$/.test(data)) {
     const targetId = parseInt(data.split('_').pop(), 10);
     const user = db.getUser(targetId);
@@ -3639,7 +3749,9 @@ async function handleAdminCallback(bot, query) {
   }
 
   // ── Sort Products ─────────────────────────────────────────────────
-  if (data === 'admin_sort_products') {
+  if (data === 'admin_sort_products' || /^admin_sort_p_\d+$/.test(data)) {
+    const page = /^admin_sort_p_\d+$/.test(data)
+      ? parseInt(data.split('_').pop(), 10) : 0;
     const products = db.getAllProductsForSorting();
     if (!products.length) {
       await bot.editMessageText('📦 No products to sort.', {
@@ -3647,13 +3759,40 @@ async function handleAdminCallback(bot, query) {
       });
       return;
     }
+    const totalPages = Math.max(1, Math.ceil(products.length / 10));
+    const pg = Math.max(0, Math.min(page, totalPages - 1));
+    const active = products.filter((p) => p.is_active).length;
+
     await bot.editMessageText(
-      '↕️ <b>Sort Products</b>\n\n' +
-      'Each product shows: status, current order, title.\n' +
-      'Tap the product name to set a custom number.\n' +
-      'Tap ▲ to move up, ▼ to move down.',
+      `↕️ <b>Product Order</b>\n\n` +
+      `📦 Total: <b>${products.length}</b>   🟢 Active: <b>${active}</b>   🔴 Hidden: <b>${products.length - active}</b>\n` +
+      `📄 Page <b>${pg + 1}</b> of <b>${totalPages}</b>\n\n` +
+      `<i>Tap a product to move it or set its exact position. ` +
+      `The number on the left is its place in the customer's list.</i>`,
       { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
-        reply_markup: adminSortProductsKb(products) }
+        reply_markup: adminSortProductsKb(products, pg) }
+    );
+    return;
+  }
+
+  // Single product inside the ordering screen
+  if (/^admin_sortitem_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product = db.getProduct(productId);
+    if (!product) { await answer('❌ Not found'); return; }
+    const all = db.getAllProductsForSorting();
+    const idx = all.findIndex((p) => p.id === productId);
+    const page = Math.max(0, Math.floor(idx / 10));
+
+    await bot.editMessageText(
+      `↕️ <b>Move Product</b>\n\n` +
+      `${product.is_active ? '🟢 Active' : '🔴 Hidden'}\n` +
+      `📦 <b>${escapeHtml(String(product.title || ''))}</b>\n` +
+      `🆔 <code>${product.id}</code>\n\n` +
+      `📍 Current position: <b>#${idx + 1}</b> of ${all.length}\n` +
+      `💵 Price: ${formatPrice(product.price)}   📊 Stock: ${product.stock_quantity || 0}`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: adminSortItemKb(productId, page) }
     );
     return;
   }
@@ -3664,16 +3803,28 @@ async function handleAdminCallback(bot, query) {
     all.forEach((p, idx) => db.setDisplayOrder(p.id, idx + 1));
   };
 
-  const refreshSortView = async () => {
+  /**
+   * Redraw the ordering list. When a product id is given, the view jumps to the
+   * page that product now sits on — otherwise nudging an item near the bottom
+   * would bounce the admin back to page 1 every time.
+   */
+  const refreshSortView = async (focusProductId = null) => {
     const products = db.getAllProductsForSorting();
     const total = products.length;
+    let page = 0;
+    if (focusProductId) {
+      const idx = products.findIndex((p) => p.id === focusProductId);
+      if (idx >= 0) page = Math.floor(idx / 10);
+    }
+    const totalPages = Math.max(1, Math.ceil(total / 10));
+    const active = products.filter((p) => p.is_active).length;
     await bot.editMessageText(
-      `↕️ <b>Sort Products</b> (${total} products)\n\n` +
-      `📌 Tap <b>#number</b> or <b>title</b> to set position.\n` +
-      `▲ / ▼ to nudge up/down by one.\n` +
-      `🟢 = active &nbsp; 🔴 = hidden`,
+      `↕️ <b>Product Order</b>\n\n` +
+      `📦 Total: <b>${total}</b>   🟢 Active: <b>${active}</b>   🔴 Hidden: <b>${total - active}</b>\n` +
+      `📄 Page <b>${page + 1}</b> of <b>${totalPages}</b>\n\n` +
+      `<i>Tap a product to move it or set its exact position.</i>`,
       { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
-        reply_markup: adminSortProductsKb(products) }
+        reply_markup: adminSortProductsKb(products, page) }
     );
   };
 
@@ -3691,7 +3842,7 @@ async function handleAdminCallback(bot, query) {
       db.setDisplayOrder(above.id, curOrder);
     }
     await answer('✅ Moved up');
-    await refreshSortView();
+    await refreshSortView(productId);
     return;
   }
 
@@ -3709,7 +3860,7 @@ async function handleAdminCallback(bot, query) {
       db.setDisplayOrder(below.id, curOrder);
     }
     await answer('✅ Moved down');
-    await refreshSortView();
+    await refreshSortView(productId);
     return;
   }
 
@@ -3757,6 +3908,7 @@ async function handleAdminCallback(bot, query) {
   if (data === 'admin_resetorder') {
     renumberAll();
     await answer('✅ Renumbered 1,2,3...');
+    // No focus product here — renumbering affects everything, so show page 1.
     await refreshSortView();
     return;
   }

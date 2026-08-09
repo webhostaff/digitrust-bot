@@ -485,6 +485,10 @@ bot.on('message', async (msg) => {
       'ADMIN_CGB_PRICE', 'ADMIN_CGB_ADDCYCLE',
       'ADMIN_RESELLER_NEW_NAME', 'ADMIN_RESELLER_BALANCE',
       States.ADMIN_LOW_STOCK, States.ADMIN_MD_CONTENT,
+      States.ADMIN_DEP_REVERSE, States.ADMIN_CUST_PRICE,
+      // Pre-existing bug: this state was handled in admin.js but never listed
+      // here, so the admin's typed refund amount never reached the handler.
+      States.ADMIN_REFUND_AMOUNT,
       'ADMIN_SEARCH_ORDER',
     ];
     if (adminStates.includes(state)) {

@@ -219,8 +219,13 @@ async function showProductsByCategory(bot, chatId, messageId, categoryId, page =
   });
 }
 
-async function showProductDetail(bot, chatId, productId, messageId = null) {
-  const product = db.getProduct(productId);
+async function showProductDetail(bot, chatId, productId, messageId = null, userId = chatId) {
+  // In a private chat chatId === userId; kept as an explicit parameter so
+  // the customer-price lookup below has a named dependency.
+  let product = db.getProduct(productId);
+  // A negotiated price for this customer replaces the public one, so the
+  // quoted price and the charged price can never diverge.
+  product = db.productForCustomer(userId, product);
   if (!product) {
     await bot.sendMessage(chatId, '❌ Product not found.');
     return;
@@ -345,8 +350,13 @@ async function showPreorderProducts(bot, chatId, messageId = null) {
   }
 }
 
-async function showPreorderProductDetail(bot, chatId, productId, messageId = null) {
-  const product = db.getProduct(productId);
+async function showPreorderProductDetail(bot, chatId, productId, messageId = null, userId = chatId) {
+  // In a private chat chatId === userId; kept as an explicit parameter so
+  // the customer-price lookup below has a named dependency.
+  let product = db.getProduct(productId);
+  // A negotiated price for this customer replaces the public one, so the
+  // quoted price and the charged price can never diverge.
+  product = db.productForCustomer(userId, product);
   if (!product || !product.is_active || !product.preorder_enabled) {
     await bot.sendMessage(chatId, '❌ Pre-order not available for this product.');
     return;

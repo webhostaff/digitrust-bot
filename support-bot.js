@@ -191,6 +191,7 @@ const BTN = {
   PAYMENTS: '💳 Payments',
   DELIVERY: '📦 Delivery',
   STOCK:    '🔴 Out of Stock',
+  REFUNDS:  '🔄 Refunds',
 };
 
 function staffKeyboard() {
@@ -198,6 +199,7 @@ function staffKeyboard() {
     keyboard: [
       [{ text: BTN.INBOX }, { text: BTN.PAYMENTS }],
       [{ text: BTN.DELIVERY }, { text: BTN.STOCK }],
+      [{ text: BTN.REFUNDS }],
     ],
     resize_keyboard: true,
     is_persistent: true,
@@ -209,16 +211,21 @@ async function showStaffHome(chatId) {
   const unread   = queries.getSupportUnreadThreads();
   const md       = queries.getManualDeliveryCounts();
   const payments = queries.countDepositReviews('pending') + queries.countPendingDeposits();
-  const stock    = queries.countNotificationsByType(['stock_out', 'stock_low'], true);
+  const stock    = queries.countOutOfStockProducts();
+  const refunds  = queries.countPendingRefundRequests();
+  const totalWork = unread + payments + md.pending + refunds;
 
   await bot.sendMessage(
     chatId,
     `🎛 <b>Support Console</b>\n\n` +
-    `📥 Unread conversations: <b>${unread}</b>\n` +
-    `💳 Payments needing attention: <b>${payments}</b>\n` +
-    `📦 Deliveries waiting: <b>${md.pending}</b>\n` +
-    `🔔 Unread stock alerts: <b>${stock}</b>\n\n` +
-    `<i>The bar below stays put — tap any section at any time.</i>`,
+    (totalWork === 0 && stock === 0
+      ? `✅ <b>Nothing needs attention.</b>\n`
+      : `${unread   ? '🔴' : '✅'} Unread conversations: <b>${unread}</b>\n` +
+        `${payments ? '💳' : '✅'} Payments to handle: <b>${payments}</b>\n` +
+        `${md.pending ? '📦' : '✅'} Deliveries waiting: <b>${md.pending}</b>\n` +
+        `${refunds  ? '🔄' : '✅'} Refund requests: <b>${refunds}</b>\n` +
+        `${stock    ? '🔴' : '✅'} Out of stock: <b>${stock}</b>\n`) +
+    `\n<i>The bar below stays put — tap any section at any time.</i>`,
     { parse_mode: 'HTML', reply_markup: staffKeyboard() }
   );
 }
@@ -399,8 +406,9 @@ async function showInbox(chatId, messageId = null, page = 0) {
       `No customer messages yet.` +
       (mdCounts.pending ? `\n\n📦 <b>${mdCounts.pending}</b> manual delivery request(s) waiting.` : '');
     await send(chatId, messageId, text, { inline_keyboard: [
-      [{ text: `📦 Manual Delivery (${mdCounts.pending})`, callback_data: 'md_list_pending_0' }],
-      [{ text: '🔔 Stock Alerts', callback_data: 'stock_list_all_0' }],
+      [{ text: `📦 Delivery (${mdCounts.pending})`, callback_data: 'md_list_pending_0' },
+       { text: `🔴 Out of Stock (${queries.countOutOfStockProducts()})`, callback_data: 'stock_list_all_0' }],
+      [{ text: `🔄 Refunds (${queries.countPendingRefundRequests()})`, callback_data: 'ref_list_0' }],
       [{ text: '🔄 Refresh', callback_data: 'inbox' }],
     ] });
     return;
@@ -437,15 +445,20 @@ async function showInbox(chatId, messageId = null, page = 0) {
     rows.push(nav);
   }
 
-  const stockUnread = queries.countNotificationsByType(['stock_out', 'stock_low'], true);
-  rows.push([{
-    text: `📦 Manual Delivery${mdCounts.pending ? ` (${mdCounts.pending})` : ''}`,
-    callback_data: 'md_list_pending_0',
-  }]);
-  rows.push([{
-    text: `🔔 Stock Alerts${stockUnread ? ` (${stockUnread})` : ''}`,
-    callback_data: 'stock_list_all_0',
-  }]);
+  const oos      = queries.countOutOfStockProducts();
+  const refunds  = queries.countPendingRefundRequests();
+  const payments = queries.countDepositReviews('pending') + queries.countPendingDeposits();
+
+  // Every section carries its own live count, so the inbox alone tells you
+  // where the work is without opening anything.
+  rows.push([
+    { text: `💳 Payments${payments ? ` (${payments})` : ''}`, callback_data: 'pay_list_all_0' },
+    { text: `📦 Delivery${mdCounts.pending ? ` (${mdCounts.pending})` : ''}`, callback_data: 'md_list_pending_0' },
+  ]);
+  rows.push([
+    { text: `🔄 Refunds${refunds ? ` (${refunds})` : ''}`, callback_data: 'ref_list_0' },
+    { text: `🔴 Out of Stock${oos ? ` (${oos})` : ''}`, callback_data: 'stock_list_all_0' },
+  ]);
   rows.push([
     { text: '🔍 Search customer', callback_data: 'cust_search' },
     { text: '🔄 Refresh', callback_data: 'inbox' },
@@ -749,38 +762,36 @@ async function showManualDetail(chatId, messageId, taskId) {
 // marks it read everywhere.
 // ═══════════════════════════════════════════════════════════════════════════
 
-const STOCK_TYPES = ['stock_out', 'stock_low'];
-const STOCK_PER_PAGE = 8;
+const STOCK_PER_PAGE = 10;
 
 /**
  * Live out-of-stock list.
  *
- * Deliberately has no tabs and no history: a row exists only while the product
- * is actually out of stock. Restocking deletes it (services/stockAlerts.js), so
- * what you see is always the current situation.
+ * Built straight from the products table, not from stored notifications, so it
+ * can never drift out of date: the instant stock is added the product stops
+ * matching the query and vanishes from this screen. Nothing to clean up.
  */
 async function showStockAlerts(chatId, messageId, _tab = 'all', page = 0) {
-  const total = queries.countNotificationsByType(STOCK_TYPES);
-  const pages = Math.max(1, Math.ceil(total / STOCK_PER_PAGE));
+  const all   = queries.getOutOfStockProducts();
+  const pages = Math.max(1, Math.ceil(all.length / STOCK_PER_PAGE));
   const pg    = Math.max(0, Math.min(page, pages - 1));
-  const rows  = queries.getNotificationsByType(STOCK_TYPES, STOCK_PER_PAGE, pg * STOCK_PER_PAGE);
-  const unread = queries.countNotificationsByType(STOCK_TYPES, true);
+  const rows  = all.slice(pg * STOCK_PER_PAGE, (pg + 1) * STOCK_PER_PAGE);
 
-  const txt = total
-    ? `🔔 <b>Out of Stock</b>\n\n` +
-      `📦 Products needing restock: <b>${total}</b>\n` +
-      (unread ? `🆕 Not yet seen: <b>${unread}</b>\n` : '') +
-      `\n<i>A product disappears from this list the moment you restock it.</i>`
-    : `🔔 <b>Out of Stock</b>\n\n` +
+  const txt = all.length
+    ? `🔴 <b>Out of Stock</b>\n\n` +
+      `📦 Products needing restock: <b>${all.length}</b>\n` +
+      `📄 Page ${pg + 1} of ${pages}\n\n` +
+      `<i>A product leaves this list the moment you add stock — nothing to clear.</i>`
+    : `🔴 <b>Out of Stock</b>\n\n` +
       `✅ <b>Everything is in stock.</b>\n\n` +
-      `<i>Products appear here when they run out, and disappear once restocked.</i>`;
+      `<i>Active products appear here the moment they run out.</i>`;
 
   const kb = [];
-  for (const n of rows) {
-    const dot = n.is_read ? '' : '🆕 ';
+  for (const p of rows) {
+    const title = String(p.title || '').replace(/\[emoji:\d+\]/g, '').trim().slice(0, 32);
     kb.push([{
-      text: `${dot}🔴 ${String(n.title).replace(/^Out of stock — /, '').slice(0, 40)} · ${formatTime(n.created_at)}`,
-      callback_data: `stock_view_${n.id}`,
+      text: `🔴 ${title} · $${Number(p.price || 0).toFixed(2)}`,
+      callback_data: `stock_prod_${p.id}`,
     }]);
   }
 
@@ -791,36 +802,100 @@ async function showStockAlerts(chatId, messageId, _tab = 'all', page = 0) {
     if (pg < pages - 1) nav.push({ text: 'Next ▶️', callback_data: `stock_list_all_${pg + 1}` });
     kb.push(nav);
   }
-
-  if (unread > 0) kb.push([{ text: '✅ Mark all as seen', callback_data: 'stock_readall_all' }]);
   kb.push([{ text: '🔄 Refresh', callback_data: `stock_list_all_${pg}` }]);
 
   await send(chatId, messageId, txt, { inline_keyboard: kb });
 }
 
-async function showStockAlert(chatId, messageId, id) {
-  const n = queries.getAdminNotification(id);
-  if (!n) {
-    await bot.sendMessage(chatId, '❌ Alert not found.');
-    return;
-  }
-  // Opening it is what marks it read.
-  queries.markNotificationRead(id);
+async function showOutOfStockProduct(chatId, messageId, productId) {
+  const p = queries.getProduct(productId);
+  if (!p) { await bot.sendMessage(chatId, '❌ Product not found.'); return; }
 
-  const icon = n.type === 'stock_out' ? '🔴' : '🟠';
-  const txt =
-    `${icon} <b>${escapeHtml(n.title)}</b>\n` +
-    `🕒 ${formatFull(n.created_at)}\n` +
-    `━━━━━━━━━━━━━━━━━━━━\n\n` +
-    `${n.body || '<i>(no details)</i>'}`;
+  const title = String(p.title || '').replace(/\[emoji:\d+\]/g, '').trim();
+  const inStock = Number(p.stock_quantity) > 0;
+
+  await send(chatId, messageId,
+    `${inStock ? '✅' : '🔴'} <b>${escapeHtml(title)}</b>\n\n` +
+    `🆔 <b>ID:</b> <code>${p.id}</code>\n` +
+    `💵 <b>Price:</b> $${Number(p.price || 0).toFixed(2)}\n` +
+    `📊 <b>Stock:</b> <b>${p.stock_quantity || 0}</b>\n` +
+    `📈 <b>Sold:</b> ${p.sales_count || 0}\n` +
+    (p.last_sold_at ? `🕒 <b>Last sold:</b> ${formatFull(p.last_sold_at)}\n` : '') +
+    (inStock
+      ? `\n✅ <i>This product is back in stock.</i>`
+      : `\n<i>Add stock from the main bot: /admin → Edit Product → Stock.</i>`),
+    { inline_keyboard: [[{ text: '🔙 Out of Stock', callback_data: 'stock_list_all_0' }]] });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// REFUND REQUESTS
+//
+// Read-only here on purpose. Approving a refund moves real money, so the
+// decision stays in the main admin panel; this screen is for triage.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const REF_PER_PAGE = 8;
+
+async function showRefunds(chatId, messageId, page = 0) {
+  const total = queries.countPendingRefundRequests();
+  const pages = Math.max(1, Math.ceil(total / REF_PER_PAGE));
+  const pg    = Math.max(0, Math.min(page, pages - 1));
+  const rows  = queries.listPendingRefundRequests(REF_PER_PAGE, pg * REF_PER_PAGE);
+
+  const txt = total
+    ? `🔄 <b>Refund Requests</b>\n\n` +
+      `⏳ Awaiting a decision: <b>${total}</b>\n` +
+      `📄 Page ${pg + 1} of ${pages}\n\n` +
+      `<i>Approve or reject from the main bot: /admin → 🔄 Refund Requests.</i>`
+    : `🔄 <b>Refund Requests</b>\n\n✅ <b>No pending requests.</b>`;
 
   const kb = [];
-  if (n.ref_type === 'product' && n.ref_id) {
-    kb.push([{ text: `📦 Product ID ${n.ref_id}`, callback_data: 'noop' }]);
+  for (const r of rows) {
+    const who = displayName(r.username, r.first_name, r.user_id);
+    kb.push([{
+      text: `🔄 #${r.order_id} · ${who.slice(0, 14)} · $${Number(r.amount || 0).toFixed(2)}`,
+      callback_data: `ref_view_${r.id}`,
+    }]);
   }
-  kb.push([{ text: '🔙 Out of Stock', callback_data: 'stock_list_all_0' }]);
+
+  if (pages > 1) {
+    const nav = [];
+    if (pg > 0)         nav.push({ text: '◀️ Prev', callback_data: `ref_list_${pg - 1}` });
+    nav.push({ text: `${pg + 1}/${pages}`, callback_data: 'noop' });
+    if (pg < pages - 1) nav.push({ text: 'Next ▶️', callback_data: `ref_list_${pg + 1}` });
+    kb.push(nav);
+  }
+  kb.push([{ text: '🔄 Refresh', callback_data: `ref_list_${pg}` }]);
 
   await send(chatId, messageId, txt, { inline_keyboard: kb });
+}
+
+async function showRefund(chatId, messageId, id) {
+  const all = queries.listPendingRefundRequests(500, 0);
+  const r = all.find((x) => x.id === id);
+  if (!r) {
+    await bot.sendMessage(chatId, 'ℹ️ This request has already been handled.');
+    return;
+  }
+  const who = displayName(r.username, r.first_name, r.user_id);
+
+  await send(chatId, messageId,
+    `🔄 <b>Refund Request #${r.id}</b>\n\n` +
+    `👤 <b>Customer:</b> ${escapeHtml(who)}\n` +
+    `🆔 <code>${r.user_id}</code>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `📦 <b>Order:</b> #${r.order_id}\n` +
+    (r.product_title ? `🛒 ${escapeHtml(String(r.product_title).slice(0, 50))}\n` : '') +
+    `💵 <b>Amount:</b> $${Number(r.amount || 0).toFixed(2)}\n` +
+    `💳 <b>Method:</b> ${escapeHtml(r.method || 'n/a')}\n` +
+    `📅 <b>Requested:</b> ${formatFull(r.created_at)}\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `📝 <b>Reason:</b>\n${escapeHtml(r.reason || '(none given)')}\n\n` +
+    `<i>Decide from the main bot: /admin → 🔄 Refund Requests.</i>`,
+    { inline_keyboard: [
+      [{ text: '💬 Message customer', callback_data: `chat_${r.user_id}` }],
+      [{ text: '🔙 Refunds', callback_data: 'ref_list_0' }],
+    ] });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -867,6 +942,10 @@ bot.onText(/^\/payments/, async (msg) => {
 
 bot.onText(/^\/menu/, async (msg) => {
   if (isStaff(msg.from.id)) await showStaffHome(msg.chat.id);
+});
+
+bot.onText(/^\/refunds/, async (msg) => {
+  if (isStaff(msg.from.id)) await showRefunds(msg.chat.id, null, 0);
 });
 
 bot.onText(/^\/alerts/, async (msg) => {
@@ -957,21 +1036,23 @@ bot.on('callback_query', async (q) => {
     }
 
     // ── Stock alerts ──────────────────────────────────────────────────────
+    if (/^stock_prod_\d+$/.test(data)) {
+      await showOutOfStockProduct(chatId, msgId, parseInt(data.split('_').pop(), 10));
+      return;
+    }
+    if (/^ref_list_\d+$/.test(data)) {
+      await showRefunds(chatId, msgId, parseInt(data.split('_').pop(), 10));
+      return;
+    }
+    if (/^ref_view_\d+$/.test(data)) {
+      await showRefund(chatId, msgId, parseInt(data.split('_').pop(), 10));
+      return;
+    }
     if (/^stock_list_[a-z_]+_\d+$/.test(data)) {
       const parts = data.split('_');
       const page  = parseInt(parts.pop(), 10);
       const tab   = parts.slice(2).join('_');
       await showStockAlerts(chatId, msgId, tab, page);
-      return;
-    }
-    if (/^stock_view_\d+$/.test(data)) {
-      await showStockAlert(chatId, msgId, parseInt(data.split('_').pop(), 10));
-      return;
-    }
-    if (/^stock_readall_[a-z_]+$/.test(data)) {
-      const cleared = queries.markAllNotificationsRead();
-      await bot.sendMessage(chatId, `✅ ${cleared} notification(s) marked as read.`);
-      await showStockAlerts(chatId, msgId, data.split('_').slice(2).join('_'), 0);
       return;
     }
 
@@ -1066,7 +1147,7 @@ bot.on('message', async (msg) => {
     // "📥 Inbox" to the customer. Any half-finished input is abandoned, which
     // is what a person expects when they tap a navigation button.
     if (text === BTN.INBOX || text === BTN.PAYMENTS ||
-        text === BTN.DELIVERY || text === BTN.STOCK) {
+        text === BTN.DELIVERY || text === BTN.STOCK || text === BTN.REFUNDS) {
       queries.setSetting(`support_state_${chatId}`, '');
       if (text === BTN.INBOX) {
         clearActiveChat(chatId);
@@ -1075,8 +1156,10 @@ bot.on('message', async (msg) => {
         await showPayments(chatId, null, 'all', 0);
       } else if (text === BTN.DELIVERY) {
         await showManualList(chatId, null, 'pending', 0);
-      } else {
+      } else if (text === BTN.STOCK) {
         await showStockAlerts(chatId, null, 'all', 0);
+      } else {
+        await showRefunds(chatId, null, 0);
       }
       return;
     }

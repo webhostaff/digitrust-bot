@@ -1712,6 +1712,116 @@ module.exports = {
   chargeWalletForManualOrder,
   settleManualOrderExternal,
 
+  /**
+   * Products that are out of stock RIGHT NOW.
+   *
+   * Read live from the products table rather than from stored notifications,
+   * so the list cannot drift: the moment stock is added the product simply
+   * stops matching the query and disappears. No cleanup, no stale rows.
+   */
+  getOutOfStockProducts: () => db.prepare(`
+    SELECT id, title, price, stock_quantity, sales_count, is_active, last_sold_at
+    FROM products
+    WHERE COALESCE(stock_quantity, 0) <= 0 AND is_active = 1
+    ORDER BY COALESCE(last_sold_at, created_at) DESC, id DESC
+  `).all(),
+
+  countOutOfStockProducts: () => db.prepare(
+    'SELECT COUNT(*) AS n FROM products WHERE COALESCE(stock_quantity,0) <= 0 AND is_active = 1'
+  ).get().n,
+
+  countPendingRefundRequests: () => db.prepare(
+    "SELECT COUNT(*) AS n FROM refund_requests WHERE status = 'pending'"
+  ).get().n,
+
+  listPendingRefundRequests: (limit, offset) => db.prepare(`
+    SELECT r.*, u.username, u.first_name, o.product_title
+    FROM refund_requests r
+    LEFT JOIN users  u ON u.telegram_id = r.user_id
+    LEFT JOIN orders o ON o.id = r.order_id
+    WHERE r.status = 'pending'
+    ORDER BY r.id DESC LIMIT ? OFFSET ?
+  `).all(limit, offset),
+
+  // ═══ Per-customer pricing ═══
+
+  /**
+   * The price THIS customer pays for THIS product.
+   *
+   * Every price shown or charged must go through here, otherwise a customer
+   * could be quoted their special price and then billed the public one.
+   */
+  getEffectivePrice: (userId, productId, fallbackPrice) => {
+    const row = db.prepare(
+      'SELECT price FROM customer_prices WHERE user_id = ? AND product_id = ?'
+    ).get(userId, productId);
+    return row ? Number(row.price) : Number(fallbackPrice);
+  },
+
+  /**
+   * Return the product as THIS customer sees it.
+   *
+   * A negotiated price overrides the public price and also switches off the
+   * bulk tiers: the agreed figure is the agreed figure, whatever the quantity.
+   * Because every screen and the checkout all read `product.price`, swapping it
+   * here means the quoted price and the charged price can never diverge.
+   */
+  productForCustomer: (userId, product) => {
+    if (!product || !userId) return product;
+    const row = db.prepare(
+      'SELECT price FROM customer_prices WHERE user_id = ? AND product_id = ?'
+    ).get(userId, product.id);
+    if (!row) return product;
+    return {
+      ...product,
+      price: Number(row.price),
+      publicPrice: Number(product.price),
+      hasCustomPrice: true,
+      bulk_tier1_qty: 0, bulk_tier1_price: 0,
+      bulk_tier2_qty: 0, bulk_tier2_price: 0,
+      bulk_tier3_qty: 0, bulk_tier3_price: 0,
+      bulk_min_qty: 0, bulk_discount: 0,
+    };
+  },
+
+  hasCustomPrice: (userId, productId) => !!db.prepare(
+    'SELECT 1 FROM customer_prices WHERE user_id = ? AND product_id = ?'
+  ).get(userId, productId),
+
+  setCustomerPrice: ({ userId, productId, price, note = null, adminId = null }) =>
+    db.prepare(`
+      INSERT INTO customer_prices (user_id, product_id, price, note, created_by)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(user_id, product_id) DO UPDATE SET
+        price = excluded.price,
+        note = excluded.note,
+        updated_at = datetime('now')
+    `).run(userId, productId, Number(price), note, adminId),
+
+  removeCustomerPrice: (userId, productId) => db.prepare(
+    'DELETE FROM customer_prices WHERE user_id = ? AND product_id = ?'
+  ).run(userId, productId).changes,
+
+  listCustomerPrices: (userId) => db.prepare(`
+    SELECT cp.*, p.title, p.price AS public_price
+    FROM customer_prices cp
+    LEFT JOIN products p ON p.id = cp.product_id
+    WHERE cp.user_id = ?
+    ORDER BY cp.id DESC
+  `).all(userId),
+
+  listPricesForProduct: (productId) => db.prepare(`
+    SELECT cp.*, u.username, u.first_name
+    FROM customer_prices cp
+    LEFT JOIN users u ON u.telegram_id = cp.user_id
+    WHERE cp.product_id = ?
+    ORDER BY cp.id DESC
+  `).all(productId),
+
+  countCustomerPrices: (userId) => db.prepare(
+    'SELECT COUNT(*) AS n FROM customer_prices WHERE user_id = ?'
+  ).get(userId).n,
+
   // ═══ V2: stock alert latches ═══
   deleteStockNotifications: (productId) => db.prepare(`
     DELETE FROM admin_notifications

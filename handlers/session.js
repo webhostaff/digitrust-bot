@@ -95,6 +95,7 @@ const States = {
   // ── V2 ──────────────────────────────────────────────────────────
   WALLET_TOPUP_USDT_AMOUNT: 'WALLET_TOPUP_USDT_AMOUNT', // reserve a unique deposit amount
   ADMIN_DEP_REVERSE:        'ADMIN_DEP_REVERSE',        // reverse a fraudulent deposit
+  ADMIN_CUST_PRICE:         'ADMIN_CUST_PRICE',         // negotiated price for one customer
   ADMIN_LOW_STOCK:  'ADMIN_LOW_STOCK',   // per-product low-stock threshold
   ADMIN_MD_CONTENT: 'ADMIN_MD_CONTENT',  // content for a manual-delivery task
 };
