@@ -1743,11 +1743,18 @@ module.exports = {
     "SELECT COUNT(*) AS n FROM refund_requests WHERE status = 'pending'"
   ).get().n,
 
+  // NOTE: `orders` has no product_title column — the title lives on `products`
+  // and must be reached through orders.product_id. Selecting o.product_title
+  // made SQLite throw "no such column", which broke the whole Refunds screen
+  // while the counter (a separate query) kept working.
   listPendingRefundRequests: (limit, offset) => db.prepare(`
-    SELECT r.*, u.username, u.first_name, o.product_title
+    SELECT r.*, u.username, u.first_name,
+           p.title AS product_title,
+           o.quantity, o.total_price, o.status AS order_status
     FROM refund_requests r
-    LEFT JOIN users  u ON u.telegram_id = r.user_id
-    LEFT JOIN orders o ON o.id = r.order_id
+    LEFT JOIN users    u ON u.telegram_id = r.user_id
+    LEFT JOIN orders   o ON o.id = r.order_id
+    LEFT JOIN products p ON p.id = o.product_id
     WHERE r.status = 'pending'
     ORDER BY r.id DESC LIMIT ? OFFSET ?
   `).all(limit, offset),
