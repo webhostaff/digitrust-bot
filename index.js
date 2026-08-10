@@ -28,7 +28,7 @@ const session        = require('./handlers/session');
 const { States }     = require('./handlers/session');
 const { ensureUser, checkJoinGate, isMember } = require('./middlewares/auth');
 const { mainMenuKb, backKb } = require('./utils/keyboard');
-const { escapeHtml } = require('./utils/format');
+const { escapeHtml, formatPrice } = require('./utils/format');
 const { notifyAdmin } = require('./services/adminNotify');
 const db = require('./database/queries');
 
@@ -844,7 +844,6 @@ bot.on('callback_query', async (query) => {
     const legacyOrder = require('./database/queries').getOrder(legacyOrderId);
     if (legacyOrder && legacyOrder.status === 'pending') {
       const { paymentMethodKb } = require('./utils/keyboard');
-      const { formatPrice } = require('./utils/format');
       await bot.editMessageText(
         `💳 <b>Select Payment Method</b>\n\nOrder #${legacyOrderId} — ${formatPrice(legacyOrder.total_price)}`,
         { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: paymentMethodKb(legacyOrderId) }
