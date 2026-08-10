@@ -83,9 +83,6 @@ async function handleQuantity(bot, msg) {
 
   // Re-check live stock before proceeding
   let product  = db.getProduct(sess.data.productId);
-  // A negotiated price for this customer replaces the public one, so the
-  // quoted price and the charged price can never diverge.
-  product = db.productForCustomer(userId, product);
   const stockQty = product?.stock_quantity || 0;
   const raw      = (msg.text || '').trim();
   const qty      = parseInt(raw, 10);
@@ -94,6 +91,12 @@ async function handleQuantity(bot, msg) {
     await bot.sendMessage(chatId, '❌ Enter a valid number (minimum 1).');
     return;
   }
+
+  // Resolve the customer's negotiated price only once the quantity is known —
+  // a tier such as "20+ units" cannot be picked before then. `qty` is a const
+  // declared just above, so reading it any earlier throws a ReferenceError.
+  product = db.productForCustomer(userId, product, qty);
+
   if (qty > stockQty) {
     await bot.sendMessage(chatId, `❌ Only <b>${stockQty}</b> available.`, { parse_mode: 'HTML' });
     return;
@@ -145,7 +148,7 @@ async function createAndShowSummary(bot, chatId, userId, email) {
   let product = db.getProduct(data.productId);
   // A negotiated price for this customer replaces the public one, so the
   // quoted price and the charged price can never diverge.
-  product = db.productForCustomer(userId, product);
+  product = db.productForCustomer(userId, product, data.quantity || 1);
 
   // 1) Cooldown check (skip for admin)
   if (!require('./admin').isAdmin(userId)) {
@@ -208,7 +211,7 @@ async function confirmOrder(bot, chatId, userId, messageId) {
   let product = db.getProduct(data.productId);
   // A negotiated price for this customer replaces the public one, so the
   // quoted price and the charged price can never diverge.
-  product = db.productForCustomer(userId, product);
+  product = db.productForCustomer(userId, product, data.quantity || 1);
 
   // Stock check (live) before creating order
   if (!product || (product.stock_quantity || 0) < data.quantity) {

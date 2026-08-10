@@ -137,10 +137,18 @@ async function handleAdminText(bot, msg) {
   // ── Per-product low-stock threshold ──────────────────────────────
   // ── Set a negotiated price for one customer ──────────────────────
   if (s === States.ADMIN_CUST_PRICE) {
-    // The product was chosen by tapping, so only a price is expected here.
+    // The product was chosen by tapping, so the price is expected first.
+    // An optional "x20" token sets the quantity this price starts from.
     const parts = String(text).trim().split(/\s+/);
     const price = parseFloat(String(parts[0] || '').replace(',', '.'));
-    const note  = parts.slice(1).join(' ') || null;
+    let minQty = 1;
+    const rest = [];
+    for (const tok of parts.slice(1)) {
+      const m = /^x(\d+)$/i.exec(tok);
+      if (m && minQty === 1) minQty = Math.max(1, parseInt(m[1], 10));
+      else rest.push(tok);
+    }
+    const note  = rest.join(' ') || null;
     const targetId  = d.cpUserId;
     const productId = d.cpProductId;
 
@@ -157,7 +165,7 @@ async function handleAdminText(bot, msg) {
     }
 
     session.clear(userId);
-    db.setCustomerPrice({ userId: targetId, productId, price, note, adminId: userId });
+    db.setCustomerPrice({ userId: targetId, productId, price, note, adminId: userId, minQty });
     logger.info(`Admin ${userId} set special price ${price} for user ${targetId} on product ${productId}`);
 
     const diff = Number(product.price) - price;
@@ -167,7 +175,8 @@ async function handleAdminText(bot, msg) {
       `👤 Customer: <code>${targetId}</code>\n` +
       `📦 ${escapeHtml(String(product.title || ''))}\n` +
       `💵 Public: ${formatPriceExact(product.price)}\n` +
-      `💲 This customer pays: <b>${formatPriceExact(price)}</b>\n` +
+      `💲 This customer pays: <b>${formatPriceExact(price)}</b>` +
+      (minQty > 1 ? ` <i>(from ${minQty} units up)</i>` : ` <i>(any quantity)</i>`) + `\n` +
       (diff > 0 ? `📉 Discount: ${formatPriceExact(diff)} per unit\n`
                 : diff < 0 ? `📈 Markup: ${formatPriceExact(-diff)} per unit\n` : '') +
       // Prices are displayed to customers rounded to cents, so anything finer
@@ -2814,7 +2823,8 @@ async function handleAdminCallback(bot, query) {
       for (const cp of list) {
         const t = String(cp.title || '').replace(/\[emoji:\d+\]/g, '').trim().slice(0, 30);
         txt += `\n📦 ${escapeHtml(t)}\n` +
-               `   ${formatPriceExact(cp.public_price)} → <b>${formatPriceExact(cp.price)}</b>` +
+               `   ${cp.min_qty > 1 ? `<b>${cp.min_qty}+</b> units` : 'any qty'}: ` +
+               `${formatPriceExact(cp.public_price)} → <b>${formatPriceExact(cp.price)}</b>` +
                (cp.note ? `  <i>(${escapeHtml(cp.note)})</i>` : '') + `\n`;
       }
       txt += `\n<i>A special price replaces the public price and ignores bulk tiers.</i>`;
@@ -2822,8 +2832,12 @@ async function handleAdminCallback(bot, query) {
 
     const kb = [[{ text: '➕ Set a special price', callback_data: `admin_cprice_add_${targetId}` }]];
     for (const cp of list.slice(0, 8)) {
-      const t = String(cp.title || '').replace(/\[emoji:\d+\]/g, '').trim().slice(0, 22);
-      kb.push([{ text: `🗑 Remove — ${t}`, callback_data: `admin_cprice_del_${targetId}_${cp.product_id}` }]);
+      const t = String(cp.title || '').replace(/\[emoji:\d+\]/g, '').trim().slice(0, 18);
+      const q = cp.min_qty > 1 ? ` ${cp.min_qty}+` : '';
+      kb.push([{
+        text: `🗑 ${t}${q} — ${formatPriceExact(cp.price)}`,
+        callback_data: `admin_cprice_del_${targetId}_${cp.product_id}_${cp.min_qty}`,
+      }]);
     }
     kb.push([{ text: '🔙 Back to user', callback_data: `admin_user_${targetId}` }]);
 
@@ -2897,19 +2911,24 @@ async function handleAdminCallback(bot, query) {
       `💵 Public price: <b>${formatPriceExact(product.price)}</b>\n` +
       (existing ? `💲 Current special: <b>${formatPriceExact(existing.price)}</b>\n` : '') +
       `\n<b>Send the price for this customer.</b>\n` +
-      `Example: <code>3.50</code>  or  <code>3.50 wholesale deal</code>\n\n` +
-      `<i>Bulk tiers stop applying to this customer for this product.</i>`,
+      `<code>3.50</code> — this price at any quantity\n` +
+      `<code>3.50 x20</code> — this price from 20 units up\n` +
+      `<code>3.50 x20 wholesale</code> — with a note\n\n` +
+      `<i>Add several tiers by repeating this with different quantities. ` +
+      `The product's own bulk tiers stop applying to this customer.</i>`,
       { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
         reply_markup: { inline_keyboard: [[{ text: '🔙 Cancel', callback_data: `admin_cprices_${targetId}` }]] } }
     ).catch(() => {});
     return;
   }
 
-  if (/^admin_cprice_del_\d+_\d+$/.test(data)) {
+  if (/^admin_cprice_del_\d+_\d+(_\d+)?$/.test(data)) {
     const parts = data.split('_');
+    // Trailing min_qty is optional so older buttons keep working.
+    const minQty    = parts.length === 6 ? parseInt(parts.pop(), 10) : null;
     const productId = parseInt(parts.pop(), 10);
     const targetId  = parseInt(parts.pop(), 10);
-    db.removeCustomerPrice(targetId, productId);
+    db.removeCustomerPrice(targetId, productId, minQty);
     logger.info(`Admin ${userId} removed special price: user ${targetId}, product ${productId}`);
     await answer('🗑 Removed');
     return await handleAdminCallback(bot, { ...query, data: `admin_cprices_${targetId}` });

@@ -281,10 +281,6 @@ async function showProductDetail(bot, chatId, productId, messageId = null, userI
   const deliveryLine = product.delivery_type === 'manual'
     ? `\n🖐 <b>Delivery:</b> Manual — sent by our team after payment`
     : '';
-  // Non-refundable products are flagged before purchase, not after.
-  const refundLine = Number(product.refund_enabled) === 1
-    ? ''
-    : `\n🚫 <b>Refunds:</b> Not available for this product`;
 
   const text =
     `${titleHtml}\n\n` +
@@ -293,7 +289,7 @@ async function showProductDetail(bot, chatId, productId, messageId = null, userI
     `💵 <b>Price:</b> ${formatPrice(product.price)}\n` +
     `${stockLine}\n` +
     `📈 <b>Sold:</b> ${product.sales_count || product.sold_count || 0}` +
-    deliveryLine + refundLine +
+    deliveryLine +
     bulkLine;
 
   const preorderInfo = {

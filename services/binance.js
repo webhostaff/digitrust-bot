@@ -160,7 +160,11 @@ async function verifyDepositByTxId(rawTxid, opts = {}) {
 
   if (!match) {
     return {
-      found: false, reason: 'pending',
+      // Distinct from 'pending': Binance cannot see this transfer AT ALL, so
+      // there is no amount and no proof anything was sent. Recording it as a
+      // pending deposit produced the "$0.00" rows in the payments list, and
+      // would let anyone fill that list with invented TxIDs.
+      found: false, reason: 'not_found',
       message:
         '⏳ This TxID was not found in our Binance deposit history yet.\n\n' +
         'Binance usually credits deposits within 1–30 minutes after on-chain confirmation.\n' +

@@ -924,9 +924,57 @@ db.exec(`
     created_by INTEGER,
     created_at TEXT    DEFAULT (datetime('now')),
     updated_at TEXT    DEFAULT (datetime('now')),
-    UNIQUE(user_id, product_id)
+    min_qty    INTEGER DEFAULT 1,
+    UNIQUE(user_id, product_id, min_qty)
   );
   CREATE INDEX IF NOT EXISTS idx_cust_price_user ON customer_prices(user_id);
 `);
+
+// Older installs created customer_prices with UNIQUE(user_id, product_id) and
+// no min_qty, which cannot express "this price from 20 units up". SQLite cannot
+// drop a UNIQUE constraint, so the table is rebuilt — copying every existing
+// row in as a min_qty = 1 tier, which is exactly what they meant before.
+try {
+  const cpCols = db.prepare('PRAGMA table_info(customer_prices)').all().map((c) => c.name);
+  if (cpCols.length && !cpCols.includes('min_qty')) {
+    db.exec('BEGIN');
+    db.exec('ALTER TABLE customer_prices RENAME TO customer_prices_old');
+    db.exec(`
+      CREATE TABLE customer_prices (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id    INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        price      REAL    NOT NULL,
+        note       TEXT,
+        created_by INTEGER,
+        created_at TEXT    DEFAULT (datetime('now')),
+        updated_at TEXT    DEFAULT (datetime('now')),
+        min_qty    INTEGER DEFAULT 1,
+        UNIQUE(user_id, product_id, min_qty)
+      );
+    `);
+    db.exec(`
+      INSERT INTO customer_prices (user_id, product_id, price, note, created_by, created_at, min_qty)
+      SELECT user_id, product_id, price, note, created_by, created_at, 1 FROM customer_prices_old
+    `);
+    db.exec('DROP TABLE customer_prices_old');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_cust_price_user ON customer_prices(user_id)');
+    db.exec('COMMIT');
+    console.log('[MIGRATION] customer_prices rebuilt with quantity tiers');
+  }
+} catch (e) {
+  try { db.exec('ROLLBACK'); } catch (e2) { /* nothing to roll back */ }
+  console.error('[MIGRATION] customer_prices rebuild:', e.message);
+}
+
+// Remove pending-deposit rows recorded before 'not_found' was separated from
+// 'pending'. They carry no amount because Binance never saw the transfer, and
+// showed up in the payments list as "$0.00".
+try {
+  const junk = db.prepare(
+    'DELETE FROM pending_deposits WHERE amount IS NULL OR amount = 0'
+  ).run().changes;
+  if (junk) console.log(`[MIGRATION] Removed ${junk} unverified pending deposit row(s)`);
+} catch (e) { /* table may not exist yet on a fresh install */ }
 
 module.exports = db;

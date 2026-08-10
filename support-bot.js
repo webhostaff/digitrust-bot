@@ -929,8 +929,11 @@ async function showRefund(chatId, messageId, id) {
     `📅 <b>Requested:</b> ${formatFull(r.created_at)}\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
     `📝 <b>Reason:</b>\n${escapeHtml(r.reason || '(none given)')}\n\n` +
-    `<i>Decide from the main bot: /admin → 🔄 Refund Requests.</i>`,
+    `<b>Refunding to the wallet moves real money.</b> Confirm on the next screen.`,
     { inline_keyboard: [
+      [{ text: '✅ Approve → Wallet', callback_data: `ref_ok_w_${r.id}` }],
+      [{ text: '💸 Approve → USDT (manual)', callback_data: `ref_ok_u_${r.id}` }],
+      [{ text: '❌ Reject', callback_data: `ref_no_${r.id}` }],
       [{ text: '💬 Message customer', callback_data: `chat_${r.user_id}` }],
       [{ text: '🔙 Refunds', callback_data: 'ref_list_0' }],
     ] });
@@ -1057,19 +1060,121 @@ bot.on('callback_query', async (q) => {
     if (/^pay_review_\d+$/.test(data)) {
       const r = queries.getDepositReview(parseInt(data.split('_').pop(), 10));
       if (!r) { await bot.sendMessage(chatId, '❌ Not found.'); return; }
-      const who = displayName(null, null, r.user_id);
+      const u = queries.getUser(r.user_id);
+      const who = displayName(u?.username, u?.first_name, r.user_id);
+      const REASONS = {
+        no_matching_reservation: 'No reservation matched this amount',
+        predates_reservation:    'Transfer is older than the reservation',
+        expired_window:          'Submitted after the claim window closed',
+      };
+      const ageMin = r.insert_time
+        ? Math.round((Date.now() - Number(r.insert_time)) / 60000) : null;
+
       await send(chatId, msgId,
-        `🛡 <b>Deposit Needs Review #${r.id}</b>\n\n` +
-        `👤 <code>${r.user_id}</code>\n` +
-        `💵 ${Number(r.amount).toFixed(6)} USDT (${r.network || 'n/a'})\n` +
+        `🛡 <b>Deposit Review #${r.id}</b>\n\n` +
+        `<b>Status:</b> ${String(r.status).toUpperCase()}\n` +
+        `⚠️ <b>Reason:</b> ${REASONS[r.reason] || r.reason || 'n/a'}\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n` +
+        `💵 <b>Amount:</b> ${Number(r.amount).toFixed(6)} USDT\n` +
+        `🌐 <b>Network:</b> ${r.network || 'n/a'}\n` +
         `🔗 <code>${escapeHtml(r.txid)}</code>\n` +
-        `⚠️ ${escapeHtml(r.reason || '')}\n\n` +
-        `<i>Approving moves real money. Do it from the main bot: ` +
-        `/admin → 🛡 Deposit Review.</i>`,
+        (ageMin !== null ? `⌛ <b>On chain:</b> ${ageMin} min ago\n` : '') +
+        `━━━━━━━━━━━━━━━━━━━━\n` +
+        `👤 <b>Claimed by:</b> ${escapeHtml(who)}\n` +
+        `🆔 <code>${r.user_id}</code>\n` +
+        (u ? `💰 <b>Balance:</b> $${Number(u.balance || 0).toFixed(2)}\n` : '') +
+        `\n<b>Approve only if this transfer really belongs to this customer.</b>`,
+        { inline_keyboard: r.status === 'pending' ? [
+            [{ text: '✅ Approve & credit', callback_data: `pay_ok_${r.id}` }],
+            [{ text: '❌ Reject', callback_data: `pay_no_${r.id}` }],
+            [{ text: '💬 Message customer', callback_data: `chat_${r.user_id}` }],
+            [{ text: '🔙 Payments', callback_data: 'pay_list_all_0' }],
+          ] : [
+            [{ text: '💬 Message customer', callback_data: `chat_${r.user_id}` }],
+            [{ text: '🔙 Payments', callback_data: 'pay_list_all_0' }],
+          ] });
+      return;
+    }
+
+    // Confirmation — crediting a deposit hands out real money.
+    if (/^pay_(ok|no)_\d+$/.test(data)) {
+      const id = parseInt(data.split('_').pop(), 10);
+      const approve = data.startsWith('pay_ok_');
+      const r = queries.getDepositReview(id);
+      if (!r || r.status !== 'pending') {
+        await bot.sendMessage(chatId, 'ℹ️ Already handled.');
+        await showPayments(chatId, msgId, 'all', 0);
+        return;
+      }
+      await send(chatId, msgId,
+        `⚠️ <b>Confirm</b>\n\n` +
+        (approve
+          ? `✅ Credit <b>${Number(r.amount).toFixed(6)} USDT</b> to <code>${r.user_id}</code>`
+          : `❌ Reject deposit review #${id}`) + `\n\n` +
+        `🔗 <code>${escapeHtml(r.txid)}</code>\n\n` +
+        `<i>This cannot be undone.</i>`,
         { inline_keyboard: [
-          [{ text: '💬 Message customer', callback_data: `chat_${r.user_id}` }],
-          [{ text: '🔙 Payments', callback_data: 'pay_list_all_0' }],
+          [{ text: '✔️ Yes, do it', callback_data: `pay_${approve ? 'ok' : 'no'}go_${id}` }],
+          [{ text: '↩️ Cancel', callback_data: `pay_review_${id}` }],
         ] });
+      return;
+    }
+
+    if (/^pay_(ok|no)go_\d+$/.test(data)) {
+      const id = parseInt(data.split('_').pop(), 10);
+      const approve = data.startsWith('pay_okgo_');
+      const r = queries.getDepositReview(id);
+      if (!r || r.status !== 'pending') {
+        await bot.sendMessage(chatId, 'ℹ️ Already handled.');
+        await showPayments(chatId, msgId, 'all', 0);
+        return;
+      }
+
+      if (!approve) {
+        queries.resolveDepositReview(id, 'rejected', `Rejected by support ${q.from.id}`, q.from.id);
+        logger.info(`Support ${q.from.id} REJECTED deposit review #${id}`);
+        await send(chatId, msgId, `❌ Deposit review #${id} rejected.`,
+          { inline_keyboard: [[{ text: '🔙 Payments', callback_data: 'pay_list_all_0' }]] });
+        return;
+      }
+
+      // saveUsedTxid throws on a duplicate — that is the replay guard, and it
+      // must run BEFORE any money moves.
+      try {
+        queries.saveUsedTxid({
+          txid: r.txid, userId: r.user_id, amount: r.amount,
+          network: r.network, asset: 'USDT', address: r.address || null,
+        });
+      } catch (e) {
+        queries.resolveDepositReview(id, 'rejected', 'TxID already credited', q.from.id);
+        await send(chatId, msgId,
+          `❌ <b>Already credited.</b>\n\nThis TxID was used before, so nothing was added.`,
+          { inline_keyboard: [[{ text: '🔙 Payments', callback_data: 'pay_list_all_0' }]] });
+        return;
+      }
+
+      queries.updateBalance(r.user_id, Number(r.amount));
+      queries.addTransaction({
+        userId: r.user_id, type: 'deposit', amount: Number(r.amount),
+        description: `USDT ${r.network} top-up (approved in support)`,
+        refId: r.txid, orderId: null,
+      });
+      queries.resolveDepositReview(id, 'approved', `Approved by support ${q.from.id}`, q.from.id);
+      queries.clearPendingDeposit(r.txid);
+      logger.info(`Support ${q.from.id} APPROVED deposit review #${id} — ${r.amount} to ${r.user_id}`);
+
+      try {
+        const fresh = queries.getUser(r.user_id);
+        await bot.sendMessage(r.user_id,
+          `✅ <b>Deposit Credited</b>\n\n` +
+          `💵 <b>${Number(r.amount).toFixed(6)} USDT</b> has been added to your wallet after review.\n` +
+          `💰 <b>New balance:</b> $${Number(fresh?.balance || 0).toFixed(2)}`,
+          { parse_mode: 'HTML' });
+      } catch (e) { /* customer may have blocked the bot */ }
+
+      await send(chatId, msgId,
+        `✅ Credited <b>${Number(r.amount).toFixed(6)} USDT</b> to <code>${r.user_id}</code>.`,
+        { inline_keyboard: [[{ text: '🔙 Payments', callback_data: 'pay_list_all_0' }]] });
       return;
     }
 
@@ -1084,6 +1189,86 @@ bot.on('callback_query', async (q) => {
     }
     if (/^ref_view_\d+$/.test(data)) {
       await showRefund(chatId, msgId, parseInt(data.split('_').pop(), 10));
+      return;
+    }
+
+    // Confirmation step — these actions move money, so never one tap.
+    if (/^ref_(ok_w|ok_u|no)_\d+$/.test(data)) {
+      const id = parseInt(data.split('_').pop(), 10);
+      const action = data.replace(/_\d+$/, '');
+      const r = queries.getRefundRequestById(id);
+      if (!r || r.status !== 'pending') {
+        await bot.sendMessage(chatId, 'ℹ️ This request has already been handled.');
+        await showRefunds(chatId, msgId, 0);
+        return;
+      }
+      const amount = Number(r.total_price) || 0;
+      const label = { ref_ok_w: `✅ Refund ${'$' + amount.toFixed(2)} to their WALLET`,
+                      ref_ok_u: '💸 Approve for MANUAL USDT transfer',
+                      ref_no:   '❌ Reject this request' }[action];
+      await send(chatId, msgId,
+        `⚠️ <b>Confirm</b>\n\n${label}\n\n` +
+        `🆔 Refund #${r.id} · Order #${r.order_id}\n` +
+        `👤 <code>${r.user_id}</code>\n\n` +
+        `<i>The customer is notified either way. This cannot be undone.</i>`,
+        { inline_keyboard: [
+          [{ text: '✔️ Yes, do it', callback_data: `${action}go_${id}` }],
+          [{ text: '↩️ Cancel', callback_data: `ref_view_${id}` }],
+        ] });
+      return;
+    }
+
+    if (/^ref_(ok_w|ok_u|no)go_\d+$/.test(data)) {
+      const id = parseInt(data.split('_').pop(), 10);
+      const action = data.replace(/go_\d+$/, '');
+      const r = queries.getRefundRequestById(id);
+      if (!r || r.status !== 'pending') {
+        await bot.sendMessage(chatId, 'ℹ️ Already handled.');
+        await showRefunds(chatId, msgId, 0);
+        return;
+      }
+      const amount = Number(r.total_price) || 0;
+      let done = '', note = '';
+
+      if (action === 'ref_ok_w') {
+        queries.updateBalance(r.user_id, amount);
+        queries.addTransaction({
+          userId: r.user_id, type: 'refund', amount,
+          description: `Refund for order #${r.order_id}`,
+          refId: `refund_${id}`, orderId: r.order_id,
+        });
+        queries.updateRefundRequest(id, 'approved', `Refunded to wallet: ${amount}$ (support)`, amount, 'wallet');
+        done = `✅ Refund #${id} approved — ${'$' + amount.toFixed(2)} credited to their wallet.`;
+        note =
+          `✅ <b>Your Refund Has Been Approved!</b>\n\n` +
+          `🆔 Refund #${id}\n📦 Order #${r.order_id}\n` +
+          `💵 Refunded: <b>$${amount.toFixed(2)}</b>\n💳 Method: Wallet\n\n` +
+          `Your wallet balance has been updated.`;
+      } else if (action === 'ref_ok_u') {
+        queries.updateRefundRequest(id, 'approved', `Approved for USDT transfer (support)`, amount, 'usdt');
+        done = `✅ Refund #${id} approved for manual USDT transfer.\n\n` +
+               `📝 Contact the customer for their USDT address.`;
+        note =
+          `✅ <b>Your Refund Has Been Approved!</b>\n\n` +
+          `🆔 Refund #${id}\n📦 Order #${r.order_id}\n` +
+          `💵 Amount: <b>$${amount.toFixed(2)}</b>\n💳 Method: USDT (manual)\n\n` +
+          `Our team will contact you for your USDT address.`;
+      } else {
+        queries.updateRefundRequest(id, 'rejected', 'Rejected by support', 0, null);
+        done = `❌ Refund #${id} rejected. The customer has been notified.`;
+        note =
+          `❌ <b>Refund Request Rejected</b>\n\n` +
+          `🆔 Refund #${id}\n📦 Order #${r.order_id}\n\n` +
+          `If you believe this is a mistake, please contact support.`;
+      }
+
+      try { await bot.sendMessage(r.user_id, note, { parse_mode: 'HTML' }); }
+      catch (e) { logger.warn(`Refund notice to ${r.user_id} failed: ${e.message}`); }
+
+      logger.info(`Support ${q.from.id} resolved refund #${id} via ${action}`);
+      await send(chatId, msgId, done, {
+        inline_keyboard: [[{ text: '🔙 Refunds', callback_data: 'ref_list_0' }]],
+      });
       return;
     }
     if (/^stock_list_[a-z_]+_\d+$/.test(data)) {

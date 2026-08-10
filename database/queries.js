@@ -1782,17 +1782,22 @@ module.exports = {
    * Because every screen and the checkout all read `product.price`, swapping it
    * here means the quoted price and the charged price can never diverge.
    */
-  productForCustomer: (userId, product) => {
+  productForCustomer: (userId, product, quantity = 1) => {
     if (!product || !userId) return product;
-    const row = db.prepare(
-      'SELECT price FROM customer_prices WHERE user_id = ? AND product_id = ?'
-    ).get(userId, product.id);
+    // Highest min_qty that the quantity still reaches — so tiers of
+    // 1 → $0.59 and 20 → $0.40 give $0.59 for 5 units and $0.40 for 25.
+    const row = db.prepare(`
+      SELECT price, min_qty FROM customer_prices
+      WHERE user_id = ? AND product_id = ? AND min_qty <= ?
+      ORDER BY min_qty DESC LIMIT 1
+    `).get(userId, product.id, Math.max(1, Number(quantity) || 1));
     if (!row) return product;
     return {
       ...product,
       price: Number(row.price),
       publicPrice: Number(product.price),
       hasCustomPrice: true,
+      customMinQty: Number(row.min_qty),
       bulk_tier1_qty: 0, bulk_tier1_price: 0,
       bulk_tier2_qty: 0, bulk_tier2_price: 0,
       bulk_tier3_qty: 0, bulk_tier3_price: 0,
@@ -1804,26 +1809,31 @@ module.exports = {
     'SELECT 1 FROM customer_prices WHERE user_id = ? AND product_id = ?'
   ).get(userId, productId),
 
-  setCustomerPrice: ({ userId, productId, price, note = null, adminId = null }) =>
+  setCustomerPrice: ({ userId, productId, price, note = null, adminId = null, minQty = 1 }) =>
     db.prepare(`
-      INSERT INTO customer_prices (user_id, product_id, price, note, created_by)
-      VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(user_id, product_id) DO UPDATE SET
+      INSERT INTO customer_prices (user_id, product_id, price, note, created_by, min_qty)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(user_id, product_id, min_qty) DO UPDATE SET
         price = excluded.price,
         note = excluded.note,
         updated_at = datetime('now')
-    `).run(userId, productId, Number(price), note, adminId),
+    `).run(userId, productId, Number(price), note, adminId, Math.max(1, Number(minQty) || 1)),
 
-  removeCustomerPrice: (userId, productId) => db.prepare(
-    'DELETE FROM customer_prices WHERE user_id = ? AND product_id = ?'
-  ).run(userId, productId).changes,
+  // minQty null removes every tier for that product.
+  removeCustomerPrice: (userId, productId, minQty = null) => (
+    minQty == null
+      ? db.prepare('DELETE FROM customer_prices WHERE user_id = ? AND product_id = ?')
+          .run(userId, productId).changes
+      : db.prepare('DELETE FROM customer_prices WHERE user_id = ? AND product_id = ? AND min_qty = ?')
+          .run(userId, productId, minQty).changes
+  ),
 
   listCustomerPrices: (userId) => db.prepare(`
     SELECT cp.*, p.title, p.price AS public_price
     FROM customer_prices cp
     LEFT JOIN products p ON p.id = cp.product_id
     WHERE cp.user_id = ?
-    ORDER BY cp.id DESC
+    ORDER BY cp.product_id ASC, cp.min_qty ASC
   `).all(userId),
 
   listPricesForProduct: (productId) => db.prepare(`
