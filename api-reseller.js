@@ -100,8 +100,13 @@ router.get('/products', requireApiKey, (req, res) => {
 // ────────────────────────────────────────────────
 router.get('/product/:id', requireApiKey, (req, res) => {
   try {
+    // The bot delivers from product_items when it has rows and falls back to
+    // stock. Counting only product_items reported 0 on a full shelf.
     const p = dbRaw.prepare(`
-      SELECT p.*, COALESCE((SELECT COUNT(*) FROM product_items WHERE product_id=p.id AND status='available'), 0) AS stock
+      SELECT p.*, (
+        COALESCE((SELECT COUNT(*) FROM product_items WHERE product_id=p.id AND status='available'), 0) +
+        COALESCE((SELECT COUNT(*) FROM stock         WHERE product_id=p.id AND is_sold = 0),        0)
+      ) AS stock
       FROM products p WHERE p.id = ? AND p.is_active = 1
     `).get(req.params.id);
     if (!p) return err(res, 404, 'Product not found');
@@ -174,22 +179,43 @@ router.post('/order', requireApiKey, (req, res) => {
         throw new Error(`Insufficient balance: need ${total.toFixed(2)}, have ${Number(r.balance).toFixed(2)}`);
       }
 
-      // Check stock
-      const available = dbRaw.prepare(`
-        SELECT id, raw_content FROM product_items WHERE product_id = ? AND status = 'available' ORDER BY id LIMIT ?
+      // Draw from the SAME pool the bot uses, preferring product_items and
+      // falling back to `stock`. Reading only product_items meant this API
+      // could report "out of stock" while the bot happily sold the item — and,
+      // when both tables held rows, the same unit could be sold twice.
+      let available = dbRaw.prepare(`
+        SELECT id, raw_content AS content FROM product_items
+        WHERE product_id = ? AND status = 'available' ORDER BY id LIMIT ?
       `).all(productId, quantity);
+      let source = 'product_items';
+
       if (available.length < quantity) {
-        throw new Error(`Out of stock: requested ${quantity}, available ${available.length}`);
+        const legacy = dbRaw.prepare(`
+          SELECT id, content FROM stock
+          WHERE product_id = ? AND is_sold = 0 ORDER BY id LIMIT ?
+        `).all(productId, quantity);
+        if (legacy.length >= quantity) {
+          available = legacy;
+          source = 'stock';
+        } else {
+          throw new Error(`Out of stock: requested ${quantity}, available ${Math.max(available.length, legacy.length)}`);
+        }
       }
 
-      // Mark items sold — track sold_to_user_id and order_id like the bot does (avoids orphaned records)
-      const ids = available.map(i => i.id);
+      const ids = available.map((i) => i.id);
       const placeholders = ids.map(() => '?').join(',');
-      dbRaw.prepare(`
-        UPDATE product_items
-        SET status='sold', sold_at=datetime('now'), sold_to_user_id=?, order_id=NULL
-        WHERE id IN (${placeholders})
-      `).run(req.reseller.id, ...ids);
+      if (source === 'product_items') {
+        dbRaw.prepare(`
+          UPDATE product_items
+          SET status='sold', sold_at=datetime('now'), sold_to_user_id=?, order_id=NULL
+          WHERE id IN (${placeholders})
+        `).run(req.reseller.id, ...ids);
+      } else {
+        dbRaw.prepare(`
+          UPDATE stock SET is_sold = 1, sold_at = datetime('now')
+          WHERE id IN (${placeholders})
+        `).run(...ids);
+      }
 
       // Decrement stock_quantity
       dbRaw.prepare(`UPDATE products SET stock_quantity = MAX(0, stock_quantity - ?) WHERE id = ?`).run(quantity, productId);
@@ -201,12 +227,12 @@ router.post('/order', requireApiKey, (req, res) => {
       db.chargeReseller(req.reseller.id, total);
 
       // Save reseller order
-      const itemsStr = available.map(i => i.raw_content).join('\n');
+      const itemsStr = available.map((i) => i.content).join('\n');
       const orderResult = db.createResellerOrder(req.reseller.id, productId, quantity, wholesale, total, itemsStr);
 
       return {
         order_id: orderResult.lastInsertRowid,
-        items: available.map(i => i.raw_content),
+        items: available.map((i) => i.content),
         new_balance: Number(r.balance) - total,
       };
     })();

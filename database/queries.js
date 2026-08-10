@@ -1759,7 +1759,214 @@ module.exports = {
     ORDER BY r.id DESC LIMIT ? OFFSET ?
   `).all(limit, offset),
 
+  /**
+   * Everything held in customer wallets right now.
+   *
+   * This is a LIABILITY, not income: the money has already been paid to you,
+   * but the customers have not spent it yet and can still buy with it or ask
+   * for it back. Worth watching alongside profit.
+   */
+  getWalletTreasury: () => {
+    const totals = db.prepare(`
+      SELECT
+        COALESCE(SUM(balance), 0)                              AS total,
+        COUNT(*)                                               AS users_total,
+        COUNT(CASE WHEN balance >  0.004 THEN 1 END)           AS users_funded,
+        COUNT(CASE WHEN balance <  -0.004 THEN 1 END)          AS users_negative,
+        COALESCE(SUM(CASE WHEN balance < 0 THEN balance END),0) AS negative_total,
+        COALESCE(MAX(balance), 0)                              AS largest
+      FROM users
+    `).get();
+
+    // Lifetime flows. 'deposit' and 'refund' add money, purchases remove it.
+    const flows = db.prepare(`
+      SELECT
+        COALESCE(SUM(CASE WHEN amount > 0 THEN amount END), 0) AS credited,
+        COALESCE(SUM(CASE WHEN amount < 0 THEN -amount END), 0) AS spent
+      FROM transactions
+      WHERE status = 'completed' OR status IS NULL
+    `).get();
+
+    const byType = db.prepare(`
+      SELECT type,
+             COUNT(*) AS n,
+             COALESCE(SUM(amount), 0) AS sum
+      FROM transactions
+      WHERE status = 'completed' OR status IS NULL
+      GROUP BY type
+      ORDER BY ABS(SUM(amount)) DESC
+    `).all();
+
+    let resellers = { count: 0, total: 0 };
+    try {
+      resellers = db.prepare(`
+        SELECT COUNT(*) AS count, COALESCE(SUM(balance), 0) AS total
+        FROM resellers WHERE is_active = 1
+      `).get();
+    } catch (e) { /* table may not exist on older installs */ }
+
+    return {
+      total:          Number(totals.total) || 0,
+      usersTotal:     totals.users_total,
+      usersFunded:    totals.users_funded,
+      usersNegative:  totals.users_negative,
+      negativeTotal:  Number(totals.negative_total) || 0,
+      largest:        Number(totals.largest) || 0,
+      credited:       Number(flows.credited) || 0,
+      spent:          Number(flows.spent) || 0,
+      byType,
+      resellerCount:  resellers.count || 0,
+      resellerTotal:  Number(resellers.total) || 0,
+    };
+  },
+
+  /** Biggest wallet holders, for the same screen. */
+  getTopWallets: (limit = 10) => db.prepare(`
+    SELECT telegram_id, username, first_name, balance
+    FROM users
+    WHERE balance > 0.004
+    ORDER BY balance DESC
+    LIMIT ?
+  `).all(limit),
+
+  // ═══ Self-service API keys ═══
+
+  /** The key for a user, creating one on first request. */
+  getOrCreateApiKey: (userId) => {
+    const existing = db.prepare('SELECT * FROM api_keys WHERE user_id = ?').get(userId);
+    if (existing) return existing;
+    const key = 'sk_' + require('crypto').randomBytes(24).toString('hex');
+    db.prepare('INSERT INTO api_keys (api_key, user_id) VALUES (?, ?)').run(key, userId);
+    return db.prepare('SELECT * FROM api_keys WHERE user_id = ?').get(userId);
+  },
+
+  /** Replace a key — used when a customer thinks theirs leaked. */
+  regenerateApiKey: (userId) => {
+    const key = 'sk_' + require('crypto').randomBytes(24).toString('hex');
+    db.prepare('DELETE FROM api_keys WHERE user_id = ?').run(userId);
+    db.prepare('INSERT INTO api_keys (api_key, user_id) VALUES (?, ?)').run(key, userId);
+    return db.prepare('SELECT * FROM api_keys WHERE user_id = ?').get(userId);
+  },
+
+  getApiKey: (userId) => db.prepare('SELECT * FROM api_keys WHERE user_id = ?').get(userId),
+
+  /** Resolve a key to its owner. Returns null for unknown or disabled keys. */
+  resolveApiKey: (key) => db.prepare(
+    "SELECT * FROM api_keys WHERE api_key = ? AND is_active = 1"
+  ).get(String(key || '')),
+
+  touchApiKey: (key) => db.prepare(
+    "UPDATE api_keys SET requests = requests + 1, last_used_at = datetime('now') WHERE api_key = ?"
+  ).run(key),
+
+  setApiKeyActive: (userId, active) => db.prepare(
+    'UPDATE api_keys SET is_active = ? WHERE user_id = ?'
+  ).run(active ? 1 : 0, userId),
+
   // ═══ Per-customer pricing ═══
+
+  /**
+   * The customer's live allowance for one product.
+   *
+   * `remaining` is derived from the usage ledger rather than a stored counter,
+   * so it can never drift: cancelled or replayed orders simply are not in the
+   * ledger. A qty_limit of 0 means unlimited.
+   *
+   * @returns {null|{price, limit, used, remaining, unlimited, note}}
+   */
+  getCustomerAllowance: (userId, productId) => {
+    const row = db.prepare(`
+      SELECT price, qty_limit, note FROM customer_prices
+      WHERE user_id = ? AND product_id = ?
+      ORDER BY min_qty ASC LIMIT 1
+    `).get(userId, productId);
+    if (!row) return null;
+
+    const used = db.prepare(`
+      SELECT COALESCE(SUM(units), 0) AS n FROM customer_price_usage
+      WHERE user_id = ? AND product_id = ?
+    `).get(userId, productId).n;
+
+    const limit = Number(row.qty_limit) || 0;
+    return {
+      price: Number(row.price),
+      limit,
+      used,
+      unlimited: limit === 0,
+      remaining: limit === 0 ? Infinity : Math.max(0, limit - used),
+      note: row.note,
+    };
+  },
+
+  /**
+   * Work out what this customer actually pays for `quantity` units.
+   *
+   * The allowance covers the first N units only; anything beyond it falls back
+   * to the normal price (including the product's own bulk tiers). So an
+   * allowance of 20 at $1.00 on a $2.00 product means 25 units cost
+   * 20x$1.00 + 5x$2.00 = $30.00, and the next order is at the normal price.
+   *
+   * @returns {{total, unitPrice, specialUnits, specialPrice, normalUnits,
+   *            normalUnitPrice, hasAllowance, remainingAfter}}
+   */
+  resolveCustomerPricing: (userId, product, quantity) => {
+    const { calcOrderPrice } = require('../utils/format');
+    const qty = Math.max(1, Number(quantity) || 1);
+    const normal = calcOrderPrice(product, qty);
+
+    const allowance = module.exports.getCustomerAllowance(userId, product.id);
+    if (!allowance) {
+      return {
+        total: normal.total, unitPrice: normal.unitPrice,
+        specialUnits: 0, specialPrice: 0,
+        normalUnits: qty, normalUnitPrice: normal.unitPrice,
+        hasAllowance: false, remainingAfter: 0,
+        discount: normal.discount, discountApplied: normal.discountApplied,
+      };
+    }
+
+    const specialUnits = allowance.unlimited ? qty : Math.min(qty, allowance.remaining);
+    const normalUnits  = qty - specialUnits;
+
+    // Price the leftover units on their own, so bulk tiers are judged on the
+    // quantity actually bought at the normal price — not on the whole order.
+    const leftover = normalUnits > 0 ? calcOrderPrice(product, normalUnits) : { total: 0, unitPrice: Number(product.price) };
+    const total = Number((specialUnits * allowance.price + leftover.total).toFixed(6));
+
+    return {
+      total,
+      unitPrice: Number((total / qty).toFixed(6)),
+      specialUnits,
+      specialPrice: allowance.price,
+      normalUnits,
+      normalUnitPrice: leftover.unitPrice,
+      hasAllowance: true,
+      unlimited: allowance.unlimited,
+      remainingAfter: allowance.unlimited ? Infinity : allowance.remaining - specialUnits,
+      discount: 0, discountApplied: false,
+    };
+  },
+
+  /**
+   * Record that an order consumed part of the allowance.
+   *
+   * Called only after payment succeeds — an abandoned order must not eat the
+   * customer's allowance. INSERT OR IGNORE on the order_id primary key makes it
+   * safe to call more than once for the same order.
+   */
+  consumeCustomerAllowance: (orderId, userId, productId, units) => {
+    if (!units || units <= 0) return false;
+    const res = db.prepare(`
+      INSERT OR IGNORE INTO customer_price_usage (order_id, user_id, product_id, units)
+      VALUES (?, ?, ?, ?)
+    `).run(orderId, userId, productId, units);
+    return res.changes > 0;
+  },
+
+  /** Give the allowance back when an order is cancelled or refunded. */
+  releaseCustomerAllowance: (orderId) =>
+    db.prepare('DELETE FROM customer_price_usage WHERE order_id = ?').run(orderId).changes > 0,
+
 
   /**
    * The price THIS customer pays for THIS product.
@@ -1782,22 +1989,25 @@ module.exports = {
    * Because every screen and the checkout all read `product.price`, swapping it
    * here means the quoted price and the charged price can never diverge.
    */
+  /**
+   * The product as this customer sees it on a listing or detail screen.
+   *
+   * Display only — the charged total comes from resolveCustomerPricing, which
+   * splits an order across the allowance and the normal price. Here the special
+   * price is shown while any allowance is left, and the public price once it is
+   * used up, so the screen never advertises a price the customer can no longer get.
+   */
   productForCustomer: (userId, product, quantity = 1) => {
     if (!product || !userId) return product;
-    // Highest min_qty that the quantity still reaches — so tiers of
-    // 1 → $0.59 and 20 → $0.40 give $0.59 for 5 units and $0.40 for 25.
-    const row = db.prepare(`
-      SELECT price, min_qty FROM customer_prices
-      WHERE user_id = ? AND product_id = ? AND min_qty <= ?
-      ORDER BY min_qty DESC LIMIT 1
-    `).get(userId, product.id, Math.max(1, Number(quantity) || 1));
-    if (!row) return product;
+    const allowance = module.exports.getCustomerAllowance(userId, product.id);
+    if (!allowance || allowance.remaining <= 0) return product;
     return {
       ...product,
-      price: Number(row.price),
+      price: allowance.price,
       publicPrice: Number(product.price),
       hasCustomPrice: true,
-      customMinQty: Number(row.min_qty),
+      allowanceRemaining: allowance.remaining,
+      allowanceUnlimited: allowance.unlimited,
       bulk_tier1_qty: 0, bulk_tier1_price: 0,
       bulk_tier2_qty: 0, bulk_tier2_price: 0,
       bulk_tier3_qty: 0, bulk_tier3_price: 0,
@@ -1809,15 +2019,17 @@ module.exports = {
     'SELECT 1 FROM customer_prices WHERE user_id = ? AND product_id = ?'
   ).get(userId, productId),
 
-  setCustomerPrice: ({ userId, productId, price, note = null, adminId = null, minQty = 1 }) =>
+  setCustomerPrice: ({ userId, productId, price, note = null, adminId = null, minQty = 1, qtyLimit = 0 }) =>
     db.prepare(`
-      INSERT INTO customer_prices (user_id, product_id, price, note, created_by, min_qty)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO customer_prices (user_id, product_id, price, note, created_by, min_qty, qty_limit)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(user_id, product_id, min_qty) DO UPDATE SET
         price = excluded.price,
         note = excluded.note,
+        qty_limit = excluded.qty_limit,
         updated_at = datetime('now')
-    `).run(userId, productId, Number(price), note, adminId, Math.max(1, Number(minQty) || 1)),
+    `).run(userId, productId, Number(price), note, adminId,
+           Math.max(1, Number(minQty) || 1), Math.max(0, Number(qtyLimit) || 0)),
 
   // minQty null removes every tier for that product.
   removeCustomerPrice: (userId, productId, minQty = null) => (

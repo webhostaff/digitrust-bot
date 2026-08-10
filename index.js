@@ -702,7 +702,7 @@ bot.on('callback_query', async (query) => {
   // intercept the next message.
   const navCallbacks = new Set([
     'back_main', 'menu_refresh', 'refresh_products', 'menu_products', 'menu_preorders', 'menu_wallet', 'menu_orders', 'menu_language', 'set_lang_en', 'set_lang_ar', 'set_lang_vi', 'set_lang_es',
-    'menu_support', 'menu_referral', 'wallet_transactions', 'menu_notifications',
+    'menu_support', 'menu_referral', 'wallet_transactions', 'menu_notifications', 'menu_api',
     'admin_panel',
   ]);
   if (navCallbacks.has(data)) {
@@ -900,6 +900,67 @@ bot.on('callback_query', async (query) => {
   if (data === 'wallet_topup_binance') { await answer(); await walletHandler.startBinancePayTopup(bot, chatId, userId, msgId); return; }
   if (data === 'wallet_topup_cryptobot'){ await answer(); await walletHandler.startCryptobotTopup(bot, chatId, userId, msgId); return; }
   if (data === 'wallet_transactions')  { await answer(); await walletHandler.showTransactions(bot, chatId, userId, msgId); return; }
+
+  // ── API access (self-service, no application needed) ─────────────
+  if (data === 'menu_api' || data === 'api_regen_confirm' || data === 'api_regen_do') {
+    await answer();
+
+    if (data === 'api_regen_confirm') {
+      await bot.editMessageText(
+        `⚠️ <b>Generate a new key?</b>\n\n` +
+        `Your current key stops working immediately. Anything using it will ` +
+        `start getting <code>401 Invalid API key</code> until you update it.\n\n` +
+        `Only do this if you think your key leaked.`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [
+            [{ text: '🔁 Yes, generate a new key', callback_data: 'api_regen_do' }],
+            [{ text: '↩️ Cancel', callback_data: 'menu_api' }],
+          ] } }
+      ).catch(() => {});
+      return;
+    }
+
+    const row = data === 'api_regen_do'
+      ? db.regenerateApiKey(userId)
+      : db.getOrCreateApiKey(userId);
+
+    const me = await bot.getMe().catch(() => ({ username: '' }));
+    const base = db.getSetting('api_base_url', '') ||
+                 (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : '') ||
+                 config.publicBaseUrl || 'https://YOUR-DOMAIN';
+    const user = db.getUser(userId);
+
+    await bot.editMessageText(
+      `🔌 <b>API Access</b>\n\n` +
+      `Buy from the shop straight from your own code.\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `🔑 <b>Your API key</b> (tap to copy):\n<code>${escapeHtml(row.api_key)}</code>\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `💰 <b>Wallet balance:</b> ${formatPrice(user?.balance || 0)}\n` +
+      `📊 <b>Requests made:</b> ${row.requests || 0}\n\n` +
+      `<b>Base URL</b>\n<code>${escapeHtml(base)}/api/v2</code>\n\n` +
+      `<b>Quick start</b>\n` +
+      `<pre>curl -H "X-API-Key: ${escapeHtml(row.api_key)}" \\\n  ${escapeHtml(base)}/api/v2/products</pre>\n` +
+      `<b>Buy</b>\n` +
+      `<pre>curl -X POST ${escapeHtml(base)}/api/v2/purchase \\\n` +
+      `  -H "X-API-Key: ${escapeHtml(row.api_key)}" \\\n` +
+      `  -H "Content-Type: application/json" \\\n` +
+      `  -d '{"product_id":1,"quantity":1}'</pre>\n` +
+      `⚠️ <b>Top up your wallet first</b> — the API spends your balance, it cannot take payments.\n\n` +
+      `🔒 <i>Treat this key like a password. Anyone holding it can spend your balance.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: '📖 Full documentation', url: `${base}/api/v2/docs` }],
+          [{ text: '💰 Top Up Wallet', callback_data: 'wallet_topup' }],
+          [{ text: '🔁 Generate new key', callback_data: 'api_regen_confirm' }],
+          [{ text: '🔙 Back', callback_data: 'back_main' }],
+        ] } }
+    ).catch(async () => {
+      await bot.sendMessage(chatId, `🔑 Your API key:\n<code>${escapeHtml(row.api_key)}</code>`,
+        { parse_mode: 'HTML' });
+    });
+    return;
+  }
 
   // ── Orders ───────────────────────────────────────────────────────
   if (data === 'menu_orders') {
@@ -1392,12 +1453,18 @@ const resellerApi   = require('./api-reseller'); // ← new: read-only addition,
 
 app.use('/', webhookRouter);
 app.use(express.json());
-app.use('/api/v1', resellerApi); // ← new mount point only
+app.use('/api/v1', resellerApi); // legacy reseller API (separate balances)
+
+// Public customer API: self-service keys, wallet-funded, same pricing and the
+// same atomic purchase path as the bot itself.
+app.set('bot', bot);   // manual-delivery notifications need a bot instance
+app.use('/api/v2', require('./api-public'));
 
 app.listen(config.webhookPort, config.webhookHost, () => {
   logger.info(`HTTP server: http://${config.webhookHost}:${config.webhookPort}/`);
   logger.info(`Health:      http://${config.webhookHost}:${config.webhookPort}/health`);
   logger.info(`Reseller API: http://${config.webhookHost}:${config.webhookPort}/api/v1/docs`);
+  logger.info(`Customer API: http://${config.webhookHost}:${config.webhookPort}/api/v2/docs`);
   if (config.cryptobotToken) {
     logger.info(`CryptoBot:   http://${config.webhookHost}:${config.webhookPort}/cryptobot/webhook`);
   }

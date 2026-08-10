@@ -22,6 +22,7 @@ const mainMenuKb = (lang = 'en') => mk([
   [btn(t(lang, 'btn_wallet'), 'menu_wallet'),         btn(t(lang, 'btn_orders'), 'menu_orders')],
   [btn(t(lang, 'btn_support'), 'menu_support'),       btn(t(lang, 'btn_vip'), 'menu_vip')],
   [btn(t(lang, 'btn_refunds'), 'refund_request_start'),         btn(t(lang, 'btn_language'), 'menu_language')],
+  [btn('🔌 API Access', 'menu_api')],
 ]);
 
 // Pre-Order products listing (customer view)
@@ -192,6 +193,7 @@ const adminMainKb = () => mk([
   [btn('🔜 Pre-Orders',      'admin_preorders'),      btn('💳 Pending',      'admin_pending')],
   [btn('👥 Users',           'admin_users'),          btn('📣 Broadcast',    'admin_broadcast')],
   [btn('📊 Statistics',      'admin_stats'),          btn('📈 Profits',      'admin_profits')],
+  [btn('🏦 Customer Wallets', 'admin_treasury')],
   [btn('🎫 Tickets',         'admin_tickets'),        btn('💸 Refund',       'admin_refund')],
   [btn('📢 Announcement',    'admin_announcement'),   btn('⚙️ Settings',     'admin_settings')],
   [btn('🎨 Emoji Library',   'admin_emojis'),         btn('🚧 Maintenance',  'admin_maintenance')],

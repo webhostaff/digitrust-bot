@@ -627,3 +627,106 @@ is now on, instead of bouncing back to page 1.
 |---|---|
 | `ADMIN_REFUND_AMOUNT` was handled in `admin.js` but never listed in `index.js` | The admin's typed refund amount never reached the handler — refund-by-amount silently did nothing |
 | `refreshSortView()` was called with an undefined `productId` in `admin_resetorder` | Introduced during this work and caught before shipping |
+
+---
+
+# Part 13 — Customer API (v2)
+
+Any customer can mint an API key from the bot menu — no application step. The
+key identifies one telegram user, and every purchase is charged to that user's
+ordinary wallet at that user's ordinary price.
+
+`🔌 API Access` in the main menu shows the key, the wallet balance, request
+count, ready-to-paste curl examples, and a button to regenerate the key.
+
+## Endpoints — `/api/v2`
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/products` | Products, priced for the caller |
+| GET | `/product/:id` | One product |
+| GET | `/balance` | Wallet balance |
+| POST | `/purchase` | Buy, paid from the wallet |
+| GET | `/orders` | Order history |
+| GET | `/order/:id` | One order, with delivered content |
+| GET | `/docs` | Documentation |
+
+Auth: `X-API-Key: sk_...`. Rate limit 60/min, plus a per-key in-flight lock so
+two concurrent purchases cannot both pass their own balance check.
+
+## Why it reuses the bot's purchase function
+
+`POST /purchase` calls `deliverOrderAndChargeWallet` — the exact function the
+bot uses. One code path, one transaction, one source of truth for balance and
+stock. Prices come from `resolveCustomerPricing`, so special prices and
+allowances apply through the API automatically.
+
+Manual-delivery products are supported: payment is taken, the order moves to
+`awaiting_delivery`, and a task is opened for the admin.
+
+## A serious bug this uncovered in `/api/v1`
+
+The bot delivers from `stock`, falling back from `product_items`. The v1
+reseller API read **only** `product_items`. Since the admin's "add stock" writes
+to `stock`, that meant:
+
+* `GET /products` reported `stock: 0` on a full shelf
+* `POST /order` answered "Out of stock" for every request
+* and if both tables ever held rows, the same unit could be sold twice while
+  `products.stock_quantity` was decremented for each
+
+v1 now reads and writes the same pool as the bot, in the same order.
+
+Separately, reseller accounts could not be created at all until this session:
+`ADMIN_RESELLER_NEW_NAME` had no text handler, so no API key could ever be
+issued and v1 was unusable regardless.
+
+## Tests
+
+16/16, run against the real stock layout (rows in `stock`, `product_items`
+empty): auth, banned accounts, insufficient balance, insufficient stock, and a
+no-double-sell check confirming three stock rows produce exactly three sales.
+
+## Compatibility aliases
+
+Other shops in this market name the same two endpoints differently, so both
+spellings are accepted:
+
+| Alias | Same as |
+|---|---|
+| `GET /me` | `GET /balance` |
+| `POST /order` | `POST /purchase` |
+
+A reseller who already wrote code against another supplier can point it here by
+changing only the base URL and the key.
+
+## Failed purchases no longer leave pending orders
+
+The order row is created before the atomic charge runs. If the charge fails
+(insufficient balance, out of stock), the row is now closed as `cancelled`
+instead of sitting in the customer's history as `pending` forever.
+
+---
+
+# Part 14 — Customer Wallets (treasury)
+
+`/admin → 🏦 Customer Wallets`
+
+Shows what the shop is currently holding on customers' behalf:
+
+* total balance across all wallets, and how many customers hold one
+* average and largest wallet
+* wallets in debt, with the total — these come from reversed deposits that had
+  already been spent
+* reseller balances (the separate `/api/v1` accounts), when any exist
+* lifetime wallet flow: credited in vs spent out, broken down by transaction type
+* `🏆 Largest wallets` — top 15 with each one's share of the total
+
+The screen states plainly that this is a **liability, not profit**: the money has
+been received, but customers can still spend it or ask for it back.
+
+## Half-a-cent threshold
+
+"Customers with a balance" counts wallets above `0.004`. A balance of `0.002`
+displays as `$0.00`, so listing it as funded would contradict what the interface
+shows — the same cent-rounding rule used for the purchase check.

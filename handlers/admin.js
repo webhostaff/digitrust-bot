@@ -141,11 +141,11 @@ async function handleAdminText(bot, msg) {
     // An optional "x20" token sets the quantity this price starts from.
     const parts = String(text).trim().split(/\s+/);
     const price = parseFloat(String(parts[0] || '').replace(',', '.'));
-    let minQty = 1;
+    let qtyLimit = 0;   // 0 = no limit
     const rest = [];
     for (const tok of parts.slice(1)) {
-      const m = /^x(\d+)$/i.exec(tok);
-      if (m && minQty === 1) minQty = Math.max(1, parseInt(m[1], 10));
+      const m = /^q(\d+)$/i.exec(tok);
+      if (m && qtyLimit === 0) qtyLimit = Math.max(0, parseInt(m[1], 10));
       else rest.push(tok);
     }
     const note  = rest.join(' ') || null;
@@ -165,7 +165,7 @@ async function handleAdminText(bot, msg) {
     }
 
     session.clear(userId);
-    db.setCustomerPrice({ userId: targetId, productId, price, note, adminId: userId, minQty });
+    db.setCustomerPrice({ userId: targetId, productId, price, note, adminId: userId, qtyLimit });
     logger.info(`Admin ${userId} set special price ${price} for user ${targetId} on product ${productId}`);
 
     const diff = Number(product.price) - price;
@@ -176,7 +176,10 @@ async function handleAdminText(bot, msg) {
       `📦 ${escapeHtml(String(product.title || ''))}\n` +
       `💵 Public: ${formatPriceExact(product.price)}\n` +
       `💲 This customer pays: <b>${formatPriceExact(price)}</b>` +
-      (minQty > 1 ? ` <i>(from ${minQty} units up)</i>` : ` <i>(any quantity)</i>`) + `\n` +
+      (qtyLimit > 0
+        ? ` <i>(for the first ${qtyLimit} units)</i>\n` +
+          `📊 After ${qtyLimit} units the normal price applies again.\n`
+        : ` <i>(no limit)</i>\n`) +
       (diff > 0 ? `📉 Discount: ${formatPriceExact(diff)} per unit\n`
                 : diff < 0 ? `📈 Markup: ${formatPriceExact(-diff)} per unit\n` : '') +
       // Prices are displayed to customers rounded to cents, so anything finer
@@ -2799,6 +2802,86 @@ async function handleAdminCallback(bot, query) {
     return;
   }
   // ═══════════════════════════════════════════════════════════════════
+  // CUSTOMER WALLETS — what the shop is holding on their behalf
+  // ═══════════════════════════════════════════════════════════════════
+
+  if (data === 'admin_treasury' || data === 'admin_treasury_top') {
+    const t = db.getWalletTreasury();
+
+    if (data === 'admin_treasury_top') {
+      const top = db.getTopWallets(15);
+      let txt = `🏆 <b>Largest Wallets</b>\n\n`;
+      if (!top.length) {
+        txt += '<i>No customer holds a balance.</i>';
+      } else {
+        top.forEach((u, i) => {
+          const who = u.username ? `@${u.username}` : (u.first_name || `User ${u.telegram_id}`);
+          const share = t.total > 0 ? ((u.balance / t.total) * 100).toFixed(1) : '0.0';
+          txt += `${String(i + 1).padStart(2)}. <b>${formatPrice(u.balance)}</b> · ${escapeHtml(who)}\n` +
+                 `     <code>${u.telegram_id}</code> — ${share}% of the total\n`;
+        });
+      }
+      try {
+        await bot.editMessageText(txt, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'admin_treasury' }]] } });
+      } catch (e) {
+        await bot.sendMessage(chatId, txt, { parse_mode: 'HTML' });
+      }
+      return;
+    }
+
+    const avg = t.usersFunded > 0 ? t.total / t.usersFunded : 0;
+    const TYPE_LABEL = {
+      deposit: '💵 Deposits', purchase: '🛒 Purchases', refund: '🔄 Refunds',
+      referral: '🎁 Referral', cashback: '💸 Cashback', reversal: '↩️ Reversals',
+      admin_add: '➕ Admin credit', admin_deduct: '➖ Admin debit',
+    };
+    const flows = t.byType.slice(0, 8).map((r) => {
+      const label = TYPE_LABEL[r.type] || `• ${r.type}`;
+      const sign = r.sum >= 0 ? '+' : '−';
+      return `   ${label}: ${sign}${formatPrice(Math.abs(r.sum))} <i>(${r.n})</i>`;
+    }).join('\n');
+
+    const txt =
+      `🏦 <b>Customer Wallets</b>\n\n` +
+      `<b>Held on their behalf right now</b>\n` +
+      `💰 <b>${formatPrice(t.total)}</b>\n\n` +
+      `👥 Customers with a balance: <b>${t.usersFunded}</b> of ${t.usersTotal}\n` +
+      `📊 Average balance: <b>${formatPrice(avg)}</b>\n` +
+      `🔝 Largest single wallet: <b>${formatPrice(t.largest)}</b>\n` +
+      (t.usersNegative > 0
+        ? `\n⚠️ <b>${t.usersNegative}</b> wallet(s) in debt: <b>${formatPrice(t.negativeTotal)}</b>\n` +
+          `<i>Negative balances come from reversed deposits that were already spent.</i>\n`
+        : '') +
+      (t.resellerCount > 0
+        ? `\n🏪 Reseller balances: <b>${formatPrice(t.resellerTotal)}</b> (${t.resellerCount} active)\n`
+        : '') +
+      `\n━━━━━━━━━━━━━━━━━━━━\n` +
+      `<b>Lifetime wallet flow</b>\n` +
+      `⬆️ Credited in: <b>${formatPrice(t.credited)}</b>\n` +
+      `⬇️ Spent out: <b>${formatPrice(t.spent)}</b>\n` +
+      (flows ? `\n<b>By type</b>\n${flows}\n` : '') +
+      `\n━━━━━━━━━━━━━━━━━━━━\n` +
+      `<i>This is money you already received but customers have not spent yet. ` +
+      `They can still buy with it or request it back, so treat it as a liability ` +
+      `rather than profit.</i>`;
+
+    try {
+      await bot.editMessageText(txt, {
+        chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: '🏆 Largest wallets', callback_data: 'admin_treasury_top' }],
+          [{ text: '🔄 Refresh', callback_data: 'admin_treasury' }],
+          [{ text: '🔙 Back', callback_data: 'admin_panel' }],
+        ] },
+      });
+    } catch (e) {
+      await bot.sendMessage(chatId, txt, { parse_mode: 'HTML' });
+    }
+    return;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
   // FRAUD RESPONSE — cancel every open order of one user
   // ═══════════════════════════════════════════════════════════════════
 
@@ -2827,7 +2910,7 @@ async function handleAdminCallback(bot, query) {
                `${formatPriceExact(cp.public_price)} → <b>${formatPriceExact(cp.price)}</b>` +
                (cp.note ? `  <i>(${escapeHtml(cp.note)})</i>` : '') + `\n`;
       }
-      txt += `\n<i>A special price replaces the public price and ignores bulk tiers.</i>`;
+      txt += `\n<i>An allowance covers the first N units the customer buys. Beyond it, the normal price applies automatically — including within the same order.</i>`;
     }
 
     const kb = [[{ text: '➕ Set a special price', callback_data: `admin_cprice_add_${targetId}` }]];
@@ -2910,12 +2993,20 @@ async function handleAdminCallback(bot, query) {
       `━━━━━━━━━━━━━━━━━━━━\n` +
       `💵 Public price: <b>${formatPriceExact(product.price)}</b>\n` +
       (existing ? `💲 Current special: <b>${formatPriceExact(existing.price)}</b>\n` : '') +
+      (() => {
+        const al = db.getCustomerAllowance(targetId, productId);
+        if (!al) return '';
+        return al.unlimited
+          ? `♾ Current allowance: no limit\n`
+          : `📊 Used <b>${al.used}</b> of ${al.limit} units — <b>${al.remaining}</b> left\n`;
+      })() +
       `\n<b>Send the price for this customer.</b>\n` +
-      `<code>3.50</code> — this price at any quantity\n` +
-      `<code>3.50 x20</code> — this price from 20 units up\n` +
-      `<code>3.50 x20 wholesale</code> — with a note\n\n` +
-      `<i>Add several tiers by repeating this with different quantities. ` +
-      `The product's own bulk tiers stop applying to this customer.</i>`,
+      `<code>3.50</code> — this price, no limit\n` +
+      `<code>3.50 q20</code> — this price for <b>20 units total</b>, then back to normal\n` +
+      `<code>3.50 q20 wholesale</code> — with a note\n\n` +
+      `<i>With a limit, the allowance covers the first 20 units the customer ` +
+      `buys — across any number of orders. Anything beyond that is charged the ` +
+      `normal price automatically.</i>`,
       { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
         reply_markup: { inline_keyboard: [[{ text: '🔙 Cancel', callback_data: `admin_cprices_${targetId}` }]] } }
     ).catch(() => {});

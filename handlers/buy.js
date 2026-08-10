@@ -92,24 +92,30 @@ async function handleQuantity(bot, msg) {
     return;
   }
 
-  // Resolve the customer's negotiated price only once the quantity is known —
-  // a tier such as "20+ units" cannot be picked before then. `qty` is a const
-  // declared just above, so reading it any earlier throws a ReferenceError.
-  product = db.productForCustomer(userId, product, qty);
 
   if (qty > stockQty) {
     await bot.sendMessage(chatId, `❌ Only <b>${stockQty}</b> available.`, { parse_mode: 'HTML' });
     return;
   }
 
-  let { total, unitPrice, discount, discountApplied } = calcOrderPrice(product, qty);
+  // An allowance covers only its first N units; anything beyond falls back to
+  // the normal price, so the two portions are priced separately and summed.
+  const pricing = db.resolveCustomerPricing(userId, product, qty);
+  let { total, unitPrice, discount, discountApplied } = pricing;
   // Apply 5% VIP discount on top
   const isVipUser = db.isVIP(userId);
   if (isVipUser) {
     total = Number((total * 0.95).toFixed(2));
     unitPrice = Number((unitPrice * 0.95).toFixed(4));
   }
-  session.update(userId, { quantity: qty, total, unitPrice, discount, discountApplied });
+  session.update(userId, {
+    quantity: qty, total, unitPrice, discount, discountApplied,
+    // Remembered so the allowance is consumed only for the units it actually
+    // covered, and only once payment succeeds.
+    allowanceUnits: pricing.specialUnits || 0,
+    allowancePrice: pricing.specialPrice || 0,
+    normalUnits:    pricing.normalUnits || 0,
+  });
 
   if (sess.data.requiresEmail) {
     session.set(userId, States.BUY_EMAIL, session.get(userId).data);
@@ -269,6 +275,12 @@ async function confirmOrder(bot, chatId, userId, messageId) {
     email:      data.email || null,
     totalPrice: data.total,
   });
+  // Persist how many units the allowance covered. Payment may complete minutes
+  // later, by which time the session could be gone.
+  try {
+    dbRaw.prepare('UPDATE orders SET allowance_units = ? WHERE id = ?')
+      .run(Number(data.allowanceUnits) || 0, orderId);
+  } catch (e) { logger.warn(`allowance_units not stored: ${e.message}`); }
   session.update(userId, { orderId });
 
   await bot.editMessageText(
@@ -350,7 +362,9 @@ async function payWithWallet(bot, chatId, userId, orderId, messageId) {
 
     const freshOrder = db.getOrder(orderId);
     await manualDelivery.openManualDelivery(bot, freshOrder, 'wallet');
-    await handleReferralReward(bot, userId);
+    const _paidOrder = db.getOrder(orderId) || order;
+    consumeAllowanceFor(_paidOrder, _paidOrder?.allowance_units);
+  await handleReferralReward(bot, userId);
 
     await bot.editMessageText(
       `✅ <b>Payment Confirmed</b>\n\n` +
@@ -407,7 +421,9 @@ async function payWithWallet(bot, chatId, userId, orderId, messageId) {
       refId: null, orderId,
     });
     await sendDelivery(bot, chatId, order, delivered, messageId);
-    await handleReferralReward(bot, userId);
+    const _paidOrder = db.getOrder(orderId) || order;
+    consumeAllowanceFor(_paidOrder, _paidOrder?.allowance_units);
+  await handleReferralReward(bot, userId);
 
     // Notify admins of the successful purchase
     const buyer       = db.getUser(userId);
@@ -786,7 +802,9 @@ async function settleDirectPayment(bot, chatId, userId, info) {
     session.clear(userId);
     const freshManualOrder = db.getOrder(order.id);
     await manualDelivery.openManualDelivery(bot, freshManualOrder, method);
-    await handleReferralReward(bot, userId);
+    const _paidOrder = db.getOrder(orderId) || order;
+    consumeAllowanceFor(_paidOrder, _paidOrder?.allowance_units);
+  await handleReferralReward(bot, userId);
 
     const stockAfterMd = db.getProduct(order.product_id)?.stock_quantity || 0;
     await checkAndNotifyStockLevel(bot, db, order.product_id, stockBefore, stockAfterMd);
@@ -833,6 +851,7 @@ async function settleDirectPayment(bot, chatId, userId, info) {
 
   session.clear(userId);
   await sendDelivery(bot, chatId, order, delivered);
+  consumeAllowanceFor(order, order?.allowance_units);
   await handleReferralReward(bot, userId);
 
   if (surplus > epsilon) {
@@ -1172,7 +1191,9 @@ async function deliverCryptobotOrder(bot, invoiceId, paidAmount, payloadStr) {
 
     const freshManual = db.getOrder(orderId);
     await manualDelivery.openManualDelivery(bot, freshManual, 'cryptobot');
-    await handleReferralReward(bot, userId);
+    const _paidOrder = db.getOrder(orderId) || order;
+    consumeAllowanceFor(_paidOrder, _paidOrder?.allowance_units);
+  await handleReferralReward(bot, userId);
     await evaluateStock(bot, order.product_id);
     return true;
   }
@@ -1236,6 +1257,34 @@ async function sendOutOfStock(bot, chatId, order, method, messageId = null) {
 }
 
 // ── Referral reward ───────────────────────────────────────────────────────────
+
+/**
+ * Consume the customer's special-price allowance for a PAID order.
+ *
+ * Called only after payment succeeds — an abandoned or failed order must never
+ * eat the allowance. The ledger is keyed by order_id, so calling this twice for
+ * the same order (webhook retry, double tap) is harmless.
+ *
+ * The unit count is read back from the session snapshot stored on the order at
+ * checkout, so it survives the session expiring between payment steps.
+ */
+function consumeAllowanceFor(order, units) {
+  const n = Number(units) || 0;
+  if (n <= 0) return;
+  try {
+    const first = db.consumeCustomerAllowance(order.id, order.user_id, order.product_id, n);
+    if (first) {
+      const left = db.getCustomerAllowance(order.user_id, order.product_id);
+      logger.info(
+        `Allowance: order #${order.id} used ${n} unit(s) for user ${order.user_id} ` +
+        `on product ${order.product_id}` +
+        (left && !left.unlimited ? ` — ${left.remaining} left` : '')
+      );
+    }
+  } catch (e) {
+    logger.error(`consumeAllowanceFor(order #${order.id}) failed: ${e.message}`);
+  }
+}
 
 async function handleReferralReward(bot, referredId) {
   const reward     = parseFloat(db.getSetting('referral_reward', '0.20'));

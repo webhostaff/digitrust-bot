@@ -925,10 +925,47 @@ db.exec(`
     created_at TEXT    DEFAULT (datetime('now')),
     updated_at TEXT    DEFAULT (datetime('now')),
     min_qty    INTEGER DEFAULT 1,
+    qty_limit  INTEGER DEFAULT 0,
     UNIQUE(user_id, product_id, min_qty)
   );
   CREATE INDEX IF NOT EXISTS idx_cust_price_user ON customer_prices(user_id);
+
+  -- How much of a customer's allowance each order consumed.
+  -- order_id is the PRIMARY KEY, so replaying a payment (webhook retry, double
+  -- tap) can never double-count. Remaining allowance is derived from the SUM of
+  -- these rows rather than a stored counter, so it cannot drift out of sync.
+  CREATE TABLE IF NOT EXISTS customer_price_usage (
+    order_id   INTEGER PRIMARY KEY,
+    user_id    INTEGER NOT NULL,
+    product_id INTEGER NOT NULL,
+    units      INTEGER NOT NULL,
+    created_at TEXT    DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_cpu_lookup ON customer_price_usage(user_id, product_id);
 `);
+
+// How many units of an order were covered by a special-price allowance.
+// Stored on the order because payment can complete long after checkout, by
+// which time the session holding this number may be gone.
+try {
+  const oCols = db.prepare('PRAGMA table_info(orders)').all().map((c) => c.name);
+  if (!oCols.includes('allowance_units')) {
+    db.exec('ALTER TABLE orders ADD COLUMN allowance_units INTEGER DEFAULT 0');
+  }
+} catch (e) {
+  console.error('[MIGRATION] allowance_units:', e.message);
+}
+
+// qty_limit turns the special price into a limited allowance: N units at the
+// agreed price, then back to the normal price.
+try {
+  const cols = db.prepare('PRAGMA table_info(customer_prices)').all().map((c) => c.name);
+  if (cols.length && !cols.includes('qty_limit')) {
+    db.exec('ALTER TABLE customer_prices ADD COLUMN qty_limit INTEGER DEFAULT 0');
+  }
+} catch (e) {
+  console.error('[MIGRATION] qty_limit:', e.message);
+}
 
 // Older installs created customer_prices with UNIQUE(user_id, product_id) and
 // no min_qty, which cannot express "this price from 20 units up". SQLite cannot
@@ -976,5 +1013,21 @@ try {
   ).run().changes;
   if (junk) console.log(`[MIGRATION] Removed ${junk} unverified pending deposit row(s)`);
 } catch (e) { /* table may not exist yet on a fresh install */ }
+
+// Self-service API keys. Any customer can mint one from the bot menu; there is
+// no application step. The key identifies a telegram user, and purchases are
+// charged to that user's normal wallet at that user's normal price — so the API
+// and the bot can never disagree about price, stock or balance.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS api_keys (
+    api_key      TEXT    PRIMARY KEY,
+    user_id      INTEGER NOT NULL UNIQUE,
+    is_active    INTEGER DEFAULT 1,
+    requests     INTEGER DEFAULT 0,
+    last_used_at TEXT,
+    created_at   TEXT    DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
+`);
 
 module.exports = db;
