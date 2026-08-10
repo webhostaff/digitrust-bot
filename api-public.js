@@ -384,7 +384,20 @@ router.get('/order/:id', requireKey, (req, res) => {
 });
 
 // ── GET /docs ────────────────────────────────────────────────────────────────
+// HTML for people, JSON for machines.
 router.get('/docs', (req, res) => {
+  try {
+    const { docsPage } = require('./docs-page');
+    const origin = `${req.protocol}://${req.get('host')}`;
+    const store  = db.getSetting('store_name', 'Store');
+    res.type('html').send(docsPage(origin, store));
+  } catch (e) {
+    logger.error(`[API v2] /docs page: ${e.message}`);
+    res.redirect('/api/v2/docs.json');
+  }
+});
+
+router.get('/docs.json', (req, res) => {
   const base = `${req.protocol}://${req.get('host')}/api/v2`;
   res.json({
     name: 'Customer API v2',

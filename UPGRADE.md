@@ -730,3 +730,21 @@ been received, but customers can still spend it or ask for it back.
 "Customers with a balance" counts wallets above `0.004`. A balance of `0.002`
 displays as `$0.00`, so listing it as funded would contradict what the interface
 shows — the same cent-rounding rule used for the purchase check.
+
+## API documentation page
+
+`/api/v2/docs` now serves a real page instead of raw JSON. The machine-readable
+version moved to `/api/v2/docs.json`.
+
+It covers: a three-step start (get key → top up → call), every endpoint with a
+copy-ready curl request beside its response, the request fields for `/purchase`
+marked required / optional / conditional, and a status-code ledger written as
+instructions rather than definitions — for a reseller a `402` is not an error,
+it means "go top up", so that is what it says.
+
+### `trust proxy`
+
+Railway terminates TLS at its edge and forwards over plain HTTP, so
+`req.protocol` reported `http` and every URL printed in the docs was wrong —
+resellers would have copied links that do not work. `app.set('trust proxy', true)`
+fixes it.

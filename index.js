@@ -1447,6 +1447,10 @@ process.on('unhandledRejection', (err) => {
 // ── Express health server ─────────────────────────────────────────────────────
 // Keeps Railway happy (HTTP port) and exposes /health + /cryptobot/webhook.
 const app           = express();
+// Railway terminates TLS at its edge and forwards over plain HTTP. Without
+// this, req.protocol reports "http" and every URL printed in the API docs is
+// wrong — resellers would copy links that do not work.
+app.set('trust proxy', true);
 const webhookRouter = require('./handlers/webhook')(bot);
 const resellerApi   = require('./api-reseller'); // ← new: read-only addition, no bot code touched
 
@@ -1463,7 +1467,7 @@ app.listen(config.webhookPort, config.webhookHost, () => {
   logger.info(`HTTP server: http://${config.webhookHost}:${config.webhookPort}/`);
   logger.info(`Health:      http://${config.webhookHost}:${config.webhookPort}/health`);
   logger.info(`Reseller API: http://${config.webhookHost}:${config.webhookPort}/api/v1/docs`);
-  logger.info(`Customer API: http://${config.webhookHost}:${config.webhookPort}/api/v2/docs`);
+  logger.info(`Customer API docs: http://${config.webhookHost}:${config.webhookPort}/api/v2/docs`);
   if (config.cryptobotToken) {
     logger.info(`CryptoBot:   http://${config.webhookHost}:${config.webhookPort}/cryptobot/webhook`);
   }
