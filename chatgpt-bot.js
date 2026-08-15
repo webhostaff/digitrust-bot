@@ -63,6 +63,31 @@ function formatDisplayDate(d) {
   return `${d.getDate()} ${months[d.getMonth()]} ${d.getFullYear()}`;
 }
 
+/**
+ * Is the ChatGPT Business seat available to sell right now?
+ *
+ * Stored as a plain setting rather than a stock count because seats are not
+ * consumed one-by-one from a shelf — either you can take another customer or
+ * you cannot. The admin flips it from the main panel.
+ */
+function isOutOfStock() {
+  try {
+    const row = db.prepare("SELECT value FROM settings WHERE key='cgb_out_of_stock'").get();
+    return String(row?.value || '0') === '1';
+  } catch (e) {
+    return false;   // never block sales because a lookup failed
+  }
+}
+
+/** Admin-editable message shown while sales are paused. */
+function outOfStockMessage() {
+  try {
+    const row = db.prepare("SELECT value FROM settings WHERE key='cgb_out_of_stock_message'").get();
+    if (row?.value) return row.value;
+  } catch (e) { /* fall through to the default */ }
+  return 'Seats are sold out at the moment. We restock regularly — check back soon.';
+}
+
 function getMonthlyPrice() {
   try {
     const row = db.prepare(`SELECT value FROM settings WHERE key='chatgpt_monthly_price'`).get();
@@ -133,6 +158,24 @@ function calculateNextCycleStarts() {
 // WELCOME / CALCULATION SCREEN
 // ════════════════════════════════════════════════════════════════
 async function showCalculation(chatId, userId, extraMonth = false) {
+  // Checked before anything is priced, so the customer never sees an offer we
+  // cannot honour.
+  if (isOutOfStock()) {
+    const buttons = [];
+    if (SUPPORT_BOT_USERNAME) {
+      buttons.push([{ text: '📞 Contact Support', url: `https://t.me/${SUPPORT_BOT_USERNAME}` }]);
+    }
+    buttons.push([{ text: '🔄 Check again', callback_data: 'cgb_recheck' }]);
+    await bot.sendMessage(
+      chatId,
+      `🔴 <b>Out of Stock</b>\n\n` +
+      `📦 ChatGPT Business Seat\n\n` +
+      `${escapeHtml(outOfStockMessage())}`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } }
+    );
+    return;
+  }
+
   const best = calculateBestCycle();
   if (!best) {
     await bot.sendMessage(chatId, '❌ Error: No billing cycles configured. Contact support.');
@@ -280,7 +323,20 @@ bot.on('callback_query', async (q) => {
     return;
   }
 
+  if (data === 'cgb_recheck') {
+    await showCalculation(chatId, userId, false);
+    return;
+  }
+
   if (data === 'order_now') {
+    // Checked again here, not only when the offer was drawn: a customer can sit
+    // on an old message for hours and tap Order after seats have sold out.
+    if (isOutOfStock()) {
+      await bot.sendMessage(chatId,
+        `🔴 <b>Out of Stock</b>\n\n${escapeHtml(outOfStockMessage())}`,
+        { parse_mode: 'HTML' });
+      return;
+    }
     const s = getSession(userId);
     if (!s || s.state !== 'AWAITING_ACTION') {
       await bot.sendMessage(chatId, '⏰ Session expired. Use /start to begin again.');

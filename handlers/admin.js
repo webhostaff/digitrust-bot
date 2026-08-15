@@ -5457,13 +5457,29 @@ async function handleAdminCallback(bot, query) {
   }
 
   // ── ChatGPT Business main panel ──
+  // Pause or resume ChatGPT Business sales. Stored as a flag rather than a
+  // stock count: a seat is not taken off a shelf, either you can serve another
+  // customer or you cannot.
+  if (data === 'admin_cgb_stock') {
+    const nowOut = db.getSetting('cgb_out_of_stock', '0') === '1';
+    db.setSetting('cgb_out_of_stock', nowOut ? '0' : '1');
+    logger.info(`Admin ${userId} set ChatGPT Business out_of_stock=${nowOut ? 0 : 1}`);
+    await answer(nowOut ? '🟢 Selling again' : '🔴 Sales paused');
+    return await handleAdminCallback(bot, { ...query, data: 'admin_cgb_panel' });
+  }
+
   if (data === 'admin_cgb_panel') {
     const cycles = db.getBillingCycles();
     const dbRaw = require('../database/db');
     const price = parseFloat((dbRaw.prepare(`SELECT value FROM settings WHERE key='chatgpt_monthly_price'`).get()?.value) || '50');
     const stats = db.getCgbStats();
 
+    const cgbOut = db.getSetting('cgb_out_of_stock', '0') === '1';
+
     let txt = `🤖 <b>ChatGPT Business — Admin Panel</b>\n\n`;
+    txt += cgbOut
+      ? `🔴 <b>SALES PAUSED</b> — customers see an out-of-stock notice\n\n`
+      : `🟢 <b>Selling</b> — seats are available\n\n`;
     txt += `💰 Monthly Price: <b>$${price.toFixed(2)}</b>\n`;
     txt += `📅 Active Billing Cycles: <b>${cycles.length}</b>\n\n`;
     txt += `━━━━━━━━━━━━━━━━━\n`;
@@ -5481,6 +5497,9 @@ async function handleAdminCallback(bot, query) {
     await bot.editMessageText(txt, {
       chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
       reply_markup: { inline_keyboard: [
+        [{ text: cgbOut ? '🟢 Resume selling' : '🔴 Mark out of stock',
+           callback_data: 'admin_cgb_stock' }],
+        [{ text: '✏️ Out-of-stock message', callback_data: 'admin_setting_cgb_out_of_stock_message' }],
         [{ text: '📊 Recent Orders', callback_data: 'admin_cgb_stats' }],
         [{ text: '📋 Active Subscriptions', callback_data: 'admin_cgb_active' }],
         [{ text: '💰 Set Monthly Price', callback_data: 'admin_cgb_setprice' }],

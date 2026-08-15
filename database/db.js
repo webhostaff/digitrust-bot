@@ -823,6 +823,11 @@ try {
   // "Running low" alerts are off by default — they bury the out-of-stock rows
   // that actually need action. Set to '1' to bring them back.
   ins.run('stock_low_alerts_enabled', '0');
+  // ChatGPT Business seats: a simple on/off rather than a stock count, because
+  // seats are not consumed one at a time from a shelf.
+  ins.run('cgb_out_of_stock', '0');
+  ins.run('cgb_out_of_stock_message',
+    'Seats are sold out at the moment. We restock regularly — check back soon.');
 } catch (e) {
   console.error('[MIGRATION V3] settings seed error:', e.message);
 }

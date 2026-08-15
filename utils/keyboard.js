@@ -584,6 +584,7 @@ const adminSettingsKb = () => mk([
   [btn('🎁 Referral Cashback', 'admin_setting_referral_cashback_enabled'), btn('💸 Cashback %', 'admin_setting_referral_cashback_pct')],
   [btn('💰 Min Order for Cashback', 'admin_setting_referral_min_order')],
   [btn('💤 Stale Product Reminders', 'admin_setting_stale_product_reminder_enabled'), btn('📅 Stale After (days)', 'admin_setting_stale_product_threshold_days')],
+  [btn('💵 Minimum Deposit', 'admin_setting_min_deposit')],
   [btn('🔔 Default Low-Stock Alert', 'admin_setting_low_stock_threshold_default'), btn('🟠 Low-Stock Alerts On/Off', 'admin_setting_stock_low_alerts_enabled')],
   [btn('📡 Admin Alert Chat ID', 'admin_setting_admin_notify_chat_id')],
   [btn('⏰ Deposit Window (min)', 'admin_setting_deposit_max_age_minutes'), btn('🛡 Strict Deposit Mode', 'admin_setting_deposit_strict_mode')],

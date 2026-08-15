@@ -795,3 +795,38 @@ The first version of this called `showProducts(bot, chatId, userId, null)` and
 were written from memory and would have shown the wrong page. The real
 signatures were read from the source and each call is now verified against them
 automatically.
+
+---
+
+# Part 16 — Configurable minimum deposit, ChatGPT Business stock
+
+## Minimum deposit was hard-coded
+
+`handlers/wallet.js` opened with `const MIN_DEPOSIT = 1` and used it in seven
+places. The `MIN_DEPOSIT` environment variable and the `min_deposit` setting
+were both seeded and both **ignored** — changing either did nothing anywhere.
+
+It is now read from settings on every call, so `/admin → ⚙️ Settings →
+💵 Minimum Deposit` takes effect immediately with no redeploy. Values below a
+cent are supported and displayed without trailing zeros (`0.05`, not
+`0.050000`). A blank, non-numeric, zero or negative value falls back to `1`
+rather than letting a typo disable the floor entirely.
+
+## ChatGPT Business out-of-stock switch
+
+`/admin → 🤖 ChatGPT Business → 🔴 Mark out of stock`
+
+The panel header shows the current state, and the message customers see is
+editable from the same screen.
+
+Stored as a flag rather than a stock count: a seat is not taken off a shelf —
+either you can serve another customer or you cannot.
+
+### Checked in two places
+
+* when the offer is drawn, so nobody is quoted a price that cannot be honoured
+* again when Order is tapped, because a customer can sit on an old message for
+  hours and tap it after seats have sold out
+
+The out-of-stock screen offers `🔄 Check again` so a customer can retry without
+restarting.

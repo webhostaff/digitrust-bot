@@ -16,7 +16,25 @@ const {
 const cryptobot = require('../services/cryptobot');
 const logger = require('../utils/logger');
 
-const MIN_DEPOSIT = 1;
+/**
+ * Minimum deposit, read live from settings on every call.
+ *
+ * This used to be a hard-coded `const MIN_DEPOSIT = 1`, so the MIN_DEPOSIT
+ * environment variable and the `min_deposit` setting were both ignored —
+ * changing either had no effect anywhere. Reading it as a function means the
+ * admin can change it from the panel and it takes effect immediately, with no
+ * redeploy.
+ */
+function minDeposit() {
+  const v = parseFloat(db.getSetting('min_deposit', String(config.minDeposit ?? 1)));
+  return Number.isFinite(v) && v > 0 ? v : 1;
+}
+
+/** Shown to customers — trims pointless zeros so 0.5 reads "0.5" not "0.500000". */
+function minDepositLabel() {
+  const v = minDeposit();
+  return v < 0.01 ? v.toFixed(4).replace(/0+$/, '') : String(Number(v.toFixed(2)));
+}
 
 // Track TXIDs currently being verified to prevent rapid duplicate submissions
 const PROCESSING_TXIDS = new Set();
@@ -106,7 +124,7 @@ async function startUsdtAmount(bot, chatId, userId, messageId, network) {
     `   Example: <code>10</code>\n\n` +
     `2️⃣ We will give you an <b>exact amount</b> to send.\n` +
     `3️⃣ You must send that exact figure — it is what identifies your deposit.\n\n` +
-    `💵 Minimum: <b>${MIN_DEPOSIT} USDT</b>`,
+    `💵 Minimum: <b>${minDepositLabel()} USDT</b>`,
     { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: cancelKb('wallet_topup') }
   ).catch(() => {});
 }
@@ -121,8 +139,8 @@ async function handleUsdtAmount(bot, msg) {
   const net    = (sess.data && sess.data.network) === 'TRC20' ? 'TRC20' : 'BEP20';
 
   const base = parseFloat(String(msg.text || '').replace(',', '.').trim());
-  if (isNaN(base) || base < MIN_DEPOSIT) {
-    await bot.sendMessage(chatId, `❌ Enter a valid amount (minimum <b>${MIN_DEPOSIT} USDT</b>).`, { parse_mode: 'HTML' });
+  if (isNaN(base) || base < minDeposit()) {
+    await bot.sendMessage(chatId, `❌ Enter a valid amount (minimum <b>${minDepositLabel()} USDT</b>).`, { parse_mode: 'HTML' });
     return;
   }
   if (base > 10000) {
@@ -186,7 +204,7 @@ async function startBinancePayTopup(bot, chatId, userId, messageId) {
     `⏰ Valid for ${PAYMENT_CONFIRM_VALIDITY_MIN} minutes and can only be used once.\n\n` +
     `<i>Example Order ID:</i>\n` +
     `<code>402117599683977216</code>\n\n` +
-    `💵 Minimum deposit: <b>${MIN_DEPOSIT} USDT</b>`,
+    `💵 Minimum deposit: <b>${minDepositLabel()} USDT</b>`,
     {
       chat_id: chatId, message_id: messageId,
       parse_mode: 'HTML', reply_markup: cancelKb('wallet_topup'),
@@ -215,7 +233,7 @@ async function startCryptobotTopup(bot, chatId, userId, messageId) {
     `2️⃣ You'll receive a payment link.\n` +
     `3️⃣ Pay via @CryptoBot on Telegram.\n` +
     `4️⃣ Your wallet is credited automatically.\n\n` +
-    `💵 Minimum: <b>${MIN_DEPOSIT} USDT</b>`,
+    `💵 Minimum: <b>${minDepositLabel()} USDT</b>`,
     {
       chat_id: chatId, message_id: messageId,
       parse_mode: 'HTML', reply_markup: cancelKb('wallet_topup'),
@@ -539,8 +557,8 @@ async function handleCryptobotAmount(bot, msg) {
   const asset  = (sess.data && sess.data.asset) || 'USDT';
 
   const wantedAmount = parseFloat(text.replace(',', '.'));
-  if (isNaN(wantedAmount) || wantedAmount < MIN_DEPOSIT) {
-    await bot.sendMessage(chatId, `❌ Enter a valid amount (minimum <b>${MIN_DEPOSIT} ${asset}</b>).`, { parse_mode: 'HTML' });
+  if (isNaN(wantedAmount) || wantedAmount < minDeposit()) {
+    await bot.sendMessage(chatId, `❌ Enter a valid amount (minimum <b>${minDepositLabel()} ${asset}</b>).`, { parse_mode: 'HTML' });
     return;
   }
   if (wantedAmount > 10000) {
@@ -647,10 +665,10 @@ async function creditFromVerifiedDeposit(bot, chatId, userId, info) {
   const { identifier, amount, network, asset, address, method } = info;
 
   const safeAmount = Number(Number(amount).toFixed(6));
-  if (safeAmount + 1e-9 < MIN_DEPOSIT) {
+  if (safeAmount + 1e-9 < minDeposit()) {
     await bot.sendMessage(
       chatId,
-      `❌ Minimum deposit is <b>${MIN_DEPOSIT} USDT</b>.\nReceived: <b>${safeAmount.toFixed(6)} USDT</b>.`,
+      `❌ Minimum deposit is <b>${minDepositLabel()} USDT</b>.\nReceived: <b>${safeAmount.toFixed(6)} USDT</b>.`,
       { parse_mode: 'HTML' }
     );
     return;
