@@ -748,3 +748,50 @@ Railway terminates TLS at its edge and forwards over plain HTTP, so
 `req.protocol` reported `http` and every URL printed in the docs was wrong —
 resellers would have copied links that do not work. `app.set('trust proxy', true)`
 fixes it.
+
+---
+
+# Part 15 — Persistent menu bar for customers
+
+The main bot used inline keyboards only, so the menu scrolled out of reach as
+soon as a few messages arrived — the same problem the support console had.
+
+Customers now get a **ReplyKeyboard** pinned to the bottom of the chat:
+
+```
+[ 🛍 Products  ] [ 💰 Wallet  ]
+[ 📦 My Orders ] [ 💬 Support ]
+```
+
+Four buttons, not more: on a phone a third row pushes the conversation off
+screen, and everything else is reachable from these four.
+
+Labels are localized, and the bar is re-sent when the language changes so it
+never sits in the previous language.
+
+## The risk this had to avoid
+
+Bar taps arrive as **ordinary text messages**. Handled in the wrong order, a tap
+on `🛍 Products` during the quantity step would be parsed as a quantity, and
+during a top-up it would be parsed as a TxID.
+
+So the interceptor is registered as the **first** `bot.on('message')` handler,
+before every input handler, and returns immediately once it matches. A tap also
+clears any half-finished input, which is what a person expects from a navigation
+button.
+
+Matching is done against **all four languages**, not just the customer's current
+one: after switching language the old bar stays on screen until Telegram
+replaces it, and those taps must still work.
+
+Matching is exact-equality per label, so ordinary input is never swallowed —
+`Products`, `🛍`, `5`, an email, a TxID and `I have a question about 🛍 Products`
+all pass through untouched. Verified: 14/14.
+
+## Signatures checked, not assumed
+
+The first version of this called `showProducts(bot, chatId, userId, null)` and
+`showSupport(bot, chatId, userId, null)`. Neither takes a `userId` — the calls
+were written from memory and would have shown the wrong page. The real
+signatures were read from the source and each call is now verified against them
+automatically.

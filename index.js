@@ -23,11 +23,13 @@ const buyHandler     = require('./handlers/buy');
 const walletHandler  = require('./handlers/wallet');
 const { showOrders, showOrderDetail }                   = require('./handlers/orders');
 const supportHandler = require('./handlers/support');
+const productsHandler = require('./handlers/products');
+const ordersHandler   = require('./handlers/orders');
 const adminHandler   = require('./handlers/admin');
 const session        = require('./handlers/session');
 const { States }     = require('./handlers/session');
 const { ensureUser, checkJoinGate, isMember } = require('./middlewares/auth');
-const { mainMenuKb, backKb } = require('./utils/keyboard');
+const { mainMenuKb, backKb, persistentMenuKb, matchNavButton } = require('./utils/keyboard');
 const { escapeHtml, formatPrice } = require('./utils/format');
 const { notifyAdmin } = require('./services/adminNotify');
 const db = require('./database/queries');
@@ -247,6 +249,43 @@ bot.onText(/\/diag_emoji/, async (msg) => {
 });
 
 // Capture for diagnostic
+// ═══════════════════════════════════════════════════════════════════════════
+// PERSISTENT BAR — tap interception
+//
+// Registered FIRST, on purpose. Bar taps arrive as ordinary text, so if this
+// ran after the state handlers a tap on "🛍 Products" during the quantity step
+// would be parsed as a quantity, and during a top-up as a TxID. Handling it
+// here and returning means a nav button always navigates.
+//
+// A tap also abandons whatever half-finished input was in progress, which is
+// what a person expects from a navigation button.
+// ═══════════════════════════════════════════════════════════════════════════
+bot.on('message', async (msg) => {
+  try {
+    if (!msg.from || msg.chat.type !== 'private' || !msg.text) return;
+    const navKey = matchNavButton(msg.text);
+    if (!navKey) return;
+
+    const userId = msg.from.id;
+    const chatId = msg.chat.id;
+    session.clear(userId);
+
+    // Signatures differ between these modules — taken from the source, not
+    // assumed: showProducts and showSupport do not take a userId.
+    if (navKey === 'btn_products') {
+      await productsHandler.showProducts(bot, chatId, null, 0);
+    } else if (navKey === 'btn_wallet') {
+      await walletHandler.showWallet(bot, chatId, userId, null);
+    } else if (navKey === 'btn_orders') {
+      await ordersHandler.showOrders(bot, chatId, userId, null, 'all', 0);
+    } else if (navKey === 'btn_support') {
+      await supportHandler.showSupport(bot, chatId, null);
+    }
+  } catch (e) {
+    logger.error(`Nav bar tap failed: ${e.message}`);
+  }
+});
+
 bot.on('message', async (msg) => {
   if (msg.from && session.get(msg.from.id).state === 'AWAIT_DIAG_EMOJI') {
     const text = msg.text || msg.caption || '';

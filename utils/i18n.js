@@ -15,6 +15,7 @@ const translations = {
 
     // Main menu
     main_menu_title: '🏠 <b>Main Menu</b>',
+    nav_bar_hint: '⌨️ <i>The bar below stays put — tap any section at any time.</i>',
     btn_products: '🛍 Products',
     btn_preorders: '🔜 Pre-Orders',
     btn_wallet: '💰 Wallet',
@@ -173,6 +174,7 @@ const translations = {
     lang_spanish: '🇪🇸 Español',
 
     main_menu_title: '🏠 <b>القائمة الرئيسية</b>',
+    nav_bar_hint: '⌨️ <i>الأزرار بالأسفل ثابتة — اضغط أي قسم في أي وقت.</i>',
     btn_products: '🛍 المنتجات',
     btn_preorders: '🔜 الحجوزات المسبقة',
     btn_wallet: '💰 المحفظة',
@@ -312,6 +314,7 @@ const translations = {
     lang_spanish: '🇪🇸 Español',
 
     main_menu_title: '🏠 <b>Menu Chính</b>',
+    nav_bar_hint: '⌨️ <i>Thanh bên dưới luôn hiển thị — chạm vào bất kỳ mục nào.</i>',
     btn_products: '🛍 Sản phẩm',
     btn_preorders: '🔜 Đặt trước',
     btn_wallet: '💰 Ví',
@@ -451,6 +454,7 @@ const translations = {
     lang_spanish: '🇪🇸 Español',
 
     main_menu_title: '🏠 <b>Menú Principal</b>',
+    nav_bar_hint: '⌨️ <i>La barra de abajo es fija — toca cualquier sección.</i>',
     btn_products: '🛍 Productos',
     btn_preorders: '🔜 Pre-Pedidos',
     btn_wallet: '💰 Cartera',

@@ -2,7 +2,7 @@
 
 const db      = require('../database/queries');
 const session = require('./session');
-const { mainMenuKb, backKb, languagePickerKb } = require('../utils/keyboard');
+const { mainMenuKb, backKb, languagePickerKb, persistentMenuKb } = require('../utils/keyboard');
 const { t } = require('../utils/i18n');
 const { formatReward } = require('../utils/format');
 // `logger` was used on line 53 but never required, so every referral attempt
@@ -26,6 +26,18 @@ async function sendMainMenu(bot, chatId, userName = '', userId = null) {
     `${greetText}\n\n${welcomeKey}\n\n${chooseText}`,
     { parse_mode: 'HTML', reply_markup: mainMenuKb(lang) }
   );
+
+  // Install the persistent bottom bar. A ReplyKeyboard cannot share a message
+  // with an inline keyboard, so it rides on a separate short message. Telegram
+  // remembers it for the chat, so this only needs to happen on /start and when
+  // the language changes.
+  try {
+    await bot.sendMessage(chatId, t(lang, 'nav_bar_hint'), {
+      parse_mode: 'HTML',
+      reply_markup: persistentMenuKb(lang),
+      disable_notification: true,
+    });
+  } catch (e) { /* never block the menu on this */ }
 }
 
 // Show language picker (called on first /start or from menu)

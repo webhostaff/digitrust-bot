@@ -17,6 +17,48 @@ const languagePickerKb = () => mk([
 
 const { t } = require('./i18n');
 
+/**
+ * Persistent bottom bar for customers.
+ *
+ * Inline keyboards live on one message and scroll out of reach as soon as a few
+ * messages arrive. This bar sits at the bottom of the chat permanently, so the
+ * four things people actually use are always one tap away.
+ *
+ * Kept to four: on a phone a fifth row pushes the conversation off screen, and
+ * everything else is reachable from these four.
+ */
+const NAV_KEYS = ['btn_products', 'btn_wallet', 'btn_orders', 'btn_support'];
+
+const persistentMenuKb = (lang = 'en') => ({
+  keyboard: [
+    [{ text: t(lang, 'btn_products') }, { text: t(lang, 'btn_wallet') }],
+    [{ text: t(lang, 'btn_orders') },   { text: t(lang, 'btn_support') }],
+  ],
+  resize_keyboard: true,
+  is_persistent: true,
+});
+
+/**
+ * Which nav button a message is, if any.
+ *
+ * Taps arrive as ordinary text, so this has to run before any input handler —
+ * otherwise tapping "🛍 Products" while entering a quantity would be parsed as
+ * a number, and while entering a TxID would be parsed as a transaction hash.
+ *
+ * Every language is checked, not just the customer's current one: someone who
+ * switches language still has the old bar on screen until Telegram replaces it.
+ */
+function matchNavButton(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return null;
+  for (const lang of ['en', 'ar', 'vi', 'es']) {
+    for (const key of NAV_KEYS) {
+      if (t(lang, key) === raw) return key;
+    }
+  }
+  return null;
+}
+
 const mainMenuKb = (lang = 'en') => mk([
   [btn(t(lang, 'btn_products'), 'menu_products'),    btn(t(lang, 'btn_preorders'), 'menu_preorders')],
   [btn(t(lang, 'btn_wallet'), 'menu_wallet'),         btn(t(lang, 'btn_orders'), 'menu_orders')],
@@ -592,7 +634,9 @@ const adminEmojiLibraryKb = (emojis) => {
 };
 
 module.exports = {
-  mainMenuKb, joinGateKb, productsKb, productDetailKb,
+  mainMenuKb,
+  persistentMenuKb,
+  matchNavButton, joinGateKb, productsKb, productDetailKb,
   languagePickerKb,
   orderConfirmKb, paymentMethodKb, walletMenuKb,
   walletTopupMethodKb, cryptobotAssetKb,
