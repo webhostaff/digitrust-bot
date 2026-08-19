@@ -968,3 +968,44 @@ still flips, so a completed order is never left looking untouched.
 
 Both order paths (direct payment and CryptoBot) now share one `orderCard()`
 builder instead of two copies of the same message.
+
+---
+
+# Part 20 — Wrong-asset deposits (Binance Pay)
+
+## The attack
+
+Reported by another shop owner: a customer sent ~160,000,000 BTTC — worth a few
+cents — where the bot expected 160 USDT. The bot read `amount: 160` (or a large
+number) and credited it as dollars, because nothing checked *which asset* had
+arrived. Binance Pay carries any listed token, so the amount alone says nothing
+about value.
+
+## Where this bot stood
+
+| Path | Before |
+|---|---|
+| USDT deposit by TxID | **Safe** — the Binance history is queried with `coin: 'USDT'`, and `services/binance.js` re-checks `match.coin` explicitly |
+| Binance Pay → wallet top-up | Safe — `handlers/wallet.js` checked `result.currency` |
+| Binance Pay → direct purchase | Safe — `handlers/buy.js` checked `result.currency` |
+| Binance Pay → **ChatGPT Business** | **VULNERABLE** — only the amount was compared |
+
+`verifyBinancePayOrder` returned `currency` but never checked it, leaving each
+caller to remember. Two of the three did; the ChatGPT bot did not.
+
+A $14.94 subscription could therefore be bought with 14.94 BTTC — about
+$0.0000067.
+
+## The fix
+
+Two layers:
+
+1. **`services/binance.js`** now rejects any Binance Pay transfer whose
+   `currency` is not USDT, before returning `found: true`. Every caller is
+   covered whether it remembers to check or not.
+2. **`chatgpt-bot.js`** checks the currency itself as well, before the amount
+   comparison.
+
+Centralising it in the verifier is the important half: a guard each caller has
+to remember will eventually be forgotten again — that is exactly how this one
+got through.

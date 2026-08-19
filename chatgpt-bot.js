@@ -669,6 +669,19 @@ bot.on('message', async (msg) => {
           await bot.sendMessage(chatId, '❌ ' + (result.message || 'Payment not found.'));
           return;
         }
+        // The asset must be USDT before the amount means anything. Without this
+        // a sender could transfer 14.94 BTTC — worth a fraction of a cent — and
+        // the amount check below would happily match it against a $14.94 price.
+        // services/binance.js now rejects non-USDT too; this is the second layer.
+        if (String(result.currency || '').toUpperCase() !== 'USDT') {
+          await bot.sendMessage(chatId,
+            `❌ <b>Wrong currency.</b>\n\n` +
+            `That transfer was <b>${escapeHtml(String(result.currency || 'unknown'))}</b>, ` +
+            `but only <b>USDT</b> is accepted.`,
+            { parse_mode: 'HTML' });
+          return;
+        }
+
         // Check amount
         if (Math.abs(result.amount - s.finalPrice) > 0.05) {
           await bot.sendMessage(chatId,

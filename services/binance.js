@@ -447,10 +447,32 @@ async function verifyBinancePayOrder(rawId) {
     };
   }
 
+  // ── FRAUD PROTECTION: the asset must be USDT ────────────────────────────
+  //
+  // The amount alone says nothing about value. Binance Pay will happily carry
+  // any listed token, so without this a sender could transfer 160,000,000 BTTC
+  // — worth a few cents — and the bot would read "amount: 160000000" and credit
+  // it as if it were dollars. `currency` was being read here for the response
+  // but never actually checked.
+  const payCurrency = String(match.currency || '').toUpperCase();
+  if (payCurrency !== 'USDT') {
+    logger.warn(
+      `[VERIFY-PAY] REJECTED — order ${orderId} is ${match.amount} ${payCurrency}, not USDT`
+    );
+    return {
+      found: false, reason: 'wrong_coin',
+      message:
+        `❌ <b>Wrong currency.</b>\n\n` +
+        `This transfer was <b>${payCurrency || 'an unknown asset'}</b>, but only ` +
+        `<b>USDT</b> is accepted.\n\n` +
+        `Please send USDT via Binance Pay and try again.`,
+    };
+  }
+
   return {
     found: true,
     amount,
-    currency: match.currency,
+    currency: payCurrency,
     transactionId: match.transactionId,
     orderType: match.orderType,
   };
