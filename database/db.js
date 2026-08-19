@@ -650,6 +650,16 @@ db.exec(`
   if (!cols.includes('read_at')) {
     db.exec('ALTER TABLE support_messages ADD COLUMN read_at TEXT DEFAULT NULL');
   }
+  // Telegram's id for this message in the CUSTOMER's chat. Without it a reply
+  // cannot be recalled — deleting needs the id, and it was never stored.
+  if (!cols.includes('tg_msg_id')) {
+    db.exec('ALTER TABLE support_messages ADD COLUMN tg_msg_id INTEGER DEFAULT NULL');
+  }
+  // Set when a reply is recalled. The row is kept rather than removed so the
+  // transcript still shows that something was sent and then withdrawn.
+  if (!cols.includes('deleted_at')) {
+    db.exec('ALTER TABLE support_messages ADD COLUMN deleted_at TEXT DEFAULT NULL');
+  }
 }
 
 // ── support_threads ──────────────────────────────────────────────────────────

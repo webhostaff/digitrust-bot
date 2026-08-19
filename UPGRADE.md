@@ -830,3 +830,94 @@ either you can serve another customer or you cannot.
 
 The out-of-stock screen offers `🔄 Check again` so a customer can retry without
 restarting.
+
+---
+
+# Part 17 — Recall a reply, copy a customer message
+
+The conversation is rendered as one transcript message, so individual lines
+cannot carry buttons. Both actions therefore work the same way: pick from a
+short list of recent messages, then act on the one you picked.
+
+Two new buttons in the chat view: `📋 Copy text` and `🗑 Recall reply`.
+
+## 🗑 Recall a reply
+
+Removes one of your own messages from the customer's chat as well as yours.
+
+This needed a schema change: `support_messages.tg_msg_id` now stores the id
+Telegram assigns in the **customer's** chat. It was never captured before, and
+without it a message cannot be deleted at all.
+
+The row is **marked** deleted, not removed — the transcript keeps showing it,
+struck through and tagged `(recalled)`. Support history should not quietly
+rewrite itself, and you need to remember what you withdrew.
+
+### The 48-hour limit
+
+Telegram will not let a bot delete its own messages after 48 hours. When that
+happens the screen says so plainly and warns that the customer can still see the
+message, rather than reporting a success that did not happen.
+
+Replies sent before this update have no `tg_msg_id` and are excluded from the
+list — they genuinely cannot be recalled.
+
+## 📋 Copy a customer message
+
+Pick a message and it comes back on its own as a code block, so one tap copies
+exactly that text and nothing else.
+
+Wallet addresses, emails and order numbers are painful to select out of a long
+transcript on a phone; this is what the feature is for. Media messages are left
+out of the list since there is nothing to copy.
+
+Tested: 13/13 — list filtering by direction and customer, a 34-character TRC20
+address copied without truncation, recall marking without deleting, no double
+recall, and exclusion of replies with no stored message id.
+
+---
+
+# Part 18 — Command menu (desktop fix)
+
+## The problem
+
+Telegram Desktop does not display a ReplyKeyboard the way phones do. It hides it
+behind a small icon in the input field, and frequently shows nothing at all — so
+the persistent bar added in Part 15 was invisible on a computer.
+
+## The fix
+
+Register the bot's commands with Telegram, which puts a **☰ Menu** button beside
+the input. That behaves identically on desktop and phone, so it is the
+dependable route in on a computer.
+
+Commands were already implemented in both bots (`/inbox`, `/payments`, …) but
+had never been registered, so Telegram did not know they existed and the menu
+button never appeared.
+
+### Scoping
+
+Registration is scoped so the wrong people never see the wrong commands:
+
+| Audience | Sees |
+|---|---|
+| Support bot — customers | `/start` only |
+| Support bot — staff | menu, inbox, payments, manual, refunds, alerts, close |
+| Main bot — customers | start, products, wallet, orders, support |
+| Main bot — admins | the above plus `/admin` |
+
+Staff and admin lists use `BotCommandScopeChat`, registered per chat id.
+
+### First-time staff
+
+Scoped registration fails for anyone who has never opened the bot — Telegram has
+no chat to attach the scope to. `ensureStaffCommands()` re-registers on the first
+interaction, so a new staff member does not need a restart.
+
+### New shortcuts in the main bot
+
+`/products`, `/wallet`, `/orders`, `/support` open the same screens as the bar.
+
+Verified: none of them is captured by the nav-bar interceptor, and the state
+handler already skips any message starting with `/` — so typing a command while
+entering a quantity or a TxID does not get parsed as input. 8/8.

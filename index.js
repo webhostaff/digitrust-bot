@@ -250,6 +250,67 @@ bot.onText(/\/diag_emoji/, async (msg) => {
 
 // Capture for diagnostic
 // ═══════════════════════════════════════════════════════════════════════════
+// COMMAND MENU
+//
+// The persistent bar is a ReplyKeyboard, which Telegram Desktop hides behind a
+// small icon rather than showing outright. The ☰ command menu behaves the same
+// on desktop and phone, so it is the dependable route in on a computer.
+//
+// Admin commands are scoped to admin chats only — customers never see /admin.
+// ═══════════════════════════════════════════════════════════════════════════
+(async () => {
+  try {
+    await bot.setMyCommands([
+      { command: 'start',    description: '🏠 Main menu' },
+      { command: 'products', description: '🛍 Browse products' },
+      { command: 'wallet',   description: '💰 Wallet and top up' },
+      { command: 'orders',   description: '📦 My orders' },
+      { command: 'support',  description: '💬 Contact support' },
+    ]);
+
+    for (const id of config.adminIds) {
+      try {
+        await bot.setMyCommands([
+          { command: 'admin',    description: '🔧 Admin panel' },
+          { command: 'start',    description: '🏠 Main menu' },
+          { command: 'products', description: '🛍 Browse products' },
+          { command: 'wallet',   description: '💰 Wallet and top up' },
+          { command: 'orders',   description: '📦 My orders' },
+          { command: 'support',  description: '💬 Contact support' },
+        ], { scope: { type: 'chat', chat_id: id } });
+      } catch (e) {
+        logger.warn(`Admin commands for ${id}: ${e.message}`);
+      }
+    }
+    logger.info('Bot command menu registered');
+  } catch (e) {
+    logger.warn(`Command registration failed: ${e.message}`);
+  }
+})();
+
+// Shortcuts for the commands above — the same screens the bar opens.
+bot.onText(/^\/products$/, async (msg) => {
+  if (msg.chat.type !== 'private') return;
+  session.clear(msg.from.id);
+  await productsHandler.showProducts(bot, msg.chat.id, null, 0);
+});
+bot.onText(/^\/wallet$/, async (msg) => {
+  if (msg.chat.type !== 'private') return;
+  session.clear(msg.from.id);
+  await walletHandler.showWallet(bot, msg.chat.id, msg.from.id, null);
+});
+bot.onText(/^\/orders$/, async (msg) => {
+  if (msg.chat.type !== 'private') return;
+  session.clear(msg.from.id);
+  await ordersHandler.showOrders(bot, msg.chat.id, msg.from.id, null, 'all', 0);
+});
+bot.onText(/^\/support$/, async (msg) => {
+  if (msg.chat.type !== 'private') return;
+  session.clear(msg.from.id);
+  await supportHandler.showSupport(bot, msg.chat.id, null);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // PERSISTENT BAR — tap interception
 //
 // Registered FIRST, on purpose. Bar taps arrive as ordinary text, so if this

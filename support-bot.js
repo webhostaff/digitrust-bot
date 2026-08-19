@@ -104,6 +104,57 @@ logger.info('🎫 Support Bot V4 started (read receipts + history + manual deliv
 // console, so there is a single place to watch.
 require('./services/adminNotify').setSupportBot(bot);
 
+// ═══════════════════════════════════════════════════════════════════════════
+// COMMAND MENU
+//
+// Telegram Desktop does not show a ReplyKeyboard the way phones do — it hides
+// it behind a small icon in the input field, and often not at all. The command
+// menu (the ☰ button beside the input) behaves identically on both, so it is
+// the reliable way in on desktop.
+//
+// Scoped deliberately: staff commands are registered per staff chat, so
+// customers writing to this same bot never see /inbox or /payments.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const STAFF_COMMANDS = [
+  { command: 'menu',     description: '🎛 Console — counts for every section' },
+  { command: 'inbox',    description: '📥 Conversations' },
+  { command: 'payments', description: '💳 Payments awaiting action' },
+  { command: 'manual',   description: '📦 Manual delivery requests' },
+  { command: 'refunds',  description: '🔄 Refund requests' },
+  { command: 'alerts',   description: '🔴 Products out of stock' },
+  { command: 'close',    description: '✅ Close the open conversation' },
+];
+
+const CUSTOMER_COMMANDS = [
+  { command: 'start', description: '💬 Contact support' },
+];
+
+async function registerCommands() {
+  try {
+    // Everyone else — just /start.
+    await bot.setMyCommands(CUSTOMER_COMMANDS);
+
+    // Each staff member gets the full list, in their own chat only.
+    for (const id of SUPPORT_STAFF) {
+      try {
+        await bot.setMyCommands(STAFF_COMMANDS, {
+          scope: { type: 'chat', chat_id: id },
+        });
+      } catch (e) {
+        // A staff member who has never opened the bot has no chat yet; the
+        // commands register the first time they do.
+        logger.warn(`Support commands for ${id}: ${e.message}`);
+      }
+    }
+    logger.info(`Support bot commands registered for ${SUPPORT_STAFF.size} staff member(s)`);
+  } catch (e) {
+    logger.warn(`Support command registration failed: ${e.message}`);
+  }
+}
+
+registerCommands();
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function escapeHtml(s) {
@@ -243,8 +294,27 @@ function matchBarButton(text) {
   return null;
 }
 
+/**
+ * Make sure this staff chat has its command list.
+ *
+ * Registration at startup fails for anyone who has never opened the bot —
+ * Telegram has no chat to scope to yet. Re-registering on first interaction
+ * closes that gap without a restart.
+ */
+const commandsDone = new Set();
+async function ensureStaffCommands(chatId) {
+  if (commandsDone.has(chatId)) return;
+  commandsDone.add(chatId);
+  try {
+    await bot.setMyCommands(STAFF_COMMANDS, { scope: { type: 'chat', chat_id: chatId } });
+  } catch (e) {
+    logger.warn(`ensureStaffCommands(${chatId}): ${e.message}`);
+  }
+}
+
 /** Show the bar and a short status line. Used on /start and after /close. */
 async function showStaffHome(chatId) {
+  await ensureStaffCommands(chatId);
   const unread   = queries.getSupportUnreadThreads();
   const md       = queries.getManualDeliveryCounts();
   const payments = queries.countDepositReviews('pending') + queries.countPendingDeposits();
@@ -566,11 +636,16 @@ async function showChat(staffChatId, targetUserId, page = 0, messageId = null) {
     const mine = m.direction === 'out';
     const who  = mine ? '📤 <b>Support</b>' : '📩 <b>Customer</b>';
     const tick = !mine ? (m.is_read ? ' ✓✓' : ' ✓') : '';
+    // A recalled reply stays in the transcript, marked — support history should
+    // not quietly rewrite itself.
+    const gone = m.deleted_at ? ' 🗑' : '';
 
-    let line = `${who} · <i>${time}</i>${tick}\n`;
+    let line = `${who} · <i>${time}</i>${tick}${gone}\n`;
     if (m.media_type) {
       const icon = { photo: '🖼', video: '🎬', voice: '🎤', document: '📎' }[m.media_type] || '📁';
       line += `${icon} <i>[${m.media_type}]</i>${m.content ? ' ' + escapeHtml(m.content) : ''}\n`;
+    } else if (m.deleted_at) {
+      line += `<s>${escapeHtml(String(m.content || '').slice(0, 60))}</s> <i>(recalled)</i>\n`;
     } else {
       line += `${m.content ? escapeHtml(m.content) : '<i>(empty)</i>'}\n`;
     }
@@ -587,6 +662,10 @@ async function showChat(staffChatId, targetUserId, page = 0, messageId = null) {
   if (mediaCount) {
     kbRows.push([{ text: `📎 Show ${mediaCount} attachment(s)`, callback_data: `chat_media_${targetUserId}_${currentPage}` }]);
   }
+  kbRows.push([
+    { text: '📋 Copy text',   callback_data: `cpy_list_${targetUserId}` },
+    { text: '🗑 Recall reply', callback_data: `del_list_${targetUserId}` },
+  ]);
   kbRows.push([{ text: '📦 Their orders', callback_data: `cust_orders_${targetUserId}` }]);
   kbRows.push([
     { text: '🔄 Refresh', callback_data: `chat_p_${targetUserId}_${currentPage}` },
@@ -603,6 +682,139 @@ async function showChat(staffChatId, targetUserId, page = 0, messageId = null) {
   }
 
   await send(staffChatId, messageId, full, { inline_keyboard: kbRows });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RECALL A REPLY  /  COPY A CUSTOMER MESSAGE
+//
+// The conversation is rendered as one transcript message, so individual lines
+// carry no buttons. Both actions therefore work the same way: pick from a short
+// list, then act on the one you picked.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const PICK_LIMIT = 10;
+
+const recentOut = rawDb.prepare(`
+  SELECT * FROM support_messages
+  WHERE user_id = ? AND direction = 'out' AND deleted_at IS NULL AND tg_msg_id IS NOT NULL
+  ORDER BY id DESC LIMIT ?
+`);
+const recentIn = rawDb.prepare(`
+  SELECT * FROM support_messages
+  WHERE user_id = ? AND direction = 'in'
+  ORDER BY id DESC LIMIT ?
+`);
+const msgById = rawDb.prepare('SELECT * FROM support_messages WHERE id = ?');
+
+/** One-line label for a message in a picker. */
+function pickLabel(m) {
+  if (m.media_type) return `${{ photo: '🖼', video: '🎬', voice: '🎤', document: '📎' }[m.media_type] || '📁'} ${m.media_type}`;
+  const c = String(m.content || '').replace(/\s+/g, ' ').trim();
+  return c ? c.slice(0, 34) : '(empty)';
+}
+
+/** Pick which of your own replies to recall. */
+async function showDeletePicker(chatId, messageId, targetUserId) {
+  const rows = recentOut.all(targetUserId, PICK_LIMIT);
+  if (!rows.length) {
+    await bot.sendMessage(chatId, 'ℹ️ Nothing of yours left to recall in this chat.');
+    return;
+  }
+  const kb = rows.map((m) => [{
+    text: `🗑 ${formatTime(m.created_at)} · ${pickLabel(m)}`,
+    callback_data: `del_ask_${m.id}`,
+  }]);
+  kb.push([{ text: '🔙 Back to chat', callback_data: `chat_${targetUserId}` }]);
+
+  await send(chatId, messageId,
+    `🗑 <b>Recall a reply</b>\n\n` +
+    `Pick the message to remove. It disappears from the customer's chat as well ` +
+    `as yours.\n\n` +
+    `<i>Telegram only lets a bot delete its own messages for 48 hours. Anything ` +
+    `older can no longer be recalled — it will still be marked as withdrawn on ` +
+    `your side.</i>`,
+    { inline_keyboard: kb });
+}
+
+/** Pick a customer message to receive on its own, ready to copy. */
+async function showCopyPicker(chatId, messageId, targetUserId) {
+  const rows = recentIn.all(targetUserId, PICK_LIMIT).filter((m) => m.content);
+  if (!rows.length) {
+    await bot.sendMessage(chatId, 'ℹ️ This customer has not sent any text yet.');
+    return;
+  }
+  const kb = rows.map((m) => [{
+    text: `📋 ${formatTime(m.created_at)} · ${pickLabel(m)}`,
+    callback_data: `cpy_${m.id}`,
+  }]);
+  kb.push([{ text: '🔙 Back to chat', callback_data: `chat_${targetUserId}` }]);
+
+  await send(chatId, messageId,
+    `📋 <b>Copy a customer message</b>\n\n` +
+    `Pick one and it comes back on its own, as a code block — tap it to copy ` +
+    `just that text.\n\n` +
+    `<i>Useful for wallet addresses, emails and order numbers, which are awkward ` +
+    `to select out of the transcript.</i>`,
+    { inline_keyboard: kb });
+}
+
+/** Send one message's exact text, alone, so a tap copies only that. */
+async function sendCopyable(chatId, msgRowId) {
+  const m = msgById.get(msgRowId);
+  if (!m || !m.content) {
+    await bot.sendMessage(chatId, '❌ Nothing to copy here.');
+    return;
+  }
+  await bot.sendMessage(chatId,
+    `<code>${escapeHtml(m.content)}</code>`,
+    { parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: '📋 Pick another', callback_data: `cpy_list_${m.user_id}` }],
+        [{ text: '🔙 Back to chat', callback_data: `chat_${m.user_id}` }],
+      ] } });
+}
+
+/**
+ * Remove a reply from the customer's chat.
+ *
+ * The row is marked deleted rather than removed, so the transcript still shows
+ * that something was sent and withdrawn — support history should not quietly
+ * rewrite itself.
+ */
+async function recallReply(chatId, messageId, msgRowId) {
+  const m = msgById.get(msgRowId);
+  if (!m) {
+    await bot.sendMessage(chatId, '❌ Message not found.');
+    return;
+  }
+  if (m.deleted_at) {
+    await bot.sendMessage(chatId, 'ℹ️ Already recalled.');
+    return;
+  }
+
+  let gone = false, why = '';
+  try {
+    await bot.deleteMessage(m.user_id, m.tg_msg_id);
+    gone = true;
+  } catch (e) {
+    why = /too old|can't be deleted|message to delete not found/i.test(e.message)
+      ? 'Telegram will not delete messages older than 48 hours.'
+      : e.message;
+  }
+
+  rawDb.prepare("UPDATE support_messages SET deleted_at = datetime('now') WHERE id = ?")
+    .run(msgRowId);
+  logger.info(`Support recalled message #${msgRowId} for user ${m.user_id} (removed=${gone})`);
+
+  await send(chatId, messageId,
+    gone
+      ? `✅ <b>Recalled.</b>\n\nThe message is gone from the customer's chat.`
+      : `⚠️ <b>Could not remove it from their chat.</b>\n\n${escapeHtml(why)}\n\n` +
+        `<i>It is marked as withdrawn in your transcript, but the customer can still see it.</i>`,
+    { inline_keyboard: [
+      [{ text: '🗑 Recall another', callback_data: `del_list_${m.user_id}` }],
+      [{ text: '🔙 Back to chat', callback_data: `chat_${m.user_id}` }],
+    ] });
 }
 
 /** Replay the media attachments of one conversation page. */
@@ -1014,6 +1226,7 @@ bot.on('callback_query', async (q) => {
   const data   = q.data || '';
   const chatId = q.message.chat.id;
   const msgId  = q.message.message_id;
+  ensureStaffCommands(chatId);   // fire and forget
 
   try {
     if (data === 'noop') return;
@@ -1036,6 +1249,39 @@ bot.on('callback_query', async (q) => {
       await replayMedia(chatId, parseInt(parts[2], 10), parseInt(parts[3], 10));
       return;
     }
+    // ── Recall a reply / copy a customer message ─────────────────────────
+    if (/^cpy_list_\d+$/.test(data)) {
+      await showCopyPicker(chatId, msgId, parseInt(data.split('_').pop(), 10));
+      return;
+    }
+    if (/^cpy_\d+$/.test(data)) {
+      await sendCopyable(chatId, parseInt(data.split('_').pop(), 10));
+      return;
+    }
+    if (/^del_list_\d+$/.test(data)) {
+      await showDeletePicker(chatId, msgId, parseInt(data.split('_').pop(), 10));
+      return;
+    }
+    if (/^del_ask_\d+$/.test(data)) {
+      const id = parseInt(data.split('_').pop(), 10);
+      const m = msgById.get(id);
+      if (!m) { await bot.sendMessage(chatId, '❌ Not found.'); return; }
+      await send(chatId, msgId,
+        `⚠️ <b>Recall this reply?</b>\n\n` +
+        `<i>${formatFull(m.created_at)}</i>\n\n` +
+        `${m.content ? escapeHtml(String(m.content).slice(0, 300)) : `[${m.media_type}]`}\n\n` +
+        `It will be removed from the customer's chat. This cannot be undone.`,
+        { inline_keyboard: [
+          [{ text: '🗑 Yes, recall it', callback_data: `del_go_${id}` }],
+          [{ text: '↩️ Cancel', callback_data: `del_list_${m.user_id}` }],
+        ] });
+      return;
+    }
+    if (/^del_go_\d+$/.test(data)) {
+      await recallReply(chatId, msgId, parseInt(data.split('_').pop(), 10));
+      return;
+    }
+
     if (/^cust_orders_\d+$/.test(data)) {
       await showCustomerOrders(chatId, parseInt(data.split('_').pop(), 10), msgId);
       return;
@@ -1447,24 +1693,27 @@ bot.on('message', async (msg) => {
     const contentText = msg.text || msg.caption || '';
 
     try {
+      // Keep the id Telegram assigns in the CUSTOMER's chat — recalling a reply
+      // later is impossible without it.
+      let sent;
       if (msg.text) {
-        await bot.sendMessage(targetUserId,
+        sent = await bot.sendMessage(targetUserId,
           `📩 <b>Support</b>\n\n${escapeHtml(msg.text)}`, { parse_mode: 'HTML' });
       } else if (msg.photo && msg.photo.length) {
         fileId = msg.photo[msg.photo.length - 1].file_id; mediaType = 'photo';
-        await bot.sendPhoto(targetUserId, fileId, {
+        sent = await bot.sendPhoto(targetUserId, fileId, {
           caption: msg.caption ? `📩 ${escapeHtml(msg.caption)}` : '📩 From Support',
           parse_mode: 'HTML',
         });
       } else if (msg.document) {
         fileId = msg.document.file_id; mediaType = 'document';
-        await bot.sendDocument(targetUserId, fileId, { caption: '📩 From Support' });
+        sent = await bot.sendDocument(targetUserId, fileId, { caption: '📩 From Support' });
       } else if (msg.voice) {
         fileId = msg.voice.file_id; mediaType = 'voice';
-        await bot.sendVoice(targetUserId, fileId, { caption: '📩 From Support' });
+        sent = await bot.sendVoice(targetUserId, fileId, { caption: '📩 From Support' });
       } else if (msg.video) {
         fileId = msg.video.file_id; mediaType = 'video';
-        await bot.sendVideo(targetUserId, fileId, {
+        sent = await bot.sendVideo(targetUserId, fileId, {
           caption: msg.caption ? `📩 ${escapeHtml(msg.caption)}` : '📩 From Support',
           parse_mode: 'HTML',
         });
@@ -1473,7 +1722,11 @@ bot.on('message', async (msg) => {
         return;
       }
 
-      insertMsg.run(targetUserId, null, null, 'out', contentText, mediaType, fileId);
+      const ins = insertMsg.run(targetUserId, null, null, 'out', contentText, mediaType, fileId);
+      if (sent && sent.message_id) {
+        rawDb.prepare('UPDATE support_messages SET tg_msg_id = ? WHERE id = ?')
+          .run(sent.message_id, ins.lastInsertRowid);
+      }
       const rcpt = queries.getUser(targetUserId);
       const rcptName = displayName(rcpt?.username, rcpt?.first_name, targetUserId);
       await bot.sendMessage(chatId, `✅ Sent to <b>${escapeHtml(rcptName)}</b>`, {
