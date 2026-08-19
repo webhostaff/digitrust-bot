@@ -921,3 +921,50 @@ interaction, so a new staff member does not need a restart.
 Verified: none of them is captured by the nav-bar interceptor, and the state
 handler already skips any message starting with `/` — so typing a command while
 entering a quantity or a TxID does not get parsed as input. 8/8.
+
+---
+
+# Part 19 — ChatGPT Business order cards: red until activated, green after
+
+## Why they looked alike
+
+Two problems compounded:
+
+1. The pending button read `✅ Notify Customer` and the finished one
+   `✅ Customer Notified` — **both opened with a green tick**.
+2. Pressing the button called `editMessageReplyMarkup`, which changes only the
+   button. The message body never changed, so a finished order still said
+   "Press the button below to notify the customer".
+
+Scrolling back through a day's orders, nothing distinguished done from pending.
+
+## Now
+
+The whole card is banded — a solid bar top and bottom, so the state reads
+correctly even when the card is half scrolled off screen:
+
+```
+🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥        🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩
+🔴 NOT ACTIVATED YET           🟢 ACTIVATED — customer notified
+   — action needed
+   …order details…                …order details…
+⬇️ Activate the seat, then      ✅ Activated 19/08 17:32.
+   press the button below.         The customer has been told.
+🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥        🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩
+```
+
+The pending button is now `🔔 Activate & Notify Customer` — no tick, since the
+tick was half the confusion. After pressing: `✅ Done — customer notified`.
+
+## Rebuilt from the database, not from the message
+
+The first attempt reconstructed the green card by parsing the old message text.
+That is fragile: `q.message.text` arrives with HTML already decoded, so
+re-escaping it by hand would mangle any address containing `&` or `<`.
+
+The card is now rebuilt from `chatgpt_subscriptions` and `orders` using the
+order id already carried in the callback data. If that ever fails, the button
+still flips, so a completed order is never left looking untouched.
+
+Both order paths (direct payment and CryptoBot) now share one `orderCard()`
+builder instead of two copies of the same message.

@@ -88,6 +88,58 @@ function outOfStockMessage() {
   return 'Seats are sold out at the moment. We restock regularly — check back soon.';
 }
 
+/**
+ * Admin order card, in one of two states.
+ *
+ * Both states used to open with a green ✅ — the pending button read
+ * "✅ Notify Customer" and the finished one "✅ Customer Notified" — and the
+ * message body never changed at all, only the button. Two orders side by side
+ * were impossible to tell apart at a glance.
+ *
+ * Now the whole card is banded: a solid red bar top and bottom while the seat
+ * is still waiting, solid green once it is activated. The band is the first and
+ * last thing on screen, so it reads correctly even when the card is half
+ * scrolled off.
+ */
+const BAND_RED   = '🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥';
+const BAND_GREEN = '🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩';
+
+function orderCard(d, activated = false) {
+  const band = activated ? BAND_GREEN : BAND_RED;
+  const head = activated
+    ? '🟢 <b>ACTIVATED</b> — customer notified'
+    : '🔴 <b>NOT ACTIVATED YET</b> — action needed';
+
+  return (
+    `${band}\n` +
+    `${head}\n\n` +
+    `🆔 Order: <b>#${d.orderId}</b>\n` +
+    `👤 Customer: ${d.name} (<code>${d.userId}</code>)\n` +
+    `📧 Email: <code>${d.email}</code>\n` +
+    `⏱ Duration: <b>${d.days} days</b>\n` +
+    `📅 Start date: <b>${d.startDate}</b>\n` +
+    `📅 End date: <b>${d.endDate}</b>\n` +
+    `💵 Paid: <b>$${d.paid}</b>\n` +
+    `💳 Method: <b>${d.method}</b>\n` +
+    `🔗 ${d.refLabel}: <code>${d.ref}</code>\n\n` +
+    (activated
+      ? `✅ <i>Activated on ${d.activatedAt || 'now'}. The customer has been told.</i>\n`
+      : `⬇️ <b>Activate the seat, then press the button below.</b>\n`) +
+    `${band}`
+  );
+}
+
+function orderCardButtons(d) {
+  return {
+    inline_keyboard: [[{
+      // No green tick here on purpose — a checkmark on the pending button is
+      // exactly what made the two states look alike.
+      text: '🔔 Activate & Notify Customer',
+      callback_data: `cgb_notify_${d.orderId}_${d.userId}_${d.days}_${encodeURIComponent(d.endDate)}`,
+    }]],
+  };
+}
+
 function getMonthlyPrice() {
   try {
     const row = db.prepare(`SELECT value FROM settings WHERE key='chatgpt_monthly_price'`).get();
@@ -293,10 +345,54 @@ bot.on('callback_query', async (q) => {
         logger.warn(`cgb_notify_: could not mark order/sub active: ${e.message}`);
       }
 
-      await bot.editMessageReplyMarkup(
-        { inline_keyboard: [[{ text: '✅ Customer Notified ✓', callback_data: 'noop' }]] },
-        { chat_id: chatId, message_id: msgId }
-      ).catch(() => {});
+      // Repaint the WHOLE card green, not just the button. Editing only the
+      // markup left the red band and "NOT ACTIVATED YET" in place, which is
+      // what made finished and pending orders look identical in the scrollback.
+      //
+      // Rebuilt from the database rather than by parsing the old message text:
+      // q.message.text arrives with HTML already decoded, so re-escaping it by
+      // hand would mangle any address containing & or <.
+      try {
+        const sub = db.prepare(
+          'SELECT * FROM chatgpt_subscriptions WHERE order_id = ?'
+        ).get(parseInt(orderId, 10));
+        const ord = db.prepare('SELECT * FROM orders WHERE id = ?').get(parseInt(orderId, 10));
+        const u   = db.prepare(
+          'SELECT username, first_name FROM users WHERE telegram_id = ?'
+        ).get(Number(customerId));
+        const who = u?.username ? '@' + u.username : (u?.first_name || `User ${customerId}`);
+
+        const p2 = (n) => String(n).padStart(2, '0');
+        const now = new Date();
+
+        const greenCard = orderCard({
+          orderId,
+          userId:    customerId,
+          days,
+          name:      escapeHtml(who),
+          email:     escapeHtml(sub?.email || '—'),
+          startDate: sub?.start_date || '—',
+          endDate:   endDate,
+          paid:      Number(sub?.final_price ?? ord?.total_price ?? 0).toFixed(2),
+          method:    ord?.payment_method || '—',
+          refLabel:  'Order',
+          ref:       String(orderId),
+          activatedAt: `${p2(now.getDate())}/${p2(now.getMonth() + 1)} ${p2(now.getHours())}:${p2(now.getMinutes())}`,
+        }, true);
+
+        await bot.editMessageText(greenCard, {
+          chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '✅ Done — customer notified', callback_data: 'noop' }]] },
+        });
+      } catch (e) {
+        // Never leave the card looking untouched: if the repaint fails for any
+        // reason, at least flip the button so the state is still readable.
+        logger.warn(`cgb_notify_: card repaint failed: ${e.message}`);
+        await bot.editMessageReplyMarkup(
+          { inline_keyboard: [[{ text: '✅ Done — customer notified', callback_data: 'noop' }]] },
+          { chat_id: chatId, message_id: msgId }
+        ).catch(() => {});
+      }
     } catch (e) {
       await bot.sendMessage(chatId, `❌ Could not notify customer: ${e.message}`);
     }
@@ -662,28 +758,21 @@ async function confirmPayment(chatId, userId, orderId, txid, sessionData) {
       pay_cryptobot:'🤖 CryptoBot',
     }[paymentMethod] || paymentMethod;
 
-    await bot.sendMessage(ADMIN_ID,
-      `🎉 <b>New ChatGPT Business Order</b>\n\n` +
-      `🆔 Order: <b>#${orderId}</b>\n` +
-      `👤 Customer: ${escapeHtml(name)} (<code>${userId}</code>)\n` +
-      `📧 Email: <code>${escapeHtml(sessionData.email)}</code>\n` +
-      `⏱ Duration: <b>${totalDays} days</b>\n` +
-      `📅 Start date: <b>${sessionData.startDate}</b>\n` +
-      `📅 End date: <b>${sessionData.endDate}</b>\n` +
-      `💵 Paid: <b>$${sessionData.finalPrice.toFixed(2)}</b>\n` +
-      `💳 Method: <b>${payMethodLabel}</b>\n` +
-      `🔗 TxID: <code>${escapeHtml(txid)}</code>\n\n` +
-      `⬇️ Press the button below to notify the customer once you activate their subscription:`,
-      {
-        parse_mode: 'HTML',
-        reply_markup: {
-          inline_keyboard: [[{
-            text: '✅ Notify Customer — Subscription Activated',
-            callback_data: `cgb_notify_${orderId}_${userId}_${totalDays}_${encodeURIComponent(sessionData.endDate)}`,
-          }]],
-        },
-      }
-    );
+    const card = {
+      orderId, userId, days: totalDays,
+      name:      escapeHtml(name),
+      email:     escapeHtml(sessionData.email),
+      startDate: sessionData.startDate,
+      endDate:   sessionData.endDate,
+      paid:      sessionData.finalPrice.toFixed(2),
+      method:    payMethodLabel,
+      refLabel:  'TxID',
+      ref:       escapeHtml(txid),
+    };
+    await bot.sendMessage(ADMIN_ID, orderCard(card, false), {
+      parse_mode: 'HTML',
+      reply_markup: orderCardButtons(card),
+    });
   } catch (e) {}
 }
 
@@ -751,28 +840,21 @@ async function confirmCryptobotPayment(invoiceId, paidAmount, orderId, userId) {
     const user = db.prepare('SELECT username, first_name FROM users WHERE telegram_id=?').get(userId);
     const name = user?.username ? '@' + user.username : (user?.first_name || `User ${userId}`);
 
-    await bot.sendMessage(ADMIN_ID,
-      `🎉 <b>New ChatGPT Business Order</b>\n\n` +
-      `🆔 Order: <b>#${orderId}</b>\n` +
-      `👤 Customer: ${escapeHtml(name)} (<code>${userId}</code>)\n` +
-      `📧 Email: <code>${escapeHtml(sub.email)}</code>\n` +
-      `⏱ Duration: <b>${totalDays} days</b>\n` +
-      `📅 Start date: <b>${sub.start_date}</b>\n` +
-      `📅 End date: <b>${sub.end_date}</b>\n` +
-      `💵 Paid: <b>$${Number(paidAmount).toFixed(2)}</b>\n` +
-      `💳 Method: <b>🤖 CryptoBot</b>\n` +
-      `🔗 Invoice: <code>${escapeHtml(String(invoiceId))}</code>\n\n` +
-      `⬇️ Press the button below to notify the customer once you activate their subscription:`,
-      {
-        parse_mode: 'HTML',
-        reply_markup: {
-          inline_keyboard: [[{
-            text: '✅ Notify Customer — Subscription Activated',
-            callback_data: `cgb_notify_${orderId}_${userId}_${totalDays}_${encodeURIComponent(sub.end_date)}`,
-          }]],
-        },
-      }
-    );
+    const card = {
+      orderId, userId, days: totalDays,
+      name:      escapeHtml(name),
+      email:     escapeHtml(sub.email),
+      startDate: sub.start_date,
+      endDate:   sub.end_date,
+      paid:      Number(paidAmount).toFixed(2),
+      method:    '🤖 CryptoBot',
+      refLabel:  'Invoice',
+      ref:       escapeHtml(String(invoiceId)),
+    };
+    await bot.sendMessage(ADMIN_ID, orderCard(card, false), {
+      parse_mode: 'HTML',
+      reply_markup: orderCardButtons(card),
+    });
   } catch (e) {
     logger.warn(`confirmCryptobotPayment: could not notify admin: ${e.message}`);
   }
