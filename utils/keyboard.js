@@ -72,9 +72,14 @@ const preorderProductsKb = (products) => {
   const rows = products.map((p) => {
     const remaining = Math.max(0, (p.preorder_max || 0) - (p.preorder_count || 0));
     const avail = remaining > 0 ? `🔜 ${remaining} left` : '❌ Full';
-    const marker = p.premium_emoji_id ? '⭐️ ' : '';
-    const cleanTitle = stripEmojiCodes(p.title || '');
-    return [btn(`${marker}${cleanTitle} — ${formatPrice(p.price)} [${avail}]`, `preorder_view_${p.id}`)];
+    // The old '⭐️ ' prefix was a stand-in for "this product has a premium
+    // emoji". The real emoji can be shown now, so the placeholder is gone.
+    const title = stripEmojiCodes(p.title || '').trim();
+    return [iconBtn(
+      `${title} — ${formatPrice(p.price)} [${avail}]`,
+      `preorder_view_${p.id}`,
+      { iconId: productIconId(p), inStock: remaining > 0 }
+    )];
   });
   rows.push([btn('🔙 Back', 'back_main')]);
   return mk(rows);
@@ -144,10 +149,43 @@ function iconsEnabled() {
   }
 }
 
+/** First [emoji:ID] marker found in any string, or null. */
+function iconIdFrom(text) {
+  const m = String(text || '').match(/\[emoji:(\d+)\]/);
+  return m ? m[1] : null;
+}
+
 /** Premium emoji id for a product: the title's marker, else the legacy column. */
 function productIconId(p) {
-  const m = String(p.title || '').match(/\[emoji:(\d+)\]/);
-  return (m && m[1]) || (p.premium_emoji_id ? String(p.premium_emoji_id) : null);
+  return iconIdFrom(p.title) || (p.premium_emoji_id ? String(p.premium_emoji_id) : null);
+}
+
+/**
+ * Build a button with a premium-emoji icon and a colour, falling back to a plain
+ * button when icons are switched off.
+ *
+ * Shared so every list — categories, products, pre-orders, admin lists — looks
+ * the same. handlers/products.js hand-builds the category menu instead of using
+ * productsKb, which is why icons appeared inside a category but nowhere else.
+ *
+ * @param {string} label      button text (markers already stripped)
+ * @param {string} data       callback_data
+ * @param {object} opts       { iconId, inStock, style }
+ */
+function iconBtn(label, data, opts = {}) {
+  const fancy = iconsEnabled();
+  let text = String(label || '');
+  const iconId = fancy ? (opts.iconId || null) : null;
+  if (iconId) text = text.replace(LEADING_EMOJI, '') || text;
+
+  const button = btn(text, data);
+  if (fancy) {
+    if (iconId) button.icon_custom_emoji_id = iconId;
+    const style = opts.style
+      || (opts.inStock === undefined ? 'primary' : (opts.inStock ? 'primary' : 'danger'));
+    if (style) button.style = style;
+  }
+  return button;
 }
 
 // Drop a label's leading emoji when that emoji is being shown as the icon,
@@ -166,17 +204,12 @@ const productsKb = (products, page = 0) => {
     const inStock = qty > 0;
     const stock   = inStock ? `✅ ${qty}` : `❌ Out`;
 
-    const iconId = fancy ? productIconId(p) : null;
-    let title = cleanTitle(p.title || '');
-    if (iconId) title = title.replace(LEADING_EMOJI, '') || title;
-    title = title.slice(0, 50);
-
-    const button = btn(`${title} — ${formatPrice(p.price)} [${stock}]`, `product_${p.id}`);
-    if (fancy) {
-      if (iconId) button.icon_custom_emoji_id = iconId;
-      button.style = inStock ? 'primary' : 'danger';   // blue in stock, red out
-    }
-    return [button];
+    const title = cleanTitle(p.title || '').slice(0, 50);
+    return [iconBtn(
+      `${title} — ${formatPrice(p.price)} [${stock}]`,
+      `product_${p.id}`,
+      { iconId: productIconId(p), inStock }
+    )];
   });
 
   // Pagination row (only if more than one page)
@@ -681,6 +714,9 @@ const adminEmojiLibraryKb = (emojis) => {
 };
 
 module.exports = {
+  // Shared button helpers — exported so handlers that hand-build keyboards
+  // (handlers/products.js does, for the category menu) can match this file.
+  iconBtn, iconIdFrom, productIconId, iconsEnabled, stripEmojiCodes, cleanTitle,
   mainMenuKb,
   persistentMenuKb,
   matchNavButton, joinGateKb, productsKb, productDetailKb,

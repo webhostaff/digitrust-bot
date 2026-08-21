@@ -71,7 +71,8 @@ function buildTextAndEntities(rawText) {
   return { text: result, entities };
 }
 
-const { productsKb, productDetailKb, backKb, preorderProductsKb, preorderDetailKb } = require('../utils/keyboard');
+const { productsKb, productDetailKb, backKb, preorderProductsKb, preorderDetailKb,
+        iconBtn, iconIdFrom, productIconId, stripEmojiCodes } = require('../utils/keyboard');
 const { formatPrice, expandPremiumEmojis } = require('../utils/format');
 
 // Safe message updater: tries editMessageText, falls back to delete+send if message was a photo/media
@@ -127,17 +128,24 @@ async function showCategories(bot, chatId, messageId = null) {
   const rows = [];
 
   // 1) Categories FIRST — in pairs (2 per row to save space)
+  //
+  // Built with iconBtn so a category row gets the same premium-emoji icon and
+  // colour treatment as the product rows inside it. The icon id can come from
+  // either the category's emoji field or its name, since a premium emoji typed
+  // into either is stored as an [emoji:ID] marker.
+  const catButton = (c) => {
+    const count = db.getProductsByCategory(c.id).filter(p => p.is_active).length;
+    const iconId = iconIdFrom(c.emoji) || iconIdFrom(c.name);
+    const emojiText = stripEmojiCodes(c.emoji || '').trim();
+    const nameText  = stripEmojiCodes(c.name  || '').trim();
+    const label = `${emojiText ? emojiText + ' ' : ''}${nameText} (${count})`;
+    // An empty category reads as unavailable, like an out-of-stock product.
+    return iconBtn(label, `cat_${c.id}`, { iconId, inStock: count > 0 });
+  };
+
   for (let i = 0; i < categories.length; i += 2) {
-    const c1 = categories[i];
-    const c2 = categories[i + 1];
-    const count1 = db.getProductsByCategory(c1.id).filter(p => p.is_active).length;
-    const label1 = `${c1.emoji ? c1.emoji + ' ' : ''}${c1.name} (${count1})`;
-    const row = [{ text: label1, callback_data: `cat_${c1.id}` }];
-    if (c2) {
-      const count2 = db.getProductsByCategory(c2.id).filter(p => p.is_active).length;
-      const label2 = `${c2.emoji ? c2.emoji + ' ' : ''}${c2.name} (${count2})`;
-      row.push({ text: label2, callback_data: `cat_${c2.id}` });
-    }
+    const row = [catButton(categories[i])];
+    if (categories[i + 1]) row.push(catButton(categories[i + 1]));
     rows.push(row);
   }
 
@@ -149,7 +157,8 @@ async function showCategories(bot, chatId, messageId = null) {
   // 3) Uncategorized products — one per row
   for (const p of uncategorized) {
     const qty = (typeof p.stock_quantity === 'number') ? p.stock_quantity : (p.stock_count || 0);
-    const stock = qty > 0 ? `✅ ${qty}` : `❌ Out`;
+    const inStock = qty > 0;
+    const stock = inStock ? `✅ ${qty}` : `❌ Out`;
     const cleanTitle = String(p.title || '')
       .replace(/\[emoji:\d+\]/g, '')
       .replace(/^[\s\u00A0\u200B\u200C\u200D\u2060\uFEFF]+/, '')
@@ -157,7 +166,11 @@ async function showCategories(bot, chatId, messageId = null) {
       .trim()
       .slice(0, 45);
     const price = `$${(p.price || 0).toFixed(2)}`;
-    rows.push([{ text: `${cleanTitle} — ${price} [${stock}]`, callback_data: `product_${p.id}` }]);
+    rows.push([iconBtn(
+      `${cleanTitle} — ${price} [${stock}]`,
+      `product_${p.id}`,
+      { iconId: productIconId(p), inStock }
+    )]);
   }
 
   rows.push([{ text: '🔄 Refresh', callback_data: 'refresh_products' }, { text: '🔙 Back', callback_data: 'back_main' }]);
