@@ -128,10 +128,14 @@ const productsKb = (products, page = 0) => {
   const slice = products.slice(start, start + PRODUCTS_PER_PAGE);
 
   const rows = slice.map((p) => {
-    const qty   = (typeof p.stock_quantity === 'number') ? p.stock_quantity : (p.stock_count || 0);
-    const stock = qty > 0 ? `✅ ${qty}` : `❌ Out`;
-    const title = cleanTitle(p.title || '').slice(0, 50);
-    return [btn(`${title} — ${formatPrice(p.price)} [${stock}]`, `product_${p.id}`)];
+    const qty = (typeof p.stock_quantity === 'number') ? p.stock_quantity : (p.stock_count || 0);
+    // Telegram has no colour field on an inline button, so the status is carried
+    // by a coloured square at the START of the label — where the eye lands first
+    // and where it stays readable even when a long title is truncated.
+    const band  = qty > 0 ? '🟩' : '🟥';
+    const stock = qty > 0 ? `✅ ${qty}` : '❌ Out';
+    const title = cleanTitle(p.title || '').slice(0, 44);
+    return [btn(`${band} ${title} — ${formatPrice(p.price)} [${stock}]`, `product_${p.id}`)];
   });
 
   // Pagination row (only if more than one page)
