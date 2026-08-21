@@ -113,18 +113,34 @@ async function handleAdminText(bot, msg) {
   const chatId = msg.chat.id;
 
   // ── AUTO-CONVERT premium emojis to [emoji:ID] markers ──────────
-  // EXCEPTION: For product titles, we KEEP the original Unicode emoji intact
-  // (since buttons can display the actual emoji char, and inline messages will
-  // still render premium if the bot account has Premium).
+  // Product titles used to be excluded here, on the reasoning that "buttons can
+  // display the actual emoji char anyway". That discarded the custom_emoji_id,
+  // so a premium logo typed into a title was reduced to its plain placeholder
+  // and the product page fell back to the old premium_emoji_id field — which is
+  // why a published title showed a DIFFERENT logo than the one that was typed.
+  //
+  // Titles are now converted like every other field. convertCustomEmojisToMarkers
+  // keeps the placeholder right after the marker ("[emoji:123]✨ Gemini"), so:
+  //   • utils/keyboard.js strips the marker and still has ✨ for the label
+  //   • the button also gets the real logo via icon_custom_emoji_id (Bot API 9.4)
+  //   • utils/format.js renders the true premium emoji on the product page
   const sessCheck = session.get(userId);
-  // For product TITLES, keep original Unicode emoji intact (don't convert to [emoji:ID])
-  // This covers BOTH: editing existing title AND adding new product title
   const isProductTitle =
     sessCheck.state === States.ADMIN_ADD_TITLE ||
     (sessCheck.state === States.ADMIN_EDIT_VALUE && sessCheck.data && sessCheck.data.editField === 'title');
-  const text = isProductTitle
-    ? (msg.text || msg.caption || '').trim()  // Keep original — no conversion
-    : convertCustomEmojisToMarkers(msg).trim();
+  const text = convertCustomEmojisToMarkers(msg).trim();
+
+  // A title carrying its own emoji makes the separate premium_emoji_id field
+  // redundant — and while it is still set, products.js prepends it as a
+  // hardcoded prefix, which is the stale "random logo". Clear it.
+  if (isProductTitle && /\[emoji:\d+\]/.test(text) &&
+      sessCheck.state === States.ADMIN_EDIT_VALUE && sessCheck.data.editProductId) {
+    try {
+      db.updateProduct(sessCheck.data.editProductId, 'premium_emoji_id', null);
+    } catch (e) {
+      logger.warn(`[EMOJI] could not clear premium_emoji_id: ${e.message}`);
+    }
+  }
 
   const sess   = session.get(userId);
   const s      = sess.state;

@@ -147,13 +147,25 @@ const truncate = (str, maxLen = 30) =>
 // Convert [emoji:ID] markers to Telegram premium emoji tags.
 // Usage:  "[emoji:5368324170671202286]🎉 Welcome!" → animated emoji + "🎉 Welcome!"
 // Multiple emojis supported. Fallback emoji is the optional emoji right after the closing ].
+// The placeholder is one whole emoji: a pictographic character OR a two-letter
+// flag (a regional-indicator pair, which is NOT Extended_Pictographic), plus any
+// trailing skin-tone modifier, variation selector, keycap or ZWJ continuation.
+//
+// The previous pattern was /\[emoji:(\d+)\](\S?)/g. `\S` matches ONE UTF-16 code
+// unit, but most emoji (🎨 = U+1F3A8) are surrogate PAIRS of two units. So it
+// captured half an emoji as the fallback and left the orphaned half loose in the
+// string. Telegram then received a malformed custom-emoji entity, which renders
+// as a broken glyph — or attaches the entity to the wrong span, so a different
+// emoji from the pack appears. That is the "logo changes to a random one" bug.
+const EMOJI_BASE = '(?:\\p{Regional_Indicator}\\p{Regional_Indicator}|\\p{Extended_Pictographic})';
+const EMOJI_MOD  = '(?:[\\u{1F3FB}-\\u{1F3FF}]|\\u{FE0F}|\\u{20E3}|\\u{200D}' + EMOJI_BASE + ')';
+const EMOJI_MARKER = new RegExp(`\\[emoji:(\\d+)\\](${EMOJI_BASE}${EMOJI_MOD}*)?`, 'gu');
+
 function expandPremiumEmojis(text) {
   if (!text) return text;
-  // Pattern: [emoji:NUMERIC_ID]optional-fallback-emoji
-  return String(text).replace(/\[emoji:(\d+)\](\S?)/g, (match, id, fallback) => {
-    const fb = fallback || '🎁';
-    return `<tg-emoji emoji-id="${id}">${fb}</tg-emoji>`;
-  });
+  return String(text).replace(EMOJI_MARKER, (match, id, fallback) =>
+    `<tg-emoji emoji-id="${id}">${fallback || '🎁'}</tg-emoji>`
+  );
 }
 
 

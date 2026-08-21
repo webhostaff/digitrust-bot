@@ -121,21 +121,62 @@ function cleanTitle(text) {
     .trim();
 }
 
+// ── Button icon + colour (Bot API 9.4) ────────────────────────────────────────
+// InlineKeyboardButton gained two fields this codebase predates:
+//   icon_custom_emoji_id — a premium emoji shown BEFORE the button text. A custom
+//                          emoji cannot live inside `text` (that is plain text),
+//                          but as its own field it renders fine.
+//   style                — 'default' | 'primary' | 'success' | 'danger'
+//
+// Telegram REJECTS unknown reply_markup fields rather than ignoring them, so both
+// sit behind the `button_icons_enabled` setting: set it to 0 for the plain
+// original buttons, no redeploy needed.
+function iconsEnabled() {
+  try {
+    // Required lazily to avoid a require cycle: database code also loads this file.
+    const db = require('../database/queries');
+    const v = String(db.getSetting('button_icons_enabled', '1') || '').trim().toLowerCase();
+    // Forgiving on purpose: the settings screen is a free-text box, so "off",
+    // "no" and "false" must disable it just as reliably as "0".
+    return !['0', 'no', 'off', 'false', 'disabled', 'non'].includes(v);
+  } catch (_) {
+    return true;
+  }
+}
+
+/** Premium emoji id for a product: the title's marker, else the legacy column. */
+function productIconId(p) {
+  const m = String(p.title || '').match(/\[emoji:(\d+)\]/);
+  return (m && m[1]) || (p.premium_emoji_id ? String(p.premium_emoji_id) : null);
+}
+
+// Drop a label's leading emoji when that emoji is being shown as the icon,
+// otherwise the same symbol appears twice on the button.
+const LEADING_EMOJI = /^(?:\p{Regional_Indicator}\p{Regional_Indicator}|\p{Extended_Pictographic})(?:[\u{1F3FB}-\u{1F3FF}]|\u{FE0F}|\u{20E3}|\u{200D}(?:\p{Regional_Indicator}\p{Regional_Indicator}|\p{Extended_Pictographic}))*\s*/u;
+
 const productsKb = (products, page = 0) => {
   const totalPages = Math.max(1, Math.ceil(products.length / PRODUCTS_PER_PAGE));
   const currentPage = Math.max(0, Math.min(page, totalPages - 1));
   const start = currentPage * PRODUCTS_PER_PAGE;
   const slice = products.slice(start, start + PRODUCTS_PER_PAGE);
+  const fancy = iconsEnabled();
 
   const rows = slice.map((p) => {
-    const qty = (typeof p.stock_quantity === 'number') ? p.stock_quantity : (p.stock_count || 0);
-    // Telegram has no colour field on an inline button, so the status is carried
-    // by a coloured square at the START of the label — where the eye lands first
-    // and where it stays readable even when a long title is truncated.
-    const band  = qty > 0 ? '🟩' : '🟥';
-    const stock = qty > 0 ? `✅ ${qty}` : '❌ Out';
-    const title = cleanTitle(p.title || '').slice(0, 44);
-    return [btn(`${band} ${title} — ${formatPrice(p.price)} [${stock}]`, `product_${p.id}`)];
+    const qty     = (typeof p.stock_quantity === 'number') ? p.stock_quantity : (p.stock_count || 0);
+    const inStock = qty > 0;
+    const stock   = inStock ? `✅ ${qty}` : `❌ Out`;
+
+    const iconId = fancy ? productIconId(p) : null;
+    let title = cleanTitle(p.title || '');
+    if (iconId) title = title.replace(LEADING_EMOJI, '') || title;
+    title = title.slice(0, 50);
+
+    const button = btn(`${title} — ${formatPrice(p.price)} [${stock}]`, `product_${p.id}`);
+    if (fancy) {
+      if (iconId) button.icon_custom_emoji_id = iconId;
+      button.style = inStock ? 'primary' : 'danger';   // blue in stock, red out
+    }
+    return [button];
   });
 
   // Pagination row (only if more than one page)
@@ -582,6 +623,7 @@ const adminOrdersKb = (orders, page = 0) => {
 const adminSettingsKb = () => mk([
   [btn('🏪 Store Name',        'admin_setting_store_name'),         btn('💵 Min Deposit',       'admin_setting_min_deposit')],
   [btn('🔧 Maintenance',       'admin_setting_maintenance_mode'),   btn('🔒 Join Required',     'admin_setting_join_required_enabled')],
+  [btn('🎨 Button Icons',      'admin_setting_button_icons_enabled')],
   [btn('💬 Group Link',        'admin_setting_required_group_link'),btn('📢 Channel Link',       'admin_setting_required_channel_link')],
   [btn('📡 Updates Channel',   'admin_setting_updates_channel_id'), btn('💬 Updates Group',      'admin_setting_updates_group_id')],
   [btn('🔔 Product Notifs',    'admin_setting_product_notifications_enabled'), btn('📦 Stock Notifs', 'admin_setting_stock_notifications_enabled')],
