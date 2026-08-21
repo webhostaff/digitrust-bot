@@ -201,7 +201,11 @@ async function showProductsByCategory(bot, chatId, messageId, categoryId, page =
   } else {
     products = db.getProductsByCategory(categoryId).filter(p => p.is_active);
     const cat = db.getCategoryById(categoryId);
-    title = `${cat?.emoji || '🗂'} ${cat?.name || 'Category'}`;
+    // expandPremiumEmojis turns an [emoji:ID] marker into a real <tg-emoji> tag.
+    // Without it the raw marker was printed literally in the message header,
+    // e.g. "[emoji:5474521476197536994]🖤 CAPCUT". Message text CAN carry a
+    // premium emoji (unlike button labels), so the logo shows here properly.
+    title = expandPremiumEmojis(`${cat?.emoji || '🗂'} ${cat?.name || 'Category'}`.trim());
   }
 
   if (!products.length) {

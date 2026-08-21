@@ -18,6 +18,8 @@ const {
   adminResetWalletConfirmKb,
   adminPreorderConfirmDeliverKb,
   adminEmojiLibraryKb,
+  // Shared button helpers, aliased so they cannot collide with local names.
+  iconBtn: kbIconBtn, iconIdFrom: kbIconIdFrom, stripEmojiCodes: kbStripEmojiCodes,
 } = require('../utils/keyboard');
 const items = require('../database/items');
 const { formatPrice, formatPriceExact, escapeHtml, expandPremiumEmojis, scaleTiersProportionally } = require('../utils/format');
@@ -5370,7 +5372,9 @@ async function handleAdminCallback(bot, query) {
     let txt = `🗂 <b>Categories Management</b>\n\nTotal: ${categories.length}\n\n`;
     const rows = categories.map(c => {
       const productsCount = db.getProductsByCategory(c.id).length;
-      return [{ text: `${c.emoji || '📂'} ${c.name} (${productsCount})`, callback_data: `admin_cat_edit_${c.id}` }];
+      const iconId = kbIconIdFrom(c.emoji) || kbIconIdFrom(c.name);
+      const label = `${kbStripEmojiCodes(c.emoji || '📂').trim()} ${kbStripEmojiCodes(c.name).trim()} (${productsCount})`;
+      return [kbIconBtn(label, `admin_cat_edit_${c.id}`, { iconId, style: 'default' })];
     });
     if (categories.length === 0) txt += '<i>No categories yet. Create one!</i>';
     rows.push([{ text: '➕ New Category', callback_data: 'admin_cat_new' }]);
@@ -5395,7 +5399,9 @@ async function handleAdminCallback(bot, query) {
     const cat = db.getCategoryById(catId);
     if (!cat) { await answer('❌ Not found'); return; }
     const products = db.getProductsByCategory(catId);
-    let txt = `🗂 <b>${escapeHtml(cat.emoji || '')} ${escapeHtml(cat.name)}</b>\n\n`;
+    // escapeHtml leaves an [emoji:ID] marker untouched (no HTML chars in it), so
+    // expanding afterwards is safe and renders the real premium emoji.
+    let txt = `🗂 <b>${expandPremiumEmojis(escapeHtml(cat.emoji || '') + ' ' + escapeHtml(cat.name))}</b>\n\n`;
     txt += `📦 Products: <b>${products.length}</b>\n`;
     if (products.length) {
       txt += '\n<b>Products in this category:</b>\n';
@@ -5436,11 +5442,16 @@ async function handleAdminCallback(bot, query) {
     const categories = db.getAllCategories();
     const product = db.getProduct(productId);
     let txt = `🗂 <b>Assign Category</b>\n\nProduct: <b>${escapeHtml(product?.title || '')}</b>\n\n`;
-    txt += `Current: ${product?.category_id ? (db.getCategoryById(product.category_id)?.name || 'Unknown') : '(none)'}\n\nSelect:`;
-    const rows = categories.map(c => [{
-      text: `${c.emoji || '📂'} ${c.name}`,
-      callback_data: `admin_setcat_${productId}_${c.id}`,
-    }]);
+    // Markers stripped rather than expanded: this is a short inline label, and a
+    // <tg-emoji> tag inside it adds noise for no gain.
+    const curCat = product?.category_id ? db.getCategoryById(product.category_id) : null;
+    const curName = curCat ? kbStripEmojiCodes(curCat.name || '').trim() || 'Unknown' : '(none)';
+    txt += `Current: ${escapeHtml(curName)}\n\nSelect:`;
+    const rows = categories.map(c => [kbIconBtn(
+      `${kbStripEmojiCodes(c.emoji || '📂').trim()} ${kbStripEmojiCodes(c.name).trim()}`,
+      `admin_setcat_${productId}_${c.id}`,
+      { iconId: kbIconIdFrom(c.emoji) || kbIconIdFrom(c.name), style: 'default' }
+    )]);
     rows.push([{ text: '❌ Remove from category', callback_data: `admin_setcat_${productId}_0` }]);
     rows.push([{ text: '🔙 Back', callback_data: `admin_edit_p_${productId}` }]);
     await bot.editMessageText(txt, {
