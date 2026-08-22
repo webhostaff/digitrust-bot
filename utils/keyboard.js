@@ -445,13 +445,14 @@ const adminProductsKb = (products, action = 'edit') =>
   mk([
     ...products.map((p) => {
       const qty = (typeof p.stock_quantity === 'number') ? p.stock_quantity : (p.stock_count || 0);
-      const cleanTitle = stripEmojiCodes(p.title || '');
-      return [
-        btn(
-          `${cleanTitle} — ${formatPrice(p.price)} [${qty} stock / ${p.sales_count || 0} sold]`,
-          `admin_${action}_p_${p.id}`
-        ),
-      ];
+      const title = stripEmojiCodes(p.title || '').trim();
+      // Same icon + colour treatment as the customer list, so the admin sees the
+      // real product logo instead of a plain fallback character.
+      return [iconBtn(
+        `${title} — ${formatPrice(p.price)} [${qty} stock / ${p.sales_count || 0} sold]`,
+        `admin_${action}_p_${p.id}`,
+        { iconId: productIconId(p), inStock: qty > 0 }
+      )];
     }),
     [btn('🔙 Back', 'admin_panel')],
   ]);

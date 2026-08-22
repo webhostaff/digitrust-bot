@@ -1381,6 +1381,9 @@ async function handleAdminText(bot, msg) {
     }
 
     const result = db.addEmoji(name.toLowerCase().replace(/\s+/g, '_'), emojiId, fallback);
+    // The plain-emoji -> premium map is cached for a minute; drop it so the new
+    // entry takes effect on the very next message instead of up to 60s later.
+    try { require('../utils/format').clearEmojiCache(); } catch (_) {}
     session.clear(userId);
 
     if (!result) {

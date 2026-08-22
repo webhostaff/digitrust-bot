@@ -8,7 +8,8 @@ const config  = require('../config');
 const {
   orderConfirmKb, paymentMethodKb, cancelKb, backKb, mainMenuKb, walletMenuKb,
 } = require('../utils/keyboard');
-const { formatPrice, formatReward, calcOrderPrice, PAYMENT_CONFIRM_VALIDITY_MIN, checkPaymentWindow } = require('../utils/format');
+const { formatPrice, formatReward, calcOrderPrice, PAYMENT_CONFIRM_VALIDITY_MIN, checkPaymentWindow,
+        renderEmojis } = require('../utils/format');
 const cryptobot = require('../services/cryptobot');
 const { checkAndNotifyStockLevel } = require('../services/notifications');
 const { evaluateStock } = require('../services/stockAlerts');
@@ -434,7 +435,7 @@ async function payWithWallet(bot, chatId, userId, orderId, messageId) {
     let adminMsg =
       `🛒 <b>New Order Paid</b>\n\n` +
       `🆔 <b>Order:</b> #${order.id}\n` +
-      `📦 <b>Product:</b> ${order.product_title}\n` +
+      `📦 <b>Product:</b> ${renderEmojis(order.product_title)}\n` +
       `🔢 <b>Quantity:</b> ${order.quantity}\n` +
       `💵 <b>Total:</b> ${formatPrice(order.total_price)}\n` +
       `💳 <b>Payment:</b> Wallet\n\n` +
@@ -445,8 +446,12 @@ async function payWithWallet(bot, chatId, userId, orderId, messageId) {
     }
     adminMsg += `💰 <b>Remaining Balance:</b> ${formatPrice(newBalance)}`;
 
+    // renderEmojis upgrades every plain emoji in the notification to its premium
+    // version, using the admin's emoji library. One call restyles the whole
+    // message without touching its layout.
+    const adminMsgFinal = renderEmojis(adminMsg);
     for (const adminId of config.adminIds) {
-      bot.sendMessage(adminId, adminMsg, { parse_mode: 'HTML' }).catch(() => {});
+      bot.sendMessage(adminId, adminMsgFinal, { parse_mode: 'HTML' }).catch(() => {});
     }
 
     // Auto-fire low-stock / out-of-stock notifications to channel + group
@@ -893,7 +898,7 @@ async function notifyAdminsDirect(bot, userId, order, paid, method, identifier, 
   let msg =
     `🛒 <b>New Order Paid</b>\n\n` +
     `🆔 <b>Order:</b> #${order.id}\n` +
-    `📦 <b>Product:</b> ${order.product_title}\n` +
+    `📦 <b>Product:</b> ${renderEmojis(order.product_title)}\n` +
     `🔢 <b>Quantity:</b> ${order.quantity}\n` +
     `💵 <b>Required:</b> ${formatPrice(order.total_price)}\n` +
     `💵 <b>Received:</b> ${formatPrice(paid)}\n` +
@@ -905,8 +910,9 @@ async function notifyAdminsDirect(bot, userId, order, paid, method, identifier, 
   msg += `🧾 <b>Payment ID:</b> <code>${identifier}</code>\n`;
   msg += `💰 <b>New Balance:</b> ${formatPrice(newBalance)}`;
 
+  const msgFinal = renderEmojis(msg);
   for (const adminId of config.adminIds) {
-    bot.sendMessage(adminId, msg, { parse_mode: 'HTML' }).catch(() => {});
+    bot.sendMessage(adminId, msgFinal, { parse_mode: 'HTML' }).catch(() => {});
   }
 }
 
@@ -1029,7 +1035,7 @@ async function sendDelivery(bot, chatId, order, content, messageId = null) {
   for (const adminId of config.adminIds) {
     bot.sendMessage(
       adminId,
-      `🛒 <b>Order Delivered</b> #${order.id}\n${order.product_title} ×${order.quantity} | ${formatPrice(order.total_price)}\n📅 ${purchaseDate}`,
+      renderEmojis(`🛒 <b>Order Delivered</b> #${order.id}\n${order.product_title} ×${order.quantity} | ${formatPrice(order.total_price)}\n📅 ${purchaseDate}`),
       { parse_mode: 'HTML' }
     ).catch(() => {});
   }

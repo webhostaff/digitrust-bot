@@ -32,7 +32,7 @@ function escapeHtml(s) {
 
 const db     = require('../database/queries');
 const logger = require('../utils/logger');
-const { formatPrice } = require('../utils/format');
+const { formatPrice, renderEmojis } = require('../utils/format');
 
 // Bot username shown in announcements
 const BOT_USERNAME = '@DIGISELLABOT';
@@ -72,6 +72,10 @@ async function publishToGroupWithPhoto(bot, product, text, replyMarkup = null) {
     logger.warn('required_group_id not set — skipping group publish');
     return false;
   }
+  // Groups support custom emoji (Bot API 9.4), so plain emoji are upgraded
+  // here. publishToChannel deliberately does NOT do this — Telegram lists
+  // only private, group and supergroup chats.
+  text = renderEmojis(text);
   try {
     if (product && product.image_file_id) {
       await bot.sendPhoto(groupId, product.image_file_id, {
@@ -122,6 +126,10 @@ async function publishToGroup(bot, text, replyMarkup = null) {
     logger.warn('updates_group_id not set — skipping group publish');
     return false;
   }
+  // Groups support custom emoji (Bot API 9.4), so plain emoji are upgraded
+  // here. publishToChannel deliberately does NOT do this — Telegram lists
+  // only private, group and supergroup chats.
+  text = renderEmojis(text);
   try {
     await bot.sendMessage(groupId, text, { parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: replyMarkup || undefined });
     return true;

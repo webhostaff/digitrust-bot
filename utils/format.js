@@ -168,6 +168,89 @@ function expandPremiumEmojis(text) {
   );
 }
 
+// ── Automatic premium upgrade ─────────────────────────────────────────────────
+// Bot API 9.4 (9 Feb 2026) allows a bot to send custom emoji "in messages
+// directly sent by the bot to private, group and supergroup chats if the owner
+// of the bot has a Telegram Premium subscription".
+//
+// The bot cannot invent emoji ids, so the mapping comes from the emoji_library
+// table the admin already fills in (/admin → Emoji Library): each row stores a
+// premium emoji_id plus the plain `fallback` character it stands for. Anywhere
+// that plain character appears in outgoing text, it is upgraded to the premium
+// version — so a single library entry restyles every message at once, with no
+// hardcoded ids anywhere in the code.
+//
+// NOTE: channels are deliberately absent from Telegram's list above, so channel
+// posts keep the plain emoji no matter what is in the library.
+
+let _emojiMapCache = null;
+let _emojiMapAt = 0;
+const EMOJI_MAP_TTL_MS = 60000;
+
+/** { plainCharacter -> premiumId }, refreshed at most once a minute. */
+function emojiMap() {
+  const now = Date.now();
+  if (_emojiMapCache && (now - _emojiMapAt) < EMOJI_MAP_TTL_MS) return _emojiMapCache;
+  const map = new Map();
+  try {
+    // Lazy require: database/queries.js loads this module, so a top-level
+    // require here would be a cycle.
+    const db = require('../database/queries');
+    for (const row of db.getAllEmojis()) {
+      const plain = String(row.fallback || '').trim();
+      if (plain && row.emoji_id) map.set(plain, String(row.emoji_id));
+    }
+  } catch (_) { /* library unavailable — leave text untouched */ }
+  _emojiMapCache = map;
+  _emojiMapAt = now;
+  return map;
+}
+
+/** Called after the library changes so the next message picks it up at once. */
+function clearEmojiCache() { _emojiMapCache = null; _emojiMapAt = 0; }
+
+/**
+ * Replace plain emoji with their premium equivalents, leaving HTML alone.
+ *
+ * The text is split on tags, so nothing inside <b>, <code> or an existing
+ * <tg-emoji> is touched — double-wrapping an emoji that is already premium
+ * would produce a malformed entity.
+ */
+function premiumizeEmojis(text) {
+  if (!text) return text;
+  const map = emojiMap();
+  if (!map.size) return text;
+
+  const parts = String(text).split(/(<[^>]*>)/);
+  let depth = 0;                       // inside a <tg-emoji> element?
+
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (part.startsWith('<')) {
+      if (/^<tg-emoji\b/i.test(part)) depth++;
+      else if (/^<\/tg-emoji>/i.test(part)) depth = Math.max(0, depth - 1);
+      continue;                        // never rewrite a tag itself
+    }
+    if (depth > 0 || !part) continue;  // already premium — leave it
+
+    let out = part;
+    for (const [plain, id] of map) {
+      if (!out.includes(plain)) continue;
+      out = out.split(plain).join(`<tg-emoji emoji-id="${id}">${plain}</tg-emoji>`);
+    }
+    parts[i] = out;
+  }
+  return parts.join('');
+}
+
+/**
+ * The one call every outgoing message should use: expand [emoji:ID] markers
+ * first, then upgrade whatever plain emoji remain.
+ */
+function renderEmojis(text) {
+  return premiumizeEmojis(expandPremiumEmojis(text));
+}
+
 
 // Format bulk tiers for display
 function formatBulkTiersDisplay(product) {
@@ -228,7 +311,8 @@ function formatBulkTiersDisplay(product) {
 }
 
 module.exports = {
-  expandPremiumEmojis, formatPrice, formatPriceExact, calcOrderPrice, formatBulkTiersDisplay, formatReward, statusEmoji, escapeHtml, truncate,
+  expandPremiumEmojis, premiumizeEmojis, renderEmojis, clearEmojiCache,
+  formatPrice, formatPriceExact, calcOrderPrice, formatBulkTiersDisplay, formatReward, statusEmoji, escapeHtml, truncate,
   PAYMENT_CONFIRM_VALIDITY_MIN, PAYMENT_CONFIRM_VALIDITY_MS, checkPaymentWindow,
   scaleTiersProportionally,
 };
