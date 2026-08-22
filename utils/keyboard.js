@@ -384,18 +384,60 @@ const adminPreorderDetailKb = (preorderId, status) => {
  * with 25 products. One product per row gives the name the full width, and
  * paging keeps the screen short enough to actually read.
  */
-const SORT_PAGE_SIZE = 10;
+const SORT_PAGE_SIZE = 8;
 
-const adminSortProductsKb = (products, page = 0) => {
+/** One list row: `#3  🟢 Notion Education Plus — $1.90 · 8 left`. */
+function sortRowLabel(p, pos, prefix = '') {
+  const status = p.is_active ? '🟢' : '🔴';
+  const title  = stripEmojiCodes(String(p.title || '')).trim().slice(0, 30);
+  const price  = formatPrice(p.price || 0);
+  const stock  = Number(p.stock_quantity || 0);
+  return `${prefix}#${pos} ${status} ${title} — ${price} · ${stock}`;
+}
+
+/**
+ * Product ordering list — a two-mode screen.
+ *
+ * BROWSE: every product is one full-width row. Tapping it picks the product up.
+ * HOLDING: the four arrows appear at the top and every other row turns into a
+ * drop slot, so a product can travel from #24 to #1 in a single tap instead of
+ * twenty-three nudges. The arrows stay live while holding, so small corrections
+ * are still one tap each and the product is never put down between them.
+ *
+ * Arrows are deliberately not printed beside every product: Telegram splits a
+ * row's width evenly between its buttons, so a `name | ⬆️ | ⬇️` row leaves the
+ * name about a third of the screen — the very squeeze that made the previous
+ * four-per-row layout unreadable.
+ */
+const adminSortProductsKb = (products, page = 0, heldId = null) => {
   const totalPages = Math.max(1, Math.ceil(products.length / SORT_PAGE_SIZE));
-  const pg = Math.max(0, Math.min(page, totalPages - 1));
-  const slice = products.slice(pg * SORT_PAGE_SIZE, (pg + 1) * SORT_PAGE_SIZE);
+  const pg    = Math.max(0, Math.min(page, totalPages - 1));
+  const start = pg * SORT_PAGE_SIZE;
+  const slice = products.slice(start, start + SORT_PAGE_SIZE);
+  const held  = heldId ? products.find((p) => p.id === heldId) : null;
 
-  const rows = slice.map((p, i) => {
-    const pos = pg * SORT_PAGE_SIZE + i + 1;
-    const status = p.is_active ? '🟢' : '🔴';
-    const title = String(p.title || '').replace(/\[emoji:\d+\]/g, '').trim().slice(0, 34);
-    return [btn(`#${pos}  ${status} ${title}`, `admin_sortitem_${p.id}`)];
+  const rows = [];
+
+  if (held) {
+    rows.push([
+      btn('⏫ Top', 'admin_sortmv_top'),
+      btn('⬆️ Up',  'admin_sortmv_up'),
+      btn('⬇️ Down','admin_sortmv_dn'),
+      btn('⏬ End', 'admin_sortmv_bot'),
+    ]);
+  }
+
+  slice.forEach((p, i) => {
+    const pos = start + i + 1;
+    if (held && p.id === held.id) {
+      rows.push([btn(sortRowLabel(p, pos, '✋ '), 'noop')]);
+    } else if (held) {
+      // Tapping row #N puts the held product AT #N — the number on the button
+      // is the position it will end up in, not a vague "before/after this one".
+      rows.push([btn(sortRowLabel(p, pos, '⤵️ '), `admin_sortdrop_${pos}`)]);
+    } else {
+      rows.push([btn(sortRowLabel(p, pos), `admin_sortgrab_${p.id}`)]);
+    }
   });
 
   if (totalPages > 1) {
@@ -406,9 +448,12 @@ const adminSortProductsKb = (products, page = 0) => {
     rows.push(nav);
   }
 
-  rows.push([btn('🔢 Jump to Position', 'admin_sortbynum')]);
-  rows.push([btn('🔄 Auto-Renumber (1,2,3...)', 'admin_resetorder')]);
-  rows.push([btn('🔙 Back', 'admin_panel')]);
+  if (held) {
+    rows.push([btn('✅ Done — put it down', 'admin_sortdone')]);
+  } else {
+    rows.push([btn('🔄 Auto-Renumber (1,2,3...)', 'admin_resetorder')]);
+    rows.push([btn('🔙 Back', 'admin_panel')]);
+  }
   return mk(rows);
 };
 

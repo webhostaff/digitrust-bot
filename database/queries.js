@@ -62,8 +62,12 @@ const markStaleReminderSent = db.prepare(`
   UPDATE products SET last_stale_reminder_at = datetime('now') WHERE id = ?
 `);
 
+// The sorting screen mirrors what the customer sees, so it carries the same
+// facts the customer list shows: price, stock and sales. Without them the admin
+// is reordering bare titles and has to leave the screen to check anything.
 const getAllProductsForSorting = db.prepare(`
-  SELECT id, title, display_order, is_active
+  SELECT id, title, display_order, is_active,
+         price, stock_quantity, sales_count, premium_emoji_id
   FROM products
   ORDER BY display_order ASC, id ASC
 `);

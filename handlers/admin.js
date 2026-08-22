@@ -35,6 +35,46 @@ const logger = require('../utils/logger');
 // Pending notification context per admin user
 const pendingNotifs = new Map();
 
+// ── Product ordering ──────────────────────────────────────────────────────────
+
+/**
+ * Which product each admin is currently "holding" on the ordering screen.
+ * Deliberately in memory rather than the session store: the ordering screen is
+ * pure navigation state, and parking it in the FSM session would collide with
+ * whatever text-input flow the admin was in.
+ */
+const sortHeld = new Map(); // userId -> productId
+
+const SORT_PAGE_SIZE = 8; // must match utils/keyboard.js
+
+/** Products in customer order, positions guaranteed to be 1,2,3,… */
+function sortedProducts() {
+  const all = db.getAllProductsForSorting();
+  // display_order ties fall back to id, so two products can share a number and
+  // the list silently reorders itself on the next write. Normalising on read
+  // makes every position an honest, unique slot.
+  all.forEach((p, idx) => {
+    if (p.display_order !== idx + 1) db.setDisplayOrder(p.id, idx + 1);
+  });
+  return all;
+}
+
+/**
+ * Move a product so it ends up at `targetIdx` (0-based), shifting the rest.
+ * @returns {number} the index it actually landed on
+ */
+function moveProductTo(productId, targetIdx) {
+  const all = sortedProducts();
+  const from = all.findIndex((p) => p.id === productId);
+  if (from === -1) return -1;
+
+  const to = Math.max(0, Math.min(targetIdx, all.length - 1));
+  const [moved] = all.splice(from, 1);
+  all.splice(to, 0, moved);
+  all.forEach((p, idx) => db.setDisplayOrder(p.id, idx + 1));
+  return to;
+}
+
 // ── Security guard ────────────────────────────────────────────────────────────
 
 /**
@@ -1534,12 +1574,16 @@ async function handleAdminText(bot, msg) {
 
     session.clear(userId);
     const products = db.getAllProductsForSorting();
+    // Land on the page the product moved to, not always page 1 — otherwise
+    // sending something to #24 shows a screen it isn't on.
+    const page = Math.floor((targetPos - 1) / 8);
     await bot.sendMessage(
       chatId,
-      `✅ <b>${moving.title}</b> moved to position <b>#${targetPos}</b>.\n` +
+      `✅ <b>${escapeHtml(kbStripEmojiCodes(String(moving.title || '')).trim())}</b> ` +
+      `moved to position <b>#${targetPos}</b>.\n` +
       `All other products auto-shifted.\n\n` +
-      `↕️ <b>Sort Products</b> updated:`,
-      { parse_mode: 'HTML', reply_markup: adminSortProductsKb(products) }
+      `↕️ <b>Product Order</b> updated:`,
+      { parse_mode: 'HTML', reply_markup: adminSortProductsKb(products, page) }
     );
     return;
   }
@@ -1786,6 +1830,59 @@ async function handleAdminCallback(bot, query) {
   const answer = (text = '') => bot.answerCallbackQuery(query.id, { text }).catch(() => {});
 
   await answer();
+
+  /**
+   * Draw the ordering screen.
+   *
+   * The status line carries all the feedback, because answerCallbackQuery has
+   * already fired once above — a second call is rejected by Telegram, so toast
+   * popups never actually reach the admin on this screen.
+   *
+   * @param {number} page
+   * @param {string} note  optional one-line result of the last action
+   */
+  async function renderSortScreen(page = 0, note = '') {
+    const products = sortedProducts();
+    if (!products.length) {
+      sortHeld.delete(userId);
+      await bot.editMessageText('📦 No products to sort.', {
+        chat_id: chatId, message_id: msgId, reply_markup: adminBackKb(),
+      }).catch(() => {});
+      return;
+    }
+
+    const heldId = sortHeld.get(userId) || null;
+    const held   = heldId ? products.find((p) => p.id === heldId) : null;
+    if (heldId && !held) sortHeld.delete(userId);
+
+    const totalPages = Math.max(1, Math.ceil(products.length / SORT_PAGE_SIZE));
+    const pg     = Math.max(0, Math.min(page, totalPages - 1));
+    const active = products.filter((p) => p.is_active).length;
+
+    let text =
+      `↕️ <b>Product Order</b>\n\n` +
+      `📦 Total: <b>${products.length}</b>   🟢 Active: <b>${active}</b>   🔴 Hidden: <b>${products.length - active}</b>\n` +
+      `📄 Page <b>${pg + 1}</b> of <b>${totalPages}</b>\n`;
+
+    if (held) {
+      const pos = products.findIndex((p) => p.id === held.id) + 1;
+      text +=
+        `\n✋ <b>Holding:</b> ${escapeHtml(kbStripEmojiCodes(String(held.title || '')).trim())}\n` +
+        `📍 Currently at <b>#${pos}</b>\n\n` +
+        `<i>Tap any row to drop it on that number, or use the arrows above. ` +
+        `Page through the list while holding — it stays in your hand.</i>`;
+    } else {
+      text += `\n<i>Tap a product to pick it up, then tap the position you want it in. ` +
+              `#1 is the first thing customers see.</i>`;
+    }
+
+    if (note) text += `\n\n${note}`;
+
+    await bot.editMessageText(text, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: adminSortProductsKb(products, pg, heldId),
+    }).catch(() => {});
+  }
 
   // ═══════════════════════════════════════════════════════════════════
   // V2 CALLBACKS — refund eligibility, delivery mode, stock alerts,
@@ -3944,29 +4041,74 @@ async function handleAdminCallback(bot, query) {
     return;
   }
 
-  // ── Sort Products ─────────────────────────────────────────────────
+  // ══════════════════════════════════════════════════════════════════
+  // PRODUCT ORDERING — pick a product up, drop it where it belongs
+  // ══════════════════════════════════════════════════════════════════
   if (data === 'admin_sort_products' || /^admin_sort_p_\d+$/.test(data)) {
     const page = /^admin_sort_p_\d+$/.test(data)
       ? parseInt(data.split('_').pop(), 10) : 0;
-    const products = db.getAllProductsForSorting();
-    if (!products.length) {
-      await bot.editMessageText('📦 No products to sort.', {
-        chat_id: chatId, message_id: msgId, reply_markup: adminBackKb(),
-      });
+    // Entering from the panel always starts with empty hands; only paging keeps
+    // whatever is being carried.
+    if (data === 'admin_sort_products') sortHeld.delete(userId);
+    await renderSortScreen(page);
+    return;
+  }
+
+  // Pick a product up.
+  if (/^admin_sortgrab_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const all = sortedProducts();
+    const idx = all.findIndex((p) => p.id === productId);
+    if (idx === -1) { await answer('❌ Not found'); return; }
+
+    sortHeld.set(userId, productId);
+    await renderSortScreen(Math.floor(idx / SORT_PAGE_SIZE));
+    return;
+  }
+
+  // Drop it at an exact position.
+  if (/^admin_sortdrop_\d+$/.test(data)) {
+    const target = parseInt(data.split('_').pop(), 10);
+    const productId = sortHeld.get(userId);
+    if (!productId) { await renderSortScreen(0, '👆 Pick a product first.'); return; }
+
+    const newIdx = moveProductTo(productId, target - 1);
+    await renderSortScreen(Math.floor(newIdx / SORT_PAGE_SIZE), `✅ Moved to <b>#${newIdx + 1}</b>`);
+    return;
+  }
+
+  // Nudge / send to an end. The product stays in hand so corrections chain.
+  if (/^admin_sortmv_(top|up|dn|bot)$/.test(data)) {
+    const dir = data.split('_').pop();
+    const productId = sortHeld.get(userId);
+    if (!productId) { await renderSortScreen(0, '👆 Pick a product first.'); return; }
+
+    const all = sortedProducts();
+    const idx = all.findIndex((p) => p.id === productId);
+    if (idx === -1) { sortHeld.delete(userId); await renderSortScreen(0, '❌ That product no longer exists.'); return; }
+
+    const targets = { top: 0, up: idx - 1, dn: idx + 1, bot: all.length - 1 };
+    const wanted  = targets[dir];
+    if (wanted === idx || wanted < 0 || wanted > all.length - 1) {
+      const edge = (dir === 'up' || dir === 'top') ? '⛔ Already at the top' : '⛔ Already at the end';
+      await renderSortScreen(Math.floor(idx / SORT_PAGE_SIZE), edge);
       return;
     }
-    const totalPages = Math.max(1, Math.ceil(products.length / 10));
-    const pg = Math.max(0, Math.min(page, totalPages - 1));
-    const active = products.filter((p) => p.is_active).length;
 
-    await bot.editMessageText(
-      `↕️ <b>Product Order</b>\n\n` +
-      `📦 Total: <b>${products.length}</b>   🟢 Active: <b>${active}</b>   🔴 Hidden: <b>${products.length - active}</b>\n` +
-      `📄 Page <b>${pg + 1}</b> of <b>${totalPages}</b>\n\n` +
-      `<i>Tap a product to move it or set its exact position. ` +
-      `The number on the left is its place in the customer's list.</i>`,
-      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
-        reply_markup: adminSortProductsKb(products, pg) }
+    const newIdx = moveProductTo(productId, wanted);
+    await renderSortScreen(Math.floor(newIdx / SORT_PAGE_SIZE), `✅ Moved to <b>#${newIdx + 1}</b>`);
+    return;
+  }
+
+  // Put it down — back to browsing.
+  if (data === 'admin_sortdone') {
+    const productId = sortHeld.get(userId);
+    sortHeld.delete(userId);
+    const all = sortedProducts();
+    const idx = productId ? all.findIndex((p) => p.id === productId) : -1;
+    await renderSortScreen(
+      idx >= 0 ? Math.floor(idx / SORT_PAGE_SIZE) : 0,
+      idx >= 0 ? `✅ Saved at <b>#${idx + 1}</b>` : ''
     );
     return;
   }
@@ -3993,70 +4135,25 @@ async function handleAdminCallback(bot, query) {
     return;
   }
 
-  // Helper: rebuild display_order as 1,2,3,... from the current sorted list
-  const renumberAll = () => {
-    const all = db.getAllProductsForSorting();
-    all.forEach((p, idx) => db.setDisplayOrder(p.id, idx + 1));
-  };
-
-  /**
-   * Redraw the ordering list. When a product id is given, the view jumps to the
-   * page that product now sits on — otherwise nudging an item near the bottom
-   * would bounce the admin back to page 1 every time.
-   */
-  const refreshSortView = async (focusProductId = null) => {
-    const products = db.getAllProductsForSorting();
-    const total = products.length;
-    let page = 0;
-    if (focusProductId) {
-      const idx = products.findIndex((p) => p.id === focusProductId);
-      if (idx >= 0) page = Math.floor(idx / 10);
-    }
-    const totalPages = Math.max(1, Math.ceil(total / 10));
-    const active = products.filter((p) => p.is_active).length;
-    await bot.editMessageText(
-      `↕️ <b>Product Order</b>\n\n` +
-      `📦 Total: <b>${total}</b>   🟢 Active: <b>${active}</b>   🔴 Hidden: <b>${total - active}</b>\n` +
-      `📄 Page <b>${page + 1}</b> of <b>${totalPages}</b>\n\n` +
-      `<i>Tap a product to move it or set its exact position.</i>`,
-      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
-        reply_markup: adminSortProductsKb(products, page) }
-    );
-  };
-
-  // Move product up
-  if (/^admin_moveup_\d+$/.test(data)) {
+  // ── Legacy move buttons ───────────────────────────────────────────
+  // The list no longer prints these, but a message an admin scrolled back to
+  // still carries them. Routed through the same code as the new screen so an
+  // old button can never write a different ordering than the current one.
+  if (/^admin_moveup_\d+$/.test(data) || /^admin_movedown_\d+$/.test(data)) {
     const productId = parseInt(data.split('_').pop(), 10);
-    renumberAll();
-    const all = db.getAllProductsForSorting();
+    const all = sortedProducts();
     const idx = all.findIndex((p) => p.id === productId);
-    if (idx > 0) {
-      const above = all[idx - 1];
-      const curOrder   = idx + 1;
-      const aboveOrder = idx;
-      db.setDisplayOrder(productId, aboveOrder);
-      db.setDisplayOrder(above.id, curOrder);
-    }
-    await answer('✅ Moved up');
-    await refreshSortView(productId);
-    return;
-  }
+    if (idx === -1) { await renderSortScreen(0, '❌ That product no longer exists.'); return; }
 
-  // Move product down
-  if (/^admin_movedown_\d+$/.test(data)) {
-    const productId = parseInt(data.split('_').pop(), 10);
-    renumberAll();
-    const all = db.getAllProductsForSorting();
-    const idx = all.findIndex((p) => p.id === productId);
-    if (idx < all.length - 1 && idx !== -1) {
-      const below = all[idx + 1];
-      const curOrder   = idx + 1;
-      const belowOrder = idx + 2;
-      db.setDisplayOrder(productId, belowOrder);
-      db.setDisplayOrder(below.id, curOrder);
+    const wanted = data.startsWith('admin_moveup_') ? idx - 1 : idx + 1;
+    if (wanted < 0 || wanted > all.length - 1) {
+      await renderSortScreen(Math.floor(idx / SORT_PAGE_SIZE),
+        wanted < 0 ? '⛔ Already at the top' : '⛔ Already at the end');
+      return;
     }
-    await answer('✅ Moved down');
-    await refreshSortView(productId);
+
+    const newIdx = moveProductTo(productId, wanted);
+    await renderSortScreen(Math.floor(newIdx / SORT_PAGE_SIZE), `✅ Moved to <b>#${newIdx + 1}</b>`);
     return;
   }
 
@@ -4102,10 +4199,9 @@ async function handleAdminCallback(bot, query) {
 
   // Auto-renumber (Reset orders to 1,2,3,...)
   if (data === 'admin_resetorder') {
-    renumberAll();
-    await answer('✅ Renumbered 1,2,3...');
-    // No focus product here — renumbering affects everything, so show page 1.
-    await refreshSortView();
+    sortedProducts(); // normalising IS the renumber
+    // Renumbering affects everything, so there is no product to focus on.
+    await renderSortScreen(0, '✅ Positions renumbered 1, 2, 3…');
     return;
   }
 
