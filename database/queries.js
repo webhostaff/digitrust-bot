@@ -72,6 +72,30 @@ const getAllProductsForSorting = db.prepare(`
   ORDER BY display_order ASC, id ASC
 `);
 
+// ── Scoped ordering ──────────────────────────────────────────────────────────
+// The customer never sees one flat list: categories are their own screens and
+// everything without a category falls under "📦 Other Products". Ordering has to
+// work the same way, or the admin is dragging rows around a list that exists
+// nowhere in the shop.
+//
+// is_active = 0 is excluded on purpose. A deleted product is a soft-delete —
+// still in the table, invisible to customers — so listing it among the things
+// being arranged is noise about a product that cannot be bought.
+const SORT_COLS = `id, title, display_order, is_active,
+                   price, stock_quantity, sales_count, premium_emoji_id, category_id`;
+
+const getUncategorizedForSorting = db.prepare(`
+  SELECT ${SORT_COLS} FROM products
+  WHERE is_active = 1 AND (category_id IS NULL OR category_id = 0)
+  ORDER BY display_order ASC, id ASC
+`);
+
+const getCategoryForSorting = db.prepare(`
+  SELECT ${SORT_COLS} FROM products
+  WHERE is_active = 1 AND category_id = ?
+  ORDER BY display_order ASC, id ASC
+`);
+
 const updateDisplayOrder = db.prepare(`
   UPDATE products SET display_order = ? WHERE id = ?
 `);
@@ -1439,6 +1463,15 @@ module.exports = {
   getProductsByCategory: (catId) => cat_getProducts.all(catId),
   setProductCategory:  (productId, catId)       => cat_setProduct.run(catId, productId),
   getAllProductsForSorting: () => getAllProductsForSorting.all(),
+
+  /**
+   * The products of ONE customer-visible list, in the order they appear there.
+   * @param {number|null} categoryId  null → the "📦 Other Products" group
+   */
+  getProductsForSorting: (categoryId = null) =>
+    (categoryId == null || categoryId === 0)
+      ? getUncategorizedForSorting.all()
+      : getCategoryForSorting.all(categoryId),
 
   // Same ordering, but carrying the fields a picker needs. getAllProductsForSorting
   // returns only (id, title, display_order, is_active) — no price — so a picker

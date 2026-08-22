@@ -386,17 +386,32 @@ const adminPreorderDetailKb = (preorderId, status) => {
  */
 const SORT_PAGE_SIZE = 8;
 
-/** One list row: `#3  🟢 Notion Education Plus — $1.90 · 8 left`. */
-function sortRowLabel(p, pos, prefix = '') {
-  const status = p.is_active ? '🟢' : '🔴';
-  const title  = stripEmojiCodes(String(p.title || '')).trim().slice(0, 30);
-  const price  = formatPrice(p.price || 0);
-  const stock  = Number(p.stock_quantity || 0);
-  return `${prefix}#${pos} ${status} ${title} — ${price} · ${stock}`;
+/**
+ * One list row, formatted exactly like the customer's product button so the
+ * admin is arranging the thing they can actually see in the shop:
+ * `#3 Notion Education Plus — $1.90 [✅ 8]`.
+ */
+function sortRowButton(p, pos, prefix, callbackData) {
+  const title = stripEmojiCodes(String(p.title || ''))
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 34);
+  const qty     = Number(p.stock_quantity || 0);
+  const inStock = qty > 0;
+  const stock   = inStock ? `✅ ${qty}` : '❌ Out';
+  const label   = `#${pos} ${title} — ${formatPrice(p.price || 0)} [${stock}]`;
+
+  const button = iconBtn(label, callbackData, { iconId: productIconId(p), inStock });
+  // The prefix goes on AFTER iconBtn. iconBtn strips a label's leading emoji so
+  // the same symbol isn't shown twice next to a premium icon — and "⤵️" is an
+  // emoji, so prefixing first made the drop marker vanish on exactly those
+  // products that have a custom icon.
+  if (prefix) button.text = prefix + button.text;
+  return button;
 }
 
 /**
- * Product ordering list — a two-mode screen.
+ * Product ordering list — a two-mode screen, scoped to ONE customer list.
  *
  * BROWSE: every product is one full-width row. Tapping it picks the product up.
  * HOLDING: the four arrows appear at the top and every other row turns into a
@@ -430,13 +445,13 @@ const adminSortProductsKb = (products, page = 0, heldId = null) => {
   slice.forEach((p, i) => {
     const pos = start + i + 1;
     if (held && p.id === held.id) {
-      rows.push([btn(sortRowLabel(p, pos, '✋ '), 'noop')]);
+      rows.push([sortRowButton(p, pos, '✋ ', 'noop')]);
     } else if (held) {
       // Tapping row #N puts the held product AT #N — the number on the button
       // is the position it will end up in, not a vague "before/after this one".
-      rows.push([btn(sortRowLabel(p, pos, '⤵️ '), `admin_sortdrop_${pos}`)]);
+      rows.push([sortRowButton(p, pos, '⤵️ ', `admin_sortdrop_${pos}`)]);
     } else {
-      rows.push([btn(sortRowLabel(p, pos), `admin_sortgrab_${p.id}`)]);
+      rows.push([sortRowButton(p, pos, '', `admin_sortgrab_${p.id}`)]);
     }
   });
 
@@ -451,8 +466,7 @@ const adminSortProductsKb = (products, page = 0, heldId = null) => {
   if (held) {
     rows.push([btn('✅ Done — put it down', 'admin_sortdone')]);
   } else {
-    rows.push([btn('🔄 Auto-Renumber (1,2,3...)', 'admin_resetorder')]);
-    rows.push([btn('🔙 Back', 'admin_panel')]);
+    rows.push([btn('🔙 Other lists', 'admin_sortlists'), btn('🏠 Admin Panel', 'admin_panel')]);
   }
   return mk(rows);
 };
