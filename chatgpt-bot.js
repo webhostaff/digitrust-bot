@@ -58,6 +58,22 @@ function formatDate(d) {
   return d.toISOString().slice(0, 10);
 }
 
+/**
+ * Wallet balance from the shared users table.
+ *
+ * Read fresh every time rather than cached in the session: the customer can top
+ * up in the main bot while this one is sitting on the summary screen, and a
+ * stale figure would either hide money they have or offer money they spent.
+ */
+function getBalance(userId) {
+  try {
+    const row = db.prepare('SELECT balance FROM users WHERE telegram_id = ?').get(userId);
+    return Number(row?.balance) || 0;
+  } catch (e) {
+    return 0;
+  }
+}
+
 function formatDisplayDate(d) {
   const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
   return `${d.getDate()} ${months[d.getMonth()]} ${d.getFullYear()}`;
@@ -502,6 +518,109 @@ bot.on('callback_query', async (q) => {
     return;
   }
 
+  // Balance shown but too small — explain instead of silently doing nothing.
+  if (data === 'balance_short') {
+    const s = getSession(userId);
+    const bal = getBalance(userId);
+    const need = s?.finalPrice || 0;
+    await bot.sendMessage(chatId,
+      `👛 <b>Not enough balance</b>\n\n` +
+      `Your balance: <b>$${bal.toFixed(2)}</b>\n` +
+      `Order total: <b>$${need.toFixed(2)}</b>\n` +
+      `Short by: <b>$${Math.max(0, need - bal).toFixed(2)}</b>\n\n` +
+      `Top up in the main store bot, or pay the full amount with one of the crypto methods above.`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  // ── Pay with wallet balance ────────────────────────────────────────────────
+  // Same wallet as the main store: both bots share one database and one users
+  // row, so credit earned or topped up there is spendable here.
+  if (data === 'pay_balance') {
+    const s = getSession(userId);
+    if (!s || s.state !== 'CONFIRM_ORDER') {
+      await bot.sendMessage(chatId, '⏰ Session expired. Use /start to begin again.');
+      return;
+    }
+
+    if (isOutOfStock()) {
+      await bot.sendMessage(chatId, '😔 Sorry, seats just sold out. Nothing was charged.');
+      clearSession(userId);
+      return;
+    }
+
+    let orderId = null;
+    try {
+      let cgbProductId = 0;
+      try {
+        const p = db.prepare(`SELECT id FROM products WHERE is_chatgpt_business=1 LIMIT 1`).get();
+        if (p) cgbProductId = p.id;
+      } catch (e) {}
+
+      // Order first, so the transaction row can point at it and support has
+      // something to look up if the charge fails halfway.
+      const orderResult = db.prepare(`
+        INSERT INTO orders (user_id, product_id, quantity, total_price, payment_method, status, email)
+        VALUES (?, ?, 1, ?, 'balance', 'pending', ?)
+      `).run(userId, cgbProductId, s.finalPrice, s.email);
+      orderId = orderResult.lastInsertRowid;
+
+      // Atomic: balance check, debit and ledger entry in one DB transaction, so
+      // the same dollar cannot also be spent in the main bot mid-purchase.
+      const charge = queries.chargeWallet(userId, s.finalPrice, {
+        type:        'purchase',
+        description: `ChatGPT Business seat — order #${orderId}`,
+        orderId,
+      });
+
+      if (!charge.ok) {
+        db.prepare(`UPDATE orders SET status='cancelled' WHERE id=?`).run(orderId);
+        await bot.sendMessage(chatId,
+          `❌ <b>Payment failed</b>\n\n` +
+          (charge.reason === 'no_account'
+            ? 'No wallet found for your account. Open the main store bot once, then try again.'
+            : `Your balance: <b>$${charge.balance.toFixed(2)}</b>\n` +
+              `Order total: <b>$${s.finalPrice.toFixed(2)}</b>\n\n` +
+              `Nothing was charged. Top up in the main store bot, or pay with crypto.`),
+          { parse_mode: 'HTML' });
+        return;
+      }
+
+      try {
+        queries.createCgbSubscription(
+          orderId, userId, s.email, s.startDate, s.endDate,
+          s.daysRemaining + (s.extraMonth ? 30 : 0),
+          s.basePrice, s.extraMonth ? 1 : 0, s.finalPrice
+        );
+      } catch (subErr) {
+        logger.error('createCgbSubscription failed: ' + subErr.message);
+      }
+
+      const paid = {
+        ...s,
+        orderId,
+        paymentMethod: 'pay_balance',
+        endDate:       s.endDate      || 'N/A',
+        startDate:     s.startDate    || new Date().toISOString().slice(0, 10),
+        daysRemaining: s.daysRemaining || 0,
+        extraMonth:    s.extraMonth   || false,
+        finalPrice:    s.finalPrice   || 0,
+      };
+      // The wallet reference doubles as the receipt line, so the admin card
+      // shows the remaining balance instead of an empty TxID field.
+      await confirmPayment(chatId, userId, orderId, `wallet · $${charge.balance.toFixed(2)} left`, paid);
+    } catch (e) {
+      logger.error('Balance payment error: ' + e.message);
+      if (orderId) {
+        try { db.prepare(`UPDATE orders SET status='cancelled' WHERE id=?`).run(orderId); } catch (_) {}
+      }
+      await bot.sendMessage(chatId,
+        `❌ Error processing payment: ${e.message}\n\nIf money left your balance, contact support with order #${orderId || '—'}.`,
+        { parse_mode: 'HTML' });
+    }
+    return;
+  }
+
   if (data.startsWith('change_email')) {
     const s = getSession(userId);
     if (!s) return;
@@ -625,6 +744,16 @@ bot.on('message', async (msg) => {
     s.email = text;
     setSession(userId, 'CONFIRM_ORDER', s);
 
+    // The wallet is the same one the main bot tops up — same database, same
+    // users row — so a customer with credit there can spend it here instead of
+    // being sent off to make another crypto transfer.
+    const balance = getBalance(userId);
+    // Compare in whole cents. Two figures that print the same must behave the
+    // same — a float comparison would reject $5.00 against a total stored as
+    // 4.999999999.
+    const canPayWithBalance =
+      Math.round(balance * 100) >= Math.round(s.finalPrice * 100);
+
     // Show order summary
     const txt =
       `📋 <b>Order Summary</b>\n\n` +
@@ -633,18 +762,30 @@ bot.on('message', async (msg) => {
       `📅 From: ${s.startDate}\n` +
       `📅 To: ${s.endDate}\n` +
       `⏳ Duration: ${s.daysRemaining + (s.extraMonth ? 30 : 0)} days\n` +
-      `💰 <b>Total: $${s.finalPrice.toFixed(2)}</b>\n\n` +
+      `💰 <b>Total: $${s.finalPrice.toFixed(2)}</b>\n` +
+      `👛 Your balance: <b>$${balance.toFixed(2)}</b>\n\n` +
       `Select payment method:`;
+
+    const rows = [];
+    if (canPayWithBalance) {
+      // Instant and no TxID to paste, so it goes first.
+      rows.push([{ text: `👛 Pay with Balance ($${balance.toFixed(2)})`, callback_data: 'pay_balance' }]);
+    } else if (balance > 0) {
+      // Shown but disabled rather than hidden: a customer who knows they have
+      // credit would otherwise think the bot lost it.
+      rows.push([{ text: `👛 Balance $${balance.toFixed(2)} — not enough`, callback_data: 'balance_short' }]);
+    }
+    rows.push(
+      [{ text: '💳 Pay with Binance Pay', callback_data: 'pay_binance' }],
+      [{ text: '💎 USDT BEP20', callback_data: 'pay_bep20' }, { text: '💎 USDT TRC20', callback_data: 'pay_trc20' }],
+      [{ text: '🤖 CryptoBot', callback_data: 'pay_cryptobot' }],
+      [{ text: '✏️ Change Email', callback_data: 'change_email' }],
+      [{ text: '❌ Cancel', callback_data: 'cancel' }],
+    );
 
     await bot.sendMessage(chatId, txt, {
       parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: [
-        [{ text: '💳 Pay with Binance Pay', callback_data: 'pay_binance' }],
-        [{ text: '💎 USDT BEP20', callback_data: 'pay_bep20' }, { text: '💎 USDT TRC20', callback_data: 'pay_trc20' }],
-        [{ text: '🤖 CryptoBot', callback_data: 'pay_cryptobot' }],
-        [{ text: '✏️ Change Email', callback_data: 'change_email' }],
-        [{ text: '❌ Cancel', callback_data: 'cancel' }],
-      ] },
+      reply_markup: { inline_keyboard: rows },
     });
     return;
   }
@@ -769,6 +910,7 @@ async function confirmPayment(chatId, userId, orderId, txid, sessionData) {
       pay_bep20:    '💎 USDT BEP20',
       pay_trc20:    '💎 USDT TRC20',
       pay_cryptobot:'🤖 CryptoBot',
+      pay_balance:  '👛 Wallet Balance',
     }[paymentMethod] || paymentMethod;
 
     const card = {
@@ -779,7 +921,8 @@ async function confirmPayment(chatId, userId, orderId, txid, sessionData) {
       endDate:   sessionData.endDate,
       paid:      sessionData.finalPrice.toFixed(2),
       method:    payMethodLabel,
-      refLabel:  'TxID',
+      // A wallet payment has no TxID; the field carries the receipt line instead.
+      refLabel:  paymentMethod === 'pay_balance' ? 'Wallet' : 'TxID',
       ref:       escapeHtml(txid),
     };
     await bot.sendMessage(ADMIN_ID, orderCard(card, false), {

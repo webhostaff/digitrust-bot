@@ -38,13 +38,44 @@ const { formatPrice, renderEmojis } = require('../utils/format');
 const BOT_USERNAME = '@DIGISELLABOT';
 
 /**
+ * Where announcements go.
+ *
+ * Two separate pairs of settings exist and they are NOT the same thing:
+ *
+ *   updates_channel_id / updates_group_id   ← "📡 Updates Channel" and
+ *                                             "💬 Updates Group" in the admin
+ *                                             settings panel — where posts go
+ *   required_channel_id / required_group_id ← the forced-subscription chats a
+ *                                             customer must join to buy
+ *
+ * Every publisher here used to read only the `required_*` pair, so whatever the
+ * admin typed into "Updates Channel" was written to a key nothing ever read.
+ * Posting therefore worked only while the two happened to be the same chat, and
+ * went silent the moment the forced-join channel was changed or cleared —
+ * exactly the "it used to post and then stopped" symptom.
+ *
+ * The updates chat wins when it is set; the required chat is the fallback so
+ * existing installs that only ever configured the forced-join channel keep
+ * working untouched.
+ */
+function updatesChannelId() {
+  return String(db.getSetting('updates_channel_id', '') || '').trim()
+      || String(db.getSetting('required_channel_id', '') || '').trim();
+}
+
+function updatesGroupId() {
+  return String(db.getSetting('updates_group_id', '') || '').trim()
+      || String(db.getSetting('required_group_id', '') || '').trim();
+}
+
+/**
  * Publish a message to the updates channel.
  */
 // Publish to channel WITH product photo if available
 async function publishToChannelWithPhoto(bot, product, text, replyMarkup = null) {
-  const channelId = db.getSetting('required_channel_id', '');
+  const channelId = updatesChannelId();
   if (!channelId) {
-    logger.warn('required_channel_id not set — skipping channel publish');
+    logger.warn('No updates/required channel configured — skipping channel publish');
     return false;
   }
   try {
@@ -61,15 +92,15 @@ async function publishToChannelWithPhoto(bot, product, text, replyMarkup = null)
     }
     return true;
   } catch (e) {
-    logger.warn(`publishToChannelWithPhoto failed: ${e.message}`);
+    logger.warn(`publishToChannelWithPhoto failed (chat ${channelId}): ${e.message}`);
     return false;
   }
 }
 
 async function publishToGroupWithPhoto(bot, product, text, replyMarkup = null) {
-  const groupId = db.getSetting('required_group_id', '');
+  const groupId = updatesGroupId();
   if (!groupId) {
-    logger.warn('required_group_id not set — skipping group publish');
+    logger.warn('No updates/required group configured — skipping group publish');
     return false;
   }
   // Groups support custom emoji (Bot API 9.4), so plain emoji are upgraded
@@ -90,7 +121,7 @@ async function publishToGroupWithPhoto(bot, product, text, replyMarkup = null) {
     }
     return true;
   } catch (e) {
-    logger.warn(`publishToGroupWithPhoto failed: ${e.message}`);
+    logger.warn(`publishToGroupWithPhoto failed (chat ${groupId}): ${e.message}`);
     return false;
   }
 }
@@ -103,27 +134,27 @@ async function autoPublishWithPhoto(bot, product, text, replyMarkup = null) {
 }
 
 async function publishToChannel(bot, text, replyMarkup = null) {
-  const channelId = db.getSetting('required_channel_id', '');
+  const channelId = updatesChannelId();
   if (!channelId) {
-    logger.warn('updates_channel_id not set — skipping channel publish');
+    logger.warn('No updates/required channel configured — skipping channel publish');
     return false;
   }
   try {
     await bot.sendMessage(channelId, text, { parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: replyMarkup || undefined });
     return true;
   } catch (e) {
-    logger.error(`Channel publish failed: ${e.message}`);
+    logger.error(`Channel publish failed (chat ${channelId}): ${e.message}`);
     return false;
   }
 }
 
 /**
- * Publish a message to the discussion group (requiredGroupId).
+ * Publish a message to the updates group.
  */
 async function publishToGroup(bot, text, replyMarkup = null) {
-  const groupId = db.getSetting('required_group_id', '');
+  const groupId = updatesGroupId();
   if (!groupId) {
-    logger.warn('updates_group_id not set — skipping group publish');
+    logger.warn('No updates/required group configured — skipping group publish');
     return false;
   }
   // Groups support custom emoji (Bot API 9.4), so plain emoji are upgraded
@@ -134,7 +165,7 @@ async function publishToGroup(bot, text, replyMarkup = null) {
     await bot.sendMessage(groupId, text, { parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: replyMarkup || undefined });
     return true;
   } catch (e) {
-    logger.error(`Group publish failed: ${e.message}`);
+    logger.error(`Group publish failed (chat ${groupId}): ${e.message}`);
     return false;
   }
 }
@@ -360,4 +391,6 @@ module.exports = {
   buildOutOfStockText,
   buildPriceDropText,
   buildStaleProductText,
+  updatesChannelId,
+  updatesGroupId,
 };

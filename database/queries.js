@@ -1366,6 +1366,58 @@ function chargeWalletForPreorder(userId, amount) {
   })();
 }
 
+/**
+ * Charge a wallet and write the matching transaction row, atomically.
+ *
+ * The ChatGPT Business bot runs as a separate process against the same database
+ * file, so a read-then-write pair from there could interleave with a purchase in
+ * the main bot and spend the same dollar twice. Wrapping the check, the debit
+ * and the ledger entry in one SQLite transaction closes that window regardless
+ * of which bot is calling.
+ *
+ * @returns {{ok:boolean, balance:number, reason?:string}} `balance` is what the
+ *          user has left on success, or what they actually had on failure.
+ */
+function chargeWallet(userId, amount, meta = {}) {
+  return db.transaction(() => {
+    const row = db.prepare('SELECT balance FROM users WHERE telegram_id = ?').get(userId);
+    if (!row) return { ok: false, balance: 0, reason: 'no_account' };
+
+    const balance = Number(row.balance) || 0;
+    if (!hasEnough(balance, amount)) return { ok: false, balance, reason: 'insufficient' };
+
+    updateBalance.run(-amount, userId);
+    insertTransaction.run({
+      userId,
+      type:        meta.type        || 'purchase',
+      amount:      -Math.abs(Number(amount)),
+      description: meta.description || 'Wallet payment',
+      refId:       meta.refId       || null,
+      orderId:     meta.orderId     || null,
+    });
+
+    const after = db.prepare('SELECT balance FROM users WHERE telegram_id = ?').get(userId);
+    return { ok: true, balance: Number(after?.balance) || 0 };
+  })();
+}
+
+/** Refund a wallet charge — used when an order cannot be completed after payment. */
+function refundWallet(userId, amount, meta = {}) {
+  return db.transaction(() => {
+    updateBalance.run(Math.abs(Number(amount)), userId);
+    insertTransaction.run({
+      userId,
+      type:        meta.type        || 'refund',
+      amount:      Math.abs(Number(amount)),
+      description: meta.description || 'Wallet refund',
+      refId:       meta.refId       || null,
+      orderId:     meta.orderId     || null,
+    });
+    const after = db.prepare('SELECT balance FROM users WHERE telegram_id = ?').get(userId);
+    return { ok: true, balance: Number(after?.balance) || 0 };
+  })();
+}
+
 module.exports = {
   // Users
   upsertAndGetUser,
@@ -1566,6 +1618,8 @@ module.exports = {
   deliverOrder,
   deliverOrderAndChargeWallet,
   chargeWalletForPreorder,
+  chargeWallet,
+  refundWallet,
 
   // Transactions
   addTransaction:    (data) => insertTransaction.run(data),

@@ -27,6 +27,7 @@ const {
   publishToChannel, publishToGroup, broadcastToUsers, autoPublish, autoPublishWithPhoto,
   buildNewProductText, buildStockUpdateText,
   buildLowStockText, buildOutOfStockText, buildPriceDropText,
+  updatesChannelId, updatesGroupId,
 } = require('../services/notifications');
 const { notifyBackInStockSubscribers } = require('./buy');
 const { evaluateStock } = require('../services/stockAlerts');
@@ -6059,8 +6060,8 @@ async function handleAdminCallback(bot, query) {
     const { publishToChannel, publishToGroup } = require('../services/notifications');
     const vipImg = db.getSetting('vip_image_file_id', '');
     if (vipImg) {
-      const channelId = db.getSetting('required_channel_id', '');
-      const groupId   = db.getSetting('required_group_id', '');
+      const channelId = updatesChannelId();
+      const groupId   = updatesGroupId();
       if (channelId) await bot.sendPhoto(channelId, vipImg, { caption: text, parse_mode: 'HTML', reply_markup: kb }).catch(() => {});
       if (groupId)   await bot.sendPhoto(groupId, vipImg, { caption: text, parse_mode: 'HTML', reply_markup: kb }).catch(() => {});
     } else {
@@ -6107,8 +6108,8 @@ async function handleAdminCallback(bot, query) {
         `🚧 <b>Bot Under Maintenance</b>\n\n` +
         `${msg}\n\n` +
         `⏰ Service will resume shortly. Thank you for your patience.`;
-      const channelId = db.getSetting('required_channel_id', '');
-      const groupId = db.getSetting('required_group_id', '');
+      const channelId = updatesChannelId();
+      const groupId = updatesGroupId();
       if (channelId) {
         try { await bot.sendMessage(channelId, announcement, { parse_mode: 'HTML' }); } catch (e) { logger.warn(`Channel notify failed: ${e.message}`); }
       }
@@ -6141,8 +6142,8 @@ async function handleAdminCallback(bot, query) {
         `✅ <b>Bot is Back Online!</b>\n\n` +
         `🎉 Maintenance complete — service is fully operational again.\n` +
         `Thank you for your patience! 💚`;
-      const channelId = db.getSetting('required_channel_id', '');
-      const groupId = db.getSetting('required_group_id', '');
+      const channelId = updatesChannelId();
+      const groupId = updatesGroupId();
       if (channelId) {
         try { await bot.sendMessage(channelId, announcement, { parse_mode: 'HTML' }); } catch (e) { logger.warn(`Channel notify failed: ${e.message}`); }
       }
@@ -6357,6 +6358,72 @@ async function handleAdminCallback(bot, query) {
     });
     return;
   }
+  // ── Broadcast health check ────────────────────────────────────────
+  // Auto-posting fails silently by design — a publish error is logged and
+  // swallowed so a broken channel never blocks a sale. That leaves no way to
+  // tell "not configured" from "bot was kicked" from "notifications switched
+  // off", so this asks Telegram directly and reports each cause by name.
+  if (data === 'admin_broadcast_check' || data === 'admin_broadcast_test') {
+    const doTest = data === 'admin_broadcast_test';
+    const stockOn = db.getSetting('stock_notifications_enabled', '1') === '1';
+
+    const targets = [
+      { label: '📡 Channel', id: updatesChannelId(),
+        source: db.getSetting('updates_channel_id', '') ? 'Updates Channel' : 'Required Channel (fallback)' },
+      { label: '💬 Group',   id: updatesGroupId(),
+        source: db.getSetting('updates_group_id', '')   ? 'Updates Group'   : 'Required Group (fallback)' },
+    ];
+
+    const lines = [];
+    for (const t of targets) {
+      if (!t.id) {
+        lines.push(`${t.label}: ⚪️ <b>Not set</b> — nothing will be posted here.`);
+        continue;
+      }
+      try {
+        const chat = await bot.getChat(t.id);
+        const me   = await bot.getChatMember(t.id, (await bot.getMe()).id);
+        // "administrator" is what actually matters: a plain member cannot post
+        // to a channel, and Telegram reports that only when you try to send.
+        const canPost = me.status === 'administrator' || me.status === 'creator';
+        lines.push(
+          `${t.label}: ${canPost ? '🟢' : '🔴'} <b>${escapeHtml(chat.title || String(t.id))}</b>\n` +
+          `   <code>${escapeHtml(String(t.id))}</code> · from ${t.source}\n` +
+          `   Bot status: <b>${me.status}</b>${canPost ? '' : ' — needs to be an admin to post'}`
+        );
+      } catch (e) {
+        lines.push(
+          `${t.label}: 🔴 <b>Unreachable</b>\n` +
+          `   <code>${escapeHtml(String(t.id))}</code> · from ${t.source}\n` +
+          `   ${escapeHtml(e.message)}`
+        );
+      }
+    }
+
+    if (doTest) {
+      const sent = await autoPublish(bot,
+        `🩺 <b>Test post</b>\n\nIf you can read this, automatic stock updates will appear here.`
+      ).catch(() => false);
+      lines.push(`\n${sent ? '✅ Test post delivered.' : '❌ Test post could not be delivered.'}`);
+    }
+
+    await bot.editMessageText(
+      `🩺 <b>Broadcast Check</b>\n\n` +
+      `📦 Stock notifications: ${stockOn ? '🟢 <b>ON</b>' : '🔴 <b>OFF</b> — turn on “Stock Notifs” in settings'}\n\n` +
+      lines.join('\n\n') +
+      `\n\n<i>Posts go to the Updates Channel/Group when set, otherwise to the ` +
+      `required-subscription chats.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: '🚀 Send test post', callback_data: 'admin_broadcast_test' }],
+          [{ text: '📡 Set Updates Channel', callback_data: 'admin_setting_updates_channel_id' },
+           { text: '💬 Set Updates Group',   callback_data: 'admin_setting_updates_group_id' }],
+          [{ text: '🔙 Back to Settings', callback_data: 'admin_settings' }],
+        ] } }
+    ).catch(() => {});
+    return;
+  }
+
   if (/^admin_setting_/.test(data)) {
     const key     = data.replace('admin_setting_', '');
     const current = db.getSetting(key);

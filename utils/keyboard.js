@@ -719,6 +719,7 @@ const adminSettingsKb = () => mk([
   [btn('🎨 Button Icons',      'admin_setting_button_icons_enabled')],
   [btn('💬 Group Link',        'admin_setting_required_group_link'),btn('📢 Channel Link',       'admin_setting_required_channel_link')],
   [btn('📡 Updates Channel',   'admin_setting_updates_channel_id'), btn('💬 Updates Group',      'admin_setting_updates_group_id')],
+  [btn('🩺 Broadcast Check',   'admin_broadcast_check')],
   [btn('🔔 Product Notifs',    'admin_setting_product_notifications_enabled'), btn('📦 Stock Notifs', 'admin_setting_stock_notifications_enabled')],
   [btn('🎁 Referral Cashback', 'admin_setting_referral_cashback_enabled'), btn('💸 Cashback %', 'admin_setting_referral_cashback_pct')],
   [btn('💰 Min Order for Cashback', 'admin_setting_referral_min_order')],
