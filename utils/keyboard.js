@@ -396,17 +396,17 @@ function sortRowButton(p, pos, prefix, callbackData) {
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 34);
-  const qty     = Number(p.stock_quantity || 0);
-  const inStock = qty > 0;
-  const stock   = inStock ? `✅ ${qty}` : '❌ Out';
-  const label   = `#${pos} ${title} — ${formatPrice(p.price || 0)} [${stock}]`;
 
-  const button = iconBtn(label, callbackData, { iconId: productIconId(p), inStock });
-  // The prefix goes on AFTER iconBtn. iconBtn strips a label's leading emoji so
-  // the same symbol isn't shown twice next to a premium icon — and "⤵️" is an
-  // emoji, so prefixing first made the drop marker vanish on exactly those
-  // products that have a custom icon.
-  if (prefix) button.text = prefix + button.text;
+  // iconBtn drops a label's LEADING emoji when it is also showing that emoji as
+  // the premium icon — otherwise the symbol appears twice. It can only do that
+  // while the emoji is still first in the string, so the button is built from
+  // the bare title and the position number is added afterwards. Composing
+  // `#3 🤖 Title` first would hide the emoji from that rule and print it twice.
+  const button = iconBtn(title, callbackData, { iconId: productIconId(p), inStock: Number(p.stock_quantity || 0) > 0 });
+
+  const qty   = Number(p.stock_quantity || 0);
+  const stock = qty > 0 ? `✅ ${qty}` : '❌ Out';
+  button.text = `${prefix}#${pos} ${button.text} — ${formatPrice(p.price || 0)} [${stock}]`;
   return button;
 }
 
