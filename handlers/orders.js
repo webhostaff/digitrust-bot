@@ -10,6 +10,7 @@
  */
 
 const db = require('../database/queries');
+const logger = require('../utils/logger');
 const { orderDetailKb, backKb } = require('../utils/keyboard');
 const { formatPrice, statusEmoji } = require('../utils/format');
 
@@ -270,15 +271,20 @@ async function showOrderDetail(bot, chatId, userId, orderId, messageId, callback
   if (refundButton) kb.inline_keyboard.push(refundButton);
   kb.inline_keyboard.push([{ text: '🔙 Back to Orders', callback_data: 'menu_orders' }]);
 
+  // My Orders is the recovery path: it is where a customer goes when the
+  // delivery message never arrived. It must be the most reliable screen in the
+  // bot, so it never sends custom emoji either.
   try {
     await bot.editMessageText(text, {
       chat_id: chatId, message_id: messageId,
-      parse_mode: 'HTML', reply_markup: kb,
+      parse_mode: 'HTML', reply_markup: kb, plain_emoji: true,
     });
   } catch (e) {
     try {
-      await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: kb });
-    } catch (e2) { /* ignore */ }
+      await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: kb, plain_emoji: true });
+    } catch (e2) {
+      logger.error(`order detail #${order.id} could not be shown to ${chatId}: ${e2.message}`);
+    }
   }
 
   if (contentAsFile) {
@@ -288,12 +294,13 @@ async function showOrderDetail(bot, chatId, userId, orderId, messageId, callback
         .replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 30);
       await bot.sendDocument(chatId, buffer, {
         caption: `📎 Order #${order.id} — ${order.quantity} item(s)`,
+        plain_emoji: true,
       }, { filename: `order_${order.id}_${safeName}.txt`, contentType: 'text/plain' });
     } catch (e) {
       try {
         const chunks = String(order.delivered_content).match(/[\s\S]{1,3500}/g) || [];
         for (const chunk of chunks) {
-          await bot.sendMessage(chatId, `<pre>${escapeHtml(chunk)}</pre>`, { parse_mode: 'HTML' });
+          await bot.sendMessage(chatId, `<pre>${escapeHtml(chunk)}</pre>`, { parse_mode: 'HTML', plain_emoji: true });
         }
       } catch (e2) { /* ignore */ }
     }

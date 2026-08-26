@@ -171,7 +171,9 @@ async function completeManualDelivery(bot, taskId, content = null) {
 
   let sent = false;
   try {
+    // Manually delivered goods get the same protection as automatic ones.
     await bot.sendMessage(task.user_id, body, {
+      plain_emoji: true,
       parse_mode: 'HTML',
       reply_markup: { inline_keyboard: [[{ text: '📦 My Orders', callback_data: 'menu_orders' }]] },
     });

@@ -984,6 +984,9 @@ async function sendDelivery(bot, chatId, order, content, messageId = null) {
       await bot.editMessageText(text, {
         chat_id: chatId, message_id: messageId,
         parse_mode: 'HTML', reply_markup: mainMenuKb(),
+        // Plain emoji, always. This message carries what the customer paid for;
+        // an animated product name is not worth any chance of losing it.
+        plain_emoji: true,
       });
       deliveryDelivered = true;
     } catch (e) {
@@ -993,7 +996,9 @@ async function sendDelivery(bot, chatId, order, content, messageId = null) {
   // If edit failed OR no messageId, send a new message
   if (!deliveryDelivered) {
     try {
-      await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: mainMenuKb() });
+      await bot.sendMessage(chatId, text, {
+        parse_mode: 'HTML', reply_markup: mainMenuKb(), plain_emoji: true,
+      });
       deliveryDelivered = true;
     } catch (e) {
       logger.error(`sendDelivery: sendMessage FAILED for order #${order.id} user ${chatId}: ${e.message}`);
@@ -1021,6 +1026,7 @@ async function sendDelivery(bot, chatId, order, content, messageId = null) {
       const filename = `order_${order.id}_${safeName}.txt`;
       await bot.sendDocument(chatId, buffer, {
         caption: `📎 Order #${order.id} — ${order.quantity} item(s)`,
+        plain_emoji: true,
       }, { filename, contentType: 'text/plain' });
     } catch (e) {
       logger.error(`Failed to send order #${order.id} as file: ${e.message}`);
@@ -1028,7 +1034,7 @@ async function sendDelivery(bot, chatId, order, content, messageId = null) {
       try {
         const chunks = contentStr.match(/[\s\S]{1,3500}/g) || [];
         for (const chunk of chunks) {
-          await bot.sendMessage(chatId, `<pre>${chunk.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}</pre>`, { parse_mode: 'HTML' });
+          await bot.sendMessage(chatId, `<pre>${chunk.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}</pre>`, { parse_mode: 'HTML', plain_emoji: true });
         }
       } catch (e2) {
         logger.error(`Failed to send fallback chunks for order #${order.id}: ${e2.message}`);

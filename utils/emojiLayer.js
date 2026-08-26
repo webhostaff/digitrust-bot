@@ -86,13 +86,49 @@ function iconsEnabled() {
   }
 }
 
-/** Did this failure come from the custom-emoji entity rather than our content? */
+/**
+ * Did this failure come from a custom emoji rather than our content?
+ *
+ * DOCUMENT_INVALID is the important one and it is not obvious: a Telegram
+ * custom emoji IS a document internally, so an emoji id the bot may not use
+ * comes back as "400 Bad Request: DOCUMENT_INVALID" — from sendMessage, with no
+ * mention of emoji anywhere. Missing it meant paid orders failed to deliver:
+ * the retry never fired and the customer got nothing.
+ */
 function isCustomEmojiError(err) {
   const msg = String(err && err.message || '').toLowerCase();
-  return msg.includes('custom_emoji')
+  return msg.includes('document_invalid')
+      || msg.includes('custom_emoji')
       || msg.includes('custom emoji')
+      || msg.includes('emoji_invalid')
+      || msg.includes('stickerset_invalid')
+      || msg.includes('media_empty')
       || msg.includes("can't parse entities")
       || msg.includes('entity');
+}
+
+// ── Circuit breaker ───────────────────────────────────────────────────────────
+// If Telegram refuses custom emoji, it refuses ALL of them — the usual cause is
+// the bot owner's Telegram Premium having lapsed, which is account-wide. Without
+// a breaker every single message would pay for a failed request plus a retry,
+// doubling latency on the delivery path for no benefit. One failure disables
+// rendering for a cooling-off period; after it, one message tries again, so the
+// bot heals itself the moment Premium is back with no restart needed.
+const BREAKER_COOLDOWN_MS = 15 * 60 * 1000;
+let breakerUntil = 0;
+
+function customEmojiAllowed() { return Date.now() >= breakerUntil; }
+
+function tripBreaker(label, reason) {
+  if (customEmojiAllowed()) {
+    logger.error(
+      `[emoji:${label}] Telegram refused custom emoji — falling back to plain ` +
+      `emoji for ${BREAKER_COOLDOWN_MS / 60000} minutes. Cause: ${reason}. ` +
+      `Usually means the bot owner's Telegram Premium is not active, or an ` +
+      `emoji id in the library is wrong. Check /admin → Settings → Emoji Check.`
+    );
+  }
+  breakerUntil = Date.now() + BREAKER_COOLDOWN_MS;
 }
 
 /**
@@ -129,10 +165,28 @@ function installEmojiLayer(bot, label = 'bot') {
           ? args[spec.optsArg] : null;
 
         const chatId = spec.chatIdArg >= 0 ? args[spec.chatIdArg] : (opts ? opts.chat_id : null);
-        const allowCustom = !(await isChannel(this, chatId));
+
+        // `plain_emoji: true` opts a message out of custom emoji entirely.
+        // Used by anything the customer PAID for — a delivery message carries
+        // their licence key, and decoration must never be able to put it at
+        // risk. The retry below would rescue it, but a rescued message is still
+        // a failed request first: slower, and one more thing that can go wrong
+        // on the one message that must not.
+        const forcePlain = !!(opts && opts.plain_emoji);
+        if (opts && 'plain_emoji' in opts) delete opts.plain_emoji; // never send it to Telegram
+
+        // Breaker next: while it is open nothing custom goes out at all, so a
+        // delivery message is never held up by decoration.
+        const allowCustom = !forcePlain && customEmojiAllowed() && !(await isChannel(this, chatId));
 
         if (opts && opts.reply_markup) {
           prepareMarkup(opts.reply_markup, iconsEnabled() && allowCustom);
+        }
+        if (!allowCustom && opts && opts.reply_markup && Array.isArray(opts.reply_markup.inline_keyboard)) {
+          // Button icons are custom emoji too — the same refusal applies.
+          for (const row of opts.reply_markup.inline_keyboard) {
+            for (const b of row) { if (b) delete b.icon_custom_emoji_id; }
+          }
         }
 
         const parseMode = opts ? opts.parse_mode : null;
@@ -153,36 +207,27 @@ function installEmojiLayer(bot, label = 'bot') {
         // chat type, or the bot owner's Premium lapsed). Resend as plain emoji
         // rather than dropping the message.
         if (!isCustomEmojiError(err)) throw err;
-        logger.warn(`[emoji:${label}] ${spec.name} rejected entities, retrying plain: ${err.message}`);
+        tripBreaker(label, err.message);
 
         const opts = (args[spec.optsArg] && typeof args[spec.optsArg] === 'object')
           ? args[spec.optsArg] : null;
         const plain = (t) => stripEmojiMarkers(String(t).replace(/<tg-emoji[^>]*>(.*?)<\/tg-emoji>/gi, '$1'));
 
-        // ONLY the message text is downgraded. Button icons travel in
-        // `icon_custom_emoji_id`, a separate field that has nothing to do with
-        // text entities — stripping those too turned one bad emoji id in the
-        // library into "every button lost its icon" across the whole bot.
+        // Everything custom is removed in ONE step: text entities and button
+        // icons are both custom emoji, and a refusal does not say which one it
+        // objected to. Downgrading only half would fail again and cost the
+        // customer another round-trip on a message they have already paid for.
         if (spec.textKey && opts && typeof opts[spec.textKey] === 'string') {
           opts[spec.textKey] = plain(opts[spec.textKey]);
         } else if (!spec.textKey && spec.textArg >= 0 && typeof args[spec.textArg] === 'string') {
           args[spec.textArg] = plain(args[spec.textArg]);
         }
-
-        try {
-          return await original.apply(this, args);
-        } catch (err2) {
-          // Still refused, so the icons are the remaining suspect. This is the
-          // last resort before the message would be lost entirely.
-          if (!isCustomEmojiError(err2)) throw err2;
-          logger.warn(`[emoji:${label}] ${spec.name} still refused, dropping button icons: ${err2.message}`);
-          if (opts && opts.reply_markup && Array.isArray(opts.reply_markup.inline_keyboard)) {
-            for (const row of opts.reply_markup.inline_keyboard) {
-              for (const b of row) { if (b) { delete b.icon_custom_emoji_id; delete b.style; } }
-            }
+        if (opts && opts.reply_markup && Array.isArray(opts.reply_markup.inline_keyboard)) {
+          for (const row of opts.reply_markup.inline_keyboard) {
+            for (const b of row) { if (b) delete b.icon_custom_emoji_id; }
           }
-          return await original.apply(this, args);
         }
+        return await original.apply(this, args);
       }
     };
   }

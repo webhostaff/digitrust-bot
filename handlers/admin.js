@@ -22,7 +22,7 @@ const {
   iconBtn: kbIconBtn, iconIdFrom: kbIconIdFrom, stripEmojiCodes: kbStripEmojiCodes,
 } = require('../utils/keyboard');
 const items = require('../database/items');
-const { formatPrice, formatPriceExact, escapeHtml, expandPremiumEmojis, scaleTiersProportionally } = require('../utils/format');
+const { formatPrice, formatPriceExact, escapeHtml, expandPremiumEmojis, scaleTiersProportionally, productEmojiId } = require('../utils/format');
 const {
   publishToChannel, publishToGroup, broadcastToUsers, autoPublish, autoPublishWithPhoto,
   buildNewProductText, buildStockUpdateText,
@@ -6689,6 +6689,26 @@ async function handleAdminCallback(bot, query) {
         `<i>If icons still look plain: the messages above are the real test. Plain there ` +
         `means the bot owner's account has no active Telegram Premium — Telegram only ` +
         `lets a bot send custom emoji while its owner is Premium.</i>`;
+    }
+
+    // A product's emoji lives in its title, not the library, so the library can
+    // be spotless while every product still fails. This tests the real ids.
+    const prodBad = [];
+    for (const p of db.getAllProductsForSorting().slice(0, 10)) {
+      const id = productEmojiId(p);
+      if (!id) continue;
+      try {
+        await bot.sendMessage(chatId,
+          `<tg-emoji emoji-id="${id}">🛍</tg-emoji> ${escapeHtml(kbStripEmojiCodes(String(p.title || '')).trim().slice(0, 40))}`,
+          { parse_mode: 'HTML', disable_notification: true });
+      } catch (e) {
+        prodBad.push(`• <code>${escapeHtml(kbStripEmojiCodes(String(p.title || '')).trim().slice(0, 28))}</code> — ${escapeHtml(e.message)}`);
+      }
+    }
+    if (prodBad.length) {
+      verdict += `\n\n🔴 <b>${prodBad.length} product emoji rejected</b>\n` + prodBad.join('\n') +
+        `\n\n<i>DOCUMENT_INVALID here means the bot cannot use that emoji id. ` +
+        `Re-pick the emoji on the product, or check Telegram Premium on the bot owner account.</i>`;
     }
 
     await bot.sendMessage(chatId,
