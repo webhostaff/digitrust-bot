@@ -73,7 +73,7 @@ function buildTextAndEntities(rawText) {
 
 const { productsKb, productDetailKb, backKb, preorderProductsKb, preorderDetailKb,
         iconBtn, iconIdFrom, productIconId, stripEmojiCodes } = require('../utils/keyboard');
-const { formatPrice, expandPremiumEmojis } = require('../utils/format');
+const { formatPrice, expandPremiumEmojis, productEmojiId } = require('../utils/format');
 
 // Safe message updater: tries editMessageText, falls back to delete+send if message was a photo/media
 async function safeUpdateMessage(bot, chatId, messageId, text, options = {}) {
@@ -289,8 +289,12 @@ async function showProductDetail(bot, chatId, productId, messageId = null, userI
   const bulkLine = _ftd(product);
 
   // Format title with premium emoji if set
-  const titleHtml = product.premium_emoji_id
-    ? `<tg-emoji emoji-id="${product.premium_emoji_id}">🛍</tg-emoji> <b>${expandPremiumEmojis(product.title)}</b>`
+  // productEmojiId puts the title's own [emoji:ID] marker first. Reading the
+  // legacy column first showed the OLD emoji here while buttons already showed
+  // the new one, because changing a product's emoji rewrites the title marker.
+  const productEmoji = productEmojiId(product);
+  const titleHtml = productEmoji
+    ? `<tg-emoji emoji-id="${productEmoji}">🛍</tg-emoji> <b>${expandPremiumEmojis(product.title)}</b>`
     : `<b>${expandPremiumEmojis(product.title)}</b>`;
 
   // Manual products are fulfilled by a human — say so up-front so the buyer
@@ -375,8 +379,9 @@ async function showPreorderProductDetail(bot, chatId, productId, messageId = nul
     return;
   }
   const remaining = Math.max(0, (product.preorder_max || 0) - (product.preorder_count || 0));
-  const preorderTitle = product.premium_emoji_id
-    ? `<tg-emoji emoji-id="${product.premium_emoji_id}">🔜</tg-emoji> <b>${expandPremiumEmojis(product.title)}</b>`
+  const preorderEmoji = productEmojiId(product);
+  const preorderTitle = preorderEmoji
+    ? `<tg-emoji emoji-id="${preorderEmoji}">🔜</tg-emoji> <b>${expandPremiumEmojis(product.title)}</b>`
     : `🔜 <b>${expandPremiumEmojis(product.title)}</b>`;
   const text =
     `${preorderTitle}\n\n` +

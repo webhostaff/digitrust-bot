@@ -1583,6 +1583,76 @@ async function handleAdminText(bot, msg) {
     return;
   }
 
+  // ── Spend ranks: edit one field / add a tier ──────────────────────
+  if (s === States.ADMIN_RANK_EDIT) {
+    const { rankId, field } = sess.data || {};
+    const raw = String(text || '').trim();
+
+    if (field === 'legacy_vip') {
+      const pct = parseFloat(raw.replace('%', ''));
+      if (!isFinite(pct) || pct < 0 || pct > 100) {
+        await bot.sendMessage(chatId, '❌ Send a number between 0 and 100.');
+        return;
+      }
+      db.setSetting('legacy_vip_discount_pct', String(pct));
+      session.clear(userId);
+      await bot.sendMessage(chatId, `✅ Old VIP members now keep <b>${pct}%</b> for life.`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🏆 Ranks', callback_data: 'admin_ranks' }]] } });
+      return;
+    }
+
+    let value = raw;
+    if (field === 'min_spend' || field === 'discount_pct') {
+      // Tolerant of "$600" and "5%" — the admin is typing into a chat box, not
+      // a validated form, and rejecting those would just be pedantic.
+      value = parseFloat(raw.replace(/[$%,\s]/g, ''));
+      if (!isFinite(value) || value < 0) {
+        await bot.sendMessage(chatId, '❌ Send a number, for example 600 or 5.');
+        return;
+      }
+      if (field === 'discount_pct' && value > 100) {
+        await bot.sendMessage(chatId, '❌ A discount above 100% would pay the customer to buy.');
+        return;
+      }
+    } else if (!value) {
+      await bot.sendMessage(chatId, '❌ That cannot be empty.');
+      return;
+    }
+
+    try {
+      db.updateRankTier(rankId, field, value);
+    } catch (e) {
+      await bot.sendMessage(chatId, `❌ ${escapeHtml(e.message)}`);
+      return;
+    }
+    session.clear(userId);
+    const t = db.getRankTier(rankId);
+    await bot.sendMessage(chatId,
+      `✅ Updated.\n\n${t.emoji || '🏅'} <b>${escapeHtml(t.name)}</b> — $${Number(t.min_spend).toFixed(0)}+ → <b>${Number(t.discount_pct)}%</b>`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🏆 Ranks', callback_data: 'admin_ranks' }]] } });
+    return;
+  }
+
+  if (s === States.ADMIN_RANK_ADD) {
+    const parts = String(text || '').split('|').map((x) => x.trim());
+    if (parts.length < 4) {
+      await bot.sendMessage(chatId, '❌ Use: <code>NAME | EMOJI | MIN_SPEND | DISCOUNT%</code>', { parse_mode: 'HTML' });
+      return;
+    }
+    const [name, emoji] = parts;
+    const minSpend = parseFloat(String(parts[2]).replace(/[$,\s]/g, ''));
+    const pct      = parseFloat(String(parts[3]).replace(/[%\s]/g, ''));
+    if (!name || !isFinite(minSpend) || !isFinite(pct) || pct < 0 || pct > 100 || minSpend < 0) {
+      await bot.sendMessage(chatId, '❌ Check the numbers. Example: <code>ELITE | 👑 | 3000 | 20</code>', { parse_mode: 'HTML' });
+      return;
+    }
+    db.addRankTier(name, emoji || '🏅', minSpend, pct);
+    session.clear(userId);
+    await bot.sendMessage(chatId, `✅ Tier <b>${escapeHtml(name)}</b> added.`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🏆 Ranks', callback_data: 'admin_ranks' }]] } });
+    return;
+  }
+
   // ── Legacy: typed position number ─────────────────────────────────
   // Nothing puts an admin into this state any more — positions are tapped, not
   // typed. A stale session left over from before the change is answered here
@@ -5621,10 +5691,48 @@ async function handleAdminCallback(bot, query) {
         [{ text: '📋 Active Subscriptions', callback_data: 'admin_cgb_active' }],
         [{ text: '💰 Set Monthly Price', callback_data: 'admin_cgb_setprice' }],
         [{ text: '📅 Manage Cycles', callback_data: 'admin_cgb_cycles' }],
+        [{ text: '🔄 Renewals', callback_data: 'admin_cgb_renewals' }],
         [{ text: '🔙 Back', callback_data: 'admin_panel' }],
       ] }
     }).catch(() => {});
     return;
+  }
+
+  // ── CGB renewals: who is staying next cycle, and reminder settings ──
+  if (data === 'admin_cgb_renewals') {
+    const reserved = db.getCgbReserved();
+    const on   = db.getSetting('cgb_reminder_enabled', '1') === '1';
+    const days = db.getSetting('cgb_reminder_days', '2');
+    const ws   = db.getSetting('cgb_workspace_name', 'chatgpt_Team');
+
+    let txt =
+      `🔄 <b>ChatGPT Business — Renewals</b>\n\n` +
+      `⏰ Reminder: ${on ? `🟢 <b>ON</b> — sent <b>${escapeHtml(String(days))}</b> day(s) before expiry` : '🔴 <b>OFF</b>'}\n` +
+      `🏢 Workspace shown to customers: <b>${escapeHtml(String(ws))}</b>\n\n` +
+      `✅ <b>${reserved.length}</b> seat${reserved.length === 1 ? '' : 's'} reserved for the next cycle`;
+
+    if (reserved.length) {
+      txt += `\n\n` + reserved.slice(0, 20).map((r) =>
+        `• <code>${escapeHtml(r.email || '')}</code> — ends ${r.end_date}`).join('\n');
+      if (reserved.length > 20) txt += `\n<i>…and ${reserved.length - 20} more</i>`;
+    }
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: on ? '🔴 Turn OFF reminders' : '🟢 Turn ON reminders', callback_data: 'admin_cgb_rem_toggle' }],
+        [{ text: `⏰ Reminder days (${days})`, callback_data: 'admin_setting_cgb_reminder_days' }],
+        [{ text: '🏢 Workspace name', callback_data: 'admin_setting_cgb_workspace_name' }],
+        [{ text: '🔙 Back', callback_data: 'admin_cgb_panel' }],
+      ] }
+    }).catch(() => {});
+    return;
+  }
+
+  if (data === 'admin_cgb_rem_toggle') {
+    const on = db.getSetting('cgb_reminder_enabled', '1') === '1';
+    db.setSetting('cgb_reminder_enabled', on ? '0' : '1');
+    return handleAdminCallback(bot, { ...query, data: 'admin_cgb_renewals' });
   }
 
   // ── CGB Full Stats / Recent Orders ──
@@ -6422,6 +6530,109 @@ async function handleAdminCallback(bot, query) {
         ] } }
     ).catch(() => {});
     return;
+  }
+
+  // ══════════════════════════════════════════════════════════════════
+  // SPEND RANKS — thresholds and percentages, fully editable
+  // ══════════════════════════════════════════════════════════════════
+  if (data === 'admin_ranks') {
+    const tiers   = db.getRankTiers();
+    const on      = db.getSetting('rank_system_enabled', '1') === '1';
+    const vipPct  = db.getSetting('legacy_vip_discount_pct', '5');
+    const started = db.getSetting('rank_system_started_at', '—');
+    const vipCount = db.countVIPs();
+
+    const rows = tiers.map((t) => ([{
+      text: `${t.emoji || '🏅'} ${t.name} — $${Number(t.min_spend).toFixed(0)}+ → ${Number(t.discount_pct)}%`,
+      callback_data: `admin_rank_${t.id}`,
+    }]));
+    rows.push([{ text: '➕ Add tier', callback_data: 'admin_rank_add' }]);
+    rows.push([{ text: on ? '🔴 Turn OFF ranks' : '🟢 Turn ON ranks', callback_data: 'admin_rank_toggle' }]);
+    rows.push([{ text: `👑 Legacy VIP discount: ${vipPct}%`, callback_data: 'admin_rank_vippct' }]);
+    rows.push([{ text: '🔙 Back', callback_data: 'admin_panel' }]);
+
+    await bot.editMessageText(
+      `🏆 <b>Spend Ranks</b>\n\n` +
+      `Status: ${on ? '🟢 <b>ON</b>' : '🔴 <b>OFF</b>'}\n` +
+      `Counting since: <b>${escapeHtml(String(started))}</b>\n\n` +
+      `<b>Tiers</b> — tap one to edit its threshold or percentage:\n` +
+      tiers.map((t) => `${t.emoji || '🏅'} <b>${escapeHtml(t.name)}</b> — spend $${Number(t.min_spend).toFixed(0)}+ → <b>${Number(t.discount_pct)}%</b> off`).join('\n') +
+      `\n\n👑 <b>${vipCount}</b> old VIP member${vipCount === 1 ? '' : 's'} keep <b>${escapeHtml(String(vipPct))}%</b> for life — ` +
+      `they only ever move up, never down.\n\n` +
+      `<i>Spending is counted from zero starting the day ranks were switched on. ` +
+      `Purchases made before that do not count.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (data === 'admin_rank_toggle') {
+    const on = db.getSetting('rank_system_enabled', '1') === '1';
+    db.setSetting('rank_system_enabled', on ? '0' : '1');
+    return handleAdminCallback(bot, { ...query, data: 'admin_ranks' });
+  }
+
+  if (data === 'admin_rank_vippct') {
+    session.set(userId, States.ADMIN_RANK_EDIT, { rankId: 0, field: 'legacy_vip' });
+    await bot.sendMessage(chatId,
+      `👑 <b>Legacy VIP discount</b>\n\nSend the percentage old VIP members keep for life (e.g. <code>5</code>).`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (data === 'admin_rank_add') {
+    session.set(userId, States.ADMIN_RANK_ADD, {});
+    await bot.sendMessage(chatId,
+      `➕ <b>New tier</b>\n\nSend it as: <code>NAME | EMOJI | MIN_SPEND | DISCOUNT%</code>\n\n` +
+      `Example: <code>ELITE | 👑 | 3000 | 20</code>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (/^admin_rank_\d+$/.test(data)) {
+    const tierId = parseInt(data.split('_').pop(), 10);
+    const t = db.getRankTier(tierId);
+    if (!t) { await bot.sendMessage(chatId, '❌ Tier not found.'); return; }
+    await bot.editMessageText(
+      `${t.emoji || '🏅'} <b>${escapeHtml(t.name)}</b>\n\n` +
+      `Unlocks at: <b>$${Number(t.min_spend).toFixed(2)}</b>\n` +
+      `Discount: <b>${Number(t.discount_pct)}%</b>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+        [{ text: '💵 Edit amount', callback_data: `admin_rankf_${tierId}_min_spend` },
+         { text: '📉 Edit discount', callback_data: `admin_rankf_${tierId}_discount_pct` }],
+        [{ text: '✏️ Rename', callback_data: `admin_rankf_${tierId}_name` },
+         { text: '😀 Emoji', callback_data: `admin_rankf_${tierId}_emoji` }],
+        [{ text: '🗑 Delete tier', callback_data: `admin_rankdel_${tierId}` }],
+        [{ text: '🔙 Back', callback_data: 'admin_ranks' }],
+      ] } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_rankf_\d+_(min_spend|discount_pct|name|emoji)$/.test(data)) {
+    const parts  = data.split('_');
+    const tierId = parseInt(parts[2], 10);
+    const field  = parts.slice(3).join('_');
+    session.set(userId, States.ADMIN_RANK_EDIT, { rankId: tierId, field });
+    const prompt = {
+      min_spend:    'Send the amount a customer must spend to unlock this tier (e.g. <code>600</code>).',
+      discount_pct: 'Send the discount percentage (e.g. <code>5</code>).',
+      name:         'Send the new tier name.',
+      emoji:        'Send the emoji for this tier.',
+    }[field];
+    await bot.sendMessage(chatId, `✏️ ${prompt}`, { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (/^admin_rankdel_\d+$/.test(data)) {
+    const tierId = parseInt(data.split('_').pop(), 10);
+    const tiers = db.getRankTiers();
+    if (tiers.length <= 1) {
+      await bot.sendMessage(chatId, '❌ At least one tier must remain — it is the starting rank every customer sits in.');
+      return;
+    }
+    db.deleteRankTier(tierId);
+    return handleAdminCallback(bot, { ...query, data: 'admin_ranks' });
   }
 
   if (/^admin_setting_/.test(data)) {

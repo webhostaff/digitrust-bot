@@ -29,6 +29,7 @@ const db = new Database(dbPath);
 const queries = require('./database/queries');
 
 const bot = new TelegramBot(CHATGPT_BOT_TOKEN, { polling: true });
+require('./utils/emojiLayer').installEmojiLayer(bot, 'cgb');
 logger.info('🤖 ChatGPT Business Bot started');
 
 // ════════════════════════════════════════════════════════════════
@@ -304,6 +305,145 @@ async function showCalculation(chatId, userId, extraMonth = false) {
 }
 
 // ════════════════════════════════════════════════════════════════
+// RENEWALS — main menu, seat list, details card
+// ════════════════════════════════════════════════════════════════
+
+function workspaceName(sub) {
+  if (sub && sub.workspace) return sub.workspace;
+  try {
+    const row = db.prepare(`SELECT value FROM settings WHERE key='cgb_workspace_name'`).get();
+    return row?.value || 'chatgpt_Team';
+  } catch (e) {
+    return 'chatgpt_Team';
+  }
+}
+
+/** Whole days left on a seat, never negative. */
+function daysLeft(sub) {
+  const end = new Date(`${sub.end_date}T00:00:00`);
+  const now = new Date(); now.setHours(0, 0, 0, 0);
+  return Math.max(0, Math.ceil((end - now) / 86400000));
+}
+
+function elapsedDays(sub) {
+  const start = new Date(`${sub.start_date}T00:00:00`);
+  const now = new Date(); now.setHours(0, 0, 0, 0);
+  return Math.max(0, Math.round((now - start) / 86400000));
+}
+
+async function showMainMenu(chatId, userId, messageId = null) {
+  const subs = queries.getCgbSubsByUser(userId);
+  const rows = [];
+
+  // Renew is only offered when there is something to renew — a button that
+  // always answers "you have no subscriptions" is just a dead end.
+  if (subs.length) {
+    rows.push([
+      { text: '🔄 Renew', callback_data: 'cgb_renew_list' },
+      { text: '✨ New',   callback_data: 'cgb_new' },
+    ]);
+    rows.push([{ text: '📋 Details', callback_data: 'cgb_details_list' }]);
+  } else {
+    rows.push([{ text: '✨ Buy a seat', callback_data: 'cgb_new' }]);
+  }
+
+  const txt =
+    `🤖 <b>ChatGPT Business</b>\n\n` +
+    (subs.length
+      ? `You have <b>${subs.length}</b> active seat${subs.length === 1 ? '' : 's'}.\n` +
+        `Purchase a new seat or renew a current subscription.\nChoose an option below:`
+      : `Purchase a seat below.`);
+
+  const opts = { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } };
+  if (messageId) {
+    await bot.editMessageText(txt, { chat_id: chatId, message_id: messageId, ...opts }).catch(async () => {
+      await bot.sendMessage(chatId, txt, opts);
+    });
+  } else {
+    await bot.sendMessage(chatId, txt, opts);
+  }
+}
+
+/**
+ * The customer's seats as tappable rows.
+ * @param {string} action 'renew' or 'details' — decides where a tap goes.
+ */
+async function showSubList(chatId, userId, action, messageId = null) {
+  const subs = queries.getCgbSubsByUser(userId);
+  if (!subs.length) {
+    await bot.sendMessage(chatId, '📭 You have no active subscriptions yet.');
+    return;
+  }
+
+  const rows = subs.map((s) => {
+    const d = daysLeft(s);
+    // The tick/hourglass is the whole point of this list: at a glance the
+    // customer sees which seat is about to lapse.
+    const mark = d <= 2 ? '⏳' : '✅';
+    return [{ text: `${mark} ${s.email} — ${d}d left`, callback_data: `cgb_${action}_${s.id}` }];
+  });
+  rows.push([{ text: '🔙 Back', callback_data: 'cgb_menu' }]);
+
+  const txt = action === 'renew'
+    ? `🔄 <b>Renew</b>\n\nSelect the email you want to renew from the list below:`
+    : `📋 <b>Details</b>\n\nSelect an email to see its subscription:`;
+
+  const opts = { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } };
+  if (messageId) {
+    await bot.editMessageText(txt, { chat_id: chatId, message_id: messageId, ...opts }).catch(async () => {
+      await bot.sendMessage(chatId, txt, opts);
+    });
+  } else {
+    await bot.sendMessage(chatId, txt, opts);
+  }
+}
+
+/** Full card for one seat: plan, period, status and next-cycle decision. */
+async function showSubDetails(chatId, subId, messageId = null) {
+  const s = queries.getCgbSubById(subId);
+  if (!s) { await bot.sendMessage(chatId, '❌ Subscription not found.'); return; }
+
+  const d  = daysLeft(s);
+  const ws = workspaceName(s);
+
+  const nextLine = s.renew_intent === 'yes'
+    ? '✅ <b>Reserved</b> for the next cycle'
+    : s.renew_intent === 'no'
+      ? '🚫 You chose <b>not</b> to renew'
+      : 'Not reserved for next cycle yet';
+
+  const txt =
+    `📧 <b>Email</b>\n<code>${escapeHtml(s.email || '')}</code>\n\n` +
+    `📚 <b>Subscription</b>\n` +
+    `🎫 Plan: ChatGPT Business Seat\n` +
+    `🏢 Workspace: ${escapeHtml(ws)}\n` +
+    `💳 Amount: $${Number(s.final_price).toFixed(2)}\n` +
+    `⏳ Elapsed days: ${elapsedDays(s)}\n` +
+    `📅 Period: ${s.start_date} → ${s.end_date}\n\n` +
+    `📍 <b>Current status</b>\n` +
+    `${d > 0 ? '🟢' : '🔴'} ${d > 0 ? `Active in ${escapeHtml(ws)}` : 'Expired'}\n` +
+    `⌛️ Remaining: ${d} day(s)\n\n` +
+    `🔁 <b>Next cycle</b>\n${nextLine}\n\n` +
+    (s.renew_intent === 'yes'
+      ? `<i>Your seat is held. You will be asked to pay when the new cycle opens.</i>`
+      : `👇 Tap <b>Renew</b> to reserve this email for the next cycle.`);
+
+  const rows = [];
+  if (s.renew_intent !== 'yes') rows.push([{ text: '🔄 Renew subscription', callback_data: `cgb_renewyes_${s.id}` }]);
+  if (s.renew_intent !== 'no')  rows.push([{ text: '❌ Will not renew',     callback_data: `cgb_renewno_${s.id}` }]);
+  rows.push([{ text: '🔙 Back', callback_data: 'cgb_menu' }]);
+
+  const opts = { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } };
+  if (messageId) {
+    await bot.editMessageText(txt, { chat_id: chatId, message_id: messageId, ...opts }).catch(async () => {
+      await bot.sendMessage(chatId, txt, opts);
+    });
+  } else {
+    await bot.sendMessage(chatId, txt, opts);
+  }
+}
+
+// ════════════════════════════════════════════════════════════════
 // /start COMMAND
 // ════════════════════════════════════════════════════════════════
 bot.onText(/\/start(.*)/, async (msg, match) => {
@@ -318,7 +458,12 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
     `).run(userId, msg.from.username || null, msg.from.first_name || null, msg.from.last_name || null);
   } catch (e) {}
 
-  await showCalculation(chatId, userId, false);
+  // Existing customers land on the menu so renewing is one tap; first-time
+  // visitors go straight to the price, since a menu with one live option is
+  // just an extra tap between them and buying.
+  const hasSubs = queries.getCgbSubsByUser(userId).length > 0;
+  if (hasSubs) await showMainMenu(chatId, userId);
+  else await showCalculation(chatId, userId, false);
 });
 
 // ════════════════════════════════════════════════════════════════
@@ -356,6 +501,16 @@ bot.on('callback_query', async (q) => {
       // Mark subscription as active in the DB (was never done before — gap fix)
       try {
         queries.activateCgbSubscription(parseInt(orderId, 10));
+        // Stamp the workspace onto the row at activation. Reading the setting
+        // later would show today's workspace on an old seat if the shop ever
+        // moves accounts, which is exactly the field a customer would query.
+        try {
+          const activated = queries.getCgbSubscriptionByOrder(parseInt(orderId, 10));
+          if (activated && !activated.workspace) {
+            const wsRow = db.prepare(`SELECT value FROM settings WHERE key='cgb_workspace_name'`).get();
+            queries.setCgbWorkspace(activated.id, wsRow?.value || 'chatgpt_Team');
+          }
+        } catch (e) { logger.warn(`workspace stamp: ${e.message}`); }
         db.prepare(`UPDATE orders SET status='delivered' WHERE id=?`).run(parseInt(orderId, 10));
       } catch (e) {
         logger.warn(`cgb_notify_: could not mark order/sub active: ${e.message}`);
@@ -411,6 +566,63 @@ bot.on('callback_query', async (q) => {
       }
     } catch (e) {
       await bot.sendMessage(chatId, `❌ Could not notify customer: ${e.message}`);
+    }
+    return;
+  }
+
+  // ── Renewal navigation ─────────────────────────────────────────────────────
+  if (data === 'cgb_menu')         { await showMainMenu(chatId, userId, msgId); return; }
+  if (data === 'cgb_new')          { await showCalculation(chatId, userId, false); return; }
+  if (data === 'cgb_renew_list')   { await showSubList(chatId, userId, 'renew', msgId); return; }
+  if (data === 'cgb_details_list') { await showSubList(chatId, userId, 'details', msgId); return; }
+
+  if (/^cgb_(renew|details)_\d+$/.test(data)) {
+    const subId = parseInt(data.split('_').pop(), 10);
+    const sub = queries.getCgbSubById(subId);
+    // Ownership is re-checked here, not just assumed from the list that
+    // produced the button: callback_data is client-supplied and can be replayed
+    // with any id, which would otherwise expose another customer's email.
+    if (!sub || String(sub.user_id) !== String(userId)) {
+      await bot.sendMessage(chatId, '❌ Subscription not found.');
+      return;
+    }
+    await showSubDetails(chatId, subId, msgId);
+    return;
+  }
+
+  if (/^cgb_renew(yes|no)_\d+$/.test(data)) {
+    const wantsRenew = data.startsWith('cgb_renewyes_');
+    const subId = parseInt(data.split('_').pop(), 10);
+    const sub = queries.getCgbSubById(subId);
+    if (!sub || String(sub.user_id) !== String(userId)) {
+      await bot.sendMessage(chatId, '❌ Subscription not found.');
+      return;
+    }
+
+    queries.setCgbRenewIntent(subId, wantsRenew ? 'yes' : 'no');
+    // A decision means the reminder has done its job; sending it later would
+    // be nagging someone who already answered.
+    queries.markCgbReminded(subId);
+
+    if (wantsRenew) {
+      await notifyAdminRenewal(sub, 'yes');
+      await bot.sendMessage(chatId,
+        `✅ <b>Reserved</b>\n\n` +
+        `<code>${escapeHtml(sub.email)}</code> is held for the next cycle.\n\n` +
+        `We will message you when the new cycle opens so you can pay and keep the same email.`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+          [{ text: '📋 My subscriptions', callback_data: 'cgb_details_list' }],
+          [{ text: '🔙 Menu', callback_data: 'cgb_menu' }],
+        ] } });
+    } else {
+      await notifyAdminRenewal(sub, 'no');
+      await bot.sendMessage(chatId,
+        `👍 Noted — <code>${escapeHtml(sub.email)}</code> will not be renewed.\n\n` +
+        `It stays active until <b>${sub.end_date}</b>. You can change your mind any time before then.`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+          [{ text: '🔄 Actually, renew it', callback_data: `cgb_renewyes_${subId}` }],
+          [{ text: '🔙 Menu', callback_data: 'cgb_menu' }],
+        ] } });
     }
     return;
   }
@@ -1018,6 +1230,103 @@ async function confirmCryptobotPayment(invoiceId, paidAmount, orderId, userId) {
   return true;
 }
 
+// ════════════════════════════════════════════════════════════════
+// RENEWAL REMINDERS
+// ════════════════════════════════════════════════════════════════
+
+/** Tell the shop owner which way a customer decided, so seats can be planned. */
+async function notifyAdminRenewal(sub, intent) {
+  if (!ADMIN_ID) return;
+  try {
+    const reserved = queries.getCgbReserved().length;
+    await bot.sendMessage(ADMIN_ID,
+      `${intent === 'yes' ? '🔄' : '🚫'} <b>Renewal decision</b>\n\n` +
+      `📧 <code>${escapeHtml(sub.email || '')}</code>\n` +
+      `👤 <code>${sub.user_id}</code>\n` +
+      `📅 Ends: ${sub.end_date}\n` +
+      `Decision: <b>${intent === 'yes' ? 'WILL RENEW' : 'will NOT renew'}</b>\n\n` +
+      `📊 Seats reserved for next cycle: <b>${reserved}</b>`,
+      { parse_mode: 'HTML' });
+  } catch (e) {
+    logger.warn(`notifyAdminRenewal: ${e.message}`);
+  }
+}
+
+function reminderSettings() {
+  const get = (k, d) => {
+    try {
+      const r = db.prepare('SELECT value FROM settings WHERE key = ?').get(k);
+      return r ? r.value : d;
+    } catch (e) { return d; }
+  };
+  return {
+    enabled: String(get('cgb_reminder_enabled', '1')) === '1',
+    days:    Math.max(0, parseInt(get('cgb_reminder_days', '2'), 10) || 2),
+  };
+}
+
+/**
+ * Message every customer whose seat expires within the configured window.
+ *
+ * Each seat is flagged the moment its message is sent, so this is safe to run
+ * on a timer and safe to run twice — a duplicate reminder reads as spam, and
+ * the whole point is to feel like a service, not a nag.
+ */
+async function sendRenewalReminders() {
+  const { enabled, days } = reminderSettings();
+  if (!enabled) return 0;
+
+  let sent = 0;
+  let due = [];
+  try {
+    due = queries.getCgbDueReminders(days);
+  } catch (e) {
+    logger.error(`renewal reminders query failed: ${e.message}`);
+    return 0;
+  }
+
+  for (const sub of due) {
+    const d = daysLeft(sub);
+    try {
+      await bot.sendMessage(sub.user_id,
+        `⏰ <b>Your ChatGPT Business seat expires in ${d} day${d === 1 ? '' : 's'}</b>\n\n` +
+        `📧 <code>${escapeHtml(sub.email || '')}</code>\n` +
+        `🏢 Workspace: ${escapeHtml(workspaceName(sub))}\n` +
+        `📅 Ends: <b>${sub.end_date}</b>\n\n` +
+        `Reserve it now to keep the same email next cycle — seats are limited and ` +
+        `unreserved ones are released to other customers.`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+          [{ text: '🔄 Renew subscription', callback_data: `cgb_renewyes_${sub.id}` }],
+          [{ text: '❌ Will not renew',     callback_data: `cgb_renewno_${sub.id}` }],
+          [{ text: '📋 Details',            callback_data: `cgb_details_${sub.id}` }],
+        ] } });
+      queries.markCgbReminded(sub.id);
+      sent++;
+      // Telegram throttles bulk sends; a short gap keeps the run under the limit.
+      await new Promise((r) => setTimeout(r, 120));
+    } catch (e) {
+      // A customer who blocked the bot must not stop the rest of the run, and
+      // the seat is flagged anyway so the loop cannot retry it forever.
+      logger.warn(`reminder to ${sub.user_id} failed: ${e.message}`);
+      queries.markCgbReminded(sub.id);
+    }
+  }
+
+  if (sent) logger.info(`[CGB] ${sent} renewal reminder(s) sent`);
+  return sent;
+}
+
+// Hourly rather than daily: a daily timer only fires if the process happens to
+// be alive at that moment, and a redeploy at the wrong hour would silently skip
+// a day of reminders. Hourly with a per-seat flag costs nothing and cannot skip.
+const REMINDER_INTERVAL_MS = 60 * 60 * 1000;
+setTimeout(() => {
+  sendRenewalReminders().catch((e) => logger.error(`reminder run: ${e.message}`));
+  setInterval(() => {
+    sendRenewalReminders().catch((e) => logger.error(`reminder run: ${e.message}`));
+  }, REMINDER_INTERVAL_MS);
+}, 30000); // let the process finish booting first
+
 bot.on('polling_error', e => logger.error(`CGB polling: ${e.message}`));
 
-module.exports = { bot, confirmCryptobotPayment };
+module.exports = { bot, confirmCryptobotPayment, sendRenewalReminders };

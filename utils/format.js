@@ -251,6 +251,38 @@ function renderEmojis(text) {
   return premiumizeEmojis(expandPremiumEmojis(text));
 }
 
+/**
+ * Remove [emoji:ID] markers, keeping the plain fallback character.
+ *
+ * Used wherever a custom-emoji entity cannot be sent — button labels, plain-text
+ * messages, channel posts. Without this the raw marker reaches the customer and
+ * they see a long number in the middle of a product name.
+ */
+function stripEmojiMarkers(text) {
+  if (!text) return text;
+  return String(text).replace(/\[emoji:\d+\]/g, '');
+}
+
+/**
+ * The premium emoji id for a product — ONE definition for the whole codebase.
+ *
+ * Two places store an id and they disagreed. `products.title` can carry an
+ * inline `[emoji:ID]` marker, and the legacy `products.premium_emoji_id` column
+ * holds one too. utils/keyboard.js let the title win while handlers/products.js
+ * and services/notifications.js let the column win, so after changing a
+ * product's emoji the buttons showed the new one while the product page and the
+ * channel post still showed the old one — the "old emojis come back" report.
+ *
+ * The title wins, because that is what the admin edits when they change an
+ * emoji; the column is a fallback for products created before markers existed.
+ */
+function productEmojiId(p) {
+  if (!p) return null;
+  const m = String(p.title || '').match(/\[emoji:(\d+)\]/);
+  if (m) return m[1];
+  return p.premium_emoji_id ? String(p.premium_emoji_id) : null;
+}
+
 
 // Format bulk tiers for display
 function formatBulkTiersDisplay(product) {
@@ -312,6 +344,7 @@ function formatBulkTiersDisplay(product) {
 
 module.exports = {
   expandPremiumEmojis, premiumizeEmojis, renderEmojis, clearEmojiCache,
+  stripEmojiMarkers, productEmojiId,
   formatPrice, formatPriceExact, calcOrderPrice, formatBulkTiersDisplay, formatReward, statusEmoji, escapeHtml, truncate,
   PAYMENT_CONFIRM_VALIDITY_MIN, PAYMENT_CONFIRM_VALIDITY_MS, checkPaymentWindow,
   scaleTiersProportionally,

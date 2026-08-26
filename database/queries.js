@@ -464,6 +464,24 @@ function addStockItems(productId, lines) {
  * falls back to legacy stock table otherwise.
  * Returns delivered content string or null if no stock.
  */
+/**
+ * Add an order's value to the buyer's rank counter.
+ *
+ * Reads the amount from the orders row rather than taking it as an argument:
+ * the callers each compute price differently (wallet, crypto, API, manual), and
+ * the stored total is the one figure that is definitely what the customer paid.
+ */
+function accrueRankSpend(orderId, userId) {
+  try {
+    if (!userId) return;
+    const o = db.prepare('SELECT total_price FROM orders WHERE id = ?').get(orderId);
+    const amount = Number(o?.total_price) || 0;
+    if (amount > 0) rankSpendAdd.run(amount, userId);
+  } catch (e) {
+    // Never let rank bookkeeping roll back a completed, paid-for delivery.
+  }
+}
+
 function deliverOrder(orderId, productId, quantity, paymentMethod, userId) {
   const items = require('./items');
 
@@ -498,6 +516,11 @@ function deliverOrder(orderId, productId, quantity, paymentMethod, userId) {
     // completeOrder now has WHERE status='pending' — second call returns 0 changes
     const res = completeOrder.run(content, paymentMethod, orderId);
     if (res.changes === 0) return null; // Lost the race — another payment beat us
+
+    // Rank accrual lives here, immediately after the row that can only change
+    // once. Every payment method funnels through completeOrder, so this is the
+    // single place that cannot miss a sale or count one twice.
+    accrueRankSpend(orderId, userId);
 
     incrementSoldCount.run(quantity, productId);
     incrementSalesCount.run(quantity, productId);
@@ -546,6 +569,8 @@ function deliverOrderAndChargeWallet(orderId, productId, quantity, userId, price
     const res = completeOrder.run(content, 'wallet', orderId);
     if (res.changes === 0) return { result: 'already_processed' };
 
+    accrueRankSpend(orderId, userId);
+
     // Deduct balance atomically in the same transaction
     updateBalance.run(-priceN, userId);
 
@@ -555,6 +580,94 @@ function deliverOrderAndChargeWallet(orderId, productId, quantity, userId, price
     markProductSoldNow.run(productId);
     return { result: 'ok', content };
   })();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SPEND RANKS
+// ══════════════════════════════════════════════════════════════════════════════
+
+const rankTiersAll   = db.prepare('SELECT * FROM rank_tiers ORDER BY min_spend ASC, id ASC');
+const rankTierById   = db.prepare('SELECT * FROM rank_tiers WHERE id = ?');
+const rankTierInsert = db.prepare('INSERT INTO rank_tiers (name, emoji, min_spend, discount_pct) VALUES (?, ?, ?, ?)');
+const rankTierDelete = db.prepare('DELETE FROM rank_tiers WHERE id = ?');
+const rankSpendGet   = db.prepare('SELECT rank_spend, rank_started_at, is_vip FROM users WHERE telegram_id = ?');
+const rankSpendAdd   = db.prepare(`
+  UPDATE users
+  SET rank_spend = COALESCE(rank_spend, 0) + ?,
+      rank_started_at = COALESCE(rank_started_at, datetime('now'))
+  WHERE telegram_id = ?
+`);
+const rankSpendSet   = db.prepare('UPDATE users SET rank_spend = ? WHERE telegram_id = ?');
+
+function rankSystemOn() {
+  return String(getSettingValue('rank_system_enabled', '1')) === '1';
+}
+
+function getSettingValue(key, fallback) {
+  const row = getSetting.get(key);
+  return row ? row.value : fallback;
+}
+
+/** The tier a given spend total falls into — the highest one it reaches. */
+function tierForSpend(spend, tiers) {
+  const list = tiers || rankTiersAll.all();
+  let current = null;
+  for (const t of list) {
+    if (Number(spend) + 1e-9 >= Number(t.min_spend)) current = t;
+  }
+  return current || list[0] || null;
+}
+
+/**
+ * Everything the UI needs about a customer's rank.
+ *
+ * `spend` is the counter that started at zero, NOT their lifetime total — see
+ * the V4 migration note in database/db.js for why those must stay separate.
+ */
+function getUserRank(userId) {
+  const tiers = rankTiersAll.all();
+  const row   = rankSpendGet.get(userId);
+  const spend = Number(row?.rank_spend) || 0;
+
+  const tier = tierForSpend(spend, tiers);
+  const next = tiers.find((t) => Number(t.min_spend) > spend) || null;
+
+  const tierPct   = Number(tier?.discount_pct) || 0;
+  const legacyPct = (row && row.is_vip === 1)
+    ? (parseFloat(getSettingValue('legacy_vip_discount_pct', '5')) || 0) : 0;
+
+  return {
+    spend,
+    tier,
+    next,
+    tiers,
+    isLegacyVip: !!(row && row.is_vip === 1),
+    tierPct,
+    legacyPct,
+    // The grandfather promise: a VIP never drops below what they had, but they
+    // still climb if their own spending earns them more.
+    discountPct: Math.max(tierPct, legacyPct),
+    remaining: next ? Math.max(0, Number(next.min_spend) - spend) : 0,
+  };
+}
+
+/**
+ * The discount percentage to apply to a customer's order.
+ * Returns 0 when the rank system is switched off AND they are not a legacy VIP.
+ */
+function resolveDiscountPct(userId) {
+  const row = rankSpendGet.get(userId);
+  const legacyPct = (row && row.is_vip === 1)
+    ? (parseFloat(getSettingValue('legacy_vip_discount_pct', '5')) || 0) : 0;
+  if (!rankSystemOn()) return legacyPct;
+  return getUserRank(userId).discountPct;
+}
+
+/** Multiply a price by the customer's discount. */
+function applyRankDiscount(userId, amount) {
+  const pct = resolveDiscountPct(userId);
+  if (!pct) return Number(amount);
+  return Number((Number(amount) * (1 - pct / 100)).toFixed(2));
 }
 
 function payReferralReward(referredId, rewardAmount) {
@@ -738,6 +851,59 @@ const cgb_markNotified = (orderId, days) => {
   const col = days === 3 ? 'notified_3d' : days === 1 ? 'notified_1d' : 'notified_0d';
   return db.prepare(`UPDATE chatgpt_subscriptions SET ${col}=1 WHERE order_id=?`).run(orderId);
 };
+
+// ── Renewals ─────────────────────────────────────────────────────────────────
+
+/** A customer's live seats, soonest to expire first. */
+const cgb_getUserSubs = db.prepare(`
+  SELECT * FROM chatgpt_subscriptions
+  WHERE user_id = ? AND status = 'active'
+  ORDER BY date(end_date) ASC, id ASC
+`);
+
+const cgb_getSubById = db.prepare('SELECT * FROM chatgpt_subscriptions WHERE id = ?');
+
+const cgb_setRenewIntent = db.prepare(`
+  UPDATE chatgpt_subscriptions
+  SET renew_intent = ?, renew_set_at = datetime('now'), updated_at = datetime('now')
+  WHERE id = ?
+`);
+
+/**
+ * Seats that are due a reminder.
+ *
+ * `reminder_sent = 0` is what makes this safe to run on a timer: the scheduler
+ * can fire every hour, or twice after a restart, and each customer is still
+ * messaged exactly once. Seats whose owner already said "no" are skipped —
+ * nagging someone who declined is the fastest way to lose them.
+ */
+const cgb_getDueReminders = db.prepare(`
+  SELECT cs.*, u.username, u.first_name
+  FROM chatgpt_subscriptions cs
+  LEFT JOIN users u ON cs.user_id = u.telegram_id
+  WHERE cs.status = 'active'
+    AND COALESCE(cs.reminder_sent, 0) = 0
+    AND COALESCE(cs.renew_intent, '') <> 'no'
+    AND date(cs.end_date) <= date('now', '+' || ? || ' days')
+    AND date(cs.end_date) >= date('now')
+  ORDER BY date(cs.end_date) ASC
+`);
+
+const cgb_markReminded = db.prepare(`
+  UPDATE chatgpt_subscriptions SET reminder_sent = 1, updated_at = datetime('now') WHERE id = ?
+`);
+
+/** Seats whose owner has asked to be carried into the next cycle. */
+const cgb_getReserved = db.prepare(`
+  SELECT cs.*, u.username, u.first_name
+  FROM chatgpt_subscriptions cs
+  LEFT JOIN users u ON cs.user_id = u.telegram_id
+  WHERE cs.status = 'active' AND cs.renew_intent = 'yes'
+  ORDER BY date(cs.end_date) ASC
+`);
+
+const cgb_setWorkspace = db.prepare('UPDATE chatgpt_subscriptions SET workspace = ? WHERE id = ?');
+const cgb_linkRenewal  = db.prepare('UPDATE chatgpt_subscriptions SET renewed_from = ? WHERE id = ?');
 
 
 // ═══ RESELLERS ═══════════════════════════════════════
@@ -1465,6 +1631,16 @@ module.exports = {
   activateCgbSubscription: (orderId) => cgb_activateSub.run(orderId),
   getActiveCgbSubs: () => cgb_getActive.all(),
   getExpiringCgbSubs: (days) => cgb_getExpiringSubs.all(days),
+
+  // ── CGB renewals ──
+  getCgbSubsByUser:   (userId) => cgb_getUserSubs.all(userId),
+  getCgbSubById:      (id) => cgb_getSubById.get(id),
+  setCgbRenewIntent:  (id, intent) => cgb_setRenewIntent.run(intent, id).changes,
+  getCgbDueReminders: (days) => cgb_getDueReminders.all(days),
+  markCgbReminded:    (id) => cgb_markReminded.run(id).changes,
+  getCgbReserved:     () => cgb_getReserved.all(),
+  setCgbWorkspace:    (id, ws) => cgb_setWorkspace.run(ws, id).changes,
+  linkCgbRenewal:     (prevId, newId) => cgb_linkRenewal.run(prevId, newId).changes,
   markCgbNotified: cgb_markNotified,
   getCgbStats: () => ({
     total:        db.prepare(`SELECT COUNT(*) AS n FROM chatgpt_subscriptions`).get().n,
@@ -1618,6 +1794,24 @@ module.exports = {
   deliverOrder,
   deliverOrderAndChargeWallet,
   chargeWalletForPreorder,
+
+  // ── Spend ranks ──
+  getUserRank,
+  resolveDiscountPct,
+  applyRankDiscount,
+  getRankTiers:   () => rankTiersAll.all(),
+  getRankTier:    (id) => rankTierById.get(id),
+  addRankTier:    (name, emoji, minSpend, pct) => rankTierInsert.run(name, emoji, minSpend, pct).lastInsertRowid,
+  deleteRankTier: (id) => rankTierDelete.run(id).changes,
+  updateRankTier: (id, field, value) => {
+    // Whitelisted rather than interpolated: `field` reaches here from a
+    // callback_data string, and an unchecked name would be SQL injection.
+    const allowed = ['name', 'emoji', 'min_spend', 'discount_pct'];
+    if (!allowed.includes(field)) throw new Error(`Invalid rank field: ${field}`);
+    return db.prepare(`UPDATE rank_tiers SET ${field} = ? WHERE id = ?`).run(value, id).changes;
+  },
+  setRankSpend:   (userId, amount) => rankSpendSet.run(Number(amount) || 0, userId).changes,
+  addRankSpend:   (userId, amount) => rankSpendAdd.run(Number(amount) || 0, userId).changes,
   chargeWallet,
   refundWallet,
 

@@ -17,8 +17,9 @@ function expandTitleEmojis(t) {
 function formatProductTitle(product) {
   const title = product ? (product.title || '') : '';
   const expandedTitle = expandTitleEmojis(title);
-  if (product && product.premium_emoji_id) {
-    return `<tg-emoji emoji-id="${product.premium_emoji_id}">🛍</tg-emoji> <b>${expandedTitle}</b>`;
+  const emojiId = productEmojiId(product);
+  if (emojiId) {
+    return `<tg-emoji emoji-id="${emojiId}">🛍</tg-emoji> <b>${expandedTitle}</b>`;
   }
   return `<b>${expandedTitle}</b>`;
 }
@@ -32,7 +33,7 @@ function escapeHtml(s) {
 
 const db     = require('../database/queries');
 const logger = require('../utils/logger');
-const { formatPrice, renderEmojis } = require('../utils/format');
+const { formatPrice, renderEmojis, productEmojiId } = require('../utils/format');
 
 // Bot username shown in announcements
 const BOT_USERNAME = '@DIGISELLABOT';

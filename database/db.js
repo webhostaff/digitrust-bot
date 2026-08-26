@@ -1045,4 +1045,98 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
 `);
 
+// ══════════════════════════════════════════════════════════════════════════════
+// V4 — SPEND RANKS
+//
+// Replaces the flat, hardcoded 5% VIP discount with configurable tiers the
+// admin edits from the panel: each tier is a spend threshold and a percentage.
+//
+// Counting starts at ZERO when the system is switched on. `rank_spend` is a
+// separate counter rather than a SUM over the orders table on purpose — a
+// customer who already spent thousands must not wake up at the top tier the day
+// this ships. Only purchases made from here on move a customer up.
+//
+// The old `is_vip` flag is untouched. Existing VIPs keep their discount for
+// life; see resolveDiscountPct in database/queries.js.
+// ══════════════════════════════════════════════════════════════════════════════
+try {
+  const userCols = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name);
+  if (!userCols.includes('rank_spend')) {
+    db.exec('ALTER TABLE users ADD COLUMN rank_spend REAL DEFAULT 0');
+  }
+  if (!userCols.includes('rank_started_at')) {
+    db.exec('ALTER TABLE users ADD COLUMN rank_started_at TEXT DEFAULT NULL');
+  }
+} catch (e) {
+  console.error('[MIGRATION V4] rank columns:', e.message);
+}
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS rank_tiers (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT    NOT NULL,
+    emoji        TEXT    DEFAULT '🏅',
+    min_spend    REAL    NOT NULL DEFAULT 0,
+    discount_pct REAL    NOT NULL DEFAULT 0,
+    created_at   TEXT    DEFAULT (datetime('now'))
+  );
+`);
+
+try {
+  const n = db.prepare('SELECT COUNT(*) AS n FROM rank_tiers').get().n;
+  if (n === 0) {
+    // Starting values only — every number here is editable from
+    // /admin → 🏆 Ranks. The two the shop owner specified ($600 → 5%,
+    // $1100 → 10%) are used as given; the rest fill in around them.
+    const ins = db.prepare('INSERT INTO rank_tiers (name, emoji, min_spend, discount_pct) VALUES (?, ?, ?, ?)');
+    ins.run('BUYER',    '🛒', 0,    0);
+    ins.run('SILVER',   '🥈', 300,  3);
+    ins.run('GOLD',     '🥇', 600,  5);
+    ins.run('PLATINUM', '💠', 1100, 10);
+    ins.run('DIAMOND',  '💎', 2000, 15);
+    console.log('[SEED] Default rank tiers created');
+  }
+  const ins = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)');
+  ins.run('rank_system_enabled', '1');
+  // What a grandfathered VIP keeps. Matches the old hardcoded 5%.
+  ins.run('legacy_vip_discount_pct', '5');
+  ins.run('rank_system_started_at', new Date().toISOString().slice(0, 10));
+} catch (e) {
+  console.error('[SEED] rank tiers:', e.message);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// V4b — ChatGPT Business renewals
+//
+// A seat is sold per billing cycle, so the interesting question is always "will
+// this customer keep it next cycle?". `renew_intent` records their answer, which
+// is what lets the shop know how many seats to hold before the cycle turns
+// rather than finding out on the day.
+// ══════════════════════════════════════════════════════════════════════════════
+try {
+  const cgbCols = db.prepare('PRAGMA table_info(chatgpt_subscriptions)').all().map((c) => c.name);
+  const addCol = (name, decl) => {
+    if (!cgbCols.includes(name)) db.exec(`ALTER TABLE chatgpt_subscriptions ADD COLUMN ${name} ${decl}`);
+  };
+  addCol('workspace',     "TEXT DEFAULT NULL");
+  addCol('renew_intent',  "TEXT DEFAULT NULL");   // 'yes' | 'no' | NULL = undecided
+  addCol('renew_set_at',  "TEXT DEFAULT NULL");
+  addCol('renewed_from',  "INTEGER DEFAULT NULL"); // previous subscription id
+  // The existing notified_3d/1d/0d columns were never written by anything. A
+  // dedicated column is added rather than reusing one of them so the reminder
+  // day stays configurable without the column name having to lie about it.
+  addCol('reminder_sent', "INTEGER DEFAULT 0");
+} catch (e) {
+  console.error('[MIGRATION V4b] cgb renewal columns:', e.message);
+}
+
+try {
+  const ins = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)');
+  ins.run('cgb_reminder_days', '2');            // how many days before expiry to remind
+  ins.run('cgb_reminder_enabled', '1');
+  ins.run('cgb_workspace_name', 'chatgpt_Team'); // shown on the details card
+} catch (e) {
+  console.error('[SEED] cgb renewal settings:', e.message);
+}
+
 module.exports = db;

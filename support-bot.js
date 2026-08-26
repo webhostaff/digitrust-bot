@@ -98,6 +98,7 @@ const getFirstUnread = rawDb.prepare(`
 `);
 
 const bot = new TelegramBot(SUPPORT_BOT_TOKEN, { polling: true });
+require('./utils/emojiLayer').installEmojiLayer(bot, 'support');
 logger.info('🎫 Support Bot V4 started (read receipts + history + manual delivery)');
 
 // Route every admin notification raised anywhere in the codebase into this

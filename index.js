@@ -14,6 +14,9 @@ if (!config.botToken) {
 
 // ── Init bot ──────────────────────────────────────────────────────────────────
 const bot = new TelegramBot(config.botToken, { polling: true });
+// Every outgoing message renders [emoji:ID] markers as real premium emoji.
+// Installed here rather than at each call site so no message can be missed.
+require('./utils/emojiLayer').installEmojiLayer(bot, 'store');
 logger.info('Telegram bot polling started.');
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -1410,8 +1413,28 @@ bot.on('callback_query', async (query) => {
         `🔥 Invite ${REQUIRED} friends today and secure your VIP status forever.`;
     }
 
+    // Rank summary sits above the VIP text: it is the live discount the
+    // customer actually gets, whereas VIP is now a legacy perk most people
+    // cannot earn any more.
+    if (db.getSetting('rank_system_enabled', '1') === '1') {
+      const r = db.getUserRank(userId);
+      const tierLine = r.tier
+        ? `${r.tier.emoji || '🏅'} <b>${r.tier.name}</b> — <b>${r.discountPct}%</b> off every order`
+        : `<b>${r.discountPct}%</b> off every order`;
+      const nextLine = r.next
+        ? `\n📈 Spend <b>${formatPrice(r.remaining)}</b> more to reach ${r.next.emoji || '🏅'} <b>${r.next.name}</b> (${r.next.discount_pct}%)`
+        : `\n🏆 You are at the highest rank.`;
+      text =
+        `🏆 <b>Your rank</b>\n${tierLine}\n` +
+        `🛒 Spent so far: <b>${formatPrice(r.spend)}</b>${nextLine}\n` +
+        (r.isLegacyVip && r.legacyPct >= r.tierPct
+          ? `👑 <i>Your lifetime VIP discount of ${r.legacyPct}% is protected.</i>\n` : '') +
+        `\n➖➖➖➖➖\n\n` + text;
+    }
+
     const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(inviteLink)}&text=${encodeURIComponent('Join this awesome store and unlock VIP for life!')}`;
     const kb = { inline_keyboard: [
+      [{ text: '🏆 All ranks', callback_data: 'menu_ranks' }],
       [{ text: '👉 Share with friends & become VIP', url: shareUrl }],
       [{ text: '🔙 Back', callback_data: 'back_main' }],
     ] };
@@ -1421,6 +1444,36 @@ bot.on('callback_query', async (query) => {
     } catch (e) {
       try { await bot.deleteMessage(chatId, msgId); } catch (e2) {}
       await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: kb, disable_web_page_preview: true });
+    }
+    return;
+  }
+
+  // ── Rank ladder ──────────────────────────────────────────────────
+  if (data === 'menu_ranks') {
+    await answer();
+    const r = db.getUserRank(userId);
+    const rows = r.tiers.map((t) => {
+      const reached = r.spend + 1e-9 >= Number(t.min_spend);
+      const here    = r.tier && r.tier.id === t.id;
+      const mark    = here ? '👉' : (reached ? '✅' : '🔒');
+      return `${mark} ${t.emoji || '🏅'} <b>${t.name}</b> — ${formatPrice(t.min_spend)}+ → <b>${Number(t.discount_pct)}%</b>`;
+    }).join('\n');
+
+    const text =
+      `🏆 <b>Ranks</b>\n\n` +
+      `The more you spend, the bigger your permanent discount.\n\n` +
+      rows + `\n\n` +
+      `🛒 You have spent <b>${formatPrice(r.spend)}</b>\n` +
+      (r.next
+        ? `📈 <b>${formatPrice(r.remaining)}</b> more unlocks ${r.next.emoji || '🏅'} <b>${r.next.name}</b>`
+        : `🏆 You are at the highest rank.`) +
+      (r.isLegacyVip ? `\n👑 <i>VIP member — your ${r.legacyPct}% is protected for life.</i>` : '');
+
+    const kb = { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu_vip' }]] };
+    try {
+      await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: kb });
+    } catch (e) {
+      await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: kb });
     }
     return;
   }

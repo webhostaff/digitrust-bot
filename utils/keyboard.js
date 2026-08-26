@@ -157,7 +157,9 @@ function iconIdFrom(text) {
 
 /** Premium emoji id for a product: the title's marker, else the legacy column. */
 function productIconId(p) {
-  return iconIdFrom(p.title) || (p.premium_emoji_id ? String(p.premium_emoji_id) : null);
+  // Delegates to the single definition in format.js so keyboards, product pages
+  // and channel posts can never disagree about which emoji a product has.
+  return require('./format').productEmojiId(p);
 }
 
 /**
@@ -321,7 +323,7 @@ const adminMainKb = () => mk([
   [btn('🛡 Deposit Review',  'admin_deposits')],
   [btn('🔄 Refund Requests', 'admin_refund_requests')],
   [btn('🛡️ Deposit Cutoff',  'admin_cutoff')],
-  [btn('👑 VIP Broadcast',    'admin_vip_toggle')],
+  [btn('👑 VIP Broadcast',    'admin_vip_toggle'), btn('🏆 Ranks', 'admin_ranks')],
   [btn('🕵️ Audit Wallet Bugs', 'admin_audit_wallets')],
   [btn('🚨 Audit OOS Exploit',  'admin_audit_oos')],
   [btn('🗂 Categories',         'admin_categories')],

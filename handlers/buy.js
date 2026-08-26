@@ -103,11 +103,15 @@ async function handleQuantity(bot, msg) {
   // the normal price, so the two portions are priced separately and summed.
   const pricing = db.resolveCustomerPricing(userId, product, qty);
   let { total, unitPrice, discount, discountApplied } = pricing;
-  // Apply 5% VIP discount on top
-  const isVipUser = db.isVIP(userId);
-  if (isVipUser) {
-    total = Number((total * 0.95).toFixed(2));
-    unitPrice = Number((unitPrice * 0.95).toFixed(4));
+  // Rank discount on top. resolveDiscountPct returns the better of the
+  // customer's earned tier and the discount a grandfathered VIP keeps for life,
+  // so switching to ranks can never lower what an existing VIP already had.
+  const rankPct = db.resolveDiscountPct(userId);
+  const isVipUser = rankPct > 0;
+  if (rankPct > 0) {
+    const mult = 1 - rankPct / 100;
+    total = Number((total * mult).toFixed(2));
+    unitPrice = Number((unitPrice * mult).toFixed(4));
   }
   session.update(userId, {
     quantity: qty, total, unitPrice, discount, discountApplied,
@@ -1434,7 +1438,7 @@ async function handlePreorderQty(bot, msg) {
 
   session.update(userId, { preQty: qty });
   let total = qty * sess.data.productPrice;
-  if (db.isVIP(userId)) total = Number((total * 0.95).toFixed(2));
+  total = db.applyRankDiscount(userId, total);
   session.update(userId, { preTotal: total });
 
   if (sess.data.requiresEmail) {
