@@ -159,17 +159,30 @@ function installEmojiLayer(bot, label = 'bot') {
           ? args[spec.optsArg] : null;
         const plain = (t) => stripEmojiMarkers(String(t).replace(/<tg-emoji[^>]*>(.*?)<\/tg-emoji>/gi, '$1'));
 
+        // ONLY the message text is downgraded. Button icons travel in
+        // `icon_custom_emoji_id`, a separate field that has nothing to do with
+        // text entities — stripping those too turned one bad emoji id in the
+        // library into "every button lost its icon" across the whole bot.
         if (spec.textKey && opts && typeof opts[spec.textKey] === 'string') {
           opts[spec.textKey] = plain(opts[spec.textKey]);
         } else if (!spec.textKey && spec.textArg >= 0 && typeof args[spec.textArg] === 'string') {
           args[spec.textArg] = plain(args[spec.textArg]);
         }
-        if (opts && opts.reply_markup && Array.isArray(opts.reply_markup.inline_keyboard)) {
-          for (const row of opts.reply_markup.inline_keyboard) {
-            for (const b of row) { if (b) delete b.icon_custom_emoji_id; }
+
+        try {
+          return await original.apply(this, args);
+        } catch (err2) {
+          // Still refused, so the icons are the remaining suspect. This is the
+          // last resort before the message would be lost entirely.
+          if (!isCustomEmojiError(err2)) throw err2;
+          logger.warn(`[emoji:${label}] ${spec.name} still refused, dropping button icons: ${err2.message}`);
+          if (opts && opts.reply_markup && Array.isArray(opts.reply_markup.inline_keyboard)) {
+            for (const row of opts.reply_markup.inline_keyboard) {
+              for (const b of row) { if (b) { delete b.icon_custom_emoji_id; delete b.style; } }
+            }
           }
+          return await original.apply(this, args);
         }
-        return await original.apply(this, args);
       }
     };
   }

@@ -152,7 +152,12 @@ async function handleStart(bot, msg, args) {
   }
 
   // Show VIP intro only on FIRST start (no orders yet, never seen intro)
-  const seenVipIntro = db.getSetting(`vip_intro_seen_${userId}`, '0') === '1';
+  // VIP is closed to new customers — see the note on menu_ranks in index.js.
+  // The intro is skipped entirely rather than left behind a setting, because a
+  // brand-new user being pitched a status they can no longer earn is worse than
+  // no pitch at all.
+  const vipClosedToNew = db.getSetting('vip_system_enabled', '1') !== '1';
+  const seenVipIntro = vipClosedToNew || db.getSetting(`vip_intro_seen_${userId}`, '0') === '1';
   if (!seenVipIntro && !db.isVIP(userId)) {
     db.setSetting(`vip_intro_seen_${userId}`, '1');
     await bot.sendMessage(chatId,

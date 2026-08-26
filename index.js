@@ -1448,28 +1448,42 @@ bot.on('callback_query', async (query) => {
     return;
   }
 
-  // ── Rank ladder ──────────────────────────────────────────────────
+  // ── Rank ladder — the customer-facing loyalty screen ──────────────
+  // This replaced "VIP FOR LIFE" in the main menu. VIP is no longer something a
+  // new customer can earn, so advertising it would be selling a closed door;
+  // existing holders keep their percentage and are told so here.
   if (data === 'menu_ranks') {
     await answer();
     const r = db.getUserRank(userId);
-    const rows = r.tiers.map((t) => {
+
+    const ladder = r.tiers.map((t) => {
       const reached = r.spend + 1e-9 >= Number(t.min_spend);
       const here    = r.tier && r.tier.id === t.id;
       const mark    = here ? '👉' : (reached ? '✅' : '🔒');
-      return `${mark} ${t.emoji || '🏅'} <b>${t.name}</b> — ${formatPrice(t.min_spend)}+ → <b>${Number(t.discount_pct)}%</b>`;
+      const name    = here ? `<b>${escapeHtml(t.name)}</b>` : escapeHtml(t.name);
+      return `${mark} ${t.emoji || '🏅'} ${name} — ${formatPrice(t.min_spend)}+ → <b>${Number(t.discount_pct)}%</b>`;
     }).join('\n');
 
     const text =
-      `🏆 <b>Ranks</b>\n\n` +
-      `The more you spend, the bigger your permanent discount.\n\n` +
-      rows + `\n\n` +
-      `🛒 You have spent <b>${formatPrice(r.spend)}</b>\n` +
+      `🏆 <b>Your Rank</b>\n\n` +
+      `${r.tier ? `${r.tier.emoji || '🏅'} <b>${escapeHtml(r.tier.name)}</b>` : '🏅'} — ` +
+      `you get <b>${r.discountPct}%</b> off every order\n` +
+      `🛒 Total spent: <b>${formatPrice(r.spend)}</b>\n` +
       (r.next
-        ? `📈 <b>${formatPrice(r.remaining)}</b> more unlocks ${r.next.emoji || '🏅'} <b>${r.next.name}</b>`
-        : `🏆 You are at the highest rank.`) +
-      (r.isLegacyVip ? `\n👑 <i>VIP member — your ${r.legacyPct}% is protected for life.</i>` : '');
+        ? `📈 Spend <b>${formatPrice(r.remaining)}</b> more to unlock ` +
+          `${r.next.emoji || '🏅'} <b>${escapeHtml(r.next.name)}</b> (${Number(r.next.discount_pct)}%)\n`
+        : `🏆 You have reached the highest rank.\n`) +
+      (r.isLegacyVip
+        ? `👑 <i>Founding VIP member — your ${r.legacyPct}% is protected for life.</i>\n`
+        : '') +
+      `\n➖➖➖➖➖\n\n` +
+      `<b>All ranks</b>\n${ladder}\n\n` +
+      `<i>The discount applies automatically at checkout. Nothing to claim.</i>`;
 
-    const kb = { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu_vip' }]] };
+    const kb = { inline_keyboard: [
+      [{ text: '🛍 Start shopping', callback_data: 'menu_products' }],
+      [{ text: '🔙 Back', callback_data: 'back_main' }],
+    ] };
     try {
       await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: kb });
     } catch (e) {

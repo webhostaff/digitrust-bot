@@ -6541,6 +6541,7 @@ async function handleAdminCallback(bot, query) {
     const vipPct  = db.getSetting('legacy_vip_discount_pct', '5');
     const started = db.getSetting('rank_system_started_at', '—');
     const vipCount = db.countVIPs();
+    const vipOpen  = db.getSetting('vip_system_enabled', '1') === '1';
 
     const rows = tiers.map((t) => ([{
       text: `${t.emoji || '🏅'} ${t.name} — $${Number(t.min_spend).toFixed(0)}+ → ${Number(t.discount_pct)}%`,
@@ -6549,6 +6550,8 @@ async function handleAdminCallback(bot, query) {
     rows.push([{ text: '➕ Add tier', callback_data: 'admin_rank_add' }]);
     rows.push([{ text: on ? '🔴 Turn OFF ranks' : '🟢 Turn ON ranks', callback_data: 'admin_rank_toggle' }]);
     rows.push([{ text: `👑 Legacy VIP discount: ${vipPct}%`, callback_data: 'admin_rank_vippct' }]);
+    rows.push([{ text: vipOpen ? '🔒 Close VIP to new customers' : '🔓 Reopen VIP to new customers',
+                 callback_data: 'admin_rank_vipclose' }]);
     rows.push([{ text: '🔙 Back', callback_data: 'admin_panel' }]);
 
     await bot.editMessageText(
@@ -6558,7 +6561,9 @@ async function handleAdminCallback(bot, query) {
       `<b>Tiers</b> — tap one to edit its threshold or percentage:\n` +
       tiers.map((t) => `${t.emoji || '🏅'} <b>${escapeHtml(t.name)}</b> — spend $${Number(t.min_spend).toFixed(0)}+ → <b>${Number(t.discount_pct)}%</b> off`).join('\n') +
       `\n\n👑 <b>${vipCount}</b> old VIP member${vipCount === 1 ? '' : 's'} keep <b>${escapeHtml(String(vipPct))}%</b> for life — ` +
-      `they only ever move up, never down.\n\n` +
+      `they only ever move up, never down.\n` +
+      `${vipOpen ? '⚠️ VIP is still <b>OPEN</b> — new customers can unlock it by inviting 3 friends.'
+                 : '🔒 VIP is <b>CLOSED</b> to new customers. Existing members keep theirs.'}\n\n` +
       `<i>Spending is counted from zero starting the day ranks were switched on. ` +
       `Purchases made before that do not count.</i>`,
       { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }
@@ -6569,6 +6574,14 @@ async function handleAdminCallback(bot, query) {
   if (data === 'admin_rank_toggle') {
     const on = db.getSetting('rank_system_enabled', '1') === '1';
     db.setSetting('rank_system_enabled', on ? '0' : '1');
+    return handleAdminCallback(bot, { ...query, data: 'admin_ranks' });
+  }
+
+  if (data === 'admin_rank_vipclose') {
+    // Closing VIP does not touch a single is_vip row — it only stops new ones
+    // being granted, which is what keeps the promise to existing members.
+    const open = db.getSetting('vip_system_enabled', '1') === '1';
+    db.setSetting('vip_system_enabled', open ? '0' : '1');
     return handleAdminCallback(bot, { ...query, data: 'admin_ranks' });
   }
 
@@ -6633,6 +6646,59 @@ async function handleAdminCallback(bot, query) {
     }
     db.deleteRankTier(tierId);
     return handleAdminCallback(bot, { ...query, data: 'admin_ranks' });
+  }
+
+  // ── Emoji health check ────────────────────────────────────────────
+  // Premium emoji depend on things this code cannot see: the bot owner's
+  // Telegram Premium subscription, and whether each stored emoji_id is real.
+  // Both fail the same way — a plain emoji where an animated one should be —
+  // so this asks Telegram itself and reports the actual error.
+  if (data === 'admin_emoji_check') {
+    const iconsOn  = db.getSetting('button_icons_enabled', '1') === '1';
+    const autoOn   = db.getSetting('emoji_auto_upgrade', '1') === '1';
+    const library  = db.getAllEmojis();
+
+    const lines = [
+      `🎨 Button icons: ${iconsOn ? '🟢 ON' : '🔴 OFF — premium icons are disabled everywhere'}`,
+      `♻️ Auto-upgrade: ${autoOn ? '🟢 ON' : '🔴 OFF'}`,
+      `📚 Emoji library: <b>${library.length}</b> entr${library.length === 1 ? 'y' : 'ies'}`,
+    ];
+
+    // Test each library id individually — one bad id is enough to make every
+    // message fall back to plain, and only a per-id test can name which.
+    const bad = [];
+    for (const row of library.slice(0, 12)) {
+      try {
+        await bot.sendMessage(chatId,
+          `<tg-emoji emoji-id="${row.emoji_id}">${row.fallback || '🎁'}</tg-emoji> ${escapeHtml(row.name || '')}`,
+          { parse_mode: 'HTML', disable_notification: true });
+      } catch (e) {
+        bad.push(`• <code>${escapeHtml(row.name || row.emoji_id)}</code> — ${escapeHtml(e.message)}`);
+      }
+    }
+
+    let verdict;
+    if (bad.length) {
+      verdict = `🔴 <b>${bad.length} broken entr${bad.length === 1 ? 'y' : 'ies'}</b>\n` + bad.join('\n') +
+        `\n\n<i>Fix or delete these in the Emoji Library. Until then, messages containing ` +
+        `them fall back to plain emoji.</i>`;
+    } else if (!library.length) {
+      verdict = `⚪️ Library is empty — only products with their own <code>[emoji:ID]</code> show premium icons.`;
+    } else {
+      verdict = `🟢 Every library entry was accepted by Telegram.\n\n` +
+        `<i>If icons still look plain: the messages above are the real test. Plain there ` +
+        `means the bot owner's account has no active Telegram Premium — Telegram only ` +
+        `lets a bot send custom emoji while its owner is Premium.</i>`;
+    }
+
+    await bot.sendMessage(chatId,
+      `🩺 <b>Emoji Check</b>\n\n${lines.join('\n')}\n\n${verdict}`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+        [{ text: iconsOn ? '🔴 Turn OFF icons' : '🟢 Turn ON icons', callback_data: 'admin_setting_button_icons_enabled' }],
+        [{ text: autoOn ? '🔴 Turn OFF auto-upgrade' : '🟢 Turn ON auto-upgrade', callback_data: 'admin_setting_emoji_auto_upgrade' }],
+        [{ text: '🔙 Settings', callback_data: 'admin_settings' }],
+      ] } });
+    return;
   }
 
   if (/^admin_setting_/.test(data)) {

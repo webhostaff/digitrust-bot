@@ -62,7 +62,7 @@ function matchNavButton(text) {
 const mainMenuKb = (lang = 'en') => mk([
   [btn(t(lang, 'btn_products'), 'menu_products'),    btn(t(lang, 'btn_preorders'), 'menu_preorders')],
   [btn(t(lang, 'btn_wallet'), 'menu_wallet'),         btn(t(lang, 'btn_orders'), 'menu_orders')],
-  [btn(t(lang, 'btn_support'), 'menu_support'),       btn(t(lang, 'btn_vip'), 'menu_vip')],
+  [btn(t(lang, 'btn_support'), 'menu_support'),       btn(t(lang, 'btn_vip'), 'menu_ranks')],
   [btn(t(lang, 'btn_refunds'), 'refund_request_start'),         btn(t(lang, 'btn_language'), 'menu_language')],
   [btn('🔌 API Access', 'menu_api')],
 ]);
@@ -721,7 +721,7 @@ const adminSettingsKb = () => mk([
   [btn('🎨 Button Icons',      'admin_setting_button_icons_enabled')],
   [btn('💬 Group Link',        'admin_setting_required_group_link'),btn('📢 Channel Link',       'admin_setting_required_channel_link')],
   [btn('📡 Updates Channel',   'admin_setting_updates_channel_id'), btn('💬 Updates Group',      'admin_setting_updates_group_id')],
-  [btn('🩺 Broadcast Check',   'admin_broadcast_check')],
+  [btn('🩺 Broadcast Check',   'admin_broadcast_check'), btn('🎨 Emoji Check', 'admin_emoji_check')],
   [btn('🔔 Product Notifs',    'admin_setting_product_notifications_enabled'), btn('📦 Stock Notifs', 'admin_setting_stock_notifications_enabled')],
   [btn('🎁 Referral Cashback', 'admin_setting_referral_cashback_enabled'), btn('💸 Cashback %', 'admin_setting_referral_cashback_pct')],
   [btn('💰 Min Order for Cashback', 'admin_setting_referral_min_order')],

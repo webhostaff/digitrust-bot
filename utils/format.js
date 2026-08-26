@@ -218,6 +218,16 @@ function clearEmojiCache() { _emojiMapCache = null; _emojiMapAt = 0; }
  */
 function premiumizeEmojis(text) {
   if (!text) return text;
+  // Kill switch. This upgrade now runs on EVERY outgoing message, so a single
+  // wrong emoji_id in the library would make Telegram reject messages
+  // bot-wide. Setting emoji_auto_upgrade to 0 leaves explicit [emoji:ID]
+  // markers working and only disables the library-driven substitution.
+  try {
+    const db = require('../database/queries');
+    const v = String(db.getSetting('emoji_auto_upgrade', '1') || '').trim().toLowerCase();
+    if (['0', 'no', 'off', 'false'].includes(v)) return text;
+  } catch (_) { /* settings unavailable — carry on */ }
+
   const map = emojiMap();
   if (!map.size) return text;
 
