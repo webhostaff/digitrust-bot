@@ -324,6 +324,7 @@ const adminMainKb = () => mk([
   [btn('🔄 Refund Requests', 'admin_refund_requests')],
   [btn('🛡️ Deposit Cutoff',  'admin_cutoff')],
   [btn('👑 VIP Broadcast',    'admin_vip_toggle'), btn('🏆 Ranks', 'admin_ranks')],
+  [btn('🔎 Trace TxID', 'admin_txid_search')],
   [btn('🕵️ Audit Wallet Bugs', 'admin_audit_wallets')],
   [btn('🚨 Audit OOS Exploit',  'admin_audit_oos')],
   [btn('🗂 Categories',         'admin_categories')],

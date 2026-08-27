@@ -670,6 +670,108 @@ function applyRankDiscount(userId, amount) {
   return Number((Number(amount) * (1 - pct / 100)).toFixed(2));
 }
 
+/**
+ * Trace one TxID (or Binance transfer id) across every table that could mention
+ * it, and say what happened to the money.
+ *
+ * The point is to answer the three questions support actually gets asked, in
+ * one place: did it arrive, was it credited, and where did it go afterwards.
+ * Each of those lives in a different table, which is why "I sent it, check"
+ * used to mean opening five screens.
+ *
+ * The needle is matched case-insensitively and trimmed, because customers paste
+ * hashes with stray whitespace and mixed case constantly.
+ */
+function traceTxid(needle) {
+  const q = String(needle || '').trim();
+  if (!q) return null;
+  const like = `%${q}%`;
+
+  const safe = (fn, fallback = []) => { try { return fn(); } catch (e) { return fallback; } };
+
+  // 1. Credited deposits — the money arrived and the wallet went up.
+  const credited = safe(() => db.prepare(`
+    SELECT ut.*, u.username, u.first_name, u.balance
+    FROM used_txids ut LEFT JOIN users u ON ut.user_id = u.telegram_id
+    WHERE ut.txid LIKE ? COLLATE NOCASE
+  `).all(like));
+
+  // 2. The ledger entry written when it was credited, plus anything referencing it.
+  const ledger = safe(() => db.prepare(`
+    SELECT * FROM transactions WHERE ref_id LIKE ? COLLATE NOCASE
+    ORDER BY created_at DESC
+  `).all(like));
+
+  // 3. Seen by the watcher but not yet credited.
+  const pending = safe(() => db.prepare(`
+    SELECT * FROM pending_deposits WHERE txid LIKE ? COLLATE NOCASE
+  `).all(like));
+
+  // 4. Held for manual review (wrong amount, late, unknown sender…).
+  const review = safe(() => db.prepare(`
+    SELECT * FROM deposit_reviews WHERE txid LIKE ? COLLATE NOCASE
+  `).all(like));
+
+  // 5. Claimed against a unique-amount deposit intent.
+  const intents = safe(() => db.prepare(`
+    SELECT * FROM deposit_intents WHERE claimed_txid LIKE ? COLLATE NOCASE
+  `).all(like));
+
+  // 6. Taken back by an admin.
+  const reversals = safe(() => db.prepare(`
+    SELECT * FROM balance_reversals WHERE txid LIKE ? COLLATE NOCASE
+  `).all(like));
+
+  // 7. Used to pay for an order directly, rather than to top up.
+  const orders = safe(() => db.prepare(`
+    SELECT o.*, p.title AS product_title, u.username
+    FROM orders o
+    LEFT JOIN products p ON o.product_id = p.id
+    LEFT JOIN users u ON o.user_id = u.telegram_id
+    WHERE o.payment_proof LIKE ? COLLATE NOCASE
+    ORDER BY o.id DESC
+  `).all(like));
+
+  // 8. Payment-provider invoices (NOWPayments / CryptoBot).
+  const nowInv = safe(() => db.prepare(`
+    SELECT * FROM nowpayments_invoices
+    WHERE tx_hash LIKE ? COLLATE NOCASE OR payment_id LIKE ? COLLATE NOCASE
+       OR invoice_id LIKE ? COLLATE NOCASE OR order_id LIKE ? COLLATE NOCASE
+  `).all(like, like, like, like));
+
+  const cbInv = safe(() => db.prepare(`
+    SELECT * FROM cryptobot_invoices
+    WHERE invoice_id LIKE ? COLLATE NOCASE OR order_id LIKE ? COLLATE NOCASE
+  `).all(like, like));
+
+  // Whichever table matched, it names a user; that is the thread to pull.
+  const userId =
+    credited[0]?.user_id ?? pending[0]?.user_id ?? review[0]?.user_id ??
+    intents[0]?.user_id ?? reversals[0]?.user_id ?? orders[0]?.user_id ??
+    nowInv[0]?.telegram_user_id ?? cbInv[0]?.telegram_user_id ?? null;
+
+  const user = userId ? safe(() => db.prepare(
+    'SELECT telegram_id, username, first_name, balance, is_vip, rank_spend FROM users WHERE telegram_id = ?'
+  ).get(userId), null) : null;
+
+  // What the customer did with the money AFTER it landed — the question a
+  // "did he already spend it?" dispute actually turns on.
+  const spentAfter = (userId && credited[0]?.created_at) ? safe(() => db.prepare(`
+    SELECT o.id, o.total_price, o.status, o.created_at, o.payment_method, p.title AS product_title
+    FROM orders o LEFT JOIN products p ON o.product_id = p.id
+    WHERE o.user_id = ? AND o.created_at >= ?
+      AND o.status NOT IN ('cancelled', 'pending')
+    ORDER BY o.id DESC LIMIT 15
+  `).all(userId, credited[0].created_at)) : [];
+
+  const found = credited.length || ledger.length || pending.length || review.length ||
+                intents.length || reversals.length || orders.length ||
+                nowInv.length || cbInv.length;
+
+  return { query: q, found: !!found, user, credited, ledger, pending, review,
+           intents, reversals, orders, nowInv, cbInv, spentAfter };
+}
+
 function payReferralReward(referredId, rewardAmount) {
   return db.transaction(() => {
     const referral = getReferralByReferred.get(referredId);
@@ -854,10 +956,19 @@ const cgb_markNotified = (orderId, days) => {
 
 // ── Renewals ─────────────────────────────────────────────────────────────────
 
-/** A customer's live seats, soonest to expire first. */
+/**
+ * A customer's live seats, soonest to expire first.
+ *
+ * 'pending' is included deliberately. A subscription is inserted as 'pending'
+ * and only flips to 'active' when an admin taps "notify customer" — but the
+ * customer has already PAID at insert time. Filtering to 'active' meant every
+ * seat whose invite had not been sent yet was invisible to its owner, so the
+ * whole renewals menu looked like it did nothing.
+ */
 const cgb_getUserSubs = db.prepare(`
   SELECT * FROM chatgpt_subscriptions
-  WHERE user_id = ? AND status = 'active'
+  WHERE user_id = ?
+    AND COALESCE(status, 'pending') IN ('active', 'pending')
   ORDER BY date(end_date) ASC, id ASC
 `);
 
@@ -881,7 +992,7 @@ const cgb_getDueReminders = db.prepare(`
   SELECT cs.*, u.username, u.first_name
   FROM chatgpt_subscriptions cs
   LEFT JOIN users u ON cs.user_id = u.telegram_id
-  WHERE cs.status = 'active'
+  WHERE COALESCE(cs.status, 'pending') IN ('active', 'pending')
     AND COALESCE(cs.reminder_sent, 0) = 0
     AND COALESCE(cs.renew_intent, '') <> 'no'
     AND date(cs.end_date) <= date('now', '+' || ? || ' days')
@@ -898,7 +1009,8 @@ const cgb_getReserved = db.prepare(`
   SELECT cs.*, u.username, u.first_name
   FROM chatgpt_subscriptions cs
   LEFT JOIN users u ON cs.user_id = u.telegram_id
-  WHERE cs.status = 'active' AND cs.renew_intent = 'yes'
+  WHERE COALESCE(cs.status, 'pending') IN ('active', 'pending')
+    AND cs.renew_intent = 'yes'
   ORDER BY date(cs.end_date) ASC
 `);
 
@@ -1794,6 +1906,8 @@ module.exports = {
   deliverOrder,
   deliverOrderAndChargeWallet,
   chargeWalletForPreorder,
+
+  traceTxid,
 
   // ── Spend ranks ──
   getUserRank,

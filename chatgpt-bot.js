@@ -335,17 +335,14 @@ async function showMainMenu(chatId, userId, messageId = null) {
   const subs = queries.getCgbSubsByUser(userId);
   const rows = [];
 
-  // Renew is only offered when there is something to renew — a button that
-  // always answers "you have no subscriptions" is just a dead end.
-  if (subs.length) {
-    rows.push([
-      { text: '🔄 Renew', callback_data: 'cgb_renew_list' },
-      { text: '✨ New',   callback_data: 'cgb_new' },
-    ]);
-    rows.push([{ text: '📋 Details', callback_data: 'cgb_details_list' }]);
-  } else {
-    rows.push([{ text: '✨ Buy a seat', callback_data: 'cgb_new' }]);
-  }
+  // Every option is always shown. Hiding Renew when the list looks empty made
+  // the bot appear unchanged to customers whose seat simply is not recorded
+  // here yet — they had no way to even ask about it.
+  rows.push([
+    { text: '🔄 Renew', callback_data: 'cgb_renew_list' },
+    { text: '✨ New',   callback_data: 'cgb_new' },
+  ]);
+  rows.push([{ text: '📋 Details', callback_data: 'cgb_details_list' }]);
 
   const txt =
     `🤖 <b>ChatGPT Business</b>\n\n` +
@@ -371,7 +368,18 @@ async function showMainMenu(chatId, userId, messageId = null) {
 async function showSubList(chatId, userId, action, messageId = null) {
   const subs = queries.getCgbSubsByUser(userId);
   if (!subs.length) {
-    await bot.sendMessage(chatId, '📭 You have no active subscriptions yet.');
+    // A seat bought in the main store leaves no record in this bot, so "you
+    // have none" would be wrong as often as it is right. Say what is actually
+    // known and give the customer a way forward.
+    await bot.sendMessage(chatId,
+      `📭 <b>No subscriptions found on this account</b>\n\n` +
+      `If you bought a seat here, it will appear once it is activated.\n` +
+      `If you bought it somewhere else in the shop, contact support with your ` +
+      `email and it will be added.`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+        [{ text: '✨ Buy a seat', callback_data: 'cgb_new' }],
+        [{ text: '🔙 Menu', callback_data: 'cgb_menu' }],
+      ] } });
     return;
   }
 
@@ -458,12 +466,93 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
     `).run(userId, msg.from.username || null, msg.from.first_name || null, msg.from.last_name || null);
   } catch (e) {}
 
-  // Existing customers land on the menu so renewing is one tap; first-time
-  // visitors go straight to the price, since a menu with one live option is
-  // just an extra tap between them and buying.
-  const hasSubs = queries.getCgbSubsByUser(userId).length > 0;
-  if (hasSubs) await showMainMenu(chatId, userId);
-  else await showCalculation(chatId, userId, false);
+  // The menu is ALWAYS shown.
+  //
+  // It used to appear only for customers with a row in chatgpt_subscriptions,
+  // and those rows are created solely by purchases made inside THIS bot. Every
+  // seat sold as a normal product in the main store therefore had no row, its
+  // owner was sent straight to the price calculator, and the entire renewals
+  // feature was invisible to almost everyone. Reachability must not depend on
+  // which till the customer happened to buy at.
+  await showMainMenu(chatId, userId);
+});
+
+// A second door into the same menu, for anyone who scrolled past /start.
+bot.onText(/^\/(menu|renew|subscriptions?)$/i, async (msg) => {
+  await showMainMenu(msg.chat.id, msg.from.id);
+});
+
+/**
+ * Register a seat that was sold outside this bot.
+ *
+ * ChatGPT Business is also sold as an ordinary product in the main store, and
+ * those sales write no row here — so their owners have nothing to renew and get
+ * no expiry reminder. Rather than guessing dates from old orders (a wrong end
+ * date means a reminder at the wrong time, which is worse than none), the shop
+ * owner states the facts once and the seat behaves like any other from then on.
+ *
+ *   /addseat <userId> <email> <YYYY-MM-DD end date> [price]
+ */
+bot.onText(/^\/addseat\s+(.+)$/i, async (msg, match) => {
+  if (String(msg.from.id) !== String(ADMIN_ID)) return;
+  const chatId = msg.chat.id;
+  const parts  = String(match[1] || '').trim().split(/\s+/);
+
+  if (parts.length < 3) {
+    await bot.sendMessage(chatId,
+      `📝 <b>Register an existing seat</b>\n\n` +
+      `<code>/addseat &lt;userId&gt; &lt;email&gt; &lt;YYYY-MM-DD&gt; [price]</code>\n\n` +
+      `Example:\n<code>/addseat 5626665035 sasha@gmail.com 2026-09-30 12.50</code>\n\n` +
+      `<i>Use this for seats bought in the main store. The customer will then see ` +
+      `it under Renew and Details, and get the expiry reminder.</i>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  const [rawUser, email, endDate] = parts;
+  const price  = parseFloat(parts[3] || '0') || 0;
+  const target = parseInt(rawUser, 10);
+
+  if (!Number.isFinite(target) || !/^\S+@\S+\.\S+$/.test(email) || !/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
+    await bot.sendMessage(chatId, '❌ Check the format: userId must be a number, then an email, then YYYY-MM-DD.');
+    return;
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+  const days  = Math.max(0, Math.ceil(
+    (new Date(`${endDate}T00:00:00`) - new Date(`${today}T00:00:00`)) / 86400000));
+
+  try {
+    db.prepare(`INSERT OR IGNORE INTO users (telegram_id) VALUES (?)`).run(target);
+    // order_id 0 marks a seat with no order behind it in this bot.
+    const info = db.prepare(`
+      INSERT INTO chatgpt_subscriptions
+        (order_id, user_id, email, start_date, end_date, days_remaining,
+         base_price, extra_month, final_price, status, workspace)
+      VALUES (0, ?, ?, ?, ?, ?, ?, 0, ?, 'active', ?)
+    `).run(target, email, today, endDate, days, price, price,
+           db.prepare(`SELECT value FROM settings WHERE key='cgb_workspace_name'`).get()?.value || 'chatgpt_Team');
+
+    await bot.sendMessage(chatId,
+      `✅ <b>Seat registered</b>\n\n` +
+      `📧 <code>${escapeHtml(email)}</code>\n` +
+      `👤 <code>${target}</code>\n` +
+      `📅 Ends ${endDate} (${days} day${days === 1 ? '' : 's'} left)\n\n` +
+      `The customer can now see it under 🔄 Renew and 📋 Details, and will be ` +
+      `reminded before it expires.`,
+      { parse_mode: 'HTML' });
+
+    await bot.sendMessage(target,
+      `🤖 <b>Your ChatGPT Business seat is now tracked here</b>\n\n` +
+      `📧 <code>${escapeHtml(email)}</code>\n📅 Ends <b>${endDate}</b>\n\n` +
+      `Send /menu any time to renew it or see the details.`,
+      { parse_mode: 'HTML' }).catch(() => {
+      bot.sendMessage(chatId, '⚠️ Seat saved, but the customer has not started this bot yet — they will see it when they do.');
+    });
+    if (info.lastInsertRowid) logger.info(`[CGB] seat ${info.lastInsertRowid} registered manually for ${target}`);
+  } catch (e) {
+    await bot.sendMessage(chatId, `❌ Could not save: ${e.message}`);
+  }
 });
 
 // ════════════════════════════════════════════════════════════════
@@ -1083,11 +1172,35 @@ bot.on('message', async (msg) => {
 // ════════════════════════════════════════════════════════════════
 // PAYMENT CONFIRMED — finalize order
 // ════════════════════════════════════════════════════════════════
+/**
+ * Count a ChatGPT Business sale toward the buyer's rank.
+ *
+ * The main store accrues inside completeOrder, but this bot never calls it —
+ * it writes its own orders row — so a customer could spend hundreds here and
+ * stay on the bottom tier. Guarded by the order's own status so a webhook that
+ * fires twice cannot count the same sale twice.
+ */
+function accrueRankForCgbOrder(orderId, userId) {
+  try {
+    const o = db.prepare('SELECT total_price, rank_counted FROM orders WHERE id = ?').get(orderId);
+    if (!o || Number(o.rank_counted) === 1) return;
+    const amount = Number(o.total_price) || 0;
+    if (amount <= 0) return;
+    queries.addRankSpend(userId, amount);
+    db.prepare('UPDATE orders SET rank_counted = 1 WHERE id = ?').run(orderId);
+  } catch (e) {
+    // Rank bookkeeping must never block a paid order being confirmed.
+    logger.warn(`accrueRankForCgbOrder #${orderId}: ${e.message}`);
+  }
+}
+
 async function confirmPayment(chatId, userId, orderId, txid, sessionData) {
   // Mark order as paid
   try {
     db.prepare(`UPDATE orders SET status='paid', payment_proof=? WHERE id=?`).run(txid, orderId);
   } catch (e) {}
+
+  accrueRankForCgbOrder(orderId, userId);
 
   clearSession(userId);
 
@@ -1177,6 +1290,8 @@ async function confirmCryptobotPayment(invoiceId, paidAmount, orderId, userId) {
   } catch (e) {
     logger.error(`confirmCryptobotPayment: failed to mark order #${orderId} paid: ${e.message}`);
   }
+
+  accrueRankForCgbOrder(orderId, sub.user_id);
 
   const totalDays = sub.days_remaining + (sub.extra_month ? 30 : 0);
 
@@ -1326,6 +1441,15 @@ setTimeout(() => {
     sendRenewalReminders().catch((e) => logger.error(`reminder run: ${e.message}`));
   }, REMINDER_INTERVAL_MS);
 }, 30000); // let the process finish booting first
+
+// Register the command menu. Without this the bot's ☰ button is empty, so a
+// customer has no way to discover /menu — the feature exists but is invisible
+// unless they happen to type the right word.
+bot.setMyCommands([
+  { command: 'start', description: '🤖 ChatGPT Business' },
+  { command: 'menu',  description: '📋 My subscriptions & renew' },
+]).then(() => logger.info('CGB command menu registered'))
+  .catch((e) => logger.warn(`CGB setMyCommands: ${e.message}`));
 
 bot.on('polling_error', e => logger.error(`CGB polling: ${e.message}`));
 

@@ -79,6 +79,7 @@ const States = {
   // Spend ranks: one state for editing a tier field, one for adding a tier.
   ADMIN_RANK_EDIT: 'ADMIN_RANK_EDIT',
   ADMIN_RANK_ADD:  'ADMIN_RANK_ADD',
+  ADMIN_TXID_SEARCH: 'ADMIN_TXID_SEARCH',
   ADMIN_VIP_INTERVAL: 'ADMIN_VIP_INTERVAL',
   REFUND_REASON: 'REFUND_REASON',
   REFUND_ACCOUNT: 'REFUND_ACCOUNT',

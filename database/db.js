@@ -1139,4 +1139,16 @@ try {
   console.error('[SEED] cgb renewal settings:', e.message);
 }
 
+try {
+  const orderCols = db.prepare('PRAGMA table_info(orders)').all().map((c) => c.name);
+  if (!orderCols.includes('rank_counted')) {
+    // Marks an order whose value has already been added to the buyer's rank.
+    // The ChatGPT Business bot confirms payment from a webhook that can fire
+    // more than once, and without this a retry would inflate the counter.
+    db.exec('ALTER TABLE orders ADD COLUMN rank_counted INTEGER DEFAULT 0');
+  }
+} catch (e) {
+  console.error('[MIGRATION V4] rank_counted:', e.message);
+}
+
 module.exports = db;
