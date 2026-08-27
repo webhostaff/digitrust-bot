@@ -22,6 +22,7 @@ const {
   iconBtn: kbIconBtn, iconIdFrom: kbIconIdFrom, stripEmojiCodes: kbStripEmojiCodes,
 } = require('../utils/keyboard');
 const items = require('../database/items');
+const binance = require('../services/binance');
 const { formatPrice, formatPriceExact, escapeHtml, expandPremiumEmojis, scaleTiersProportionally, productEmojiId } = require('../utils/format');
 const {
   publishToChannel, publishToGroup, broadcastToUsers, autoPublish, autoPublishWithPhoto,
@@ -1586,140 +1587,8 @@ async function handleAdminText(bot, msg) {
   // ── TxID tracer: one id, the whole story ──────────────────────────
   if (s === States.ADMIN_TXID_SEARCH) {
     session.clear(userId);
-    const needle = String(text || '').trim();
-    if (needle.length < 4) {
-      await bot.sendMessage(chatId, '❌ Send at least 4 characters of the id.');
-      return;
-    }
-
-    const r = db.traceTxid(needle);
-    const money = (n) => `$${Number(n || 0).toFixed(2)}`;
-    const short = (v) => {
-      const x = String(v || '');
-      // Hashes are 64 characters; printing them whole buries the answer.
-      return x.length > 22 ? `${x.slice(0, 10)}…${x.slice(-8)}` : x;
-    };
-
-    if (!r || !r.found) {
-      await bot.sendMessage(chatId,
-        `🔎 <b>${escapeHtml(short(needle))}</b>\n\n` +
-        `❌ <b>Not found anywhere.</b>\n\n` +
-        `This id was never credited, never queued, and never held for review. ` +
-        `Either the deposit never reached your address, or the customer sent a ` +
-        `different id than the one they paid with.`,
-        { parse_mode: 'HTML' });
-      return;
-    }
-
-    const L = [`🔎 <b>Payment trace</b>\n<code>${escapeHtml(short(needle))}</code>`];
-
-    if (r.user) {
-      L.push(
-        `\n👤 <b>Customer</b>\n` +
-        `${r.user.username ? '@' + escapeHtml(r.user.username) : escapeHtml(r.user.first_name || '—')} · ` +
-        `<code>${r.user.telegram_id}</code>\n` +
-        `💰 Balance now: <b>${money(r.user.balance)}</b>` +
-        (r.user.is_vip ? ' · 👑 VIP' : '') +
-        `\n🛒 Rank spend: ${money(r.user.rank_spend)}`
-      );
-    }
-
-    // ── Did it arrive and get credited?
-    if (r.credited.length) {
-      for (const c of r.credited) {
-        L.push(
-          `\n✅ <b>CREDITED to wallet</b>\n` +
-          `💵 Amount: <b>${money(c.amount)}</b>\n` +
-          `🌐 ${escapeHtml(c.network || '?')} ${escapeHtml(c.asset || '')}\n` +
-          `📅 ${escapeHtml(c.created_at || '—')}`
-        );
-      }
-    } else if (r.review.length) {
-      for (const v of r.review) {
-        L.push(
-          `\n⏸ <b>HELD FOR REVIEW — not credited</b>\n` +
-          `💵 ${money(v.amount)} · ${escapeHtml(v.network || '?')}\n` +
-          `❓ Reason: ${escapeHtml(v.reason || '—')}\n` +
-          `📊 Status: <b>${escapeHtml(v.status || 'pending')}</b>` +
-          (v.admin_note ? `\n📝 ${escapeHtml(v.admin_note)}` : '')
-        );
-      }
-    } else if (r.pending.length) {
-      for (const p of r.pending) {
-        L.push(
-          `\n⏳ <b>SEEN but NOT credited</b>\n` +
-          `💵 ${money(p.amount)} · ${escapeHtml(p.network || '?')}\n` +
-          `🔁 Checked ${p.attempts} time(s), first seen ${escapeHtml(p.first_seen || '—')}`
-        );
-      }
-    }
-
-    if (r.intents.length) {
-      for (const i of r.intents) {
-        L.push(`\n🎯 <b>Matched a deposit request</b>\nExpected <b>${money(i.unique_amount)}</b> · status ${escapeHtml(i.status)}`);
-      }
-    }
-
-    // ── Was it used to pay for an order directly?
-    if (r.orders.length) {
-      L.push(`\n🛍 <b>Paid for ${r.orders.length} order(s) directly</b>`);
-      for (const o of r.orders.slice(0, 6)) {
-        L.push(`• #${o.id} — ${escapeHtml(kbStripEmojiCodes(String(o.product_title || '')).trim().slice(0, 28))} · ${money(o.total_price)} · <b>${escapeHtml(o.status)}</b>`);
-      }
-    }
-
-    if (r.nowInv.length || r.cbInv.length) {
-      for (const i of r.nowInv) {
-        L.push(`\n🧾 <b>NOWPayments invoice</b>\n${money(i.amount)} · ${escapeHtml(i.payment_status || '?')} · ${i.credited ? '✅ credited' : '❌ not credited'} · ${escapeHtml(i.purpose || '')}`);
-      }
-      for (const i of r.cbInv) {
-        L.push(`\n🤖 <b>CryptoBot invoice</b>\n${money(i.amount)} · ${i.credited ? '✅ credited' : '❌ not credited'} · ${escapeHtml(i.purpose || '')}${i.paid_at ? ` · paid ${escapeHtml(i.paid_at)}` : ''}`);
-      }
-    }
-
-    if (r.reversals.length) {
-      for (const v of r.reversals) {
-        L.push(`\n↩️ <b>REVERSED by admin</b>\n−${money(v.amount)} · ${escapeHtml(v.reason || '—')}\nBalance ${money(v.balance_before)} → ${money(v.balance_after)}`);
-      }
-    }
-
-    if (r.ledger.length) {
-      L.push(`\n📒 <b>Ledger</b>`);
-      for (const t of r.ledger.slice(0, 5)) {
-        L.push(`• ${Number(t.amount) >= 0 ? '+' : ''}${money(t.amount)} · ${escapeHtml(t.type)} · ${escapeHtml(String(t.created_at || '').slice(0, 16))}`);
-      }
-    }
-
-    // ── What happened to the money afterwards?
-    if (r.credited.length) {
-      if (r.spentAfter.length) {
-        const spent = r.spentAfter.reduce((a, o) => a + Number(o.total_price || 0), 0);
-        L.push(`\n💸 <b>Spent after this deposit: ${money(spent)}</b> across ${r.spentAfter.length} order(s)`);
-        for (const o of r.spentAfter.slice(0, 8)) {
-          L.push(`• #${o.id} — ${escapeHtml(kbStripEmojiCodes(String(o.product_title || '')).trim().slice(0, 26))} · ${money(o.total_price)} · ${escapeHtml(o.payment_method || '')}`);
-        }
-        if (r.spentAfter.length > 8) L.push(`<i>…and ${r.spentAfter.length - 8} more</i>`);
-      } else {
-        L.push(`\n💤 <b>Nothing bought since this deposit.</b> The money is still in the wallet.`);
-      }
-    }
-
-    const kb = { inline_keyboard: [] };
-    if (r.user) kb.inline_keyboard.push([{ text: '👤 Open customer', callback_data: `admin_txid_user_${r.user.telegram_id}` }]);
-    kb.inline_keyboard.push([{ text: '🔎 Trace another', callback_data: 'admin_txid_search' }]);
-    kb.inline_keyboard.push([{ text: '🔙 Admin Panel', callback_data: 'admin_panel' }]);
-
-    // Telegram caps a message at 4096 characters; a busy wallet can exceed it.
-    const full = L.join('\n');
-    const parts = full.match(/[\s\S]{1,3500}/g) || [full];
-    for (let i = 0; i < parts.length; i++) {
-      await bot.sendMessage(chatId, parts[i], {
-        parse_mode: 'HTML',
-        reply_markup: i === parts.length - 1 ? kb : undefined,
-      }).catch(async () => {
-        await bot.sendMessage(chatId, parts[i].replace(/<[^>]+>/g, ''));
-      });
-    }
+    logger.info(`[TXID] admin ${userId} tracing "${String(text).slice(0, 24)}" via panel`);
+    await runTxidTrace(bot, chatId, text);
     return;
   }
 
@@ -2037,6 +1906,187 @@ async function finalizeProduct(bot, chatId, userId, stockLines) {
 }
 
 // ── Callback handler ──────────────────────────────────────────────────────────
+
+
+/**
+ * Build and send the payment trace report.
+ *
+ * Shared by the /txid command and the admin panel button so the two can never
+ * drift apart — the report is the feature, the two entry points are just doors.
+ */
+async function runTxidTrace(bot, chatId, rawText) {
+    const needle = String(rawText || '').trim();
+    if (needle.length < 4) {
+      await bot.sendMessage(chatId, '❌ Send at least 4 characters of the id.');
+      return;
+    }
+
+    const r = db.traceTxid(needle);
+    const money = (n) => `$${Number(n || 0).toFixed(2)}`;
+    const short = (v) => {
+      const x = String(v || '');
+      // Hashes are 64 characters; printing them whole buries the answer.
+      return x.length > 22 ? `${x.slice(0, 10)}…${x.slice(-8)}` : x;
+    };
+
+    if (!r || !r.found) {
+      // The local tables only know about deposits the bot itself picked up.
+      // "Not in my database" and "never arrived" are different answers, and
+      // only Binance can tell them apart — so ask it before saying no.
+      let chainLine = '';
+      try {
+        const chain = await binance.findDepositRaw(needle);
+        if (!chain.ok) {
+          chainLine = `\n\n⚠️ <i>Could not check Binance: ${escapeHtml(chain.error || 'unknown error')}</i>`;
+        } else if (chain.matches.length) {
+          const d = chain.matches[0];
+          const state = d.status === 1 ? '✅ Completed on Binance'
+                      : d.status === 0 ? '⏳ Still pending on Binance'
+                      : d.status === 6 ? '🔒 Credited but withdrawal-locked'
+                      : `Status code ${d.status}`;
+          chainLine =
+            `\n\n🟡 <b>FOUND ON BINANCE — but never credited here</b>\n` +
+            `💵 <b>$${Number(d.amount).toFixed(2)}</b> ${escapeHtml(d.coin || '')}\n` +
+            `🌐 ${escapeHtml(d.network || '?')}\n` +
+            `📥 To: <code>${escapeHtml(String(d.address || '—'))}</code>\n` +
+            `📅 ${new Date(d.insertTime).toISOString().slice(0, 16).replace('T', ' ')}\n` +
+            `📊 ${state}\n\n` +
+            `<i>The money is in your Binance account. It was not added to any ` +
+            `wallet — most often because it went to a different address than the ` +
+            `one the bot watches, or arrived without a matching deposit request. ` +
+            `Add it manually with ➕ Add User Balance once you know the customer.</i>`;
+        } else {
+          chainLine = `\n\n🔍 <i>Also checked your Binance deposit history (last 180 days) — no such deposit.</i>`;
+        }
+      } catch (e) {
+        logger.warn(`[TXID] Binance lookup failed: ${e.message}`);
+        chainLine = `\n\n⚠️ <i>Binance check failed: ${escapeHtml(e.message)}</i>`;
+      }
+
+      await bot.sendMessage(chatId,
+        `🔎 <b>${escapeHtml(short(needle))}</b>\n\n` +
+        `❌ <b>Not in the bot's records.</b>\n` +
+        `Never credited, never queued, never held for review.` +
+        chainLine,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+          [{ text: '➕ Add User Balance', callback_data: 'admin_add_balance' }],
+          [{ text: '🔎 Trace another', callback_data: 'admin_txid_search' }],
+        ] } });
+      return;
+    }
+
+    const L = [`🔎 <b>Payment trace</b>\n<code>${escapeHtml(short(needle))}</code>`];
+
+    if (r.user) {
+      L.push(
+        `\n👤 <b>Customer</b>\n` +
+        `${r.user.username ? '@' + escapeHtml(r.user.username) : escapeHtml(r.user.first_name || '—')} · ` +
+        `<code>${r.user.telegram_id}</code>\n` +
+        `💰 Balance now: <b>${money(r.user.balance)}</b>` +
+        (r.user.is_vip ? ' · 👑 VIP' : '') +
+        `\n🛒 Rank spend: ${money(r.user.rank_spend)}`
+      );
+    }
+
+    // ── Did it arrive and get credited?
+    if (r.credited.length) {
+      for (const c of r.credited) {
+        L.push(
+          `\n✅ <b>CREDITED to wallet</b>\n` +
+          `💵 Amount: <b>${money(c.amount)}</b>\n` +
+          `🌐 ${escapeHtml(c.network || '?')} ${escapeHtml(c.asset || '')}\n` +
+          `📅 ${escapeHtml(c.created_at || '—')}`
+        );
+      }
+    } else if (r.review.length) {
+      for (const v of r.review) {
+        L.push(
+          `\n⏸ <b>HELD FOR REVIEW — not credited</b>\n` +
+          `💵 ${money(v.amount)} · ${escapeHtml(v.network || '?')}\n` +
+          `❓ Reason: ${escapeHtml(v.reason || '—')}\n` +
+          `📊 Status: <b>${escapeHtml(v.status || 'pending')}</b>` +
+          (v.admin_note ? `\n📝 ${escapeHtml(v.admin_note)}` : '')
+        );
+      }
+    } else if (r.pending.length) {
+      for (const p of r.pending) {
+        L.push(
+          `\n⏳ <b>SEEN but NOT credited</b>\n` +
+          `💵 ${money(p.amount)} · ${escapeHtml(p.network || '?')}\n` +
+          `🔁 Checked ${p.attempts} time(s), first seen ${escapeHtml(p.first_seen || '—')}`
+        );
+      }
+    }
+
+    if (r.intents.length) {
+      for (const i of r.intents) {
+        L.push(`\n🎯 <b>Matched a deposit request</b>\nExpected <b>${money(i.unique_amount)}</b> · status ${escapeHtml(i.status)}`);
+      }
+    }
+
+    // ── Was it used to pay for an order directly?
+    if (r.orders.length) {
+      L.push(`\n🛍 <b>Paid for ${r.orders.length} order(s) directly</b>`);
+      for (const o of r.orders.slice(0, 6)) {
+        L.push(`• #${o.id} — ${escapeHtml(kbStripEmojiCodes(String(o.product_title || '')).trim().slice(0, 28))} · ${money(o.total_price)} · <b>${escapeHtml(o.status)}</b>`);
+      }
+    }
+
+    if (r.nowInv.length || r.cbInv.length) {
+      for (const i of r.nowInv) {
+        L.push(`\n🧾 <b>NOWPayments invoice</b>\n${money(i.amount)} · ${escapeHtml(i.payment_status || '?')} · ${i.credited ? '✅ credited' : '❌ not credited'} · ${escapeHtml(i.purpose || '')}`);
+      }
+      for (const i of r.cbInv) {
+        L.push(`\n🤖 <b>CryptoBot invoice</b>\n${money(i.amount)} · ${i.credited ? '✅ credited' : '❌ not credited'} · ${escapeHtml(i.purpose || '')}${i.paid_at ? ` · paid ${escapeHtml(i.paid_at)}` : ''}`);
+      }
+    }
+
+    if (r.reversals.length) {
+      for (const v of r.reversals) {
+        L.push(`\n↩️ <b>REVERSED by admin</b>\n−${money(v.amount)} · ${escapeHtml(v.reason || '—')}\nBalance ${money(v.balance_before)} → ${money(v.balance_after)}`);
+      }
+    }
+
+    if (r.ledger.length) {
+      L.push(`\n📒 <b>Ledger</b>`);
+      for (const t of r.ledger.slice(0, 5)) {
+        L.push(`• ${Number(t.amount) >= 0 ? '+' : ''}${money(t.amount)} · ${escapeHtml(t.type)} · ${escapeHtml(String(t.created_at || '').slice(0, 16))}`);
+      }
+    }
+
+    // ── What happened to the money afterwards?
+    if (r.credited.length) {
+      if (r.spentAfter.length) {
+        const spent = r.spentAfter.reduce((a, o) => a + Number(o.total_price || 0), 0);
+        L.push(`\n💸 <b>Spent after this deposit: ${money(spent)}</b> across ${r.spentAfter.length} order(s)`);
+        for (const o of r.spentAfter.slice(0, 8)) {
+          L.push(`• #${o.id} — ${escapeHtml(kbStripEmojiCodes(String(o.product_title || '')).trim().slice(0, 26))} · ${money(o.total_price)} · ${escapeHtml(o.payment_method || '')}`);
+        }
+        if (r.spentAfter.length > 8) L.push(`<i>…and ${r.spentAfter.length - 8} more</i>`);
+      } else {
+        L.push(`\n💤 <b>Nothing bought since this deposit.</b> The money is still in the wallet.`);
+      }
+    }
+
+    const kb = { inline_keyboard: [] };
+    if (r.user) kb.inline_keyboard.push([{ text: '👤 Open customer', callback_data: `admin_txid_user_${r.user.telegram_id}` }]);
+    kb.inline_keyboard.push([{ text: '🔎 Trace another', callback_data: 'admin_txid_search' }]);
+    kb.inline_keyboard.push([{ text: '🔙 Admin Panel', callback_data: 'admin_panel' }]);
+
+    // Telegram caps a message at 4096 characters; a busy wallet can exceed it.
+    const full = L.join('\n');
+    const parts = full.match(/[\s\S]{1,3500}/g) || [full];
+    for (let i = 0; i < parts.length; i++) {
+      await bot.sendMessage(chatId, parts[i], {
+        parse_mode: 'HTML',
+        reply_markup: i === parts.length - 1 ? kb : undefined,
+      }).catch(async () => {
+        await bot.sendMessage(chatId, parts[i].replace(/<[^>]+>/g, ''));
+      });
+    }
+    return;
+  
+}
 
 async function handleAdminCallback(bot, query) {
   // ── Security: hard gate on every admin callback ───────────────────
@@ -7180,6 +7230,7 @@ async function handleMarkRefundSent(bot, chatId, msgId, refundId, query) {
 }
 
 module.exports = {
+  runTxidTrace,
   isAdmin,
   showAdminPanel,
   startAddProduct,

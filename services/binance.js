@@ -478,8 +478,68 @@ async function verifyBinancePayOrder(rawId) {
   };
 }
 
+/**
+ * Look a TxID up in Binance's own deposit history — no validation, no rules.
+ *
+ * `verifyDepositByTxId` answers "may this be credited?", and it says no for a
+ * dozen reasons that have nothing to do with whether the money arrived: wrong
+ * address, too old, already used, amount mismatch. When support is asked "did
+ * my deposit arrive?", every one of those is still a YES. This answers only the
+ * factual question, so the local database saying "not found" can be separated
+ * from the money genuinely never having landed.
+ *
+ * @param {string} rawTxid full or partial hash, or a Binance transfer id
+ * @returns {Promise<{ok:boolean, matches?:Array, error?:string}>}
+ */
+async function findDepositRaw(rawTxid) {
+  const needle = String(rawTxid || '').trim().toLowerCase();
+  if (!needle || needle.length < 6) return { ok: false, error: 'id too short' };
+  if (!config.binanceApiKey || !config.binanceApiSecret) return { ok: false, error: 'Binance API keys not configured' };
+
+  const now = Date.now();
+  const ninetyD = 90 * 24 * 60 * 60 * 1000;
+  const windows = [
+    { startTime: now - ninetyD, endTime: now },
+    { startTime: now - 2 * ninetyD, endTime: now - ninetyD },
+  ];
+
+  const rows = [];
+  for (const w of windows) {
+    // A failed window must not hide the other one: half an answer still tells
+    // support more than an error does.
+    try {
+      const batch = await fetchDepositHistory({ coin: 'USDT', ...w });
+      rows.push(...batch);
+    } catch (e) {
+      logger.warn(`findDepositRaw window failed: ${e.message}`);
+    }
+  }
+
+  const matches = rows.filter((d) => {
+    const tx = String(d.txId || '').toLowerCase();
+    const id = String(d.id || '').toLowerCase();
+    return tx.includes(needle) || needle.includes(tx) || id === needle;
+  });
+
+  return {
+    ok: true,
+    matches: matches.map((d) => ({
+      txId: d.txId,
+      amount: Number(d.amount),
+      coin: d.coin,
+      network: d.network,
+      address: d.address,
+      // 0 = pending, 6 = credited but withdrawal-locked, 1 = success.
+      status: Number(d.status),
+      insertTime: Number(d.insertTime),
+      confirmTimes: d.confirmTimes,
+    })),
+  };
+}
+
 module.exports = {
   verifyDepositByTxId,
   verifyBinancePayOrder,
+  findDepositRaw,
   TXID_RE,
 };

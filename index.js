@@ -468,6 +468,38 @@ bot.onText(/\/admin/, async (msg) => {
   await adminHandler.showAdminPanel(bot, msg.chat.id);
 });
 
+/**
+ * Trace a payment by id, as a command.
+ *
+ * Deliberately a command and not only a session flow. The button version has to
+ * survive: the callback setting the state, the state persisting, the dispatcher
+ * routing it, and the handler branch matching — four links, and a break in any
+ * one of them looks identical from the outside (nothing happens, nothing is
+ * logged). A command bypasses all four, so it either works or reports why.
+ */
+bot.onText(/^\/(?:txid|trace)(?:\s+(.+))?$/i, async (msg, match) => {
+  if (!adminHandler.isAdmin(msg.from.id)) return;
+  const chatId = msg.chat.id;
+  const needle = String((match && match[1]) || '').trim();
+
+  if (!needle) {
+    await bot.sendMessage(chatId,
+      '🔎 <b>Trace a payment</b>\n\nUsage: <code>/txid &lt;id&gt;</code>\n\n' +
+      'Example: <code>/txid 281d2c11fbbe</code>\n\n' +
+      '<i>Works with a TxID, a Binance transfer id, an invoice id, or any part of one.</i>',
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  logger.info(`[TXID] admin ${msg.from.id} tracing "${needle.slice(0, 24)}"`);
+  try {
+    await adminHandler.runTxidTrace(bot, chatId, needle);
+  } catch (e) {
+    logger.error(`[TXID] trace failed: ${e.stack || e.message}`);
+    await bot.sendMessage(chatId, `❌ Trace failed: ${e.message}`);
+  }
+});
+
 // ── Text messages ─────────────────────────────────────────────────────────────
 bot.on('message', async (msg) => {
   // ── /emoji_id capture handler ──────────────────────────────────────
@@ -584,6 +616,10 @@ bot.on('message', async (msg) => {
   // Verified against the code below: no state beginning with ADMIN_ is handled
   // anywhere else in this dispatcher.
   if (adminHandler.isAdmin(userId) && typeof state === 'string' && state.startsWith('ADMIN_')) {
+    // Logged because the previous failure mode was total silence: a state with
+    // no matching branch produced no reply and no error, so there was no way to
+    // tell "never routed" from "routed and ignored".
+    logger.info(`[ADMIN TEXT] ${userId} state=${state}`);
     await adminHandler.handleAdminText(bot, msg);
     return;
   }
