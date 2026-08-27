@@ -571,33 +571,21 @@ bot.on('message', async (msg) => {
   const sess  = session.get(userId);
   const state = sess.state;
 
-  // Admin states — all guarded inside handleAdminText
-  if (adminHandler.isAdmin(userId)) {
-    const adminStates = [
-      States.ADMIN_ADD_TITLE, States.ADMIN_ADD_DESCRIPTION, States.ADMIN_ADD_PRICE,
-      States.ADMIN_ADD_WARRANTY, States.ADMIN_ADD_INSTRUCTION, States.ADMIN_ADD_IMAGE, States.ADMIN_ADD_STOCK,
-      States.ADMIN_EDIT_VALUE, States.ADMIN_STOCK_DATA,
-      States.ADMIN_STOCK_ADD_QTY, States.ADMIN_STOCK_REMOVE_QTY, States.ADMIN_STOCK_SET_QTY,
-      States.ADMIN_SALES_COUNT_SET,
-      States.ADMIN_BROADCAST_MSG, States.ADMIN_BROADCAST_CONFIRM,
-      States.ADMIN_REPLY_TICKET, States.ADMIN_SETTING_VALUE, States.ADMIN_ANN_MSG,
-      States.ADMIN_BALANCE_USER_ID, States.ADMIN_BALANCE_AMOUNT_ADD, States.ADMIN_BALANCE_AMOUNT_REMOVE,
-      States.ADMIN_REFUND_ORDER_ID, States.ADMIN_REFUND_END_DATE, States.ADMIN_REFUND_WARRANTY,
-      States.ADMIN_DELETE_STOCK_ITEM, States.ADMIN_SET_ORDER, States.ADMIN_PRE_SET_MAX, States.ADMIN_PRE_SEND_CONTENT, States.ADMIN_USER_SEARCH, States.ADMIN_STOCK_CONFIRM, States.ADMIN_MAINTENANCE_MSG, States.ADMIN_EMOJI_ADD, States.ADMIN_VIP_IMAGE, States.ADMIN_VIP_LIMIT, States.ADMIN_VIP_INTERVAL, States.ADMIN_ANN_BUTTON_ASK, States.ADMIN_ANN_BUTTON_TEXT, States.ADMIN_BULK_TIER_VALUE, States.ADMIN_STOCK_BATCH,
-      'ADMIN_CAT_NEW_NAME', 'ADMIN_CAT_RENAME',
-      'ADMIN_CGB_PRICE', 'ADMIN_CGB_ADDCYCLE',
-      'ADMIN_RESELLER_NEW_NAME', 'ADMIN_RESELLER_BALANCE',
-      States.ADMIN_LOW_STOCK, States.ADMIN_MD_CONTENT,
-      States.ADMIN_DEP_REVERSE, States.ADMIN_CUST_PRICE,
-      // Pre-existing bug: this state was handled in admin.js but never listed
-      // here, so the admin's typed refund amount never reached the handler.
-      States.ADMIN_REFUND_AMOUNT,
-      'ADMIN_SEARCH_ORDER',
-    ];
-    if (adminStates.includes(state)) {
-      await adminHandler.handleAdminText(bot, msg);
-      return;
-    }
+  // Admin states — all guarded inside handleAdminText.
+  //
+  // This used to be a hand-maintained whitelist of ~50 state names, kept in
+  // this file while the states themselves live in session.js and are handled in
+  // admin.js. Every new admin flow needed a matching entry here or its typed
+  // input was silently dropped — no error, no log, nothing. That had already
+  // happened at least twice (ADMIN_REFUND_AMOUNT, and the ranks and TxID
+  // states), so the list is replaced by the rule it was always approximating:
+  // every ADMIN_* state belongs to the admin handler.
+  //
+  // Verified against the code below: no state beginning with ADMIN_ is handled
+  // anywhere else in this dispatcher.
+  if (adminHandler.isAdmin(userId) && typeof state === 'string' && state.startsWith('ADMIN_')) {
+    await adminHandler.handleAdminText(bot, msg);
+    return;
   }
 
   // User states
