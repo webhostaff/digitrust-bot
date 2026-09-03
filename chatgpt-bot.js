@@ -27,6 +27,7 @@ if (!CHATGPT_BOT_TOKEN) {
 const dbPath = process.env.DB_PATH || '/app/data/store.db';
 const db = new Database(dbPath);
 const queries = require('./database/queries');
+const cgbCycles = require('./services/cgbCycles');
 
 const bot = new TelegramBot(CHATGPT_BOT_TOKEN, { polling: true });
 require('./utils/emojiLayer').installEmojiLayer(bot, 'cgb');
@@ -157,51 +158,14 @@ function orderCardButtons(d) {
   };
 }
 
-function getMonthlyPrice() {
-  try {
-    const row = db.prepare(`SELECT value FROM settings WHERE key='chatgpt_monthly_price'`).get();
-    return parseFloat(row?.value || '50') || 50;
-  } catch (e) {
-    return 50;
-  }
-}
+const getMonthlyPrice = () => cgbCycles.getMonthlyPrice();
 
 // ════════════════════════════════════════════════════════════════
 // CORE LOGIC: Calculate best billing cycle for today
 // ════════════════════════════════════════════════════════════════
-function calculateBestCycle() {
-  const cycles = queries.getBillingCycles();
-  if (!cycles.length) {
-    // Fallback default cycles
-    cycles.push({ start_day: 26, end_day: 25 });
-    cycles.push({ start_day: 16, end_day: 15 });
-  }
-
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-
-  let best = null;
-  for (const cycle of cycles) {
-    // Compute end_date for this cycle relative to today
-    // The end_date is the next occurrence of cycle.end_day on or after today
-    let endDate = new Date(today.getFullYear(), today.getMonth(), cycle.end_day);
-    if (endDate < today) {
-      // End day already passed this month → next month
-      endDate = new Date(today.getFullYear(), today.getMonth() + 1, cycle.end_day);
-    }
-    const daysRemaining = Math.ceil((endDate - today) / (1000 * 60 * 60 * 24));
-
-    if (!best || daysRemaining > best.daysRemaining) {
-      best = {
-        cycle,
-        endDate,
-        daysRemaining,
-      };
-    }
-  }
-
-  return best;
-}
+// Both the customer bot and the admin panel now call the SAME cycle maths, so
+// the panel can never show one cycle while the bot quotes another.
+const calculateBestCycle = () => cgbCycles.calculateBestCycle();
 
 function calculateNextCycleStarts() {
   const cycles = queries.getBillingCycles();
@@ -629,6 +593,52 @@ bot.onText(/^\/(menu|renew|subscriptions?)$/i, async (msg) => {
 });
 
 /**
+ * Who renewed — admin only, inside this bot.
+ *
+ * Two lists, deliberately separate: renewals that were PAID, and customers who
+ * said yes and have not paid. Merging them would turn intentions into revenue
+ * on the same screen, and the second list is the one worth chasing.
+ */
+bot.onText(/^\/renewals?$/i, async (msg) => {
+  if (String(msg.from.id) !== String(ADMIN_ID)) return; // silent for everyone else
+  const chatId = msg.chat.id;
+
+  const paid    = queries.getCgbRenewals(20);
+  const pending = queries.getCgbPendingRenewals();
+
+  const money = (n) => `$${Number(n || 0).toFixed(2)}`;
+  const who = (r) => r.username ? `@${escapeHtml(r.username)}` : escapeHtml(r.first_name || String(r.user_id));
+
+  let txt = `🔄 <b>Renewals</b>\n\n`;
+
+  if (paid.length) {
+    const total = paid.reduce((a, r) => a + Number(r.paid || r.final_price || 0), 0);
+    txt += `✅ <b>Paid — last ${paid.length}</b> · ${money(total)} total\n\n`;
+    txt += paid.map((r) =>
+      `• ${who(r)} — <code>${escapeHtml(r.email || '')}</code>\n` +
+      `  ${money(r.paid || r.final_price)} · ${escapeHtml(r.payment_method || '—')} · ` +
+      `until ${escapeHtml(r.end_date || '')}` +
+      `${r.prev_end ? ` <i>(was ${escapeHtml(r.prev_end)})</i>` : ''}`
+    ).join('\n');
+  } else {
+    txt += `✅ <b>Paid renewals:</b> none yet.\n`;
+  }
+
+  if (pending.length) {
+    txt += `\n\n⏳ <b>Said yes, not paid — ${pending.length}</b>\n`;
+    txt += pending.slice(0, 15).map((r) => {
+      const d = daysLeft(r);
+      return `• ${who(r)} — <code>${escapeHtml(r.email || '')}</code>\n` +
+             `  ${d <= 2 ? '⏳' : '📅'} ends ${escapeHtml(r.end_date || '')} (${d}d)`;
+    }).join('\n');
+    if (pending.length > 15) txt += `\n<i>…and ${pending.length - 15} more</i>`;
+    txt += `\n\n<i>These are holds, not sales. Their seats are not secured.</i>`;
+  }
+
+  await bot.sendMessage(chatId, txt, { parse_mode: 'HTML' });
+});
+
+/**
  * Register a seat that was sold outside this bot.
  *
  * ChatGPT Business is also sold as an ordinary product in the main store, and
@@ -871,9 +881,21 @@ bot.on('callback_query', async (q) => {
   }
 
   if (data === 'cancel') {
+    // Clear the placeholder too. Clearing only the session left the half-made
+    // order and its subscription row behind — which is how one email ended up
+    // listed six times.
+    const sess = getSession(userId);
+    if (sess && sess.orderId) {
+      try {
+        db.prepare(`UPDATE orders SET status='cancelled' WHERE id=? AND status='pending'`).run(sess.orderId);
+        queries.dropUnpaidCgbSubscription(sess.orderId);
+      } catch (e) {
+        logger.warn(`cancel cleanup for order #${sess.orderId}: ${e.message}`);
+      }
+    }
     clearSession(userId);
     await bot.sendMessage(chatId,
-      '❌ Cancelled.\n\nUse /start to begin a new subscription.',
+      '❌ Cancelled. Nothing was charged.\n\nUse /start to begin again.',
       { parse_mode: 'HTML' });
     return;
   }
@@ -1035,6 +1057,7 @@ bot.on('callback_query', async (q) => {
 
       if (!charge.ok) {
         db.prepare(`UPDATE orders SET status='cancelled' WHERE id=?`).run(orderId);
+        queries.dropUnpaidCgbSubscription(orderId);
         await bot.sendMessage(chatId,
           `❌ <b>Payment failed</b>\n\n` +
           (charge.reason === 'no_account'
@@ -1061,6 +1084,10 @@ bot.on('callback_query', async (q) => {
         logger.error('createCgbSubscription failed: ' + subErr.message);
       }
 
+      // Paid in full right here, so the placeholder becomes a real seat now.
+      queries.markCgbSubscriptionPaid(orderId);
+      await notifyAdminRenewalPaid(orderId, userId, { ...s, paymentMethod: 'balance' });
+
       const paid = {
         ...s,
         orderId,
@@ -1078,6 +1105,7 @@ bot.on('callback_query', async (q) => {
       logger.error('Balance payment error: ' + e.message);
       if (orderId) {
         try { db.prepare(`UPDATE orders SET status='cancelled' WHERE id=?`).run(orderId); } catch (_) {}
+        try { queries.dropUnpaidCgbSubscription(orderId); } catch (_) {}
       }
       await bot.sendMessage(chatId,
         `❌ Error processing payment: ${e.message}\n\nIf money left your balance, contact support with order #${orderId || '—'}.`,
@@ -1364,6 +1392,11 @@ async function confirmPayment(chatId, userId, orderId, txid, sessionData) {
     db.prepare(`UPDATE orders SET status='paid', payment_proof=? WHERE id=?`).run(txid, orderId);
   } catch (e) {}
 
+  // The placeholder becomes a real seat only now — this is the point where the
+  // money is confirmed.
+  try { queries.markCgbSubscriptionPaid(orderId); } catch (e) {}
+  await notifyAdminRenewalPaid(orderId, userId, sessionData);
+
   accrueRankForCgbOrder(orderId, userId);
 
   clearSession(userId);
@@ -1455,6 +1488,8 @@ async function confirmCryptobotPayment(invoiceId, paidAmount, orderId, userId) {
     logger.error(`confirmCryptobotPayment: failed to mark order #${orderId} paid: ${e.message}`);
   }
 
+  try { queries.markCgbSubscriptionPaid(orderId); } catch (e) {}
+
   accrueRankForCgbOrder(orderId, sub.user_id);
 
   const totalDays = sub.days_remaining + (sub.extra_month ? 30 : 0);
@@ -1514,6 +1549,37 @@ async function confirmCryptobotPayment(invoiceId, paidAmount, orderId, userId) {
 // ════════════════════════════════════════════════════════════════
 
 /** Tell the shop owner which way a customer decided, so seats can be planned. */
+/**
+ * Tell the owner the moment a renewal is actually PAID.
+ *
+ * The existing notification fires when a customer merely taps Renew, which is
+ * an intention. Money arriving is the event worth interrupting someone for, and
+ * treating the two alike turns every notification into noise.
+ */
+async function notifyAdminRenewalPaid(orderId, userId, sessionData) {
+  if (!ADMIN_ID || !sessionData || !sessionData.renewalOf) return;
+  try {
+    const prev = queries.getCgbSubById(sessionData.renewalOf);
+    const u = db.prepare('SELECT username, first_name FROM users WHERE telegram_id = ?').get(userId);
+    const who = u?.username ? `@${escapeHtml(u.username)}` : escapeHtml(u?.first_name || String(userId));
+    const months = sessionData.renewMonths || 1;
+
+    await bot.sendMessage(ADMIN_ID,
+      `💰 <b>RENEWAL PAID</b>\n\n` +
+      `👤 ${who} · <code>${userId}</code>\n` +
+      `📧 <code>${escapeHtml(sessionData.email || '')}</code>\n` +
+      `📆 ${months} month${months === 1 ? '' : 's'}\n` +
+      `💵 <b>$${Number(sessionData.finalPrice || 0).toFixed(2)}</b> · ` +
+      `${escapeHtml(String(sessionData.paymentMethod || '').replace('pay_', '') || 'paid')}\n` +
+      `📅 ${escapeHtml(sessionData.startDate || '')} → <b>${escapeHtml(sessionData.endDate || '')}</b>` +
+      (prev?.end_date ? `\n<i>Previously ended ${escapeHtml(prev.end_date)}</i>` : '') +
+      `\n🧾 Order #${orderId}`,
+      { parse_mode: 'HTML' });
+  } catch (e) {
+    logger.warn(`notifyAdminRenewalPaid: ${e.message}`);
+  }
+}
+
 async function notifyAdminRenewal(sub, intent) {
   if (!ADMIN_ID) return;
   try {
@@ -1615,6 +1681,19 @@ bot.setMyCommands([
   { command: 'menu',  description: '📋 My subscriptions & renew' },
 ]).then(() => logger.info('CGB command menu registered'))
   .catch((e) => logger.warn(`CGB setMyCommands: ${e.message}`));
+
+// Admin-only commands, scoped to the owner's private chat. Telegram itself
+// enforces the scope, so /renewals never appears in a customer's ☰ menu.
+if (ADMIN_ID) {
+  bot.setMyCommands([
+    { command: 'start',    description: '🤖 ChatGPT Business' },
+    { command: 'menu',     description: '📋 My subscriptions & renew' },
+    { command: 'renewals', description: '🔄 Who renewed (admin)' },
+    { command: 'addseat',  description: '➕ Register an existing seat (admin)' },
+  ], { scope: { type: 'chat', chat_id: Number(ADMIN_ID) } })
+    .then(() => logger.info('CGB admin commands registered'))
+    .catch((e) => logger.warn(`CGB admin setMyCommands: ${e.message}`));
+}
 
 bot.on('polling_error', e => logger.error(`CGB polling: ${e.message}`));
 

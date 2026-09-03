@@ -1175,4 +1175,24 @@ try {
   console.error('[MIGRATION V5] supplier columns:', e.message);
 }
 
+// ── One-off cleanup: unpaid checkout leftovers ────────────────────────────────
+// Rows inserted before 'awaiting_payment' existed are indistinguishable from
+// real seats by status alone — but their ORDER tells the truth. A subscription
+// whose order was never paid was never a subscription.
+try {
+  const res = db.prepare(`
+    UPDATE chatgpt_subscriptions
+    SET status = 'awaiting_payment'
+    WHERE status = 'pending'
+      AND order_id IN (
+        SELECT id FROM orders WHERE status IN ('pending', 'cancelled', 'expired')
+      )
+  `).run();
+  if (res.changes) {
+    console.log(`[MIGRATION V5] ${res.changes} unpaid ChatGPT subscription row(s) hidden from customers`);
+  }
+} catch (e) {
+  console.error('[MIGRATION V5] cgb cleanup:', e.message);
+}
+
 module.exports = db;

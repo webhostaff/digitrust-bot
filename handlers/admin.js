@@ -23,6 +23,7 @@ const {
 } = require('../utils/keyboard');
 const items = require('../database/items');
 const binance = require('../services/binance');
+const cgbCycles = require('../services/cgbCycles');
 const { formatPrice, formatPriceExact, escapeHtml, expandPremiumEmojis, scaleTiersProportionally, productEmojiId } = require('../utils/format');
 const {
   publishToChannel, publishToGroup, broadcastToUsers, autoPublish, autoPublishWithPhoto,
@@ -6174,8 +6175,39 @@ async function handleAdminCallback(bot, query) {
   // ── Manage Cycles ──
   if (data === 'admin_cgb_cycles') {
     const cycles = db.getBillingCycles();
+    const best = cgbCycles.calculateBestCycle();
+    const monthly = cgbCycles.getMonthlyPrice();
+
     let txt = `📅 <b>Billing Cycles</b>\n\n`;
-    if (!cycles.length) txt += '<i>No cycles configured.</i>';
+    if (!cycles.length) {
+      txt += `<i>None configured — falling back to the built-in defaults ` +
+             `(26→25 and 16→15). Add one to take control.</i>\n\n`;
+    }
+
+    // The panel used to list cycles without saying which one was in force, so
+    // adding a cycle looked like it had no effect. It is not replaced: the bot
+    // quotes whichever ACTIVE cycle gives the customer the most days.
+    if (best) {
+      const d = best.endDate;
+      const price = ((best.daysRemaining / 30) * monthly).toFixed(2);
+      txt += `🟢 <b>In use right now</b>\n` +
+             `Day ${best.cycle.start_day} → Day ${best.cycle.end_day}` +
+             `${best.cycle.is_default ? ' <i>(built-in default)</i>' : ''}\n` +
+             `📅 A purchase today ends: <b>${d.toISOString().slice(0, 10)}</b>\n` +
+             `⏳ Days given: <b>${best.daysRemaining}</b>  💰 Price: <b>$${price}</b>\n\n`;
+
+      if (best.all.length > 1) {
+        txt += `<b>All active cycles</b>\n` +
+          best.all.map((e) =>
+            `${e === best ? '👉' : '  '} Day ${e.cycle.start_day} → ${e.cycle.end_day} — ` +
+            `${e.daysRemaining} day(s)`
+          ).join('\n') +
+          `\n\n⚠️ <i>The bot always uses the cycle with the MOST days. Adding a ` +
+          `cycle does not replace the others — delete the ones you no longer want, ` +
+          `or the old one keeps winning.</i>\n`;
+      }
+    }
+
     const rows = cycles.map(c => [{
       text: `🗑 Delete: Day ${c.start_day} → Day ${c.end_day}`,
       callback_data: `admin_cgb_delcycle_${c.id}`

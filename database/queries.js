@@ -1005,9 +1005,33 @@ const cgb_insertCycle  = db.prepare(`INSERT INTO billing_cycles (start_day, end_
 const cgb_deleteCycle  = db.prepare(`DELETE FROM billing_cycles WHERE id=?`);
 const cgb_updateCycle  = db.prepare(`UPDATE billing_cycles SET start_day=?, end_day=? WHERE id=?`);
 const cgb_getCycleById = db.prepare(`SELECT * FROM billing_cycles WHERE id=?`);
+/**
+ * A subscription row is created the moment a payment METHOD is chosen, because
+ * the CryptoBot webhook arrives later and needs a row to attach to. So it
+ * starts as 'awaiting_payment' — a placeholder, not a seat.
+ *
+ * It used to start as 'pending', which is ALSO the status of a paid seat merely
+ * waiting for the admin to send the invite. The two were indistinguishable, so
+ * every abandoned checkout left behind a row that looked like a real
+ * subscription: tap Renew, tap Cancel, and the same email appeared again in the
+ * customer's list.
+ */
 const cgb_insertSub    = db.prepare(`
   INSERT INTO chatgpt_subscriptions (order_id, user_id, email, start_date, end_date, days_remaining, base_price, extra_month, final_price, status)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'awaiting_payment')
+`);
+
+/** Promote a placeholder to a real seat once the money has arrived. */
+const cgb_markPaid = db.prepare(`
+  UPDATE chatgpt_subscriptions
+  SET status = 'pending', updated_at = datetime('now')
+  WHERE order_id = ? AND status = 'awaiting_payment'
+`);
+
+/** Drop the placeholder when a checkout is abandoned or cancelled. */
+const cgb_dropUnpaid = db.prepare(`
+  DELETE FROM chatgpt_subscriptions
+  WHERE order_id = ? AND status = 'awaiting_payment'
 `);
 const cgb_getSubByOrder = db.prepare(`SELECT * FROM chatgpt_subscriptions WHERE order_id=?`);
 const cgb_activateSub  = db.prepare(`UPDATE chatgpt_subscriptions SET status='active', updated_at=datetime('now') WHERE order_id=?`);
@@ -1082,6 +1106,51 @@ const cgb_getReserved = db.prepare(`
   LEFT JOIN users u ON cs.user_id = u.telegram_id
   WHERE COALESCE(cs.status, 'pending') IN ('active', 'pending')
     AND cs.renew_intent = 'yes'
+  ORDER BY date(cs.end_date) ASC
+`);
+
+/**
+ * Renewals: seats created as a continuation of an earlier one.
+ *
+ * `renewed_from` is set only after a renewal is PAID, so this list is money
+ * received — not intentions. A seat someone said they would renew and never
+ * paid for does not appear here, which is the whole point of separating them.
+ */
+const cgb_getRenewals = db.prepare(`
+  SELECT cs.*,
+         u.username, u.first_name,
+         prev.email      AS prev_email,
+         prev.end_date   AS prev_end,
+         o.total_price   AS paid,
+         o.payment_method
+  FROM chatgpt_subscriptions cs
+  LEFT JOIN users u   ON cs.user_id      = u.telegram_id
+  LEFT JOIN chatgpt_subscriptions prev ON cs.renewed_from = prev.id
+  LEFT JOIN orders o  ON cs.order_id     = o.id
+  -- The status filter is what makes this a list of MONEY rather than clicks.
+  -- renewed_from is written when the payment method is chosen, so without it an
+  -- abandoned checkout would be reported as a completed renewal.
+  WHERE cs.renewed_from IS NOT NULL
+    AND COALESCE(cs.status, '') IN ('active', 'pending')
+  ORDER BY cs.id DESC
+  LIMIT ?
+`);
+
+/** Customers who said they would renew but have not paid yet. */
+const cgb_getPendingRenewals = db.prepare(`
+  SELECT cs.*, u.username, u.first_name
+  FROM chatgpt_subscriptions cs
+  LEFT JOIN users u ON cs.user_id = u.telegram_id
+  WHERE cs.renew_intent = 'yes'
+    AND COALESCE(cs.status, 'pending') IN ('active', 'pending')
+    -- "Not yet paid" means no PAID successor. An unpaid placeholder pointing at
+    -- this seat is precisely the case being reported, so it must not count as
+    -- one and quietly remove the customer from the chase list.
+    AND NOT EXISTS (
+      SELECT 1 FROM chatgpt_subscriptions nxt
+      WHERE nxt.renewed_from = cs.id
+        AND COALESCE(nxt.status, '') IN ('active', 'pending')
+    )
   ORDER BY date(cs.end_date) ASC
 `);
 
@@ -1813,6 +1882,8 @@ module.exports = {
     cgb_insertSub.run(orderId, userId, email, start, end, days, base, extra, final).lastInsertRowid,
   getCgbSubscriptionByOrder: (orderId) => cgb_getSubByOrder.get(orderId),
   activateCgbSubscription: (orderId) => cgb_activateSub.run(orderId),
+  markCgbSubscriptionPaid: (orderId) => cgb_markPaid.run(orderId).changes,
+  dropUnpaidCgbSubscription: (orderId) => cgb_dropUnpaid.run(orderId).changes,
   getActiveCgbSubs: () => cgb_getActive.all(),
   getExpiringCgbSubs: (days) => cgb_getExpiringSubs.all(days),
 
@@ -1823,6 +1894,8 @@ module.exports = {
   getCgbDueReminders: (days) => cgb_getDueReminders.all(days),
   markCgbReminded:    (id) => cgb_markReminded.run(id).changes,
   getCgbReserved:     () => cgb_getReserved.all(),
+  getCgbRenewals:     (limit = 20) => cgb_getRenewals.all(limit),
+  getCgbPendingRenewals: () => cgb_getPendingRenewals.all(),
   setCgbWorkspace:    (id, ws) => cgb_setWorkspace.run(ws, id).changes,
   linkCgbRenewal:     (prevId, newId) => cgb_linkRenewal.run(prevId, newId).changes,
   markCgbNotified: cgb_markNotified,
