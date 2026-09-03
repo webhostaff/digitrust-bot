@@ -1737,8 +1737,9 @@ module.exports = {
   removeBillingCycle:  (id) => cgb_deleteCycle.run(id),
   updateBillingCycle:  (id, s, e) => cgb_updateCycle.run(s, e, id),
   getBillingCycle:     (id) => cgb_getCycleById.get(id),
+  // Returns the new row id so a renewal can be linked to the seat it replaces.
   createCgbSubscription: (orderId, userId, email, start, end, days, base, extra, final) =>
-    cgb_insertSub.run(orderId, userId, email, start, end, days, base, extra, final),
+    cgb_insertSub.run(orderId, userId, email, start, end, days, base, extra, final).lastInsertRowid,
   getCgbSubscriptionByOrder: (orderId) => cgb_getSubByOrder.get(orderId),
   activateCgbSubscription: (orderId) => cgb_activateSub.run(orderId),
   getActiveCgbSubs: () => cgb_getActive.all(),

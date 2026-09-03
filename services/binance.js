@@ -537,9 +537,68 @@ async function findDepositRaw(rawTxid) {
   };
 }
 
+/**
+ * Look an id up in Binance Pay history — internal, off-chain transfers.
+ *
+ * A customer who "sent USDT on Binance" may have used the Pay/internal transfer
+ * rather than an on-chain BEP20 withdrawal. Those never appear in deposit
+ * history, so a deposit-only search reports "never arrived" for money that is
+ * sitting in the account. Partial ids are accepted because customers screenshot
+ * these and retype them, and they are long.
+ *
+ * @returns {Promise<{ok:boolean, matches?:Array, error?:string}>}
+ */
+async function findPayTransactionRaw(rawId) {
+  const needle = String(rawId || '').trim().toLowerCase();
+  if (!needle || needle.length < 5) return { ok: false, error: 'id too short' };
+  if (!config.binanceApiKey || !config.binanceApiSecret) {
+    return { ok: false, error: 'Binance API keys not configured' };
+  }
+
+  const now = Date.now();
+  const ninetyD = 90 * 24 * 60 * 60 * 1000;
+  let history = [];
+
+  for (const w of [
+    { startTime: String(now - ninetyD), endTime: String(now) },
+    { startTime: String(now - 2 * ninetyD), endTime: String(now - ninetyD) },
+  ]) {
+    try {
+      const res = await signedGet('/sapi/v1/pay/transactions', { ...w, limit: '100' });
+      const rows = (res.data && Array.isArray(res.data.data)) ? res.data.data : [];
+      history = history.concat(rows);
+    } catch (e) {
+      logger.warn(`findPayTransactionRaw window failed: ${e.message}`);
+    }
+  }
+
+  const matches = history.filter((t) => {
+    // Binance shows a different id in each view, so all of them are searched.
+    const ids = [t.transactionId, t.orderId, t.merchantTradeNo, t.tradeNo, t.id]
+      .map((c) => String(c || '').toLowerCase())
+      .filter(Boolean);
+    return ids.some((c) => c === needle || c.includes(needle) || needle.includes(c));
+  });
+
+  return {
+    ok: true,
+    matches: matches.map((t) => ({
+      transactionId: t.transactionId,
+      orderId:       t.orderId,
+      amount:        Number(t.amount),
+      currency:      t.currency,
+      // PAY / TRANSFER / C2C — tells you how it was sent.
+      orderType:     t.orderType,
+      transactionTime: Number(t.transactionTime),
+      payerInfo:     t.payerInfo,
+    })),
+  };
+}
+
 module.exports = {
   verifyDepositByTxId,
   verifyBinancePayOrder,
   findDepositRaw,
+  findPayTransactionRaw,
   TXID_RE,
 };

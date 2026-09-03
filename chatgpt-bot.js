@@ -415,7 +415,7 @@ async function showSubDetails(chatId, subId, messageId = null) {
   const ws = workspaceName(s);
 
   const nextLine = s.renew_intent === 'yes'
-    ? '✅ <b>Reserved</b> for the next cycle'
+    ? '🟡 <b>Renewal started — payment required</b>'
     : s.renew_intent === 'no'
       ? '🚫 You chose <b>not</b> to renew'
       : 'Not reserved for next cycle yet';
@@ -433,12 +433,14 @@ async function showSubDetails(chatId, subId, messageId = null) {
     `⌛️ Remaining: ${d} day(s)\n\n` +
     `🔁 <b>Next cycle</b>\n${nextLine}\n\n` +
     (s.renew_intent === 'yes'
-      ? `<i>Your seat is held. You will be asked to pay when the new cycle opens.</i>`
-      : `👇 Tap <b>Renew</b> to reserve this email for the next cycle.`);
+      ? `⚠️ <i>Your seat is not secured until the renewal is paid. Tap Renew &amp; pay to finish.</i>`
+      : `👇 Tap <b>Renew &amp; pay</b> to keep this email for the next cycle.`);
 
   const rows = [];
-  if (s.renew_intent !== 'yes') rows.push([{ text: '🔄 Renew subscription', callback_data: `cgb_renewyes_${s.id}` }]);
-  if (s.renew_intent !== 'no')  rows.push([{ text: '❌ Will not renew',     callback_data: `cgb_renewno_${s.id}` }]);
+  // Renew stays available even after the intent is set: the intent is not a
+  // payment, and this is the button that leads to one.
+  rows.push([{ text: '🔄 Renew & pay', callback_data: `cgb_renewyes_${s.id}` }]);
+  if (s.renew_intent !== 'no') rows.push([{ text: '❌ Will not renew', callback_data: `cgb_renewno_${s.id}` }]);
   rows.push([{ text: '🔙 Back', callback_data: 'cgb_menu' }]);
 
   const opts = { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } };
@@ -688,31 +690,90 @@ bot.on('callback_query', async (q) => {
       return;
     }
 
-    queries.setCgbRenewIntent(subId, wantsRenew ? 'yes' : 'no');
-    // A decision means the reminder has done its job; sending it later would
-    // be nagging someone who already answered.
-    queries.markCgbReminded(subId);
-
-    if (wantsRenew) {
-      await notifyAdminRenewal(sub, 'yes');
-      await bot.sendMessage(chatId,
-        `✅ <b>Reserved</b>\n\n` +
-        `<code>${escapeHtml(sub.email)}</code> is held for the next cycle.\n\n` +
-        `We will message you when the new cycle opens so you can pay and keep the same email.`,
-        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
-          [{ text: '📋 My subscriptions', callback_data: 'cgb_details_list' }],
-          [{ text: '🔙 Menu', callback_data: 'cgb_menu' }],
-        ] } });
-    } else {
+    // ── "Will not renew" — a decision, nothing to pay ────────────────────────
+    if (!wantsRenew) {
+      queries.setCgbRenewIntent(subId, 'no');
+      queries.markCgbReminded(subId);
       await notifyAdminRenewal(sub, 'no');
       await bot.sendMessage(chatId,
         `👍 Noted — <code>${escapeHtml(sub.email)}</code> will not be renewed.\n\n` +
-        `It stays active until <b>${sub.end_date}</b>. You can change your mind any time before then.`,
+        `It stays active until <b>${sub.end_date}</b>. You can change your mind ` +
+        `any time before then.`,
         { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
           [{ text: '🔄 Actually, renew it', callback_data: `cgb_renewyes_${subId}` }],
           [{ text: '🔙 Menu', callback_data: 'cgb_menu' }],
         ] } });
+      return;
     }
+
+    // ── "Renew" — this is a purchase, so it goes to payment ──────────────────
+    // Tapping Renew used to only set a flag, which read as "done" to the
+    // customer: they were told the seat was reserved and were never asked for
+    // money. A seat is sold per cycle, so a renewal is a new sale and must be
+    // paid for like one.
+    if (isOutOfStock()) {
+      await bot.sendMessage(chatId,
+        `🔴 <b>No seats available for the next cycle</b>\n\n${escapeHtml(outOfStockMessage())}`,
+        { parse_mode: 'HTML' });
+      return;
+    }
+
+    const best = calculateBestCycle();
+    if (!best) {
+      await bot.sendMessage(chatId, '❌ No billing cycles configured. Please contact support.');
+      return;
+    }
+
+    const monthlyPrice = getMonthlyPrice();
+    const basePrice = Number(((best.daysRemaining / 30) * monthlyPrice).toFixed(2));
+
+    // The intent is recorded now so the shop can count seats even if the
+    // customer abandons the payment screen — but it is NOT a renewal yet.
+    queries.setCgbRenewIntent(subId, 'yes');
+    queries.markCgbReminded(subId);
+    await notifyAdminRenewal(sub, 'yes');
+
+    // Email is already known, so the renewal skips straight to payment.
+    setSession(userId, 'CONFIRM_ORDER', {
+      daysRemaining: best.daysRemaining,
+      extraMonth: false,
+      basePrice,
+      finalPrice: basePrice,
+      startDate: formatDate(new Date()),
+      endDate: formatDate(best.endDate),
+      monthlyPrice,
+      email: sub.email,
+      renewalOf: subId,
+    });
+
+    const balance = getBalance(userId);
+    const canPayWithBalance = Math.round(balance * 100) >= Math.round(basePrice * 100);
+
+    const rows = [];
+    if (canPayWithBalance) {
+      rows.push([{ text: `👛 Pay with Balance ($${balance.toFixed(2)})`, callback_data: 'pay_balance' }]);
+    } else if (balance > 0) {
+      rows.push([{ text: `👛 Balance $${balance.toFixed(2)} — not enough`, callback_data: 'balance_short' }]);
+    }
+    rows.push(
+      [{ text: '💳 Pay with Binance Pay', callback_data: 'pay_binance' }],
+      [{ text: '💎 USDT BEP20', callback_data: 'pay_bep20' }, { text: '💎 USDT TRC20', callback_data: 'pay_trc20' }],
+      [{ text: '🤖 CryptoBot', callback_data: 'pay_cryptobot' }],
+      [{ text: '❌ Cancel', callback_data: 'cgb_menu' }],
+    );
+
+    await bot.sendMessage(chatId,
+      `🔄 <b>Renew subscription</b>\n\n` +
+      `📧 <code>${escapeHtml(sub.email)}</code>\n` +
+      `🏢 ${escapeHtml(workspaceName(sub))}\n\n` +
+      `📅 Next cycle: ${formatDate(new Date())} → ${formatDate(best.endDate)}\n` +
+      `⏳ Days: <b>${best.daysRemaining}</b>\n` +
+      `💰 <b>Price: $${basePrice.toFixed(2)}</b>\n` +
+      `👛 Your balance: <b>$${balance.toFixed(2)}</b>\n\n` +
+      `⚠️ <b>Your seat is held only until you pay.</b> Unpaid holds are released ` +
+      `to other customers when the cycle turns.\n\n` +
+      `Select payment method:`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
     return;
   }
 
@@ -788,11 +849,16 @@ bot.on('callback_query', async (q) => {
 
       // Create subscription record
       try {
-        queries.createCgbSubscription(
+        const newSubId = queries.createCgbSubscription(
           orderId, userId, s.email, s.startDate, s.endDate,
           s.daysRemaining + (s.extraMonth ? 30 : 0),
           s.basePrice, s.extraMonth ? 1 : 0, s.finalPrice
         );
+        // Records which seat this renews, so the history of one email stays
+        // readable instead of looking like unrelated purchases.
+        if (s.renewalOf && newSubId) {
+          try { queries.linkCgbRenewal(s.renewalOf, newSubId); } catch (_) {}
+        }
       } catch (subErr) {
         logger.error('createCgbSubscription failed: ' + subErr.message);
       }
@@ -888,11 +954,16 @@ bot.on('callback_query', async (q) => {
       }
 
       try {
-        queries.createCgbSubscription(
+        const newSubId = queries.createCgbSubscription(
           orderId, userId, s.email, s.startDate, s.endDate,
           s.daysRemaining + (s.extraMonth ? 30 : 0),
           s.basePrice, s.extraMonth ? 1 : 0, s.finalPrice
         );
+        // Records which seat this renews, so the history of one email stays
+        // readable instead of looking like unrelated purchases.
+        if (s.renewalOf && newSubId) {
+          try { queries.linkCgbRenewal(s.renewalOf, newSubId); } catch (_) {}
+        }
       } catch (subErr) {
         logger.error('createCgbSubscription failed: ' + subErr.message);
       }
@@ -1408,12 +1479,13 @@ async function sendRenewalReminders() {
         `📧 <code>${escapeHtml(sub.email || '')}</code>\n` +
         `🏢 Workspace: ${escapeHtml(workspaceName(sub))}\n` +
         `📅 Ends: <b>${sub.end_date}</b>\n\n` +
-        `Reserve it now to keep the same email next cycle — seats are limited and ` +
-        `unreserved ones are released to other customers.`,
+        `Renew now to keep the same email next cycle. Seats are limited, and a ` +
+        `seat is only held once the renewal is <b>paid for</b> — unpaid ones are ` +
+        `released to other customers.`,
         { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
-          [{ text: '🔄 Renew subscription', callback_data: `cgb_renewyes_${sub.id}` }],
-          [{ text: '❌ Will not renew',     callback_data: `cgb_renewno_${sub.id}` }],
-          [{ text: '📋 Details',            callback_data: `cgb_details_${sub.id}` }],
+          [{ text: '🔄 Renew & pay', callback_data: `cgb_renewyes_${sub.id}` }],
+          [{ text: '❌ Will not renew', callback_data: `cgb_renewno_${sub.id}` }],
+          [{ text: '📋 Details',        callback_data: `cgb_details_${sub.id}` }],
         ] } });
       queries.markCgbReminded(sub.id);
       sent++;

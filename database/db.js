@@ -1151,4 +1151,24 @@ try {
   console.error('[MIGRATION V4] rank_counted:', e.message);
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// V5 — SUPPLIERS
+//
+// Recorded per stock item, not per product: a shop restocks the same product
+// from different suppliers, and when an account stops working the only useful
+// question is "who sold me THIS one" — which the product row cannot answer.
+// ══════════════════════════════════════════════════════════════════════════════
+try {
+  const itemCols = db.prepare('PRAGMA table_info(product_items)').all().map((c) => c.name);
+  if (!itemCols.includes('supplier')) {
+    db.exec('ALTER TABLE product_items ADD COLUMN supplier TEXT DEFAULT NULL');
+  }
+  if (!itemCols.includes('batch_note')) {
+    db.exec('ALTER TABLE product_items ADD COLUMN batch_note TEXT DEFAULT NULL');
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_items_supplier ON product_items(supplier)');
+} catch (e) {
+  console.error('[MIGRATION V5] supplier columns:', e.message);
+}
+
 module.exports = db;

@@ -52,7 +52,13 @@ async function isChannel(bot, chatId) {
 function prepareText(text, parseMode, allowCustom) {
   if (!text) return text;
   const html = String(parseMode || '').toLowerCase() === 'html';
-  return (html && allowCustom) ? renderEmojis(text) : stripEmojiMarkers(text);
+  if (!html || !allowCustom) return stripEmojiMarkers(text);
+
+  const rendered = renderEmojis(text);
+  // Unwrap only the ids known to fail. Everything else keeps its icon, which is
+  // the whole point of quarantining per id instead of switching the feature off.
+  return rendered.replace(/<tg-emoji emoji-id="(\d+)">(.*?)<\/tg-emoji>/gi,
+    (whole, id, inner) => (isQuarantined(id) ? inner : whole));
 }
 
 /**
@@ -67,10 +73,17 @@ function prepareMarkup(markup, allowIcons) {
     if (!Array.isArray(row)) continue;
     for (const button of row) {
       if (!button || typeof button.text !== 'string') continue;
+      // A quarantined icon already on the button must go, or the message it is
+      // attached to keeps failing.
+      if (button.icon_custom_emoji_id && isQuarantined(button.icon_custom_emoji_id)) {
+        delete button.icon_custom_emoji_id;
+      }
       const m = button.text.match(/\[emoji:(\d+)\]/);
       if (!m) continue;
       button.text = stripEmojiMarkers(button.text);
-      if (allowIcons && !button.icon_custom_emoji_id) button.icon_custom_emoji_id = m[1];
+      if (allowIcons && !isQuarantined(m[1]) && !button.icon_custom_emoji_id) {
+        button.icon_custom_emoji_id = m[1];
+      }
     }
   }
   return markup;
@@ -107,28 +120,96 @@ function isCustomEmojiError(err) {
       || msg.includes('entity');
 }
 
-// ── Circuit breaker ───────────────────────────────────────────────────────────
-// If Telegram refuses custom emoji, it refuses ALL of them — the usual cause is
-// the bot owner's Telegram Premium having lapsed, which is account-wide. Without
-// a breaker every single message would pay for a failed request plus a retry,
-// doubling latency on the delivery path for no benefit. One failure disables
-// rendering for a cooling-off period; after it, one message tries again, so the
-// bot heals itself the moment Premium is back with no restart needed.
-const BREAKER_COOLDOWN_MS = 15 * 60 * 1000;
-let breakerUntil = 0;
+// ── Bad-emoji quarantine ──────────────────────────────────────────────────────
+//
+// The first version disabled ALL custom emoji for 15 minutes after any single
+// failure. That produced exactly the reported symptom: icons vanish from the
+// product list, come back a while later, vanish again — because one unusable
+// emoji id, on one product, silently switched off every icon in the bot.
+//
+// Now only the ids that actually failed are quarantined. A product with a bad
+// emoji loses its icon; every other product keeps one. Ids are re-tried after a
+// cooling-off period, so a pack that becomes available again heals itself.
+const BAD_ID_TTL_MS = 6 * 60 * 60 * 1000;
+const badIds = new Map(); // emoji id -> timestamp when it may be retried
 
-function customEmojiAllowed() { return Date.now() >= breakerUntil; }
+// Account-wide failure is a different problem: if Telegram Premium lapses,
+// EVERY id fails and quarantining them one at a time would mean one failed
+// request per message. Many distinct ids failing in quick succession is the
+// signal for that, and only then is everything switched off.
+const ACCOUNT_FAIL_WINDOW_MS = 60 * 1000;
+const ACCOUNT_FAIL_THRESHOLD = 5;
+let recentFailures = [];
+let accountBreakerUntil = 0;
 
-function tripBreaker(label, reason) {
-  if (customEmojiAllowed()) {
+function isQuarantined(id) {
+  const until = badIds.get(String(id));
+  if (!until) return false;
+  if (Date.now() >= until) { badIds.delete(String(id)); return false; }
+  return true;
+}
+
+function customEmojiAllowed() { return Date.now() >= accountBreakerUntil; }
+
+/** Quarantine every custom emoji id that appeared in a message that failed. */
+/**
+ * Quarantine only the ids that are genuinely unusable.
+ *
+ * A failed message may carry a dozen emoji ids, and Telegram does not say which
+ * one it objected to. Blaming all of them punishes every product that merely
+ * shared a message with the broken one — which is exactly how a single bad pack
+ * made icons disappear from the whole list.
+ *
+ * getCustomEmojiStickers checks ids WITHOUT sending anything: valid ids come
+ * back, unknown ones do not. So the culprit is identified precisely, for one
+ * API call and no message to any customer.
+ *
+ * If every id checks out, the ids were never the problem — the account was.
+ * That is the only case where everything is switched off, because with Premium
+ * inactive each message would otherwise pay for a failed request first.
+ */
+async function quarantineFrom(bot, label, payload, reason) {
+  const ids = new Set();
+  for (const m of String(payload || '').matchAll(/emoji-id="(\d+)"/g)) ids.add(m[1]);
+  for (const m of String(payload || '').matchAll(/\[emoji:(\d+)\]/g)) ids.add(m[1]);
+  if (!ids.size) return;
+
+  const now = Date.now();
+  let valid = null;
+
+  try {
+    const list = [...ids].slice(0, 200);
+    const res = typeof bot.getCustomEmojiStickers === 'function'
+      ? await bot.getCustomEmojiStickers(list)
+      : await bot._request('getCustomEmojiStickers',
+          { form: { custom_emoji_ids: JSON.stringify(list) } });
+    const rows = Array.isArray(res) ? res : (res && res.result) || [];
+    valid = new Set(rows.map((st) => String(st.custom_emoji_id)));
+  } catch (e) {
+    logger.warn(`[emoji:${label}] could not verify emoji ids: ${e.message}`);
+  }
+
+  if (valid) {
+    const bad = [...ids].filter((id) => !valid.has(id));
+    if (bad.length) {
+      for (const id of bad) badIds.set(id, now + BAD_ID_TTL_MS);
+      logger.warn(`[emoji:${label}] quarantined invalid id(s) ${bad.join(', ')} for 6h: ${reason}`);
+      return; // culprit found — the account is fine, other icons keep working
+    }
+  }
+
+  recentFailures = recentFailures.filter((t) => now - t < ACCOUNT_FAIL_WINDOW_MS);
+  recentFailures.push(now);
+
+  if (valid || recentFailures.length >= ACCOUNT_FAIL_THRESHOLD) {
+    accountBreakerUntil = now + 15 * 60 * 1000;
+    recentFailures = [];
     logger.error(
-      `[emoji:${label}] Telegram refused custom emoji — falling back to plain ` +
-      `emoji for ${BREAKER_COOLDOWN_MS / 60000} minutes. Cause: ${reason}. ` +
-      `Usually means the bot owner's Telegram Premium is not active, or an ` +
-      `emoji id in the library is wrong. Check /admin → Settings → Emoji Check.`
+      `[emoji:${label}] Telegram refused custom emoji that all exist — disabling ` +
+      `them for 15 minutes. This means the bot owner's Telegram Premium is not ` +
+      `active. Check /admin → Settings → Emoji Check. Cause: ${reason}`
     );
   }
-  breakerUntil = Date.now() + BREAKER_COOLDOWN_MS;
 }
 
 /**
@@ -207,27 +288,65 @@ function installEmojiLayer(bot, label = 'bot') {
         // chat type, or the bot owner's Premium lapsed). Resend as plain emoji
         // rather than dropping the message.
         if (!isCustomEmojiError(err)) throw err;
-        tripBreaker(label, err.message);
 
-        const opts = (args[spec.optsArg] && typeof args[spec.optsArg] === 'object')
-          ? args[spec.optsArg] : null;
-        const plain = (t) => stripEmojiMarkers(String(t).replace(/<tg-emoji[^>]*>(.*?)<\/tg-emoji>/gi, '$1'));
+        // Everything in this message that could be the culprit gets quarantined.
+        const failedOpts = (args[spec.optsArg] && typeof args[spec.optsArg] === 'object') ? args[spec.optsArg] : null;
+        const failedText = spec.textKey
+          ? (failedOpts ? failedOpts[spec.textKey] : '')
+          : args[spec.textArg];
+        const iconIds = failedOpts && failedOpts.reply_markup && Array.isArray(failedOpts.reply_markup.inline_keyboard)
+          ? failedOpts.reply_markup.inline_keyboard.flat()
+              .map((b) => b && b.icon_custom_emoji_id).filter(Boolean)
+              .map((id) => `emoji-id="${id}"`).join(' ')
+          : '';
+        await quarantineFrom(this, label, `${failedText || ''} ${iconIds}`, err.message);
 
-        // Everything custom is removed in ONE step: text entities and button
-        // icons are both custom emoji, and a refusal does not say which one it
-        // objected to. Downgrading only half would fail again and cost the
-        // customer another round-trip on a message they have already paid for.
-        if (spec.textKey && opts && typeof opts[spec.textKey] === 'string') {
-          opts[spec.textKey] = plain(opts[spec.textKey]);
-        } else if (!spec.textKey && spec.textArg >= 0 && typeof args[spec.textArg] === 'string') {
-          args[spec.textArg] = plain(args[spec.textArg]);
-        }
-        if (opts && opts.reply_markup && Array.isArray(opts.reply_markup.inline_keyboard)) {
-          for (const row of opts.reply_markup.inline_keyboard) {
-            for (const b of row) { if (b) delete b.icon_custom_emoji_id; }
+        // Retry with the newly-identified culprit removed and nothing else.
+        // The quarantine now knows which id was bad, so the message can go out
+        // with every OTHER product's icon intact — the first failing message no
+        // longer costs the whole list its icons.
+        const stripQuarantined = (t) => String(t || '')
+          .replace(/<tg-emoji emoji-id="(\d+)">(.*?)<\/tg-emoji>/gi,
+            (whole, id, inner) => (isQuarantined(id) ? inner : whole));
+
+        if (failedOpts && failedOpts.reply_markup && Array.isArray(failedOpts.reply_markup.inline_keyboard)) {
+          for (const row of failedOpts.reply_markup.inline_keyboard) {
+            for (const b of row) {
+              if (b && b.icon_custom_emoji_id && isQuarantined(b.icon_custom_emoji_id)) {
+                delete b.icon_custom_emoji_id;
+              }
+            }
           }
         }
-        return await original.apply(this, args);
+        if (spec.textKey && failedOpts && typeof failedOpts[spec.textKey] === 'string') {
+          failedOpts[spec.textKey] = stripQuarantined(failedOpts[spec.textKey]);
+        } else if (!spec.textKey && spec.textArg >= 0 && typeof args[spec.textArg] === 'string') {
+          args[spec.textArg] = stripQuarantined(args[spec.textArg]);
+        }
+
+        try {
+          return await original.apply(this, args);
+        } catch (err2) {
+          if (!isCustomEmojiError(err2)) throw err2;
+
+          // Still refused, so the culprit was not identifiable. Everything
+          // custom comes off — a plain message beats a lost one, and this is
+          // the last step before the customer would receive nothing.
+          const plain = (t) => stripEmojiMarkers(
+            String(t).replace(/<tg-emoji[^>]*>(.*?)<\/tg-emoji>/gi, '$1'));
+
+          if (spec.textKey && failedOpts && typeof failedOpts[spec.textKey] === 'string') {
+            failedOpts[spec.textKey] = plain(failedOpts[spec.textKey]);
+          } else if (!spec.textKey && spec.textArg >= 0 && typeof args[spec.textArg] === 'string') {
+            args[spec.textArg] = plain(args[spec.textArg]);
+          }
+          if (failedOpts && failedOpts.reply_markup && Array.isArray(failedOpts.reply_markup.inline_keyboard)) {
+            for (const row of failedOpts.reply_markup.inline_keyboard) {
+              for (const b of row) { if (b) delete b.icon_custom_emoji_id; }
+            }
+          }
+          return await original.apply(this, args);
+        }
       }
     };
   }

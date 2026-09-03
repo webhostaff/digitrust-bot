@@ -12,9 +12,9 @@ const db = require('./db');
 
 const insertItem = db.prepare(`
   INSERT INTO product_items
-    (product_id, item_type, raw_content, email, password, recovery, status)
+    (product_id, item_type, raw_content, email, password, recovery, status, supplier)
   VALUES
-    (@productId, 'key', @rawContent, NULL, NULL, NULL, 'available')
+    (@productId, 'key', @rawContent, NULL, NULL, NULL, 'available', @supplier)
 `);
 
 const getAvailableItem = db.prepare(`
@@ -97,14 +97,64 @@ function validateLines(input) {
  * Insert validated items into product_items.
  * Returns number inserted.
  */
-const insertItems = db.transaction((productId, validItems) => {
+const insertItems = db.transaction((productId, validItems, supplier = null) => {
   let count = 0;
+  const who = supplier ? String(supplier).trim().slice(0, 60) : null;
   for (const item of validItems) {
-    insertItem.run({ productId, rawContent: item.raw });
+    insertItem.run({ productId, rawContent: item.raw, supplier: who });
     count++;
   }
   return count;
 });
+
+// ── Supplier lookup ───────────────────────────────────────────────────────────
+
+/**
+ * Who supplied a given account, found by any fragment of its content.
+ *
+ * Searches sold items as well as available ones — a dead account is by
+ * definition one already in a customer's hands, so restricting this to stock
+ * would answer only the case nobody asks about.
+ */
+const findItemsByContent = db.prepare(`
+  SELECT pi.*, p.title AS product_title, o.id AS order_ref
+  FROM product_items pi
+  LEFT JOIN products p ON pi.product_id = p.id
+  LEFT JOIN orders   o ON pi.order_id   = o.id
+  WHERE pi.raw_content LIKE ? COLLATE NOCASE
+  ORDER BY pi.id DESC
+  LIMIT 20
+`);
+
+const listSuppliers = db.prepare(`
+  SELECT supplier,
+         COUNT(*)                                          AS total,
+         SUM(CASE WHEN status = 'available' THEN 1 ELSE 0 END) AS in_stock,
+         SUM(CASE WHEN status = 'sold'      THEN 1 ELSE 0 END) AS sold
+  FROM product_items
+  WHERE supplier IS NOT NULL AND TRIM(supplier) <> ''
+  GROUP BY supplier
+  ORDER BY total DESC
+`);
+
+const itemsBySupplier = db.prepare(`
+  SELECT pi.*, p.title AS product_title
+  FROM product_items pi
+  LEFT JOIN products p ON pi.product_id = p.id
+  WHERE pi.supplier = ? COLLATE NOCASE
+  ORDER BY pi.id DESC
+  LIMIT 30
+`);
+
+/** Recently used supplier names, so the admin can tap instead of retyping. */
+const recentSuppliers = db.prepare(`
+  SELECT supplier, MAX(id) AS last_id
+  FROM product_items
+  WHERE supplier IS NOT NULL AND TRIM(supplier) <> ''
+  GROUP BY supplier
+  ORDER BY last_id DESC
+  LIMIT 8
+`);
 
 // ── Delivery ──────────────────────────────────────────────────────────────────
 
@@ -188,6 +238,10 @@ function deliverItemRaw(productId, userId, orderId) {
 }
 
 module.exports = {
+  findItemsByContent: (fragment) => findItemsByContent.all(`%${String(fragment || '').trim()}%`),
+  listSuppliers:      () => listSuppliers.all(),
+  itemsBySupplier:    (name) => itemsBySupplier.all(name),
+  recentSuppliers:    () => recentSuppliers.all().map((r) => r.supplier),
   validateLines,
   recoverItemsFromUser,
   insertItems,

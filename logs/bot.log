@@ -1,2 +1,4 @@
 2026-08-26T11:26:06.263Z [INFO] [emoji:test] outgoing emoji layer installed
 2026-08-26T12:47:43.657Z [INFO] [emoji:t] outgoing emoji layer installed
+2026-09-03T20:07:43.089Z [INFO] [emoji:t] outgoing emoji layer installed
+2026-09-03T20:07:43.093Z [WARN] [emoji:t] quarantined invalid id(s) 6666666666666666666 for 6h: ETELEGRAM: 400 Bad Request: DOCUMENT_INVALID

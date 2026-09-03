@@ -182,6 +182,33 @@ function convertCustomEmojisToMarkers(msg) {
   return result;
 }
 
+
+/**
+ * Buttons for the stock-confirmation screen.
+ *
+ * Recently used supplier names are offered as taps. Suppliers repeat constantly
+ * and are typed from memory, so retyping invites "Ahmed", "ahmed" and "Ahmad"
+ * to become three different suppliers in the reports.
+ */
+function stockConfirmRows(userId, productId, count) {
+  const sess = session.get(userId);
+  const current = sess?.data?.supplier || null;
+  const rows = [];
+
+  if (!current) {
+    for (const name of (items.recentSuppliers() || []).slice(0, 4)) {
+      rows.push([{ text: `🏷 ${String(name).slice(0, 30)}`, callback_data: `admin_stock_sup_${Buffer.from(String(name)).toString('base64url').slice(0, 50)}` }]);
+    }
+    rows.push([{ text: '✏️ Type supplier name', callback_data: 'admin_stock_supplier' }]);
+  } else {
+    rows.push([{ text: `🏷 Supplier: ${String(current).slice(0, 24)} — change`, callback_data: 'admin_stock_supplier' }]);
+  }
+
+  rows.push([{ text: `✅ Add ${count} item(s)${current ? '' : ' without supplier'}`, callback_data: 'admin_stock_confirm_yes' }]);
+  rows.push([{ text: '❌ Cancel', callback_data: `admin_edit_p_${productId}` }]);
+  return rows;
+}
+
 async function handleAdminText(bot, msg) {
   if (!isAdmin(msg.from.id)) return; // silent drop — already guarded in index.js
 
@@ -913,13 +940,28 @@ async function handleAdminText(bot, msg) {
       `📊 <b>Current stock:</b> ${prevStock}\n` +
       `📊 <b>New stock will be:</b> <b>${prevStock + valid.length}</b>\n\n` +
       `📋 <b>Preview:</b>\n${preview}${more}\n\n` +
+      `🏷 <b>Supplier:</b> <i>not set</i>\n\n` +
       `Are you sure you want to add these ${valid.length} item(s)?`,
-      { parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: [
-          [{ text: `✅ Yes, add ${valid.length} items`, callback_data: 'admin_stock_confirm_yes' }],
-          [{ text: '❌ Cancel', callback_data: `admin_edit_p_${productId}` }],
-        ] } }
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: stockConfirmRows(userId, productId, valid.length) } }
     );
+    return;
+  }
+
+  // ── Supplier name for the batch being added ──────────────────────
+  if (s === States.ADMIN_STOCK_SUPPLIER) {
+    const name = String(text || '').trim();
+    if (!name) { await bot.sendMessage(chatId, '❌ Send a name, or tap Skip.'); return; }
+    if (name.length > 60) { await bot.sendMessage(chatId, '❌ Too long — keep it under 60 characters.'); return; }
+
+    // Back to the confirmation screen, now carrying the supplier.
+    session.set(userId, States.ADMIN_STOCK_CONFIRM, { ...d, supplier: name });
+    const product2 = db.getProduct(d.stockProductId);
+    await bot.sendMessage(chatId,
+      `🏷 Supplier set to <b>${escapeHtml(name)}</b>\n\n` +
+      `📦 ${escapeHtml(kbStripEmojiCodes(String(product2?.title || '')).trim())}\n` +
+      `➕ <b>${(d.stockItems || []).length}</b> item(s) ready to add.`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: stockConfirmRows(userId, d.stockProductId, (d.stockItems || []).length) } });
     return;
   }
 
@@ -1584,6 +1626,51 @@ async function handleAdminText(bot, msg) {
     return;
   }
 
+  // ── Supplier lookup by account content ────────────────────────────
+  if (s === States.ADMIN_SUPPLIER_LOOKUP) {
+    session.clear(userId);
+    const frag = String(text || '').trim();
+    if (frag.length < 3) {
+      await bot.sendMessage(chatId, '❌ Send at least 3 characters.');
+      return;
+    }
+
+    const found = items.findItemsByContent(frag);
+    if (!found.length) {
+      await bot.sendMessage(chatId,
+        `🏷 <b>${escapeHtml(frag.slice(0, 40))}</b>\n\n` +
+        `❌ Not found in stock or in any delivered order.\n\n` +
+        `<i>Either it was never added through the bot, or the text does not match ` +
+        `exactly — try a shorter fragment, like just the email.</i>`,
+        { parse_mode: 'HTML' });
+      return;
+    }
+
+    const parts = found.slice(0, 8).map((it) => {
+      const who = it.supplier
+        ? `🏷 <b>${escapeHtml(it.supplier)}</b>`
+        : `🏷 <i>no supplier recorded</i>`;
+      const sold = it.status === 'sold'
+        ? `🔴 Sold${it.sold_to_user_id ? ` to <code>${it.sold_to_user_id}</code>` : ''}` +
+          `${it.order_ref ? ` · order #${it.order_ref}` : ''}${it.sold_at ? ` · ${escapeHtml(String(it.sold_at).slice(0, 16))}` : ''}`
+        : `🟢 Still in stock`;
+      return `${who}\n` +
+             `📦 ${escapeHtml(kbStripEmojiCodes(String(it.product_title || '')).trim().slice(0, 34))}\n` +
+             `${sold}\n` +
+             `📅 Added ${escapeHtml(String(it.created_at || '—').slice(0, 16))}\n` +
+             `<code>${escapeHtml(String(it.raw_content || '').slice(0, 60))}</code>`;
+    });
+
+    await bot.sendMessage(chatId,
+      `🏷 <b>Supplier lookup</b>\n\n${parts.join('\n\n➖➖➖\n\n')}` +
+      (found.length > 8 ? `\n\n<i>…and ${found.length - 8} more matches</i>` : ''),
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+        [{ text: '🔎 Look up another', callback_data: 'admin_supplier_lookup' }],
+        [{ text: '🏷 All suppliers', callback_data: 'admin_suppliers' }],
+      ] } });
+    return;
+  }
+
   // ── TxID tracer: one id, the whole story ──────────────────────────
   if (s === States.ADMIN_TXID_SEARCH) {
     session.clear(userId);
@@ -1956,7 +2043,32 @@ async function runTxidTrace(bot, chatId, rawText) {
             `one the bot watches, or arrived without a matching deposit request. ` +
             `Add it manually with ➕ Add User Balance once you know the customer.</i>`;
         } else {
-          chainLine = `\n\n🔍 <i>Also checked your Binance deposit history (last 180 days) — no such deposit.</i>`;
+          // Not an on-chain deposit — try Binance Pay. Money "sent on Binance"
+          // is often an internal transfer, which never touches deposit history
+          // at all, so stopping here would report a false "never arrived".
+          let payLine = '';
+          try {
+            const pay = await binance.findPayTransactionRaw(needle);
+            if (pay.ok && pay.matches.length) {
+              const t = pay.matches[0];
+              payLine =
+                `\n\n🟡 <b>FOUND ON BINANCE PAY — but never credited here</b>\n` +
+                `💵 <b>$${Number(t.amount).toFixed(2)}</b> ${escapeHtml(t.currency || '')}\n` +
+                `🔁 Type: ${escapeHtml(String(t.orderType || 'PAY'))} (internal transfer, off-chain)\n` +
+                `🆔 <code>${escapeHtml(String(t.transactionId || t.orderId || '—'))}</code>\n` +
+                `📅 ${new Date(t.transactionTime).toISOString().slice(0, 16).replace('T', ' ')}\n\n` +
+                `<i>The money is in your Binance account. Credit it with ` +
+                `➕ Add User Balance once you know the customer.</i>`;
+            } else if (!pay.ok) {
+              payLine = `\n⚠️ <i>Binance Pay check: ${escapeHtml(pay.error || 'failed')}</i>`;
+            }
+          } catch (e) {
+            logger.warn(`[TXID] Binance Pay lookup failed: ${e.message}`);
+          }
+
+          chainLine = payLine ||
+            `\n\n🔍 <i>Also checked Binance deposit history AND Binance Pay ` +
+            `(last 180 days) — nothing found. The money never reached your account.</i>`;
         }
       } catch (e) {
         logger.warn(`[TXID] Binance lookup failed: ${e.message}`);
@@ -3686,6 +3798,33 @@ async function handleAdminCallback(bot, query) {
     return;
   }
 
+  // ── Supplier for the batch being added ────────────────────────────
+  if (data === 'admin_stock_supplier') {
+    const sess = session.get(userId);
+    if (sess.state !== States.ADMIN_STOCK_CONFIRM) { await answer('❌ Session expired.'); return; }
+    session.set(userId, States.ADMIN_STOCK_SUPPLIER, sess.data);
+    await bot.sendMessage(chatId,
+      `🏷 <b>Supplier</b>\n\nSend the supplier's name for this batch.\n\n` +
+      `<i>Stored on every item in it, so when an account stops working you can ` +
+      `see who it came from.</i>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (/^admin_stock_sup_/.test(data)) {
+    const sess = session.get(userId);
+    if (sess.state !== States.ADMIN_STOCK_CONFIRM) { await answer('❌ Session expired.'); return; }
+    let name = '';
+    try { name = Buffer.from(data.replace('admin_stock_sup_', ''), 'base64url').toString('utf8'); } catch (_) {}
+    if (!name) { await answer('❌ Could not read that name'); return; }
+    session.update(userId, { supplier: name });
+    await bot.editMessageReplyMarkup(
+      { inline_keyboard: stockConfirmRows(userId, sess.data.stockProductId, (sess.data.stockItems || []).length) },
+      { chat_id: chatId, message_id: msgId }
+    ).catch(() => {});
+    return;
+  }
+
   // ── Confirm stock addition ────────────────────────────────────────
   if (data === 'admin_stock_confirm_yes') {
     const sess = session.get(userId);
@@ -3693,14 +3832,14 @@ async function handleAdminCallback(bot, query) {
       await answer('❌ Session expired. Please try again.');
       return;
     }
-    const { stockProductId, stockItems, prevStock } = sess.data;
+    const { stockProductId, stockItems, prevStock, supplier } = sess.data;
     const product = db.getProduct(stockProductId);
     if (!product) { await answer('❌ Product not found'); return; }
 
     const wasZero = prevStock === 0;
     logger.info(`Admin ${userId} CONFIRMED adding ${stockItems.length} stock items to product ${stockProductId}`);
 
-    const count = items.insertItems(stockProductId, stockItems);
+    const count = items.insertItems(stockProductId, stockItems, supplier || null);
     const newQty = db.adjustStockQuantity(stockProductId, count).after;
     session.clear(userId);
 
@@ -6908,6 +7047,62 @@ async function handleAdminCallback(bot, query) {
         [{ text: autoOn ? '🔴 Turn OFF auto-upgrade' : '🟢 Turn ON auto-upgrade', callback_data: 'admin_setting_emoji_auto_upgrade' }],
         [{ text: '🔙 Settings', callback_data: 'admin_settings' }],
       ] } });
+    return;
+  }
+
+  // ── Supplier lookup: "who sold me this dead account?" ─────────────
+  if (data === 'admin_supplier_lookup') {
+    session.set(userId, States.ADMIN_SUPPLIER_LOOKUP, {});
+    await bot.sendMessage(chatId,
+      `🏷 <b>Find the supplier</b>\n\n` +
+      `Send any part of the account — an email, a key, a username.\n\n` +
+      `<i>You will get the supplier, the product, when it was added, and whether ` +
+      `it was sold and to whom.</i>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (data === 'admin_suppliers') {
+    const list = items.listSuppliers();
+    if (!list.length) {
+      await bot.editMessageText(
+        `🏷 <b>Suppliers</b>\n\nNo supplier recorded yet.\n\n` +
+        `<i>Names are attached when stock is added — the next batch you add will ` +
+        `ask for one.</i>`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminBackKb() }
+      ).catch(() => {});
+      return;
+    }
+    const rows = list.slice(0, 20).map((r) => ([{
+      text: `🏷 ${String(r.supplier).slice(0, 24)} — ${r.in_stock} left / ${r.sold} sold`,
+      callback_data: `admin_sup_${Buffer.from(String(r.supplier)).toString('base64url').slice(0, 50)}`,
+    }]));
+    rows.push([{ text: '🔎 Find supplier of an account', callback_data: 'admin_supplier_lookup' }]);
+    rows.push([{ text: '🔙 Back', callback_data: 'admin_panel' }]);
+    await bot.editMessageText(
+      `🏷 <b>Suppliers</b>\n\n` +
+      list.slice(0, 20).map((r) =>
+        `• <b>${escapeHtml(String(r.supplier))}</b> — ${r.total} item(s): ${r.in_stock} in stock, ${r.sold} sold`
+      ).join('\n'),
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_sup_/.test(data)) {
+    let name = '';
+    try { name = Buffer.from(data.replace('admin_sup_', ''), 'base64url').toString('utf8'); } catch (_) {}
+    const rows = items.itemsBySupplier(name);
+    const lines = rows.slice(0, 15).map((r) =>
+      `• ${r.status === 'sold' ? '🔴' : '🟢'} ${escapeHtml(kbStripEmojiCodes(String(r.product_title || '')).trim().slice(0, 24))} — ` +
+      `<code>${escapeHtml(String(r.raw_content || '').slice(0, 30))}</code>`
+    ).join('\n');
+    await bot.editMessageText(
+      `🏷 <b>${escapeHtml(name)}</b>\n\n${lines || '<i>Nothing found.</i>'}` +
+      (rows.length > 15 ? `\n\n<i>…and ${rows.length - 15} more</i>` : ''),
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Suppliers', callback_data: 'admin_suppliers' }]] } }
+    ).catch(() => {});
     return;
   }
 
