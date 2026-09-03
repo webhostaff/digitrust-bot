@@ -453,6 +453,150 @@ async function showSubDetails(chatId, subId, messageId = null) {
   }
 }
 
+
+// ════════════════════════════════════════════════════════════════
+// RENEWAL: choose a duration, then pay
+// ════════════════════════════════════════════════════════════════
+
+/** Whole months a customer may renew for. */
+const RENEW_MONTHS = [1, 2, 3, 6, 12];
+
+/**
+ * Price a renewal of `months` whole months.
+ *
+ * A renewal starts where the current seat ends, NOT today — that is what makes
+ * it a renewal rather than a second purchase. Buying 3 months while 11 days
+ * remain must give 11 + 90 days on the same email, not 90 days that quietly
+ * discard what was already paid for.
+ */
+function priceRenewal(sub, months) {
+  const monthly = getMonthlyPrice();
+  const bulk = renewDiscountFor(months);
+  const gross = monthly * months;
+  const price = Number((gross * (1 - bulk / 100)).toFixed(2));
+
+  // Extend from the later of today and the current end date, so an expired
+  // seat is not backdated into a period the customer cannot use.
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const currentEnd = new Date(`${sub.end_date}T00:00:00`);
+  const from = currentEnd > today ? currentEnd : today;
+  const to = new Date(from.getTime() + months * 30 * 24 * 60 * 60 * 1000);
+
+  return { months, monthly, gross, bulk, price, from, to,
+           days: Math.round((to - from) / 86400000) };
+}
+
+/** Bulk discount per duration, editable from the admin panel. */
+function renewDiscountFor(months) {
+  try {
+    const row = db.prepare(`SELECT value FROM settings WHERE key='cgb_renew_discounts'`).get();
+    // Stored as "3:5,6:10,12:15" — months:percent pairs.
+    const map = {};
+    for (const pair of String(row?.value || '').split(',')) {
+      const [m, p] = pair.split(':').map((x) => parseFloat(String(x).trim()));
+      if (Number.isFinite(m) && Number.isFinite(p)) map[m] = p;
+    }
+    return Number(map[months]) || 0;
+  } catch (e) {
+    return 0;
+  }
+}
+
+async function showRenewDurations(chatId, userId, subId, messageId = null) {
+  const sub = queries.getCgbSubById(subId);
+  if (!sub) { await bot.sendMessage(chatId, '❌ Subscription not found.'); return; }
+
+  const rows = [];
+  for (const m of RENEW_MONTHS) {
+    const q = priceRenewal(sub, m);
+    const label = `${m} month${m === 1 ? '' : 's'} — $${q.price.toFixed(2)}` +
+                  (q.bulk ? `  (−${q.bulk}%)` : '');
+    rows.push([{ text: label, callback_data: `cgb_rendur_${subId}_${m}` }]);
+  }
+  rows.push([{ text: '🔙 Back', callback_data: `cgb_details_${subId}` }]);
+
+  const txt =
+    `🔄 <b>Renew — choose duration</b>\n\n` +
+    `📧 <code>${escapeHtml(sub.email)}</code>\n` +
+    `📅 Current seat ends: <b>${sub.end_date}</b>\n\n` +
+    `<i>Time is added on top of what you already have — nothing is lost.</i>`;
+
+  const opts = { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } };
+  if (messageId) {
+    await bot.editMessageText(txt, { chat_id: chatId, message_id: messageId, ...opts }).catch(async () => {
+      await bot.sendMessage(chatId, txt, opts);
+    });
+  } else {
+    await bot.sendMessage(chatId, txt, opts);
+  }
+}
+
+async function showRenewPayment(chatId, userId, subId, months, messageId = null) {
+  const sub = queries.getCgbSubById(subId);
+  if (!sub || String(sub.user_id) !== String(userId)) {
+    await bot.sendMessage(chatId, '❌ Subscription not found.');
+    return;
+  }
+  if (isOutOfStock()) {
+    await bot.sendMessage(chatId,
+      `🔴 <b>No seats available</b>\n\n${escapeHtml(outOfStockMessage())}`, { parse_mode: 'HTML' });
+    return;
+  }
+
+  const q = priceRenewal(sub, months);
+
+  setSession(userId, 'CONFIRM_ORDER', {
+    daysRemaining: q.days,
+    extraMonth: false,
+    basePrice: q.price,
+    finalPrice: q.price,
+    startDate: formatDate(q.from),
+    endDate:   formatDate(q.to),
+    monthlyPrice: q.monthly,
+    email: sub.email,
+    renewalOf: subId,
+    renewMonths: months,
+  });
+
+  const balance = getBalance(userId);
+  const canPayWithBalance = Math.round(balance * 100) >= Math.round(q.price * 100);
+
+  const rows = [];
+  if (canPayWithBalance) {
+    rows.push([{ text: `👛 Pay with Balance ($${balance.toFixed(2)})`, callback_data: 'pay_balance' }]);
+  } else if (balance > 0) {
+    rows.push([{ text: `👛 Balance $${balance.toFixed(2)} — not enough`, callback_data: 'balance_short' }]);
+  }
+  rows.push(
+    [{ text: '💳 Pay with Binance Pay', callback_data: 'pay_binance' }],
+    [{ text: '💎 USDT BEP20', callback_data: 'pay_bep20' }, { text: '💎 USDT TRC20', callback_data: 'pay_trc20' }],
+    [{ text: '🤖 CryptoBot', callback_data: 'pay_cryptobot' }],
+    [{ text: '⬅️ Change duration', callback_data: `cgb_renewyes_${subId}` }],
+  );
+
+  const txt =
+    `🔄 <b>Renew ${months} month${months === 1 ? '' : 's'}</b>\n\n` +
+    `📧 <code>${escapeHtml(sub.email)}</code>\n` +
+    `🏢 ${escapeHtml(workspaceName(sub))}\n\n` +
+    `📅 New period: ${formatDate(q.from)} → ${formatDate(q.to)}\n` +
+    `⏳ Days added: <b>${q.days}</b>\n` +
+    (q.bulk
+      ? `💰 <s>$${q.gross.toFixed(2)}</s> → <b>$${q.price.toFixed(2)}</b> (−${q.bulk}%)\n`
+      : `💰 <b>Price: $${q.price.toFixed(2)}</b>\n`) +
+    `👛 Your balance: <b>$${balance.toFixed(2)}</b>\n\n` +
+    `⚠️ <b>Your seat is held only once payment is complete.</b>\n\n` +
+    `Select payment method:`;
+
+  const opts = { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } };
+  if (messageId) {
+    await bot.editMessageText(txt, { chat_id: chatId, message_id: messageId, ...opts }).catch(async () => {
+      await bot.sendMessage(chatId, txt, opts);
+    });
+  } else {
+    await bot.sendMessage(chatId, txt, opts);
+  }
+}
+
 // ════════════════════════════════════════════════════════════════
 // /start COMMAND
 // ════════════════════════════════════════════════════════════════
@@ -709,71 +853,20 @@ bot.on('callback_query', async (q) => {
     // ── "Renew" — this is a purchase, so it goes to payment ──────────────────
     // Tapping Renew used to only set a flag, which read as "done" to the
     // customer: they were told the seat was reserved and were never asked for
-    // money. A seat is sold per cycle, so a renewal is a new sale and must be
-    // paid for like one.
-    if (isOutOfStock()) {
-      await bot.sendMessage(chatId,
-        `🔴 <b>No seats available for the next cycle</b>\n\n${escapeHtml(outOfStockMessage())}`,
-        { parse_mode: 'HTML' });
-      return;
-    }
-
-    const best = calculateBestCycle();
-    if (!best) {
-      await bot.sendMessage(chatId, '❌ No billing cycles configured. Please contact support.');
-      return;
-    }
-
-    const monthlyPrice = getMonthlyPrice();
-    const basePrice = Number(((best.daysRemaining / 30) * monthlyPrice).toFixed(2));
-
-    // The intent is recorded now so the shop can count seats even if the
-    // customer abandons the payment screen — but it is NOT a renewal yet.
+    // money. A seat is sold per cycle, so a renewal is a new sale.
     queries.setCgbRenewIntent(subId, 'yes');
     queries.markCgbReminded(subId);
     await notifyAdminRenewal(sub, 'yes');
+    await showRenewDurations(chatId, userId, subId);
+    return;
+  }
 
-    // Email is already known, so the renewal skips straight to payment.
-    setSession(userId, 'CONFIRM_ORDER', {
-      daysRemaining: best.daysRemaining,
-      extraMonth: false,
-      basePrice,
-      finalPrice: basePrice,
-      startDate: formatDate(new Date()),
-      endDate: formatDate(best.endDate),
-      monthlyPrice,
-      email: sub.email,
-      renewalOf: subId,
-    });
-
-    const balance = getBalance(userId);
-    const canPayWithBalance = Math.round(balance * 100) >= Math.round(basePrice * 100);
-
-    const rows = [];
-    if (canPayWithBalance) {
-      rows.push([{ text: `👛 Pay with Balance ($${balance.toFixed(2)})`, callback_data: 'pay_balance' }]);
-    } else if (balance > 0) {
-      rows.push([{ text: `👛 Balance $${balance.toFixed(2)} — not enough`, callback_data: 'balance_short' }]);
-    }
-    rows.push(
-      [{ text: '💳 Pay with Binance Pay', callback_data: 'pay_binance' }],
-      [{ text: '💎 USDT BEP20', callback_data: 'pay_bep20' }, { text: '💎 USDT TRC20', callback_data: 'pay_trc20' }],
-      [{ text: '🤖 CryptoBot', callback_data: 'pay_cryptobot' }],
-      [{ text: '❌ Cancel', callback_data: 'cgb_menu' }],
-    );
-
-    await bot.sendMessage(chatId,
-      `🔄 <b>Renew subscription</b>\n\n` +
-      `📧 <code>${escapeHtml(sub.email)}</code>\n` +
-      `🏢 ${escapeHtml(workspaceName(sub))}\n\n` +
-      `📅 Next cycle: ${formatDate(new Date())} → ${formatDate(best.endDate)}\n` +
-      `⏳ Days: <b>${best.daysRemaining}</b>\n` +
-      `💰 <b>Price: $${basePrice.toFixed(2)}</b>\n` +
-      `👛 Your balance: <b>$${balance.toFixed(2)}</b>\n\n` +
-      `⚠️ <b>Your seat is held only until you pay.</b> Unpaid holds are released ` +
-      `to other customers when the cycle turns.\n\n` +
-      `Select payment method:`,
-      { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
+  // Duration chosen — price it and go to payment.
+  if (/^cgb_rendur_\d+_\d+$/.test(data)) {
+    const parts  = data.split('_');
+    const subId  = parseInt(parts[2], 10);
+    const months = parseInt(parts[3], 10);
+    await showRenewPayment(chatId, userId, subId, months, msgId);
     return;
   }
 

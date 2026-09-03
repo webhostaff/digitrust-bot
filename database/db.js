@@ -1135,6 +1135,10 @@ try {
   ins.run('cgb_reminder_days', '2');            // how many days before expiry to remind
   ins.run('cgb_reminder_enabled', '1');
   ins.run('cgb_workspace_name', 'chatgpt_Team'); // shown on the details card
+  // Renewal bulk discounts as "months:percent" pairs. Longer commitments are
+  // cheaper per month, which is the whole reason to offer them — a customer who
+  // pays 12x the monthly price up front has no reason to prefer it.
+  ins.run('cgb_renew_discounts', '3:5,6:10,12:15');
 } catch (e) {
   console.error('[SEED] cgb renewal settings:', e.message);
 }

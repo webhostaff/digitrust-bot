@@ -6087,7 +6087,9 @@ async function handleAdminCallback(bot, query) {
     let txt =
       `🔄 <b>ChatGPT Business — Renewals</b>\n\n` +
       `⏰ Reminder: ${on ? `🟢 <b>ON</b> — sent <b>${escapeHtml(String(days))}</b> day(s) before expiry` : '🔴 <b>OFF</b>'}\n` +
-      `🏢 Workspace shown to customers: <b>${escapeHtml(String(ws))}</b>\n\n` +
+      `🏢 Workspace shown to customers: <b>${escapeHtml(String(ws))}</b>\n` +
+      `🏷 Renewal discounts: <code>${escapeHtml(String(db.getSetting('cgb_renew_discounts', '3:5,6:10,12:15')))}</code>\n` +
+      `<i>Format: months:percent — e.g. <code>3:5,6:10,12:15</code></i>\n\n` +
       `✅ <b>${reserved.length}</b> seat${reserved.length === 1 ? '' : 's'} reserved for the next cycle`;
 
     if (reserved.length) {
@@ -6102,6 +6104,7 @@ async function handleAdminCallback(bot, query) {
         [{ text: on ? '🔴 Turn OFF reminders' : '🟢 Turn ON reminders', callback_data: 'admin_cgb_rem_toggle' }],
         [{ text: `⏰ Reminder days (${days})`, callback_data: 'admin_setting_cgb_reminder_days' }],
         [{ text: '🏢 Workspace name', callback_data: 'admin_setting_cgb_workspace_name' }],
+        [{ text: '🏷 Renewal discounts', callback_data: 'admin_setting_cgb_renew_discounts' }],
         [{ text: '🔙 Back', callback_data: 'admin_cgb_panel' }],
       ] }
     }).catch(() => {});
