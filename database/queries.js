@@ -750,13 +750,52 @@ function traceTxid(needle) {
     intents[0]?.user_id ?? reversals[0]?.user_id ?? orders[0]?.user_id ??
     nowInv[0]?.telegram_user_id ?? cbInv[0]?.telegram_user_id ?? null;
 
+  /**
+   * What the payment was actually FOR.
+   *
+   * `used_txids` is written by two different flows — topping up a wallet, and
+   * paying for one order directly — because its job is replay protection, not
+   * bookkeeping. Reading a row there as "credited to wallet" was therefore
+   * wrong half the time: it reported money as sitting in the balance when it
+   * had gone straight into an order and never touched the wallet.
+   *
+   * The ledger settles it. A deposit writes a POSITIVE 'deposit' row; a direct
+   * order payment writes a NEGATIVE 'purchase' row, or none at all.
+   */
+  let purpose = 'unknown';
+  let paidOrder = null;
+
+  if (credited.length) {
+    const depositRow  = ledger.find((t) => t.type === 'deposit' && Number(t.amount) > 0);
+    const purchaseRow = ledger.find((t) => Number(t.amount) < 0);
+
+    if (depositRow) {
+      purpose = 'wallet_topup';
+    } else if (purchaseRow || orders.length) {
+      purpose = 'direct_order';
+      const oid = purchaseRow?.order_id || orders[0]?.id;
+      if (oid) {
+        paidOrder = safe(() => db.prepare(`
+          SELECT o.*, p.title AS product_title
+          FROM orders o LEFT JOIN products p ON o.product_id = p.id
+          WHERE o.id = ?
+        `).get(oid), null);
+      }
+    } else {
+      // In used_txids with no ledger trace either way — real, but unexplained.
+      purpose = 'recorded_only';
+    }
+  }
+
   const user = userId ? safe(() => db.prepare(
     'SELECT telegram_id, username, first_name, balance, is_vip, rank_spend FROM users WHERE telegram_id = ?'
   ).get(userId), null) : null;
 
   // What the customer did with the money AFTER it landed — the question a
   // "did he already spend it?" dispute actually turns on.
-  const spentAfter = (userId && credited[0]?.created_at) ? safe(() => db.prepare(`
+  // Only meaningful for a top-up: a direct order payment funded exactly one
+  // order, and listing later purchases beside it implies a link that is not there.
+  const spentAfter = (purpose === 'wallet_topup' && userId && credited[0]?.created_at) ? safe(() => db.prepare(`
     SELECT o.id, o.total_price, o.status, o.created_at, o.payment_method, p.title AS product_title
     FROM orders o LEFT JOIN products p ON o.product_id = p.id
     WHERE o.user_id = ? AND o.created_at >= ?
@@ -768,8 +807,40 @@ function traceTxid(needle) {
                 intents.length || reversals.length || orders.length ||
                 nowInv.length || cbInv.length;
 
+  /**
+   * The customer's ledger either side of this payment.
+   *
+   * "I deposited it and never used it" cannot be settled by looking at the
+   * payment alone — both sides agree the money was sent. What decides it is
+   * whether the balance ever went UP by that amount, and what happened next.
+   * A running total makes that readable at a glance instead of a pile of rows.
+   */
+  const when = credited[0]?.created_at || ledger[0]?.created_at || null;
+  const around = (userId && when) ? safe(() => db.prepare(`
+    SELECT id, type, amount, description, order_id, created_at
+    FROM transactions
+    WHERE user_id = ?
+      AND created_at BETWEEN datetime(?, '-2 hours') AND datetime(?, '+12 hours')
+    ORDER BY datetime(created_at) ASC, id ASC
+    LIMIT 25
+  `).all(userId, when, when)) : [];
+
+  /**
+   * Anomalies worth an admin's attention, stated rather than left to be noticed.
+   * A purchase row with no order behind it is the shape a genuine bug leaves.
+   */
+  const flags = [];
+  const orphan = ledger.find((t) => Number(t.amount) < 0 && !t.order_id);
+  if (orphan) flags.push('debit_without_order');
+  if (credited.length && !ledger.length) flags.push('no_ledger_entry');
+  if (purpose === 'direct_order' && paidOrder &&
+      Math.abs(Number(paidOrder.total_price) - Number(credited[0]?.amount || 0)) > 0.01) {
+    flags.push('amount_mismatch');
+  }
+
   return { query: q, found: !!found, user, credited, ledger, pending, review,
-           intents, reversals, orders, nowInv, cbInv, spentAfter };
+           intents, reversals, orders, nowInv, cbInv, spentAfter,
+           purpose, paidOrder, around, flags };
 }
 
 function payReferralReward(referredId, rewardAmount) {

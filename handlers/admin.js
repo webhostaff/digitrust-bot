@@ -2103,12 +2103,30 @@ async function runTxidTrace(bot, chatId, rawText) {
     // ── Did it arrive and get credited?
     if (r.credited.length) {
       for (const c of r.credited) {
+        // The heading states what the money DID, not merely that the id is on
+        // record — those are different answers and support needs the first one.
+        const head = r.purpose === 'wallet_topup'
+          ? `✅ <b>DEPOSIT — added to wallet balance</b>`
+          : r.purpose === 'direct_order'
+            ? `🛒 <b>PAID FOR AN ORDER DIRECTLY — never entered the wallet</b>`
+            : `📗 <b>Payment on record</b>`;
+
         L.push(
-          `\n✅ <b>CREDITED to wallet</b>\n` +
+          `\n${head}\n` +
           `💵 Amount: <b>${money(c.amount)}</b>\n` +
           `🌐 ${escapeHtml(c.network || '?')} ${escapeHtml(c.asset || '')}\n` +
           `📅 ${escapeHtml(c.created_at || '—')}`
         );
+
+        if (r.purpose === 'direct_order' && r.paidOrder) {
+          L.push(
+            `📦 Order <b>#${r.paidOrder.id}</b> — ` +
+            `${escapeHtml(kbStripEmojiCodes(String(r.paidOrder.product_title || '')).trim().slice(0, 30))}\n` +
+            `💵 ${money(r.paidOrder.total_price)} · <b>${escapeHtml(r.paidOrder.status || '')}</b>`
+          );
+        } else if (r.purpose === 'recorded_only') {
+          L.push(`⚠️ <i>No matching wallet credit or order — check manually.</i>`);
+        }
       }
     } else if (r.review.length) {
       for (const v of r.review) {
@@ -2167,7 +2185,10 @@ async function runTxidTrace(bot, chatId, rawText) {
     }
 
     // ── What happened to the money afterwards?
-    if (r.credited.length) {
+    // Only a top-up has an "afterwards" — a direct order payment funded its one
+    // order and nothing else, and the sentence below would contradict the
+    // heading by talking about money still sitting in a wallet it never entered.
+    if (r.purpose === 'wallet_topup') {
       if (r.spentAfter.length) {
         const spent = r.spentAfter.reduce((a, o) => a + Number(o.total_price || 0), 0);
         L.push(`\n💸 <b>Spent after this deposit: ${money(spent)}</b> across ${r.spentAfter.length} order(s)`);
@@ -2178,6 +2199,35 @@ async function runTxidTrace(bot, chatId, rawText) {
       } else {
         L.push(`\n💤 <b>Nothing bought since this deposit.</b> The money is still in the wallet.`);
       }
+    }
+
+    // ── The dispute settler ──
+    // Shown whenever a customer says "I deposited it and never used it": the
+    // ledger either side of the payment answers it without anyone's memory.
+    if (r.around && r.around.length) {
+      L.push(`\n🧾 <b>Account activity around this payment</b>`);
+      for (const t of r.around.slice(0, 12)) {
+        const amt = Number(t.amount);
+        const sign = amt >= 0 ? '➕' : '➖';
+        const mark = (r.ledger || []).some((x) => x.id === t.id) ? ' ⬅️ <b>this one</b>' : '';
+        L.push(
+          `${sign} ${money(Math.abs(amt))} · ${escapeHtml(t.type)}` +
+          `${t.order_id ? ` · order #${t.order_id}` : ''}` +
+          ` · ${escapeHtml(String(t.created_at || '').slice(5, 16))}${mark}`
+        );
+      }
+      const ups = r.around.filter((t) => Number(t.amount) > 0).reduce((a, t) => a + Number(t.amount), 0);
+      const dns = r.around.filter((t) => Number(t.amount) < 0).reduce((a, t) => a + Math.abs(Number(t.amount)), 0);
+      L.push(`\n📊 In this window: <b>+${money(ups)}</b> in, <b>−${money(dns)}</b> out`);
+    }
+
+    if (r.flags && r.flags.length) {
+      const names = {
+        debit_without_order: '⚠️ A debit with NO order attached — money left the account with nothing to show for it. Worth investigating.',
+        no_ledger_entry:     '⚠️ Payment recorded but NO ledger entry — it was never booked as a deposit or a purchase.',
+        amount_mismatch:     '⚠️ Paid amount does not match the order total.',
+      };
+      L.push(`\n🚩 <b>Needs attention</b>\n` + r.flags.map((f) => names[f] || f).join('\n'));
     }
 
     const kb = { inline_keyboard: [] };
