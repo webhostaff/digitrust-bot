@@ -344,6 +344,18 @@ bot.on('message', async (msg) => {
       await ordersHandler.showOrders(bot, chatId, userId, null, 'all', 0);
     } else if (navKey === 'btn_support') {
       await supportHandler.showSupport(bot, chatId, null);
+    } else if (navKey === 'btn_refunds' || navKey === 'btn_api') {
+      // These two screens live in the callback router, not in a handler module.
+      // Rather than duplicate them here — where the copy would drift the first
+      // time either screen changed — the tap is replayed as the callback the
+      // inline button would have sent.
+      const fake = {
+        id: `nav_${Date.now()}`,
+        from: msg.from,
+        message: { chat: { id: chatId }, message_id: msg.message_id },
+        data: navKey === 'btn_refunds' ? 'refund_request_start' : 'menu_api',
+      };
+      await handleCallbackQuery(fake);
     }
   } catch (e) {
     logger.error(`Nav bar tap failed: ${e.message}`);
@@ -833,7 +845,9 @@ bot.on('photo', async (msg) => {
 });
 
 // ── Callback queries ──────────────────────────────────────────────────────────
-bot.on('callback_query', async (query) => {
+// Named so the nav bar can replay a tap through the very same code path an
+// inline button would take, instead of keeping a second copy of those screens.
+async function handleCallbackQuery(query) {
   const data   = query.data || '';
   const userId = query.from.id;
   const chatId = query.message.chat.id;
@@ -1694,7 +1708,7 @@ bot.on('callback_query', async (query) => {
 
   logger.warn(`Unhandled callback: ${data}`);
   await answer();
-});
+}
 
 // ── Error handlers ────────────────────────────────────────────────────────────
 
@@ -1841,6 +1855,8 @@ async function runStaleProductCheck() {
 setInterval(runStaleProductCheck, STALE_CHECK_INTERVAL_MS);
 // Run once shortly after boot too, so a freshly-enabled setting doesn't wait 6 hours
 setTimeout(runStaleProductCheck, 60 * 1000);
+
+bot.on('callback_query', handleCallbackQuery);
 
 // ── Start Support Bot ─────────────────────────────────────────────────
 require('./support-bot');

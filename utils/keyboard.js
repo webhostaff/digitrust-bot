@@ -15,7 +15,7 @@ const languagePickerKb = () => mk([
   [btn('🇻🇳 Tiếng Việt', 'set_lang_vi'), btn('🇪🇸 Español', 'set_lang_es')],
 ]);
 
-const { t } = require('./i18n');
+const { t, SUPPORTED_LANGS } = require('./i18n');
 
 /**
  * Persistent bottom bar for customers.
@@ -27,12 +27,14 @@ const { t } = require('./i18n');
  * Kept to four: on a phone a fifth row pushes the conversation off screen, and
  * everything else is reachable from these four.
  */
-const NAV_KEYS = ['btn_products', 'btn_wallet', 'btn_orders', 'btn_support'];
+const NAV_KEYS = ['btn_products', 'btn_wallet', 'btn_orders', 'btn_support',
+                  'btn_refunds', 'btn_api'];
 
 const persistentMenuKb = (lang = 'en') => ({
   keyboard: [
     [{ text: t(lang, 'btn_products') }, { text: t(lang, 'btn_wallet') }],
     [{ text: t(lang, 'btn_orders') },   { text: t(lang, 'btn_support') }],
+    [{ text: t(lang, 'btn_refunds') },  { text: t(lang, 'btn_api') }],
   ],
   resize_keyboard: true,
   is_persistent: true,
@@ -51,7 +53,7 @@ const persistentMenuKb = (lang = 'en') => ({
 function matchNavButton(text) {
   const raw = String(text || '').trim();
   if (!raw) return null;
-  for (const lang of ['en', 'ar', 'vi', 'es']) {
+  for (const lang of SUPPORTED_LANGS) {
     for (const key of NAV_KEYS) {
       if (t(lang, key) === raw) return key;
     }
@@ -64,7 +66,7 @@ const mainMenuKb = (lang = 'en') => mk([
   [btn(t(lang, 'btn_wallet'), 'menu_wallet'),         btn(t(lang, 'btn_orders'), 'menu_orders')],
   [btn(t(lang, 'btn_support'), 'menu_support'),       btn(t(lang, 'btn_vip'), 'menu_ranks')],
   [btn(t(lang, 'btn_refunds'), 'refund_request_start'),         btn(t(lang, 'btn_language'), 'menu_language')],
-  [btn('🔌 API Access', 'menu_api')],
+  [btn(t(lang, 'btn_api'), 'menu_api')],
 ]);
 
 // Pre-Order products listing (customer view)
