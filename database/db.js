@@ -1138,7 +1138,9 @@ try {
   // Renewal bulk discounts as "months:percent" pairs. Longer commitments are
   // cheaper per month, which is the whole reason to offer them — a customer who
   // pays 12x the monthly price up front has no reason to prefer it.
-  ins.run('cgb_renew_discounts', '3:5,6:10,12:15');
+  ins.run('cgb_renew_discounts', '3:3,6:5,12:8');
+  // 23:59 includes the end day, which is what "until the 25th" means to a buyer.
+  ins.run('cgb_cycle_end_time', '23:59');
 } catch (e) {
   console.error('[SEED] cgb renewal settings:', e.message);
 }

@@ -599,6 +599,23 @@ const rankSpendAdd   = db.prepare(`
 `);
 const rankSpendSet   = db.prepare('UPDATE users SET rank_spend = ? WHERE telegram_id = ?');
 
+/**
+ * Take a refunded amount back off the rank counter.
+ *
+ * Without this a refund is free rank: buy $600, reach GOLD, get the money back,
+ * keep the 5% for good. Repeat and the discount is unbounded. A refund reverses
+ * a sale, so it has to reverse everything the sale granted.
+ *
+ * MAX(0, …) because partial refunds, manual balance edits and old orders can
+ * combine to overshoot, and a negative counter would read as a debt the
+ * customer has to buy their way out of before ranking again.
+ */
+const rankSpendSubtract = db.prepare(`
+  UPDATE users
+  SET rank_spend = MAX(0, COALESCE(rank_spend, 0) - ?)
+  WHERE telegram_id = ?
+`);
+
 function rankSystemOn() {
   return String(getSettingValue('rank_system_enabled', '1')) === '1';
 }
@@ -2071,6 +2088,22 @@ module.exports = {
   },
   setRankSpend:   (userId, amount) => rankSpendSet.run(Number(amount) || 0, userId).changes,
   addRankSpend:   (userId, amount) => rankSpendAdd.run(Number(amount) || 0, userId).changes,
+
+  /**
+   * Reverse a sale's rank credit. Returns what the customer's rank was before
+   * and after, so the admin can be told when a refund actually demotes someone.
+   */
+  reduceRankSpend: (userId, amount) => {
+    const before = getUserRank(userId);
+    rankSpendSubtract.run(Math.abs(Number(amount) || 0), userId);
+    const after = getUserRank(userId);
+    return {
+      before: before.tier?.name || null,
+      after:  after.tier?.name || null,
+      demoted: (before.tier?.id || null) !== (after.tier?.id || null),
+      spend: after.spend,
+    };
+  },
   chargeWallet,
   refundWallet,
 

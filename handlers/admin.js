@@ -1627,6 +1627,43 @@ async function handleAdminText(bot, msg) {
     return;
   }
 
+  // ── Manual cycle end ──────────────────────────────────────────────
+  if (s === States.ADMIN_CGB_CYCLE_END) {
+    const raw = String(text || '').trim();
+    if (/^(off|none|clear|-)$/i.test(raw)) {
+      db.setSetting('cgb_manual_cycle_end', '');
+      session.clear(userId);
+      await bot.sendMessage(chatId, '✅ Override removed — day-of-month cycles are back in charge.',
+        { reply_markup: { inline_keyboard: [[{ text: '🕒 Cycle end', callback_data: 'admin_cgb_manual' }]] } });
+      return;
+    }
+
+    const when = new Date(raw.replace(' ', 'T'));
+    if (isNaN(when.getTime())) {
+      await bot.sendMessage(chatId, '❌ Could not read that. Use <code>YYYY-MM-DD HH:MM</code>, e.g. <code>2026-09-30 20:00</code>.',
+        { parse_mode: 'HTML' });
+      return;
+    }
+    if (when <= new Date()) {
+      // Accepting a past time would sell zero-day subscriptions for real money.
+      await bot.sendMessage(chatId, '❌ That moment has already passed. Pick a future date and time.');
+      return;
+    }
+
+    db.setSetting('cgb_manual_cycle_end', raw);
+    session.clear(userId);
+    const days = Math.max(1, Math.ceil((when - new Date()) / 86400000));
+    const monthly = cgbCycles.getMonthlyPrice();
+    await bot.sendMessage(chatId,
+      `✅ <b>Cycle now ends ${escapeHtml(raw)}</b>\n\n` +
+      `⏳ New customers get <b>${days}</b> day(s)\n` +
+      `💰 They pay <b>${formatPrice((days / 30) * monthly)}</b>\n\n` +
+      `<i>After that moment the day-of-month cycles take over again automatically.</i>`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🕒 Cycle end', callback_data: 'admin_cgb_manual' }]] } });
+    return;
+  }
+
   // ── Supplier lookup by account content ────────────────────────────
   if (s === States.ADMIN_SUPPLIER_LOOKUP) {
     session.clear(userId);
@@ -6072,9 +6109,179 @@ async function handleAdminCallback(bot, query) {
         [{ text: '💰 Set Monthly Price', callback_data: 'admin_cgb_setprice' }],
         [{ text: '📅 Manage Cycles', callback_data: 'admin_cgb_cycles' }],
         [{ text: '🔄 Renewals', callback_data: 'admin_cgb_renewals' }],
+        [{ text: '🕒 Cycle end time', callback_data: 'admin_cgb_manual' }],
         [{ text: '🔙 Back', callback_data: 'admin_panel' }],
       ] }
     }).catch(() => {});
+    return;
+  }
+
+  // ── CGB: set the exact moment the current cycle ends ──────────────
+  if (data === 'admin_cgb_manual') {
+    const manual = cgbCycles.manualCycle();
+    const best   = cgbCycles.calculateBestCycle();
+    const raw    = db.getSetting('cgb_manual_cycle_end', '');
+
+    let txt = `🕒 <b>Cycle end time</b>\n\n`;
+    if (manual) {
+      txt += `🟢 <b>Manual override ACTIVE</b>\n` +
+             `Ends: <b>${escapeHtml(String(raw))}</b>\n` +
+             `⏳ ${manual.daysRemaining} day(s) sold to new customers\n\n` +
+             `<i>Day-of-month cycles are ignored while this is set.</i>`;
+    } else {
+      txt += `⚪️ <b>No override</b> — using day-of-month cycles.\n` +
+             (best ? `Current end: <b>${best.endDate.toISOString().slice(0, 10)}</b> (${best.daysRemaining} days)\n` : '') +
+             (raw ? `\n<i>A previous override (${escapeHtml(String(raw))}) has passed and is being ignored.</i>` : '');
+    }
+    txt += `\n\n<i>Set the exact moment the current cycle closes. Everything sold ` +
+           `from now until then ends at that time; after it passes, the next cycle ` +
+           `takes over automatically.</i>`;
+
+    const pad = (n) => String(n).padStart(2, '0');
+    const at = (days, hour) => {
+      const d = new Date();
+      d.setDate(d.getDate() + days);
+      d.setHours(hour, 0, 0, 0);
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(hour)}:00`;
+    };
+    const enc = (v) => Buffer.from(v).toString('base64url');
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: '⏭ Start next cycle NOW', callback_data: 'admin_cgb_nextcycle' }],
+        [{ text: '🌙 Tonight 23:59', callback_data: `admin_cgbend_${enc(at(0, 23) .replace('23:00', '23:59'))}` }],
+        [{ text: '➕ 7 days',  callback_data: `admin_cgbend_${enc(at(7, 23).replace('23:00', '23:59'))}` },
+         { text: '➕ 14 days', callback_data: `admin_cgbend_${enc(at(14, 23).replace('23:00', '23:59'))}` }],
+        [{ text: '➕ 30 days', callback_data: `admin_cgbend_${enc(at(30, 23).replace('23:00', '23:59'))}` }],
+        [{ text: `🕓 Boundary time (${db.getSetting('cgb_cycle_end_time', '23:59')})`, callback_data: 'admin_cgb_bt' },
+         { text: `🌍 UTC${Number(db.getSetting('cgb_timezone_offset', '0')) >= 0 ? '+' : ''}${db.getSetting('cgb_timezone_offset', '0')}`, callback_data: 'admin_cgb_tz' }],
+        [{ text: '✏️ Type exact date & time', callback_data: 'admin_cgb_setend' }],
+        [{ text: '🗑 Remove override', callback_data: 'admin_cgbend_clear' }],
+        [{ text: '🔙 Back', callback_data: 'admin_cgb_panel' }],
+      ] }
+    }).catch(() => {});
+    return;
+  }
+
+  // ── One button: close the current cycle, open the next ────────────
+  if (data === 'admin_cgb_nextcycle') {
+    const next = cgbCycles.nextCycleAfterCurrent();
+    if (!next) { await answer('❌ No cycle configured'); return; }
+
+    const monthly = cgbCycles.getMonthlyPrice();
+    const pad = (n) => String(n).padStart(2, '0');
+    const d = next.endDate;
+    const stamp = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+
+    await bot.editMessageText(
+      `⏭ <b>Start the next cycle now?</b>\n\n` +
+      `<b>Changes:</b>\n` +
+      `• Current period closes immediately\n` +
+      `• New customers get <b>${next.daysRemaining}</b> day(s), ending <b>${escapeHtml(stamp)}</b>\n` +
+      `• They pay <b>${formatPrice((next.daysRemaining / 30) * monthly)}</b> instead of ` +
+      `${formatPrice((next.replaces.daysRemaining / 30) * monthly)}\n\n` +
+      `<b>Does NOT change:</b>\n` +
+      `• Seats already sold — every existing customer keeps the end date they ` +
+      `paid for. Cutting those short would take back time people bought.\n\n` +
+      `<i>Reversible: remove the override to go back to the calendar cycles.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: '✅ Yes, start next cycle', callback_data: `admin_cgbend_${Buffer.from(stamp).toString('base64url')}` }],
+          [{ text: '❌ Cancel', callback_data: 'admin_cgb_manual' }],
+        ] } }
+    ).catch(() => {});
+    return;
+  }
+
+  // ── What time of day a cycle boundary falls on ────────────────────
+  if (data === 'admin_cgb_bt') {
+    const cur = db.getSetting('cgb_cycle_end_time', '23:59');
+    await bot.editMessageText(
+      `🕓 <b>Cycle boundary time</b>\n\n` +
+      `Currently: <b>${escapeHtml(String(cur))}</b>\n\n` +
+      `This is the moment a cycle day ends.\n\n` +
+      `• <b>23:59</b> — the end day is INCLUDED. A seat "until the 25th" works ` +
+      `all through the 25th. This is what customers assume.\n` +
+      `• <b>00:00</b> — the end day is NOT included. The seat stops the instant ` +
+      `that day begins, so the 25th is not usable.\n\n` +
+      `<i>Applies to the calendar cycles and to “start next cycle” alike.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: `${cur === '00:00' ? '✅ ' : ''}00:00 — start of day`, callback_data: 'admin_cgb_bt_00:00' }],
+          [{ text: `${cur === '12:00' ? '✅ ' : ''}12:00 — midday`,       callback_data: 'admin_cgb_bt_12:00' }],
+          [{ text: `${cur === '23:59' ? '✅ ' : ''}23:59 — end of day`,   callback_data: 'admin_cgb_bt_23:59' }],
+          [{ text: '🔙 Back', callback_data: 'admin_cgb_manual' }],
+        ] } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_cgb_bt_\d{2}:\d{2}$/.test(data)) {
+    db.setSetting('cgb_cycle_end_time', data.replace('admin_cgb_bt_', ''));
+    return handleAdminCallback(bot, { ...query, data: 'admin_cgb_bt' });
+  }
+
+  // ── Which clock the bot calls "today" ─────────────────────────────
+  if (data === 'admin_cgb_tz') {
+    const cur = String(db.getSetting('cgb_timezone_offset', '0'));
+    const serverNow = new Date();
+    const shopNow = cgbCycles.localNow(serverNow);
+    const fmt = (d) => d.toISOString().slice(0, 16).replace('T', ' ');
+
+    const opts = ['-5', '-3', '0', '1', '2', '3', '4', '5.5', '8'];
+    const rows = [];
+    for (let i = 0; i < opts.length; i += 3) {
+      rows.push(opts.slice(i, i + 3).map((o) => ({
+        text: `${cur === o ? '✅ ' : ''}UTC${Number(o) >= 0 ? '+' : ''}${o}`,
+        callback_data: `admin_cgb_tz_${o}`,
+      })));
+    }
+    rows.push([{ text: '🔙 Back', callback_data: 'admin_cgb_manual' }]);
+
+    await bot.editMessageText(
+      `🌍 <b>Your timezone</b>\n\n` +
+      `🖥 Server clock: <b>${fmt(serverNow)}</b> (UTC)\n` +
+      `🏠 Shop clock: <b>${fmt(shopNow)}</b>\n\n` +
+      `<i>The server runs on UTC. If your day starts before the server's does, ` +
+      `a cycle beginning on the 5th stays on the 4th for the bot during those ` +
+      `first hours — you see the 5th, the bot does not. Setting your offset ` +
+      `puts them on the same day.</i>\n\n` +
+      `Tunisia is <b>UTC+1</b>.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: rows } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_cgb_tz_/.test(data)) {
+    db.setSetting('cgb_timezone_offset', data.replace('admin_cgb_tz_', ''));
+    return handleAdminCallback(bot, { ...query, data: 'admin_cgb_tz' });
+  }
+
+  if (data === 'admin_cgbend_clear') {
+    db.setSetting('cgb_manual_cycle_end', '');
+    return handleAdminCallback(bot, { ...query, data: 'admin_cgb_manual' });
+  }
+
+  if (/^admin_cgbend_/.test(data)) {
+    let val = '';
+    try { val = Buffer.from(data.replace('admin_cgbend_', ''), 'base64url').toString('utf8'); } catch (_) {}
+    if (val) {
+      db.setSetting('cgb_manual_cycle_end', val);
+      logger.info(`[CGB] cycle end set manually to ${val} by ${userId}`);
+    }
+    return handleAdminCallback(bot, { ...query, data: 'admin_cgb_manual' });
+  }
+
+  if (data === 'admin_cgb_setend') {
+    session.set(userId, States.ADMIN_CGB_CYCLE_END, {});
+    await bot.sendMessage(chatId,
+      `🕒 <b>Cycle end</b>\n\nSend the exact date and time:\n` +
+      `<code>YYYY-MM-DD HH:MM</code>\n\n` +
+      `Example: <code>2026-09-30 20:00</code>\n\n` +
+      `<i>Uses the server's clock. Send <code>off</code> to remove the override.</i>`,
+      { parse_mode: 'HTML' });
     return;
   }
 
@@ -6084,13 +6291,37 @@ async function handleAdminCallback(bot, query) {
     const on   = db.getSetting('cgb_reminder_enabled', '1') === '1';
     const days = db.getSetting('cgb_reminder_days', '2');
     const ws   = db.getSetting('cgb_workspace_name', 'chatgpt_Team');
+    const cfg  = db.getSetting('cgb_renew_discounts', '3:5,6:10,12:15');
+    const monthly = cgbCycles.getMonthlyPrice();
+
+    // Same threshold reading as the customer bot uses, so the preview cannot
+    // promise a price the bot would not charge.
+    const tiers = String(cfg).split(',').map((pair) => {
+      const [m, p] = pair.split(':').map((x) => parseFloat(String(x).trim()));
+      return { m, p };
+    }).filter((t) => Number.isFinite(t.m) && Number.isFinite(t.p)).sort((a, b) => a.m - b.m);
+    const pctFor = (months) => { let v = 0; for (const t of tiers) if (months >= t.m) v = t.p; return v; };
+
+    const priceTable = [1, 3, 6, 9, 12].map((m) => {
+      const pct = pctFor(m);
+      const price = (monthly * m * (1 - pct / 100));
+      return `${String(m).padStart(2)}mo  $${price.toFixed(2).padStart(7)}` +
+             (pct ? `  -${pct}%` : '');
+    }).join('\n');
+    const givenAway = monthly * 12 * (pctFor(12) / 100);
 
     let txt =
       `🔄 <b>ChatGPT Business — Renewals</b>\n\n` +
       `⏰ Reminder: ${on ? `🟢 <b>ON</b> — sent <b>${escapeHtml(String(days))}</b> day(s) before expiry` : '🔴 <b>OFF</b>'}\n` +
       `🏢 Workspace shown to customers: <b>${escapeHtml(String(ws))}</b>\n` +
-      `🏷 Renewal discounts: <code>${escapeHtml(String(db.getSetting('cgb_renew_discounts', '3:5,6:10,12:15')))}</code>\n` +
-      `<i>Format: months:percent — e.g. <code>3:5,6:10,12:15</code></i>\n\n` +
+      `🏷 Renewal discounts: <code>${escapeHtml(String(cfg))}</code>\n` +
+      `<i>Thresholds — <code>3:5,6:10</code> means 3+ months get 5%, 6+ get 10%.</i>\n\n` +
+      // The setting is abstract; the prices are not. Showing what a customer
+      // would actually be charged is the only way to judge whether a discount
+      // is too generous before it costs a sale.
+      `💵 <b>What customers pay</b> (monthly $${monthly.toFixed(2)})\n` +
+      `<code>${priceTable}</code>\n` +
+      `<i>Giving away: <b>$${givenAway.toFixed(2)}</b> on a 12-month renewal.</i>\n\n` +
       `✅ <b>${reserved.length}</b> seat${reserved.length === 1 ? '' : 's'} reserved for the next cycle`;
 
     if (reserved.length) {
@@ -6187,7 +6418,14 @@ async function handleAdminCallback(bot, query) {
     // The panel used to list cycles without saying which one was in force, so
     // adding a cycle looked like it had no effect. It is not replaced: the bot
     // quotes whichever ACTIVE cycle gives the customer the most days.
-    if (best) {
+    if (best && best.cycle.manual) {
+      // The override silences the day-based cycles entirely, so saying so here
+      // is the difference between "my edits do nothing" and "of course".
+      txt += `🕒 <b>MANUAL OVERRIDE IS ACTIVE</b>\n` +
+             `Ends: <b>${escapeHtml(String(best.cycle.ends_at))}</b>\n` +
+             `⏳ ${best.daysRemaining} day(s) · $${((best.daysRemaining / 30) * monthly).toFixed(2)}\n\n` +
+             `⚠️ <i>The cycles below are IGNORED while this is set.</i>\n\n`;
+    } else if (best) {
       const d = best.endDate;
       const price = ((best.daysRemaining / 30) * monthly).toFixed(2);
       txt += `🟢 <b>In use right now</b>\n` +
@@ -6212,6 +6450,8 @@ async function handleAdminCallback(bot, query) {
       text: `🗑 Delete: Day ${c.start_day} → Day ${c.end_day}`,
       callback_data: `admin_cgb_delcycle_${c.id}`
     }]);
+    rows.push([{ text: '⏭ Start next cycle now', callback_data: 'admin_cgb_nextcycle' }]);
+    rows.push([{ text: '🕒 Set exact end time', callback_data: 'admin_cgb_manual' }]);
     rows.push([{ text: '➕ Add Cycle', callback_data: 'admin_cgb_addcycle' }]);
     rows.push([{ text: '🔙 Back', callback_data: 'admin_cgb_panel' }]);
     await bot.editMessageText(txt, {
@@ -7386,7 +7626,13 @@ async function processRefundApproval(bot, chatId, msgId, r, amount) {
       refId: `refund_${r.id}`, orderId: orderId,
     });
     db.updateRefundRequest(r.id, 'approved', `Refunded ${amount} to wallet`, amount, 'wallet');
-    logger.info(`Refund #${r.id}: credited ${amount} to user ${r.user_id} wallet`);
+
+    // A refund undoes the sale, so it must undo the rank the sale bought.
+    const rank = db.reduceRankSpend(r.user_id, amount);
+    logger.info(
+      `Refund #${r.id}: credited ${amount} to user ${r.user_id} wallet; ` +
+      `rank spend now ${rank.spend}${rank.demoted ? ` (${rank.before} → ${rank.after})` : ''}`
+    );
 
     // Notify user
     try {
@@ -7399,7 +7645,9 @@ async function processRefundApproval(bot, chatId, msgId, r, amount) {
         { parse_mode: 'HTML' });
     } catch (e) {}
 
-    const confirmText = `✅ Refund #${r.id} completed.\n\n💵 ${formatPrice(amount)} credited to wallet.`;
+    const confirmText = `✅ Refund #${r.id} completed.\n\n💵 ${formatPrice(amount)} credited to wallet.` +
+      `\n🏆 Rank spend reduced to ${formatPrice(rank.spend)}` +
+      (rank.demoted ? ` — customer dropped from <b>${escapeHtml(String(rank.before))}</b> to <b>${escapeHtml(String(rank.after))}</b>.` : '.');
     const kb = { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'admin_refund_requests' }]] };
     try {
       await bot.editMessageText(confirmText, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: kb });
@@ -7484,6 +7732,15 @@ async function handleMarkRefundSent(bot, chatId, msgId, refundId, query) {
 
   // Mark as approved (final)
   db.updateRefundRequest(r.id, 'approved', `${method} transfer confirmed sent by admin`, amount, method);
+
+  // Same reversal as the wallet path: the money left, so the rank goes with it.
+  // Applied here rather than at approval time because a crypto refund is only
+  // real once the transfer is actually sent.
+  const rank = db.reduceRankSpend(r.user_id, amount);
+  logger.info(
+    `Refund #${r.id} sent via ${method}; rank spend now ${rank.spend}` +
+    `${rank.demoted ? ` (${rank.before} → ${rank.after})` : ''}`
+  );
 
   // Notify user
   try {

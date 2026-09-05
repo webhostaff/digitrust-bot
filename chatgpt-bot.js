@@ -422,8 +422,15 @@ async function showSubDetails(chatId, subId, messageId = null) {
 // RENEWAL: choose a duration, then pay
 // ════════════════════════════════════════════════════════════════
 
-/** Whole months a customer may renew for. */
-const RENEW_MONTHS = [1, 2, 3, 6, 12];
+/**
+ * Every month from 1 to 12.
+ *
+ * The first version offered 1, 2, 3, 6 and 12 — the durations a shop finds
+ * tidy. But a customer whose other subscriptions renew in July wants 7 months,
+ * and offering only 6 or 12 asks them to either waste a month or come back
+ * early. There is no cost to allowing all twelve, so there is no reason not to.
+ */
+const RENEW_MONTHS = Array.from({ length: 12 }, (_, i) => i + 1);
 
 /**
  * Price a renewal of `months` whole months.
@@ -450,17 +457,27 @@ function priceRenewal(sub, months) {
            days: Math.round((to - from) / 86400000) };
 }
 
-/** Bulk discount per duration, editable from the admin panel. */
+/**
+ * Bulk discount for a duration, editable from the admin panel.
+ *
+ * Read as THRESHOLDS, not exact matches: "3:5,6:10,12:15" means 3 months or
+ * more gets 5%, 6 or more gets 10%, 12 gets 15%. Exact matching would give 7
+ * months a 0% discount while 6 months got 10% — making the longer commitment
+ * cost more, which no customer would accept and no shop intends.
+ */
 function renewDiscountFor(months) {
   try {
     const row = db.prepare(`SELECT value FROM settings WHERE key='cgb_renew_discounts'`).get();
-    // Stored as "3:5,6:10,12:15" — months:percent pairs.
-    const map = {};
+    const tiers = [];
     for (const pair of String(row?.value || '').split(',')) {
       const [m, p] = pair.split(':').map((x) => parseFloat(String(x).trim()));
-      if (Number.isFinite(m) && Number.isFinite(p)) map[m] = p;
+      if (Number.isFinite(m) && Number.isFinite(p)) tiers.push({ m, p });
     }
-    return Number(map[months]) || 0;
+    tiers.sort((a, b) => a.m - b.m);
+
+    let pct = 0;
+    for (const t of tiers) if (months >= t.m) pct = t.p;
+    return pct;
   } catch (e) {
     return 0;
   }
@@ -470,20 +487,27 @@ async function showRenewDurations(chatId, userId, subId, messageId = null) {
   const sub = queries.getCgbSubById(subId);
   if (!sub) { await bot.sendMessage(chatId, '❌ Subscription not found.'); return; }
 
+  // Three per row: twelve full-width buttons would bury the Back button below
+  // the fold and make the screen a scroll rather than a choice.
   const rows = [];
+  let row = [];
   for (const m of RENEW_MONTHS) {
     const q = priceRenewal(sub, m);
-    const label = `${m} month${m === 1 ? '' : 's'} — $${q.price.toFixed(2)}` +
-                  (q.bulk ? `  (−${q.bulk}%)` : '');
-    rows.push([{ text: label, callback_data: `cgb_rendur_${subId}_${m}` }]);
+    row.push({
+      text: `${m}mo · $${q.price.toFixed(2)}${q.bulk ? ` −${q.bulk}%` : ''}`,
+      callback_data: `cgb_rendur_${subId}_${m}`,
+    });
+    if (row.length === 3) { rows.push(row); row = []; }
   }
+  if (row.length) rows.push(row);
   rows.push([{ text: '🔙 Back', callback_data: `cgb_details_${subId}` }]);
 
   const txt =
     `🔄 <b>Renew — choose duration</b>\n\n` +
     `📧 <code>${escapeHtml(sub.email)}</code>\n` +
     `📅 Current seat ends: <b>${sub.end_date}</b>\n\n` +
-    `<i>Time is added on top of what you already have — nothing is lost.</i>`;
+    `<i>Pick any number of months. Time is added on top of what you already ` +
+    `have — nothing is lost.</i>`;
 
   const opts = { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } };
   if (messageId) {

@@ -624,6 +624,69 @@ bot.on('message', async (msg) => {
     return;
   }
 
+  // ── Refund: look up an older order by number ──────────────────────
+  if (state === States.REFUND_SEARCH) {
+    const dbq = require('./database/queries');
+    const wanted = parseInt(String(msg.text || '').replace(/[^0-9]/g, ''), 10);
+    if (!Number.isFinite(wanted)) {
+      await bot.sendMessage(chatId, '❌ Send just the order number, for example 8535.');
+      return;
+    }
+
+    session.clear(userId);
+    const order = dbq.getOrder(wanted);
+
+    // Ownership is checked before anything is revealed: order numbers are
+    // sequential, so without this any customer could probe for other people's
+    // purchases simply by counting.
+    if (!order || String(order.user_id) !== String(userId)) {
+      await bot.sendMessage(chatId,
+        `❌ <b>Order #${wanted} not found on your account.</b>\n\n` +
+        `Check the number in 📦 My Orders.`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+          [{ text: '📦 My Orders', callback_data: 'menu_orders' }],
+          [{ text: '🔎 Try again', callback_data: 'refund_search' }],
+        ] } });
+      return;
+    }
+
+    // Each reason is stated plainly rather than lumped into one refusal — a
+    // customer who is told "not eligible" writes to support; one who is told
+    // the product is non-refundable does not.
+    const product = dbq.getProduct(order.product_id);
+    let problem = null;
+    if (order.status !== 'delivered') {
+      problem = `This order is <b>${escapeHtml(order.status)}</b>, not delivered. Only delivered orders can be refunded.`;
+    } else if (product && product.refund_enabled !== 1) {
+      problem = `<b>${escapeHtml(String(product.title || 'This product').replace(/\[emoji:\d+\]/g, ''))}</b> does not support refunds.`;
+    } else {
+      const existing = (dbq.getUserRefundRequests ? dbq.getUserRefundRequests(userId) : [])
+        .find((r) => String(r.order_id) === String(order.id) && r.status !== 'rejected');
+      if (existing) problem = `You already have a request for this order — status: <b>${escapeHtml(existing.status)}</b>.`;
+    }
+
+    if (problem) {
+      await bot.sendMessage(chatId, `🔎 <b>Order #${order.id}</b>\n\n${problem}`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+          [{ text: '💬 Contact support', callback_data: 'menu_support' }],
+          [{ text: '🔙 Back', callback_data: 'refund_request_start' }],
+        ] } });
+      return;
+    }
+
+    await bot.sendMessage(chatId,
+      `✅ <b>Order #${order.id} found</b>\n\n` +
+      `📦 ${escapeHtml(String(product?.title || '').replace(/\[emoji:\d+\]/g, '').trim())}\n` +
+      `💵 ${formatPrice(order.total_price)}\n` +
+      `📅 ${escapeHtml(String(order.created_at || '').slice(0, 16))}\n\n` +
+      `Tap below to request a refund for it.`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+        [{ text: '🔄 Request refund for this order', callback_data: `refund_req_${order.id}` }],
+        [{ text: '🔙 Back', callback_data: 'refund_request_start' }],
+      ] } });
+    return;
+  }
+
   // User states
   if      (state === States.BUY_QUANTITY)          await buyHandler.handleQuantity(bot, msg);
   else if (state === States.BUY_EMAIL)             await buyHandler.handleEmail(bot, msg);
@@ -1149,6 +1212,15 @@ bot.on('callback_query', async (query) => {
       const title = (o.product_title || 'Product').slice(0, 25);
       return [{ text: `#${o.id} — ${title} — $${(o.total_price||0).toFixed(2)}`, callback_data: `refund_req_${o.id}` }];
     });
+
+    // Older orders are cut off by the slice above. Without a way to reach them,
+    // a customer whose two-month-old account died simply could not file a
+    // request — the order was eligible, just off the end of the list.
+    if (eligibleOrders.length > 10) {
+      txt += `\n\n<i>Showing your 10 most recent. You have ${eligibleOrders.length} ` +
+             `refundable orders — use search for older ones.</i>`;
+    }
+    rows.push([{ text: '🔎 Search by order number', callback_data: 'refund_search' }]);
     rows.push([{ text: '🔙 Back', callback_data: 'back_main' }]);
 
     try {
@@ -1163,6 +1235,19 @@ bot.on('callback_query', async (query) => {
       });
     }
     await bot.answerCallbackQuery(query.id).catch(() => {});
+    return;
+  }
+
+  // ── Find an older order by its number ──────────────────────────────
+  if (data === 'refund_search') {
+    await bot.answerCallbackQuery(query.id).catch(() => {});
+    session.set(userId, States.REFUND_SEARCH, {});
+    await bot.sendMessage(chatId,
+      `🔎 <b>Find your order</b>\n\n` +
+      `Send the order number — for example <code>8535</code> or <code>#8535</code>.\n\n` +
+      `<i>You can find it in 📦 My Orders, or in the message you received when ` +
+      `the product was delivered.</i>`,
+      { parse_mode: 'HTML' });
     return;
   }
 
