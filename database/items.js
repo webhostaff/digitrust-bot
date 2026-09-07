@@ -146,6 +146,52 @@ const itemsBySupplier = db.prepare(`
   LIMIT 30
 `);
 
+/**
+ * Every account a customer has reported as broken, with who supplied it.
+ *
+ * Answers the question the shop owner actually has when buying from several
+ * suppliers: which of them keeps sending accounts that die. Matching is done on
+ * the email inside the reported credential blob, because customers paste the
+ * whole block — labels, password and all — and the email is the only part that
+ * reliably identifies the item.
+ */
+function reportedAccounts(limit = 40) {
+  const rows = db.prepare(`
+    SELECT rr.id, rr.order_id, rr.user_id, rr.affected_account, rr.status,
+           rr.created_at, p.title AS product_title
+    FROM refund_requests rr
+    LEFT JOIN orders   o ON rr.order_id = o.id
+    LEFT JOIN products p ON o.product_id = p.id
+    WHERE rr.affected_account IS NOT NULL AND TRIM(rr.affected_account) <> ''
+    ORDER BY rr.id DESC
+    LIMIT ?
+  `).all(limit);
+
+  const findByFragment = db.prepare(`
+    SELECT supplier, created_at FROM product_items
+    WHERE raw_content LIKE ? COLLATE NOCASE
+    ORDER BY id DESC LIMIT 1
+  `);
+
+  return rows.map((r) => {
+    const blob = String(r.affected_account || '');
+    const email = (blob.match(/[\w.+-]+@[\w.-]+\.\w{2,}/) || [])[0];
+    // Fall back to the first line that is not just a label like "CORREO:".
+    const probe = email
+      || blob.split(/[\n\r]/).map((l) => l.trim())
+             .find((l) => l && !/^[A-Za-zÀ-ÿ]+\s*:?$/.test(l)) || '';
+
+    let supplier = null, addedAt = null;
+    if (probe.length >= 4) {
+      try {
+        const hit = findByFragment.get(`%${probe}%`);
+        if (hit) { supplier = hit.supplier; addedAt = hit.created_at; }
+      } catch (e) { /* ignore */ }
+    }
+    return { ...r, probe, supplier, addedAt };
+  });
+}
+
 /** Recently used supplier names, so the admin can tap instead of retyping. */
 const recentSuppliers = db.prepare(`
   SELECT supplier, MAX(id) AS last_id
@@ -238,6 +284,7 @@ function deliverItemRaw(productId, userId, orderId) {
 }
 
 module.exports = {
+  reportedAccounts,
   findItemsByContent: (fragment) => findItemsByContent.all(`%${String(fragment || '').trim()}%`),
   listSuppliers:      () => listSuppliers.all(),
   itemsBySupplier:    (name) => itemsBySupplier.all(name),

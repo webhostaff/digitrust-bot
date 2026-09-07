@@ -973,6 +973,46 @@ const getUserRefundRequests = db.prepare(`
   WHERE rr.user_id = ?
   ORDER BY rr.id DESC LIMIT 20
 `);
+/**
+ * Sales broken down by hour of the day, in the shop's own timezone.
+ *
+ * Timestamps are stored in UTC, so a shop in UTC+1 reading them raw sees every
+ * peak an hour early — and a peak read an hour early is worse than none, since
+ * it points at the wrong time to post.
+ *
+ * @param {number} days   how far back to look
+ * @param {number} offset hours to add to UTC (Tunisia = 1)
+ */
+function salesByHour(days = 30, offset = 0) {
+  const rows = db.prepare(`
+    SELECT o.created_at, o.total_price
+    FROM orders o
+    WHERE o.status IN ('delivered', 'paid', 'completed')
+      AND o.created_at >= datetime('now', '-' || ? || ' days')
+  `).all(days);
+
+  const hours = Array.from({ length: 24 }, () => ({ count: 0, revenue: 0 }));
+  const dows  = Array.from({ length: 7 },  () => ({ count: 0, revenue: 0 }));
+
+  for (const r of rows) {
+    // SQLite writes "YYYY-MM-DD HH:MM:SS" with no zone marker; naming it UTC
+    // explicitly stops the server's own locale from shifting it a second time.
+    const t = new Date(`${String(r.created_at).replace(' ', 'T')}Z`);
+    if (isNaN(t.getTime())) continue;
+    const local = new Date(t.getTime() + offset * 3600000);
+
+    const h = local.getUTCHours();
+    const d = local.getUTCDay();
+    const amount = Number(r.total_price) || 0;
+
+    hours[h].count++;   hours[h].revenue += amount;
+    dows[d].count++;    dows[d].revenue  += amount;
+  }
+
+  return { hours, dows, total: rows.length,
+           revenue: rows.reduce((a, r) => a + (Number(r.total_price) || 0), 0) };
+}
+
 const getAllRefundRequests = db.prepare(`
   SELECT rr.*, p.title AS product_title, o.total_price,
     u.username AS username, u.first_name AS first_name
@@ -1904,6 +1944,32 @@ module.exports = {
   getActiveCgbSubs: () => cgb_getActive.all(),
   getExpiringCgbSubs: (days) => cgb_getExpiringSubs.all(days),
 
+  // ── CGB per-customer pricing ──
+  getCgbUserPrice: (userId) => {
+    try {
+      const r = db.prepare('SELECT * FROM cgb_user_prices WHERE user_id = ?').get(userId);
+      return r || null;
+    } catch (e) { return null; }
+  },
+  setCgbUserPrice: (userId, price, note, adminId) =>
+    db.prepare(`
+      INSERT INTO cgb_user_prices (user_id, monthly_price, note, created_by)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET
+        monthly_price = excluded.monthly_price,
+        note          = excluded.note,
+        updated_at    = datetime('now')
+    `).run(userId, Number(price), note || null, adminId || null).changes,
+  deleteCgbUserPrice: (userId) =>
+    db.prepare('DELETE FROM cgb_user_prices WHERE user_id = ?').run(userId).changes,
+  listCgbUserPrices: () =>
+    db.prepare(`
+      SELECT cp.*, u.username, u.first_name
+      FROM cgb_user_prices cp
+      LEFT JOIN users u ON cp.user_id = u.telegram_id
+      ORDER BY cp.updated_at DESC
+    `).all(),
+
   // ── CGB renewals ──
   getCgbSubsByUser:   (userId) => cgb_getUserSubs.all(userId),
   getCgbSubById:      (id) => cgb_getSubById.get(id),
@@ -2070,6 +2136,7 @@ module.exports = {
   chargeWalletForPreorder,
 
   traceTxid,
+  salesByHour,
 
   // ── Spend ranks ──
   getUserRank,

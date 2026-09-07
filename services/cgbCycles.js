@@ -184,7 +184,27 @@ function nextCycleAfterCurrent(from = new Date()) {
   };
 }
 
-function getMonthlyPrice() {
+/**
+ * The monthly rate — for a specific customer when one is given.
+ *
+ * A per-customer override beats the shop rate. Resellers and long-standing
+ * buyers get negotiated numbers, and the alternative is the shop owner
+ * remembering to hand-adjust every invoice, which is how a discount promised
+ * once quietly stops being honoured.
+ */
+function getMonthlyPrice(userId = null) {
+  if (userId) {
+    try {
+      const row = raw.prepare('SELECT monthly_price FROM cgb_user_prices WHERE user_id = ?').get(userId);
+      const v = Number(row?.monthly_price);
+      // 0 is a valid price (a free seat), so only a missing row falls through.
+      if (row && Number.isFinite(v) && v >= 0) return v;
+    } catch (e) { /* table may not exist yet */ }
+  }
+  return globalMonthlyPrice();
+}
+
+function globalMonthlyPrice() {
   try {
     const row = raw.prepare(`SELECT value FROM settings WHERE key='chatgpt_monthly_price'`).get();
     return parseFloat(row?.value || '50') || 50;

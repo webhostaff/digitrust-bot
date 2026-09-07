@@ -826,6 +826,23 @@ async function handleAdminText(bot, msg) {
 
     const cmd = text.trim().toUpperCase();
 
+    // Supplier for this whole upload. Accepted at any point — the name is
+    // usually remembered halfway through pasting, and forcing it up front would
+    // mean cancelling and starting the paste again.
+    if (cmd.startsWith('SUPPLIER')) {
+      const name = text.trim().slice('SUPPLIER'.length).trim();
+      if (!name) {
+        await bot.sendMessage(chatId, '❌ Send it as <code>SUPPLIER Ahmed Store</code>.', { parse_mode: 'HTML' });
+        return;
+      }
+      session.update(userId, { supplier: name.slice(0, 60) });
+      await bot.sendMessage(chatId,
+        `🏷 Supplier for this upload: <b>${escapeHtml(name.slice(0, 60))}</b>\n\n` +
+        `<i>Every item in this batch will carry it. Keep pasting, then send DONE.</i>`,
+        { parse_mode: 'HTML' });
+      return;
+    }
+
     // Cancel
     if (cmd === 'CANCEL') {
       session.clear(userId);
@@ -847,7 +864,7 @@ async function handleAdminText(bot, msg) {
       }
 
       const prevStock = product.stock_quantity || 0;
-      const count     = items.insertItems(productId, allItems);
+      const count     = items.insertItems(productId, allItems, d.supplier || null);
       db.adjustStockQuantity(productId, count);
       session.clear(userId);
 
@@ -856,6 +873,9 @@ async function handleAdminText(bot, msg) {
         `📦 Product: <b>${escapeHtml(product.title)}</b>\n` +
         `📨 Batches received: <b>${d.batchCount}</b>\n` +
         `➕ Items added: <b>${count}</b>\n` +
+        (d.supplier
+          ? `🏷 Supplier: <b>${escapeHtml(d.supplier)}</b>\n`
+          : `🏷 <i>No supplier recorded — you will not know who to chase if these fail.</i>\n`) +
         `📊 Previous stock: ${prevStock}\n` +
         `📊 New stock: <b>${prevStock + count}</b>`,
         { parse_mode: 'HTML', reply_markup: adminStockManageKb(productId) });
@@ -3224,6 +3244,8 @@ async function handleAdminCallback(bot, query) {
       `Send your items in <b>multiple messages</b> — each message can contain as many items as you want (up to Telegram's limit of 4096 chars).\n\n` +
       `Separate items within each message using <b>AYMEN</b>:\n` +
       `<code>item1AYMENitem2AYMENitem3</code>\n\n` +
+      `🏷 To tag this batch with a supplier, send:\n` +
+      `<code>SUPPLIER Ahmed Store</code>\n\n` +
       `When you've sent all batches, type <code>DONE</code> to save everything.\n` +
       `To cancel, type <code>CANCEL</code>.\n\n` +
       `📊 <b>Current stock:</b> ${product.stock_quantity}`,
@@ -4563,6 +4585,90 @@ async function handleAdminCallback(bot, query) {
   }
 
   // ── Statistics ────────────────────────────────────────────────────
+  // ── When do customers actually buy? ───────────────────────────────
+  if (data === 'admin_besttime' || /^admin_besttime_\d+$/.test(data)) {
+    const days = /^admin_besttime_\d+$/.test(data) ? parseInt(data.split('_').pop(), 10) : 30;
+    const offset = parseFloat(db.getSetting('shop_timezone_offset', '1')) || 0;
+    const r = db.salesByHour(days, offset);
+
+    if (!r.total) {
+      await bot.editMessageText(
+        `🕐 <b>Best selling hours</b>\n\nNo sales in the last ${days} days.`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminBackKb() }
+      ).catch(() => {});
+      return;
+    }
+
+    const peak = Math.max(...r.hours.map((h) => h.count));
+    const pad2 = (n) => String(n).padStart(2, '0');
+
+    // A bar per hour. Numbers alone make you hunt for the peak; a bar shows it
+    // at a glance, which is the entire question being asked.
+    const chart = r.hours.map((h, i) => {
+      const filled = peak ? Math.round((h.count / peak) * 12) : 0;
+      const bar = '█'.repeat(filled) + '░'.repeat(12 - filled);
+      return `${pad2(i)}h ${bar} ${String(h.count).padStart(3)}`;
+    }).join('\n');
+
+    // Best three-hour window — a single hour is noisy on small samples, and you
+    // cannot act on "18:00 exactly" anyway.
+    let bestStart = 0, bestSum = -1;
+    for (let i = 0; i < 24; i++) {
+      const sum = r.hours[i].count + r.hours[(i + 1) % 24].count + r.hours[(i + 2) % 24].count;
+      if (sum > bestSum) { bestSum = sum; bestStart = i; }
+    }
+
+    const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    const bestDay = r.dows.reduce((a, b, i) => (b.count > r.dows[a].count ? i : a), 0);
+    const topHours = r.hours.map((h, i) => ({ ...h, i }))
+      .sort((a, b) => b.count - a.count).slice(0, 3);
+
+    await bot.editMessageText(
+      `🕐 <b>Best selling hours</b>\n` +
+      `<i>Last ${days} days · ${r.total} orders · ${formatPrice(r.revenue)}</i>\n` +
+      `🌍 Times shown in UTC${offset >= 0 ? '+' : ''}${offset}\n\n` +
+      `🔥 <b>Busiest window: ${pad2(bestStart)}:00 – ${pad2((bestStart + 3) % 24)}:00</b>\n` +
+      `   ${bestSum} orders (${Math.round((bestSum / r.total) * 100)}% of all sales)\n` +
+      `📅 <b>Best day: ${dayNames[bestDay]}</b> — ${r.dows[bestDay].count} orders\n\n` +
+      `<b>Top hours</b>\n` +
+      topHours.map((h) => `  ${pad2(h.i)}:00 — ${h.count} orders · ${formatPrice(h.revenue)}`).join('\n') +
+      `\n\n<code>${chart}</code>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: `${days === 7 ? '✅ ' : ''}7 days`,  callback_data: 'admin_besttime_7' },
+           { text: `${days === 30 ? '✅ ' : ''}30 days`, callback_data: 'admin_besttime_30' },
+           { text: `${days === 90 ? '✅ ' : ''}90 days`, callback_data: 'admin_besttime_90' }],
+          [{ text: `🌍 Timezone (UTC${offset >= 0 ? '+' : ''}${offset})`, callback_data: 'admin_shop_tz' }],
+          [{ text: '🔙 Back', callback_data: 'admin_panel' }],
+        ] } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (data === 'admin_shop_tz') {
+    const cur = String(db.getSetting('shop_timezone_offset', '1'));
+    const opts = ['-5', '-3', '0', '1', '2', '3', '4', '5.5', '8'];
+    const rows = [];
+    for (let i = 0; i < opts.length; i += 3) {
+      rows.push(opts.slice(i, i + 3).map((o) => ({
+        text: `${cur === o ? '✅ ' : ''}UTC${Number(o) >= 0 ? '+' : ''}${o}`,
+        callback_data: `admin_shop_tz_${o}`,
+      })));
+    }
+    rows.push([{ text: '🔙 Back', callback_data: 'admin_besttime' }]);
+    await bot.editMessageText(
+      `🌍 <b>Your timezone</b>\n\nOrders are stored in UTC. Set your offset so the ` +
+      `hours below are the ones on your own clock.\n\nTunisia is <b>UTC+1</b>.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_shop_tz_/.test(data)) {
+    db.setSetting('shop_timezone_offset', data.replace('admin_shop_tz_', ''));
+    return handleAdminCallback(bot, { ...query, data: 'admin_besttime' });
+  }
+
   if (data === 'admin_stats') {
     const s = db.getStats();
     const topList = s.topProducts
@@ -7402,6 +7508,7 @@ async function handleAdminCallback(bot, query) {
       text: `🏷 ${String(r.supplier).slice(0, 24)} — ${r.in_stock} left / ${r.sold} sold`,
       callback_data: `admin_sup_${Buffer.from(String(r.supplier)).toString('base64url').slice(0, 50)}`,
     }]));
+    rows.push([{ text: '⚠️ Reported dead accounts', callback_data: 'admin_sup_reported' }]);
     rows.push([{ text: '🔎 Find supplier of an account', callback_data: 'admin_supplier_lookup' }]);
     rows.push([{ text: '🔙 Back', callback_data: 'admin_panel' }]);
     await bot.editMessageText(
@@ -7411,6 +7518,59 @@ async function handleAdminCallback(bot, query) {
       ).join('\n'),
       { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }
     ).catch(() => {});
+    return;
+  }
+
+  // ── Which supplier keeps sending accounts that die ────────────────
+  if (data === 'admin_sup_reported') {
+    const reports = items.reportedAccounts(40);
+    if (!reports.length) {
+      await bot.editMessageText(
+        `⚠️ <b>Reported accounts</b>\n\nNo customer has reported a broken account yet.`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '🔙 Suppliers', callback_data: 'admin_suppliers' }]] } }
+      ).catch(() => {});
+      return;
+    }
+
+    // Grouped by supplier, worst first. A flat list would show the same thing
+    // but would not answer the question — which supplier is the problem.
+    const bySupplier = new Map();
+    for (const r of reports) {
+      const key = r.supplier || '__unknown__';
+      if (!bySupplier.has(key)) bySupplier.set(key, []);
+      bySupplier.get(key).push(r);
+    }
+    const groups = [...bySupplier.entries()].sort((a, b) => b[1].length - a[1].length);
+
+    let txt = `⚠️ <b>Reported dead accounts</b>\n` +
+              `<i>Last ${reports.length} refund requests, grouped by who supplied the account.</i>\n`;
+
+    for (const [supplier, list] of groups) {
+      const name = supplier === '__unknown__'
+        ? '❓ <i>Supplier not recorded</i>'
+        : `🏷 <b>${escapeHtml(supplier)}</b>`;
+      txt += `\n${name} — <b>${list.length}</b> report${list.length === 1 ? '' : 's'}\n`;
+      for (const r of list.slice(0, 6)) {
+        txt += `  • <code>${escapeHtml(String(r.probe || '').slice(0, 34))}</code>` +
+               ` · #${r.order_id} · ${escapeHtml(r.status || '')}\n`;
+      }
+      if (list.length > 6) txt += `  <i>…and ${list.length - 6} more</i>\n`;
+    }
+
+    const unknown = bySupplier.get('__unknown__');
+    if (unknown && unknown.length) {
+      txt += `\n<i>Accounts with no supplier were added before suppliers were ` +
+             `recorded, or the batch was saved without a name.</i>`;
+    }
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: '🔎 Look up one account', callback_data: 'admin_supplier_lookup' }],
+        [{ text: '🔙 Suppliers', callback_data: 'admin_suppliers' }],
+      ] }
+    }).catch(() => {});
     return;
   }
 

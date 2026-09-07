@@ -1197,4 +1197,23 @@ try {
   console.error('[MIGRATION V5] cgb cleanup:', e.message);
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// V6 — PER-CUSTOMER ChatGPT Business PRICING
+//
+// A separate table from `customer_prices`: that one is keyed on a product row,
+// and a ChatGPT seat has no product — its price is computed from a monthly rate
+// and the days left in the cycle. Forcing it into the product table would mean
+// inventing a fake product just to hold a number.
+// ══════════════════════════════════════════════════════════════════════════════
+db.exec(`
+  CREATE TABLE IF NOT EXISTS cgb_user_prices (
+    user_id       INTEGER PRIMARY KEY,
+    monthly_price REAL    NOT NULL,
+    note          TEXT,
+    created_by    INTEGER,
+    created_at    TEXT    DEFAULT (datetime('now')),
+    updated_at    TEXT    DEFAULT (datetime('now'))
+  );
+`);
+
 module.exports = db;

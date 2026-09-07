@@ -158,7 +158,7 @@ function orderCardButtons(d) {
   };
 }
 
-const getMonthlyPrice = () => cgbCycles.getMonthlyPrice();
+const getMonthlyPrice = (userId = null) => cgbCycles.getMonthlyPrice(userId);
 
 // ════════════════════════════════════════════════════════════════
 // CORE LOGIC: Calculate best billing cycle for today
@@ -215,7 +215,8 @@ async function showCalculation(chatId, userId, extraMonth = false) {
     return;
   }
 
-  const monthlyPrice = getMonthlyPrice();
+  // Per-customer rate when one is set, otherwise the shop rate.
+  const monthlyPrice = getMonthlyPrice(userId);
   const basePrice = Number(((best.daysRemaining / 30) * monthlyPrice).toFixed(2));
   const finalPrice = extraMonth ? Number((basePrice + monthlyPrice).toFixed(2)) : basePrice;
   const endDate = extraMonth
@@ -441,20 +442,57 @@ const RENEW_MONTHS = Array.from({ length: 12 }, (_, i) => i + 1);
  * discard what was already paid for.
  */
 function priceRenewal(sub, months) {
-  const monthly = getMonthlyPrice();
+  const monthly = getMonthlyPrice(sub.user_id);
   const bulk = renewDiscountFor(months);
   const gross = monthly * months;
   const price = Number((gross * (1 - bulk / 100)).toFixed(2));
 
-  // Extend from the later of today and the current end date, so an expired
-  // seat is not backdated into a period the customer cannot use.
+  // A renewal always buys a WHOLE cycle on top of what is already paid for.
+  //
+  // The seat's own end is the anchor, not today. Paying two days early, one day
+  // early, or on the closing day itself must all buy the same thing — the next
+  // full cycle. Anchoring on today gave whoever paid on the last day a single
+  // day, because the boundary they were standing on is one they had already
+  // bought.
   const today = new Date(); today.setHours(0, 0, 0, 0);
+  const [bhh, bmm] = cgbCycles.boundaryTime();
   const currentEnd = new Date(`${sub.end_date}T00:00:00`);
+  currentEnd.setHours(bhh, bmm, 0, 0);
+
+  // An expired seat resumes from today: nobody should pay for a period that has
+  // already gone by.
   const from = currentEnd > today ? currentEnd : today;
-  const to = new Date(from.getTime() + months * 30 * 24 * 60 * 60 * 1000);
+  const to = cycleEndAfter(from, months);
 
   return { months, monthly, gross, bulk, price, from, to,
-           days: Math.round((to - from) / 86400000) };
+           days: Math.max(1, Math.round((to - from) / 86400000)) };
+}
+
+/**
+ * The cycle boundary `months` cycles after `from`.
+ *
+ * Falls back to a plain month-add only when no cycle day can be determined,
+ * which is better than refusing to price a renewal at all.
+ */
+function cycleEndAfter(from, months) {
+  const best = cgbCycles.calculateBestCycle();
+  const [bh, bm] = cgbCycles.boundaryTime();
+  const endDay = best && best.cycle && best.cycle.end_day;
+
+  if (!endDay) {
+    const d = new Date(from);
+    d.setMonth(d.getMonth() + months);
+    d.setHours(bh, bm, 0, 0);
+    return d;
+  }
+
+  // STRICTLY after `from`. `from` is usually the seat's existing end, which sits
+  // exactly on a boundary — and that boundary is already paid for, so landing on
+  // it again would sell the customer nothing.
+  let end = new Date(from.getFullYear(), from.getMonth(), endDay, bh, bm, 0, 0);
+  while (end <= from) end = new Date(end.getFullYear(), end.getMonth() + 1, endDay, bh, bm, 0, 0);
+  if (months > 1) end = new Date(end.getFullYear(), end.getMonth() + (months - 1), endDay, bh, bm, 0, 0);
+  return end;
 }
 
 /**
@@ -663,6 +701,105 @@ bot.onText(/^\/renewals?$/i, async (msg) => {
 });
 
 /**
+ * Per-customer monthly rate.
+ *
+ *   /setprice <userId> <price> [note]
+ *   /prices
+ *   /delprice <userId>
+ *
+ * Stored as a monthly rate rather than a fixed total, because a ChatGPT seat is
+ * billed pro-rata for the days left in the cycle. A flat total would be right
+ * on the day it was set and wrong every day after.
+ */
+bot.onText(/^\/setprice(?:\s+(.+))?$/i, async (msg, match) => {
+  if (String(msg.from.id) !== String(ADMIN_ID)) return;
+  const chatId = msg.chat.id;
+  const parts = String((match && match[1]) || '').trim().split(/\s+/).filter(Boolean);
+
+  if (parts.length < 2) {
+    const shopRate = cgbCycles.getMonthlyPrice();
+    await bot.sendMessage(chatId,
+      `💰 <b>Custom price</b>\n\n` +
+      `<code>/setprice &lt;userId&gt; &lt;monthly&gt; [note]</code>\n\n` +
+      `Example: <code>/setprice 5626665035 10 reseller</code>\n\n` +
+      `Shop rate is <b>$${shopRate.toFixed(2)}/month</b>. A custom rate replaces it ` +
+      `for that one customer, everywhere — new seats and renewals alike.\n\n` +
+      `<code>/prices</code> lists them · <code>/delprice &lt;userId&gt;</code> removes one`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  const target = parseInt(parts[0], 10);
+  const price  = parseFloat(String(parts[1]).replace(/[$,\s]/g, ''));
+  const note   = parts.slice(2).join(' ') || null;
+
+  if (!Number.isFinite(target) || !Number.isFinite(price) || price < 0) {
+    await bot.sendMessage(chatId, '❌ Need a numeric user id and a price, e.g. <code>/setprice 5626665035 10</code>.',
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  try {
+    db.prepare('INSERT OR IGNORE INTO users (telegram_id) VALUES (?)').run(target);
+    queries.setCgbUserPrice(target, price, note, msg.from.id);
+
+    const best = cgbCycles.calculateBestCycle();
+    const now  = best ? (best.daysRemaining / 30) * price : 0;
+    const u = db.prepare('SELECT username, first_name FROM users WHERE telegram_id = ?').get(target);
+
+    await bot.sendMessage(chatId,
+      `✅ <b>Custom price set</b>\n\n` +
+      `👤 ${u?.username ? '@' + escapeHtml(u.username) : escapeHtml(u?.first_name || String(target))} · <code>${target}</code>\n` +
+      `💰 <b>$${price.toFixed(2)}/month</b> (shop rate $${cgbCycles.getMonthlyPrice().toFixed(2)})\n` +
+      (note ? `📝 ${escapeHtml(note)}\n` : '') +
+      (best ? `\n<i>A seat bought today (${best.daysRemaining} days) costs them $${now.toFixed(2)}.</i>` : ''),
+      { parse_mode: 'HTML' });
+  } catch (e) {
+    await bot.sendMessage(chatId, `❌ ${e.message}`);
+  }
+});
+
+bot.onText(/^\/prices$/i, async (msg) => {
+  if (String(msg.from.id) !== String(ADMIN_ID)) return;
+  const rows = queries.listCgbUserPrices();
+  const shop = cgbCycles.getMonthlyPrice();
+
+  if (!rows.length) {
+    await bot.sendMessage(msg.chat.id,
+      `💰 <b>Custom prices</b>\n\nNone set — everyone pays the shop rate of <b>$${shop.toFixed(2)}/month</b>.\n\n` +
+      `<code>/setprice &lt;userId&gt; &lt;monthly&gt;</code>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  await bot.sendMessage(msg.chat.id,
+    `💰 <b>Custom prices</b> · shop rate $${shop.toFixed(2)}/month\n\n` +
+    rows.map((r) => {
+      const who = r.username ? `@${escapeHtml(r.username)}` : escapeHtml(r.first_name || String(r.user_id));
+      const diff = Number(r.monthly_price) - shop;
+      return `• ${who} · <code>${r.user_id}</code>\n` +
+             `  <b>$${Number(r.monthly_price).toFixed(2)}</b>/mo ` +
+             `(${diff === 0 ? 'same' : diff > 0 ? `+$${diff.toFixed(2)}` : `−$${Math.abs(diff).toFixed(2)}`})` +
+             (r.note ? ` · ${escapeHtml(r.note)}` : '');
+    }).join('\n'),
+    { parse_mode: 'HTML' });
+});
+
+bot.onText(/^\/delprice(?:\s+(\d+))?$/i, async (msg, match) => {
+  if (String(msg.from.id) !== String(ADMIN_ID)) return;
+  const target = parseInt((match && match[1]) || '', 10);
+  if (!Number.isFinite(target)) {
+    await bot.sendMessage(msg.chat.id, 'Usage: <code>/delprice &lt;userId&gt;</code>', { parse_mode: 'HTML' });
+    return;
+  }
+  const n = queries.deleteCgbUserPrice(target);
+  await bot.sendMessage(msg.chat.id,
+    n ? `✅ Custom price removed — <code>${target}</code> now pays the shop rate of $${cgbCycles.getMonthlyPrice().toFixed(2)}/month.`
+      : `ℹ️ <code>${target}</code> had no custom price.`,
+    { parse_mode: 'HTML' });
+});
+
+/**
  * Register a seat that was sold outside this bot.
  *
  * ChatGPT Business is also sold as an ordinary product in the main store, and
@@ -673,71 +810,124 @@ bot.onText(/^\/renewals?$/i, async (msg) => {
  *
  *   /addseat <userId> <email> <YYYY-MM-DD end date> [price]
  */
-bot.onText(/^\/addseat\s+(.+)$/i, async (msg, match) => {
+/**
+ * Give a seat to a customer by hand, choosing the cycle from buttons.
+ *
+ *   /addseat <userId> <email>
+ *
+ * The end date is picked afterwards rather than typed, because the useful
+ * answer is almost always "the current cycle" or "N months" — and a typed date
+ * is where a wrong end date creeps in, which then fires a reminder on the wrong
+ * day and lets a seat run past what was paid for.
+ */
+bot.onText(/^\/addseat(?:\s+(.+))?$/i, async (msg, match) => {
   if (String(msg.from.id) !== String(ADMIN_ID)) return;
   const chatId = msg.chat.id;
-  const parts  = String(match[1] || '').trim().split(/\s+/);
+  const parts  = String((match && match[1]) || '').trim().split(/\s+/).filter(Boolean);
 
-  if (parts.length < 3) {
+  if (parts.length < 2) {
     await bot.sendMessage(chatId,
-      `📝 <b>Register an existing seat</b>\n\n` +
-      `<code>/addseat &lt;userId&gt; &lt;email&gt; &lt;YYYY-MM-DD&gt; [price]</code>\n\n` +
-      `Example:\n<code>/addseat 5626665035 sasha@gmail.com 2026-09-30 12.50</code>\n\n` +
-      `<i>Use this for seats bought in the main store. The customer will then see ` +
-      `it under Renew and Details, and get the expiry reminder.</i>`,
+      `📝 <b>Add a seat manually</b>\n\n` +
+      `<code>/addseat &lt;userId&gt; &lt;email&gt;</code>\n\n` +
+      `Example:\n<code>/addseat 5626665035 sasha@gmail.com</code>\n\n` +
+      `<i>You pick the cycle next. Use this for seats sold in the main store or ` +
+      `arranged privately — the customer then sees it under Renew and Details ` +
+      `and gets the expiry reminder.</i>`,
       { parse_mode: 'HTML' });
     return;
   }
 
-  const [rawUser, email, endDate] = parts;
-  const price  = parseFloat(parts[3] || '0') || 0;
-  const target = parseInt(rawUser, 10);
-
-  if (!Number.isFinite(target) || !/^\S+@\S+\.\S+$/.test(email) || !/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
-    await bot.sendMessage(chatId, '❌ Check the format: userId must be a number, then an email, then YYYY-MM-DD.');
+  const target = parseInt(parts[0], 10);
+  const email  = parts[1];
+  if (!Number.isFinite(target) || !/^\S+@\S+\.\S+$/.test(email)) {
+    await bot.sendMessage(chatId, '❌ Need a numeric user id then an email.');
     return;
   }
 
-  const today = new Date().toISOString().slice(0, 10);
-  const days  = Math.max(0, Math.ceil(
-    (new Date(`${endDate}T00:00:00`) - new Date(`${today}T00:00:00`)) / 86400000));
+  await showSeatCyclePicker(chatId, target, email);
+});
+
+/** Cycle options for a hand-added seat. */
+async function showSeatCyclePicker(chatId, target, email) {
+  const best = cgbCycles.calculateBestCycle();
+  const monthly = cgbCycles.getMonthlyPrice(target);
+  const enc = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+
+  const rows = [];
+  if (best) {
+    rows.push([{
+      text: `📅 Current cycle — ends ${formatDate(best.endDate)} (${best.daysRemaining}d)`,
+      callback_data: `cgb_seat_${enc({ u: target, e: email, d: formatDate(best.endDate) })}`,
+    }]);
+  }
+  // Whole months from today, three per row.
+  let row = [];
+  for (const m of [1, 2, 3, 6, 12]) {
+    const end = new Date();
+    end.setMonth(end.getMonth() + m);
+    row.push({
+      text: `${m}mo`,
+      callback_data: `cgb_seat_${enc({ u: target, e: email, d: formatDate(end) })}`,
+    });
+    if (row.length === 3) { rows.push(row); row = []; }
+  }
+  if (row.length) rows.push(row);
+  rows.push([{ text: '✏️ Type an exact end date', callback_data: `cgb_seatdate_${enc({ u: target, e: email })}` }]);
+
+  await bot.sendMessage(chatId,
+    `📝 <b>Add seat</b>\n\n` +
+    `👤 <code>${target}</code>\n` +
+    `📧 <code>${escapeHtml(email)}</code>\n` +
+    `💰 Their rate: <b>$${monthly.toFixed(2)}/month</b>` +
+    `${queries.getCgbUserPrice(target) ? ' <i>(custom)</i>' : ''}\n\n` +
+    `Choose how long the seat runs:`,
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
+}
+
+/** Write the seat, tell the customer, and hand it to the normal machinery. */
+async function createSeatManually(chatId, target, email, endDate, adminId) {
+  const today = new Date();
+  const days = Math.max(0, Math.ceil(
+    (new Date(`${endDate}T23:59:00`) - today) / 86400000));
+  const monthly = cgbCycles.getMonthlyPrice(target);
+  const price = Number(((days / 30) * monthly).toFixed(2));
 
   try {
-    db.prepare(`INSERT OR IGNORE INTO users (telegram_id) VALUES (?)`).run(target);
-    // order_id 0 marks a seat with no order behind it in this bot.
-    const info = db.prepare(`
+    db.prepare('INSERT OR IGNORE INTO users (telegram_id) VALUES (?)').run(target);
+    const ws = db.prepare(`SELECT value FROM settings WHERE key='cgb_workspace_name'`).get()?.value || 'chatgpt_Team';
+
+    // order_id 0 marks a seat with no order behind it in this bot. Status is
+    // 'active' rather than 'awaiting_payment': the admin is stating a fact, not
+    // starting a checkout, so there is no payment to wait for.
+    db.prepare(`
       INSERT INTO chatgpt_subscriptions
         (order_id, user_id, email, start_date, end_date, days_remaining,
          base_price, extra_month, final_price, status, workspace)
       VALUES (0, ?, ?, ?, ?, ?, ?, 0, ?, 'active', ?)
-    `).run(target, email, today, endDate, days, price, price,
-           db.prepare(`SELECT value FROM settings WHERE key='cgb_workspace_name'`).get()?.value || 'chatgpt_Team');
+    `).run(target, email, formatDate(today), endDate, days, price, price, ws);
 
     await bot.sendMessage(chatId,
-      `✅ <b>Seat registered</b>\n\n` +
+      `✅ <b>Seat added</b>\n\n` +
       `📧 <code>${escapeHtml(email)}</code>\n` +
       `👤 <code>${target}</code>\n` +
-      `📅 Ends ${endDate} (${days} day${days === 1 ? '' : 's'} left)\n\n` +
-      `The customer can now see it under 🔄 Renew and 📋 Details, and will be ` +
-      `reminded before it expires.`,
+      `📅 Ends <b>${endDate}</b> (${days} day${days === 1 ? '' : 's'})\n` +
+      `💰 Recorded at <b>$${price.toFixed(2)}</b> · $${monthly.toFixed(2)}/mo\n\n` +
+      `<i>They can now renew it, and will be reminded before it expires.</i>`,
       { parse_mode: 'HTML' });
 
     await bot.sendMessage(target,
-      `🤖 <b>Your ChatGPT Business seat is now tracked here</b>\n\n` +
-      `📧 <code>${escapeHtml(email)}</code>\n📅 Ends <b>${endDate}</b>\n\n` +
+      `🤖 <b>Your ChatGPT Business seat is active</b>\n\n` +
+      `📧 <code>${escapeHtml(email)}</code>\n📅 Until <b>${endDate}</b>\n\n` +
       `Send /menu any time to renew it or see the details.`,
       { parse_mode: 'HTML' }).catch(() => {
-      bot.sendMessage(chatId, '⚠️ Seat saved, but the customer has not started this bot yet — they will see it when they do.');
+      bot.sendMessage(chatId, 'ℹ️ Seat saved, but the customer has not started this bot yet — they will see it when they do.');
     });
-    if (info.lastInsertRowid) logger.info(`[CGB] seat ${info.lastInsertRowid} registered manually for ${target}`);
+    logger.info(`[CGB] seat added manually for ${target} until ${endDate} by ${adminId}`);
   } catch (e) {
     await bot.sendMessage(chatId, `❌ Could not save: ${e.message}`);
   }
-});
+}
 
-// ════════════════════════════════════════════════════════════════
-// CALLBACK QUERIES
-// ════════════════════════════════════════════════════════════════
 bot.on('callback_query', async (q) => {
   const userId = q.from.id;
   const chatId = q.message.chat.id;
@@ -836,6 +1026,29 @@ bot.on('callback_query', async (q) => {
     } catch (e) {
       await bot.sendMessage(chatId, `❌ Could not notify customer: ${e.message}`);
     }
+    return;
+  }
+
+  // ── Manual seat: the admin picked a cycle ──────────────────────────────────
+  if (/^cgb_seat_/.test(data)) {
+    if (String(userId) !== String(ADMIN_ID)) return;   // silent for everyone else
+    let payload;
+    try { payload = JSON.parse(Buffer.from(data.replace('cgb_seat_', ''), 'base64url').toString('utf8')); }
+    catch (_) { await bot.sendMessage(chatId, '❌ Could not read that selection.'); return; }
+    await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msgId }).catch(() => {});
+    await createSeatManually(chatId, payload.u, payload.e, payload.d, userId);
+    return;
+  }
+
+  if (/^cgb_seatdate_/.test(data)) {
+    if (String(userId) !== String(ADMIN_ID)) return;
+    let payload;
+    try { payload = JSON.parse(Buffer.from(data.replace('cgb_seatdate_', ''), 'base64url').toString('utf8')); }
+    catch (_) { return; }
+    setSession(userId, 'ADMIN_SEAT_DATE', { target: payload.u, email: payload.e });
+    await bot.sendMessage(chatId,
+      `📅 Send the end date as <code>YYYY-MM-DD</code>\n\nExample: <code>2026-12-31</code>`,
+      { parse_mode: 'HTML' });
     return;
   }
 
@@ -1251,6 +1464,22 @@ bot.on('message', async (msg) => {
 
   const s = getSession(userId);
   if (!s) return;
+
+  // ─── Admin typed an exact end date for a manual seat ───
+  if (s.state === 'ADMIN_SEAT_DATE' && String(userId) === String(ADMIN_ID)) {
+    const raw = text;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+      await bot.sendMessage(chatId, '❌ Use <code>YYYY-MM-DD</code>, e.g. <code>2026-12-31</code>.', { parse_mode: 'HTML' });
+      return;
+    }
+    if (isNaN(new Date(`${raw}T23:59:00`).getTime())) {
+      await bot.sendMessage(chatId, '❌ That is not a real date.');
+      return;
+    }
+    clearSession(userId);
+    await createSeatManually(chatId, s.target, s.email, raw, userId);
+    return;
+  }
 
   // ─── Awaiting email ───
   if (s.state === 'AWAITING_EMAIL') {
@@ -1713,7 +1942,9 @@ if (ADMIN_ID) {
     { command: 'start',    description: '🤖 ChatGPT Business' },
     { command: 'menu',     description: '📋 My subscriptions & renew' },
     { command: 'renewals', description: '🔄 Who renewed (admin)' },
-    { command: 'addseat',  description: '➕ Register an existing seat (admin)' },
+    { command: 'addseat',  description: '➕ Add a seat manually (admin)' },
+    { command: 'setprice', description: '💰 Custom price for a customer (admin)' },
+    { command: 'prices',   description: '💰 List custom prices (admin)' },
   ], { scope: { type: 'chat', chat_id: Number(ADMIN_ID) } })
     .then(() => logger.info('CGB admin commands registered'))
     .catch((e) => logger.warn(`CGB admin setMyCommands: ${e.message}`));
