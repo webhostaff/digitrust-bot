@@ -82,32 +82,43 @@ function scaleTiersProportionally(product, oldPrice, newPrice) {
 function calcOrderPrice(product, quantity) {
   const basePrice = Number(product.price) || 0;
 
-  // Build tiers from new schema (tier1/2/3), sorted by qty DESC
-  const tiers = [
-    { qty: Number(product.bulk_tier3_qty) || 0, price: Number(product.bulk_tier3_price) || 0 },
-    { qty: Number(product.bulk_tier2_qty) || 0, price: Number(product.bulk_tier2_price) || 0 },
-    { qty: Number(product.bulk_tier1_qty) || 0, price: Number(product.bulk_tier1_price) || 0 },
-  ];
+  // Two bulk systems exist on the same product: the tier table (tier1/2/3, a
+  // price per piece) and the older single rule (bulk_min_qty + a percentage).
+  // They were evaluated as "tiers first, legacy only if no tier matched", which
+  // could charge MORE for a larger order — a 50%-off legacy rule at 10+ beat a
+  // 10%-off tier at 50+, so buying 50 cost more per piece than buying 49.
+  //
+  // Every rule the quantity qualifies for is now a candidate and the customer
+  // gets the best of them. A price ladder that ever goes up as you buy more is
+  // read as a mistake by the customer, and it is one.
+  const candidates = [];
 
-  // Find the highest tier where quantity meets qty threshold and price is set
-  let unitPrice = basePrice;
-  let appliedTier = 0;
-  for (const t of tiers) {
-    if (t.qty > 0 && t.price > 0 && quantity >= t.qty) {
-      unitPrice = t.price;
-      appliedTier = t.qty;
-      break;
+  for (const [n, q, pr] of [
+    [1, product.bulk_tier1_qty, product.bulk_tier1_price],
+    [2, product.bulk_tier2_qty, product.bulk_tier2_price],
+    [3, product.bulk_tier3_qty, product.bulk_tier3_price],
+  ]) {
+    const minQty = Number(q) || 0;
+    const price  = Number(pr) || 0;
+    if (minQty > 0 && price > 0 && quantity >= minQty) {
+      candidates.push({ unitPrice: price, tier: minQty, source: `tier${n}` });
     }
   }
 
-  // Fallback to legacy bulk_discount (% off) if no tier matched
-  if (appliedTier === 0) {
-    const bulkMin = Number(product.bulk_min_qty) || 0;
-    const bulkDiscount = Number(product.bulk_discount) || 0;
-    if (bulkMin > 0 && bulkDiscount > 0 && quantity >= bulkMin) {
-      unitPrice = basePrice * (1 - bulkDiscount / 100);
-      appliedTier = bulkMin;
-    }
+  const legacyMin = Number(product.bulk_min_qty) || 0;
+  const legacyPct = Number(product.bulk_discount) || 0;
+  if (legacyMin > 0 && legacyPct > 0 && quantity >= legacyMin) {
+    candidates.push({
+      unitPrice: basePrice * (1 - legacyPct / 100),
+      tier: legacyMin,
+      source: 'legacy',
+    });
+  }
+
+  let unitPrice = basePrice;
+  let appliedTier = 0;
+  for (const c of candidates) {
+    if (c.unitPrice < unitPrice) { unitPrice = c.unitPrice; appliedTier = c.tier; }
   }
 
   const total = Number((unitPrice * quantity).toFixed(2));

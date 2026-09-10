@@ -931,7 +931,38 @@ const getReferralCashbackStats = db.prepare(`
 `);
 
 // ── VIP ──────────────────────────────────────────────────────────────────────
-const unlockVIPQuery = db.prepare("UPDATE users SET is_vip = 1, vip_unlocked_at = datetime('now') WHERE telegram_id = ?");
+/**
+ * VIP is CLOSED. Nobody new can be granted it.
+ *
+ * The three call sites that used to unlock it are still there — referral
+ * milestones reached in the past can still fire — so the block lives here
+ * rather than at each one. A guard at the source cannot be forgotten by a
+ * fourth caller added later, which is exactly how a "removed" feature comes
+ * back.
+ *
+ * Existing holders are untouched: their discount was promised for life.
+ */
+const unlockVIPQuery = {
+  run: (userId) => {
+    try {
+      const logger = require('../utils/logger');
+      logger.info(`[VIP] grant blocked for ${userId} — the VIP system is closed`);
+    } catch (_) { /* logging must never break a purchase */ }
+    return { changes: 0 };
+  },
+};
+
+/** Revoke VIP. Used to undo grants that should never have happened. */
+const revokeVIPQuery = db.prepare(
+  'UPDATE users SET is_vip = 0, vip_unlocked_at = NULL WHERE telegram_id = ?'
+);
+
+/** VIP holders, newest first — so a recent batch can be reviewed and undone. */
+const listVIPsQuery = db.prepare(`
+  SELECT telegram_id, username, first_name, vip_unlocked_at, rank_spend
+  FROM users WHERE is_vip = 1
+  ORDER BY (vip_unlocked_at IS NULL), datetime(vip_unlocked_at) DESC
+`);
 const isVIPQuery = db.prepare('SELECT is_vip FROM users WHERE telegram_id = ?');
 const countVIPsQuery = db.prepare('SELECT COUNT(*) AS count FROM users WHERE is_vip = 1');
 const countReferralsForUser = db.prepare('SELECT COUNT(*) AS count FROM referrals WHERE referrer_id = ?');
@@ -2182,6 +2213,19 @@ module.exports = {
 
   // VIP
   unlockVIP: (userId) => unlockVIPQuery.run(userId),
+  revokeVIP: (userId) => revokeVIPQuery.run(userId).changes,
+  listVIPs:  () => listVIPsQuery.all(),
+  /**
+   * VIPs granted since a date — the ones handed out by mistake while the system
+   * was still open. Rows with no timestamp are old grants and are left alone.
+   */
+  vipsGrantedSince: (isoDate) => db.prepare(`
+    SELECT telegram_id, username, first_name, vip_unlocked_at
+    FROM users
+    WHERE is_vip = 1 AND vip_unlocked_at IS NOT NULL
+      AND datetime(vip_unlocked_at) >= datetime(?)
+    ORDER BY datetime(vip_unlocked_at) DESC
+  `).all(isoDate),
   isVIP: (userId) => {
     const r = isVIPQuery.get(userId);
     return r && r.is_vip === 1;

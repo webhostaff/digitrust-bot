@@ -152,31 +152,9 @@ async function handleStart(bot, msg, args) {
   }
 
   // Show VIP intro only on FIRST start (no orders yet, never seen intro)
-  // VIP is closed to new customers — see the note on menu_ranks in index.js.
-  // The intro is skipped entirely rather than left behind a setting, because a
-  // brand-new user being pitched a status they can no longer earn is worse than
-  // no pitch at all.
-  const vipClosedToNew = db.getSetting('vip_system_enabled', '1') !== '1';
-  const seenVipIntro = vipClosedToNew || db.getSetting(`vip_intro_seen_${userId}`, '0') === '1';
-  if (!seenVipIntro && !db.isVIP(userId)) {
-    db.setSetting(`vip_intro_seen_${userId}`, '1');
-    await bot.sendMessage(chatId,
-      `👑 <b>WELCOME — Become a VIP!</b> 👑\n\n` +
-      `🚨 <b>Limited time:</b> ⏳ VIP closes at <b>1,000 customers</b>\n\n` +
-      `Invite only <b>3 friends</b> and unlock VIP <b>forever</b>!\n\n` +
-      `🎁 <b>VIP Benefits:</b>\n` +
-      `💸 5% discount on every purchase for life\n` +
-      `🤝 Earn rewards from your team's purchases\n` +
-      `🚀 Early access to new and rare products\n` +
-      `⚡️ Priority support and faster replies\n\n` +
-      `🔥 Secure your VIP status today!`,
-      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
-        [{ text: '👑 Become VIP', callback_data: 'vip_intro_become' }],
-        [{ text: '⏭ Skip for now', callback_data: 'vip_intro_skip' }],
-      ] } }
-    );
-    return;
-  }
+  // VIP is gone. Nobody can earn it, so nobody is shown it — pitching a status
+  // that cannot be reached is worse than saying nothing. Ranks replaced it.
+  // (VIP intro removed — the programme is closed.)
 
   await sendMainMenu(bot, chatId, msg.from.first_name || '', userId);
 }

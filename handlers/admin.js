@@ -1737,6 +1737,26 @@ async function handleAdminText(bot, msg) {
     return;
   }
 
+  // ── Revoke one VIP by id ──────────────────────────────────────────
+  if (s === States.ADMIN_VIP_REVOKE) {
+    session.clear(userId);
+    const target = parseInt(String(text || '').replace(/[^0-9]/g, ''), 10);
+    if (!Number.isFinite(target)) {
+      await bot.sendMessage(chatId, '❌ Send a numeric user id.');
+      return;
+    }
+    const wasVip = db.isVIP(target);
+    const n = db.revokeVIP(target);
+    await bot.sendMessage(chatId,
+      wasVip && n
+        ? `✅ VIP removed from <code>${target}</code>.\n\n` +
+          `<i>They keep whatever discount their spend rank earns them.</i>`
+        : `ℹ️ <code>${target}</code> was not a VIP member.`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '👑 VIP members', callback_data: 'admin_vip_review' }]] } });
+    return;
+  }
+
   // ── Spend ranks: edit one field / add a tier ──────────────────────
   if (s === States.ADMIN_RANK_EDIT) {
     const { rankId, field } = sess.data || {};
@@ -2948,8 +2968,17 @@ async function handleAdminCallback(bot, query) {
     const product   = db.getProduct(productId);
     const stockQty  = product?.stock_quantity || 0;
     const statusLine = stockQty === 0 ? '❌ <b>OUT OF STOCK</b>' : '✅ <b>IN STOCK</b>';
-    const bulkInfo  = (product?.bulk_min_qty > 0 && product?.bulk_discount > 0)
-      ? `🎁 <b>Bulk:</b> ${product.bulk_min_qty}+ → ${product.bulk_discount}% off\n`
+    // Both systems, or neither — the screens used to disagree because this one
+    // only knew about the old percentage rule.
+    const tierBits = [1, 2, 3]
+      .map((n) => ({ q: product?.[`bulk_tier${n}_qty`] || 0, p: product?.[`bulk_tier${n}_price`] || 0 }))
+      .filter((t) => t.q > 0 && t.p > 0)
+      .map((t) => `${t.q}+ → $${Number(t.p).toFixed(2)}`);
+    if (product?.bulk_min_qty > 0 && product?.bulk_discount > 0) {
+      tierBits.push(`${product.bulk_min_qty}+ → ${product.bulk_discount}% off`);
+    }
+    const bulkInfo  = tierBits.length
+      ? `🎁 <b>Bulk:</b> ${tierBits.join(' · ')}\n`
       : `🎁 <b>Bulk:</b> Disabled\n`;
     const refundInfo   = Number(product?.refund_enabled) === 1
       ? '🔄 <b>Refunds:</b> ✅ Allowed\n'
@@ -3092,14 +3121,56 @@ async function handleAdminCallback(bot, query) {
       return `  • Tier ${n}: <i>not set</i>`;
     }).join('\n');
 
+    // The older percentage rule lives on the same product and is applied at
+    // checkout too. Showing only the tiers meant this screen and the product
+    // screen disagreed about the product's own pricing, with no way to tell
+    // which one the customer actually pays.
+    const legacyMin = Number(product.bulk_min_qty) || 0;
+    const legacyPct = Number(product.bulk_discount) || 0;
+    let legacyBlock = '';
+    if (legacyMin > 0 && legacyPct > 0) {
+      const legacyUnit = Number(product.price) * (1 - legacyPct / 100);
+      legacyBlock =
+        `\n⚠️ <b>Old percentage rule is also active</b>\n` +
+        `${legacyMin}+ pcs → ${legacyPct}% off = <b>$${legacyUnit.toFixed(4)}</b> each\n` +
+        `<i>Customers get whichever rule is cheapest for them.</i>\n`;
+    }
+
+    // A worked example beats a description: the ladder is what the admin is
+    // actually trying to see, and it is computed by the same code checkout uses.
+    const sample = [1, 5, 10, 25, 50, 100]
+      .map((q) => {
+        const r = calcOrderPrice(product, q);
+        return `${String(q).padStart(3)} pcs → $${r.unitPrice.toFixed(4)} each`;
+      }).join('\n');
+
     await bot.editMessageText(
       `📊 <b>Bulk Pricing — ${escapeHtml(product.title || '')}</b>\n\n` +
       `Base price (1 pc): <b>${formatPrice(product.price)}</b>\n\n` +
-      `${tierLines}\n\n` +
+      `${tierLines}\n` +
+      legacyBlock +
+      `\n💵 <b>What customers actually pay</b>\n<code>${sample}</code>\n\n` +
       `Tap a tier below to set or change it. Each tier needs a <b>minimum quantity</b> and a <b>price per piece</b> — once the customer reaches that quantity, every piece in the order is charged at that tier's price.`,
-      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminBulkPriceKb(product) }
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: (() => {
+          const kb = adminBulkPriceKb(product);
+          if (legacyMin > 0 && legacyPct > 0) {
+            kb.inline_keyboard.splice(kb.inline_keyboard.length - 1, 0,
+              [{ text: `🗑 Remove old rule (${legacyMin}+ → ${legacyPct}%)`, callback_data: `admin_bulklegacy_clear_${product.id}` }]);
+          }
+          return kb;
+        })() }
     );
     return;
+  }
+
+  // ── Remove the old percentage rule ────────────────────────────────
+  if (/^admin_bulklegacy_clear_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    db.updateProductField(productId, 'bulk_min_qty', 0);
+    db.updateProductField(productId, 'bulk_discount', 0);
+    logger.info(`[BULK] legacy percentage rule cleared on product ${productId} by ${userId}`);
+    return handleAdminCallback(bot, { ...query, data: `admin_bulkprice_${productId}` });
   }
 
   // ── Bulk Pricing — edit one tier (combined qty + price prompt) ─────
@@ -7310,8 +7381,7 @@ async function handleAdminCallback(bot, query) {
     rows.push([{ text: '➕ Add tier', callback_data: 'admin_rank_add' }]);
     rows.push([{ text: on ? '🔴 Turn OFF ranks' : '🟢 Turn ON ranks', callback_data: 'admin_rank_toggle' }]);
     rows.push([{ text: `👑 Legacy VIP discount: ${vipPct}%`, callback_data: 'admin_rank_vippct' }]);
-    rows.push([{ text: vipOpen ? '🔒 Close VIP to new customers' : '🔓 Reopen VIP to new customers',
-                 callback_data: 'admin_rank_vipclose' }]);
+    rows.push([{ text: `👑 VIP members (${vipCount}) — review & revoke`, callback_data: 'admin_vip_review' }]);
     rows.push([{ text: '🔙 Back', callback_data: 'admin_panel' }]);
 
     await bot.editMessageText(
@@ -7322,8 +7392,8 @@ async function handleAdminCallback(bot, query) {
       tiers.map((t) => `${t.emoji || '🏅'} <b>${escapeHtml(t.name)}</b> — spend $${Number(t.min_spend).toFixed(0)}+ → <b>${Number(t.discount_pct)}%</b> off`).join('\n') +
       `\n\n👑 <b>${vipCount}</b> old VIP member${vipCount === 1 ? '' : 's'} keep <b>${escapeHtml(String(vipPct))}%</b> for life — ` +
       `they only ever move up, never down.\n` +
-      `${vipOpen ? '⚠️ VIP is still <b>OPEN</b> — new customers can unlock it by inviting 3 friends.'
-                 : '🔒 VIP is <b>CLOSED</b> to new customers. Existing members keep theirs.'}\n\n` +
+      `🔒 VIP is <b>permanently closed</b> — no new member can be granted it. ` +
+      `Existing holders keep their discount.\n\n` +
       `<i>Spending is counted from zero starting the day ranks were switched on. ` +
       `Purchases made before that do not count.</i>`,
       { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }
@@ -7335,6 +7405,70 @@ async function handleAdminCallback(bot, query) {
     const on = db.getSetting('rank_system_enabled', '1') === '1';
     db.setSetting('rank_system_enabled', on ? '0' : '1');
     return handleAdminCallback(bot, { ...query, data: 'admin_ranks' });
+  }
+
+  // ── Review and revoke VIP grants ──────────────────────────────────
+  if (data === 'admin_vip_review' || /^admin_vip_review_\d+$/.test(data)) {
+    const days = /^admin_vip_review_\d+$/.test(data) ? parseInt(data.split('_').pop(), 10) : 30;
+    const since = new Date(Date.now() - days * 86400000).toISOString().slice(0, 19).replace('T', ' ');
+    const recent = db.vipsGrantedSince(since);
+    const total  = db.countVIPs();
+
+    const who = (u) => u.username ? `@${escapeHtml(u.username)}` : escapeHtml(u.first_name || String(u.telegram_id));
+
+    let txt =
+      `👑 <b>VIP members</b>\n\n` +
+      `Total: <b>${total}</b>\n` +
+      `Granted in the last ${days} days: <b>${recent.length}</b>\n\n`;
+
+    if (recent.length) {
+      txt += recent.slice(0, 20).map((u) =>
+        `• ${who(u)} · <code>${u.telegram_id}</code>\n  ${escapeHtml(String(u.vip_unlocked_at || '').slice(0, 16))}`
+      ).join('\n');
+      if (recent.length > 20) txt += `\n<i>…and ${recent.length - 20} more</i>`;
+      txt += `\n\n⚠️ <i>Revoking removes their 5% discount. Members granted before ` +
+             `this window are not touched — their discount was promised for life.</i>`;
+    } else {
+      txt += `<i>Nobody was granted VIP in this window.</i>`;
+    }
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: `${days === 7 ? '✅ ' : ''}7d`,  callback_data: 'admin_vip_review_7' },
+         { text: `${days === 30 ? '✅ ' : ''}30d`, callback_data: 'admin_vip_review_30' },
+         { text: `${days === 90 ? '✅ ' : ''}90d`, callback_data: 'admin_vip_review_90' }],
+        ...(recent.length ? [[{ text: `🗑 Revoke all ${recent.length} from this window`, callback_data: `admin_vip_revoke_${days}` }]] : []),
+        [{ text: '✏️ Revoke one by user id', callback_data: 'admin_vip_revoke_one' }],
+        [{ text: '🔙 Back', callback_data: 'admin_ranks' }],
+      ] }
+    }).catch(() => {});
+    return;
+  }
+
+  if (/^admin_vip_revoke_\d+$/.test(data)) {
+    const days = parseInt(data.split('_').pop(), 10);
+    const since = new Date(Date.now() - days * 86400000).toISOString().slice(0, 19).replace('T', ' ');
+    const list = db.vipsGrantedSince(since);
+
+    let n = 0;
+    for (const u of list) { if (db.revokeVIP(u.telegram_id)) n++; }
+    logger.info(`[VIP] ${n} grant(s) from the last ${days} days revoked by ${userId}`);
+
+    await bot.editMessageText(
+      `✅ <b>${n} VIP grant(s) revoked</b>\n\n` +
+      `They now pay the normal price, or whatever their spend rank earns them.\n` +
+      `👑 Remaining VIP members: <b>${db.countVIPs()}</b>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '👑 VIP members', callback_data: 'admin_vip_review' }]] } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (data === 'admin_vip_revoke_one') {
+    session.set(userId, States.ADMIN_VIP_REVOKE, {});
+    await bot.sendMessage(chatId, '🗑 Send the user id whose VIP should be removed.');
+    return;
   }
 
   if (data === 'admin_rank_vipclose') {

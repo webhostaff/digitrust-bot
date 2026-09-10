@@ -1460,193 +1460,14 @@ async function handleCallbackQuery(query) {
   }
 
   // ── VIP Status / Invite ──────────────────────────────────────────
-  if (data === 'menu_vip' || data === 'vip_show') {
-    await answer();
-    const isVip = db.isVIP(userId);
-    const referrals = db.countReferrals(userId);
-    const REQUIRED = 3;
-    const totalVips = db.countVIPs();
-    const VIP_LIMIT = parseInt(db.getSetting('vip_limit', '1000'), 10);
-    const slotsLeft = Math.max(0, VIP_LIMIT - totalVips);
-
-    // Check if VIP system is OPEN
-    const vipSystemOpen = db.getSetting('vip_system_enabled', '1') === '1';
-    const hasInviteePurchased = db.hasAnyInviteePurchased(userId);
-
-    // Auto-unlock requires: 3 referrals + at least ONE invitee has purchased
-    if (!isVip && referrals >= REQUIRED && slotsLeft > 0 && vipSystemOpen && hasInviteePurchased) {
-      db.unlockVIP(userId);
-      try {
-        await bot.sendMessage(chatId,
-          `👑 <b>VIP UNLOCKED!</b>\n\n` +
-          `🎉 Congratulations! You invited ${referrals} friends and unlocked VIP for LIFE!\n\n` +
-          `🎁 <b>Your benefits:</b>\n` +
-          `💸 5% discount on every purchase forever\n` +
-          `🤝 Earn rewards from your team's purchases\n` +
-          `🚀 Early access to new products\n` +
-          `⚡️ Priority support`,
-          { parse_mode: 'HTML' });
-      } catch (e) {}
-    }
-
-    const me = db.getUser(userId);
-    const botUser = await bot.getMe().catch(() => ({ username: 'YourBot' }));
-    const inviteLink = `https://t.me/${botUser.username}?start=ref_${userId}`;
-
-    let text;
-    if (db.isVIP(userId)) {
-      text =
-        `👑 <b>VIP FOR LIFE</b> 👑\n\n` +
-        `🎉 You are a VIP member!\n\n` +
-        `🎁 <b>Your active benefits:</b>\n` +
-        `💸 5% discount on every purchase\n` +
-        `🤝 Earn rewards from your team's purchases\n` +
-        `🚀 Early access to new products\n` +
-        `⚡️ Priority support\n\n` +
-        `🔗 Share & earn from friends' purchases:\n` +
-        `<code>${inviteLink}</code>\n\n` +
-        `👥 Your team: <b>${referrals}</b> members`;
-    } else {
-      const remaining = Math.max(0, REQUIRED - referrals);
-      const purchaseStatus = hasInviteePurchased
-        ? '✅ At least one friend has purchased'
-        : '⏳ No friend has purchased yet';
-      text =
-        `👑 <b>VIP FOR LIFE</b> 👑\n\n` +
-        `🚨 <b>Important:</b> ⏳ VIP closes at <b>${VIP_LIMIT.toLocaleString()} customers</b>\n` +
-        `📊 <b>${slotsLeft} slots remaining</b>\n\n` +
-        `<b>How to unlock VIP:</b>\n` +
-        `1️⃣ Invite ${REQUIRED} friends\n` +
-        `2️⃣ At least <b>one</b> of them must buy a product\n\n` +
-        `📈 <b>Your progress:</b>\n` +
-        `👥 Friends invited: <b>${referrals}/${REQUIRED}</b>\n` +
-        `🛒 Purchase status: ${purchaseStatus}\n` +
-        (remaining > 0
-          ? `🎯 <b>Need ${remaining} more friend(s)</b>\n\n`
-          : !hasInviteePurchased
-            ? `🎯 <b>Waiting for a friend to make a purchase!</b>\n\n`
-            : `🎉 <b>You qualify! Refresh to unlock.</b>\n\n`) +
-        `🎁 <b>VIP Benefits:</b>\n` +
-        `💸 5% discount on every purchase for life\n` +
-        `🤝 Earn rewards from your team's purchases\n` +
-        `🚀 Early access to new and rare products\n` +
-        `⚡️ Priority support and faster replies\n\n` +
-        `🔗 <b>Your invite link:</b>\n` +
-        `<code>${inviteLink}</code>\n\n` +
-        `🔥 Invite ${REQUIRED} friends today and secure your VIP status forever.`;
-    }
-
-    // Rank summary sits above the VIP text: it is the live discount the
-    // customer actually gets, whereas VIP is now a legacy perk most people
-    // cannot earn any more.
-    if (db.getSetting('rank_system_enabled', '1') === '1') {
-      const r = db.getUserRank(userId);
-      const tierLine = r.tier
-        ? `${r.tier.emoji || '🏅'} <b>${r.tier.name}</b> — <b>${r.discountPct}%</b> off every order`
-        : `<b>${r.discountPct}%</b> off every order`;
-      const nextLine = r.next
-        ? `\n📈 Spend <b>${formatPrice(r.remaining)}</b> more to reach ${r.next.emoji || '🏅'} <b>${r.next.name}</b> (${r.next.discount_pct}%)`
-        : `\n🏆 You are at the highest rank.`;
-      text =
-        `🏆 <b>Your rank</b>\n${tierLine}\n` +
-        `🛒 Spent so far: <b>${formatPrice(r.spend)}</b>${nextLine}\n` +
-        (r.isLegacyVip && r.legacyPct >= r.tierPct
-          ? `👑 <i>Your lifetime VIP discount of ${r.legacyPct}% is protected.</i>\n` : '') +
-        `\n➖➖➖➖➖\n\n` + text;
-    }
-
-    const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(inviteLink)}&text=${encodeURIComponent('Join this awesome store and unlock VIP for life!')}`;
-    const kb = { inline_keyboard: [
-      [{ text: '🏆 All ranks', callback_data: 'menu_ranks' }],
-      [{ text: '👉 Share with friends & become VIP', url: shareUrl }],
-      [{ text: '🔙 Back', callback_data: 'back_main' }],
-    ] };
-
-    try {
-      await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: kb, disable_web_page_preview: true });
-    } catch (e) {
-      try { await bot.deleteMessage(chatId, msgId); } catch (e2) {}
-      await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: kb, disable_web_page_preview: true });
-    }
-    return;
-  }
-
-  // ── Rank ladder — the customer-facing loyalty screen ──────────────
-  // This replaced "VIP FOR LIFE" in the main menu. VIP is no longer something a
-  // new customer can earn, so advertising it would be selling a closed door;
-  // existing holders keep their percentage and are told so here.
-  if (data === 'menu_ranks') {
-    await answer();
-    const r = db.getUserRank(userId);
-
-    const ladder = r.tiers.map((t) => {
-      const reached = r.spend + 1e-9 >= Number(t.min_spend);
-      const here    = r.tier && r.tier.id === t.id;
-      const mark    = here ? '👉' : (reached ? '✅' : '🔒');
-      const name    = here ? `<b>${escapeHtml(t.name)}</b>` : escapeHtml(t.name);
-      return `${mark} ${t.emoji || '🏅'} ${name} — ${formatPrice(t.min_spend)}+ → <b>${Number(t.discount_pct)}%</b>`;
-    }).join('\n');
-
-    const text =
-      `🏆 <b>Your Rank</b>\n\n` +
-      `${r.tier ? `${r.tier.emoji || '🏅'} <b>${escapeHtml(r.tier.name)}</b>` : '🏅'} — ` +
-      `you get <b>${r.discountPct}%</b> off every order\n` +
-      `🛒 Total spent: <b>${formatPrice(r.spend)}</b>\n` +
-      (r.next
-        ? `📈 Spend <b>${formatPrice(r.remaining)}</b> more to unlock ` +
-          `${r.next.emoji || '🏅'} <b>${escapeHtml(r.next.name)}</b> (${Number(r.next.discount_pct)}%)\n`
-        : `🏆 You have reached the highest rank.\n`) +
-      (r.isLegacyVip
-        ? `👑 <i>Founding VIP member — your ${r.legacyPct}% is protected for life.</i>\n`
-        : '') +
-      `\n➖➖➖➖➖\n\n` +
-      `<b>All ranks</b>\n${ladder}\n\n` +
-      `<i>The discount applies automatically at checkout. Nothing to claim.</i>`;
-
-    const kb = { inline_keyboard: [
-      [{ text: '🛍 Start shopping', callback_data: 'menu_products' }],
-      [{ text: '🔙 Back', callback_data: 'back_main' }],
-    ] };
-    try {
-      await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: kb });
-    } catch (e) {
-      await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: kb });
-    }
-    return;
+  // VIP has been retired. Anything still pointing at it — an old message, a
+  // saved keyboard — lands on Ranks, which is the live loyalty system.
+  if (data === 'menu_vip' || data === 'vip_show' ||
+      data === 'vip_intro_become' || data === 'vip_intro_skip') {
+    return handleCallbackQuery({ ...query, data: 'menu_ranks' });
   }
 
   // First-time VIP intro (after /start for new users)
-  if (data === 'vip_intro_become') {
-    await answer();
-    // Redirect to VIP screen
-    const query2 = { ...query, data: 'menu_vip' };
-    // Re-trigger by sending a new message
-    try { await bot.deleteMessage(chatId, msgId); } catch (e) {}
-    // Send VIP info as fresh message
-    const isVip = db.isVIP(userId);
-    const referrals = db.countReferrals(userId);
-    const botUser = await bot.getMe().catch(() => ({ username: 'YourBot' }));
-    const inviteLink = `https://t.me/${botUser.username}?start=ref_${userId}`;
-    const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(inviteLink)}&text=${encodeURIComponent('Join this awesome store and unlock VIP for life!')}`;
-    await bot.sendMessage(chatId,
-      `👑 <b>VIP FOR LIFE</b> 👑\n\n` +
-      `Invite <b>3 friends</b> and unlock VIP forever!\n\n` +
-      `🔗 Your link:\n<code>${inviteLink}</code>`,
-      { parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: [
-          [{ text: '👉 Share with friends', url: shareUrl }],
-          [{ text: '🔙 Main Menu', callback_data: 'back_main' }],
-        ] }, disable_web_page_preview: true });
-    return;
-  }
-
-  if (data === 'vip_intro_skip') {
-    await answer();
-    try { await bot.deleteMessage(chatId, msgId); } catch (e) {}
-    await sendMainMenu(bot, chatId, query.from.first_name || '', userId);
-    return;
-  }
-
   if (data === 'menu_support') { await answer(); await supportHandler.showSupport(bot, chatId, msgId); return; }
   if (data === 'support_send') { await answer(); await supportHandler.startSupportMessage(bot, chatId, userId, msgId); return; }
 
@@ -1838,9 +1659,14 @@ function scheduleVipBroadcast() {
   }, ms);
   logger.info(`VIP broadcast scheduled in ${minutes} minute(s)`);
 }
-scheduleVipBroadcast();
-// Expose globally so admin handler can reschedule
-global._scheduleVipBroadcast = scheduleVipBroadcast;
+// NOT started. The VIP programme is closed, so advertising "invite 3 friends
+// and unlock VIP forever" to the channel every half hour would be promising
+// something nobody can receive — the fastest way to lose the trust the channel
+// exists to build. The function is kept so the code reads honestly rather than
+// leaving a dangling reference in the admin handler.
+global._scheduleVipBroadcast = () => {
+  logger.info('[VIP] broadcast not scheduled — the VIP programme is closed');
+};
 
 // ── Stale Product Reminders (checked every 6 hours; settings control on/off + threshold) ──
 const { checkAndSendStaleProductReminders } = require('./services/notifications');
