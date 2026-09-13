@@ -197,10 +197,28 @@ function iconBtn(label, data, opts = {}) {
 const LEADING_EMOJI = /^(?:\p{Regional_Indicator}\p{Regional_Indicator}|\p{Extended_Pictographic})(?:[\u{1F3FB}-\u{1F3FF}]|\u{FE0F}|\u{20E3}|\u{200D}(?:\p{Regional_Indicator}\p{Regional_Indicator}|\p{Extended_Pictographic}))*\s*/u;
 
 const productsKb = (products, page = 0) => {
-  const totalPages = Math.max(1, Math.ceil(products.length / PRODUCTS_PER_PAGE));
+  // In-stock products come first, ALWAYS — before paging, so they fill page 1
+  // rather than merely floating to the top of whichever page they landed on.
+  //
+  // Sold-out items still appear: a customer who wants one can subscribe to the
+  // back-in-stock alert, and hiding them would lose those signals. But they must
+  // not stand between a customer and something they can buy today — the list in
+  // the screenshot opened with two red rows before the first buyable product.
+  //
+  // Within each group the admin's own order is preserved untouched, so arranging
+  // products by hand still decides everything except "can this be bought now".
+  const inStockQty = (p) =>
+    (typeof p.stock_quantity === 'number') ? p.stock_quantity : (p.stock_count || 0);
+
+  const ordered = products
+    .map((p, i) => ({ p, i, avail: inStockQty(p) > 0 ? 0 : 1 }))
+    .sort((a, b) => (a.avail - b.avail) || (a.i - b.i))
+    .map((x) => x.p);
+
+  const totalPages = Math.max(1, Math.ceil(ordered.length / PRODUCTS_PER_PAGE));
   const currentPage = Math.max(0, Math.min(page, totalPages - 1));
   const start = currentPage * PRODUCTS_PER_PAGE;
-  const slice = products.slice(start, start + PRODUCTS_PER_PAGE);
+  const slice = ordered.slice(start, start + PRODUCTS_PER_PAGE);
   const fancy = iconsEnabled();
 
   const rows = slice.map((p) => {
@@ -328,6 +346,7 @@ const adminMainKb = () => mk([
   [btn('🛡️ Deposit Cutoff',  'admin_cutoff')],
   [btn('👑 VIP Broadcast',    'admin_vip_toggle'), btn('🏆 Ranks', 'admin_ranks')],
   [btn('🔎 Trace TxID', 'admin_txid_search'), btn('🏷 Suppliers', 'admin_suppliers')],
+  [btn('📢 Announcements', 'admin_notices')],
   [btn('🕵️ Audit Wallet Bugs', 'admin_audit_wallets')],
   [btn('🚨 Audit OOS Exploit',  'admin_audit_oos')],
   [btn('🗂 Categories',         'admin_categories')],

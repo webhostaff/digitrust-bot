@@ -344,7 +344,17 @@ if (!existingProductCols.includes('last_stale_reminder_at')) db.exec('ALTER TABL
 const existingOrderCols = db.prepare('PRAGMA table_info(orders)').all().map((c) => c.name);
 if (!existingOrderCols.includes('payment_proof')) db.exec('ALTER TABLE orders ADD COLUMN payment_proof TEXT DEFAULT NULL');
 
-// V66: Clean existing product titles (remove leading whitespace + zero-width chars)
+// V66: Clean leading whitespace and zero-width characters from product titles.
+//
+// This runs on EVERY boot, and it used to strip `[emoji:ID]` markers as well —
+// which is where every premium product icon went on every deploy. The markers
+// ARE the icons: remove them and the product is left with a plain emoji, so the
+// shop owner re-entered them by hand after each update, only to lose them again
+// on the next restart. Category icons survived because they are stored in their
+// own column, which this never touched.
+//
+// Whitespace cleaning is still worth doing; the marker strip is not, and is
+// removed. Nothing else in the codebase rewrites a product title on startup.
 try {
   const products = db.prepare('SELECT id, title FROM products').all();
   const updateStmt = db.prepare('UPDATE products SET title = ? WHERE id = ?');
@@ -353,16 +363,15 @@ try {
     if (!p.title) continue;
     const original = p.title;
     const cleaned_title = String(original)
-      .replace(/\[emoji:\d+\]/g, '')
       .replace(/^[\s\u00A0\u200B\u200C\u200D\u2060\uFEFF]+/, '')
-      .replace(/\s+/g, ' ')
+      .replace(/[ \t]{2,}/g, ' ')
       .trim();
     if (cleaned_title !== original) {
       updateStmt.run(cleaned_title, p.id);
       cleaned++;
     }
   }
-  if (cleaned > 0) console.log(`[MIGRATION] Cleaned ${cleaned} product title(s)`);
+  if (cleaned > 0) console.log(`[MIGRATION] Cleaned whitespace in ${cleaned} product title(s)`);
 } catch (e) {
   console.error('[MIGRATION] Title cleanup error:', e.message);
 }

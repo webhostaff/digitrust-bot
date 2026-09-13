@@ -24,6 +24,8 @@ const escapeHtml = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').rep
 // ── Initiate buy ──────────────────────────────────────────────────────────────
 
 async function initiateBuy(bot, chatId, userId, productId, callbackQueryId) {
+  // Customer's language, so the whole purchase flow speaks it.
+  const lang = db.getUserLanguage ? db.getUserLanguage(userId) : 'en';
   let product = db.getProduct(productId);
   // A negotiated price for this customer replaces the public one, so the
   // quoted price and the charged price can never diverge.
@@ -43,8 +45,8 @@ async function initiateBuy(bot, chatId, userId, productId, callbackQueryId) {
         parse_mode: 'HTML',
         reply_markup: {
           inline_keyboard: [
-            [{ text: '🔔 Notify me when back in stock', callback_data: `notify_back_${productId}` }],
-            [{ text: '🔙 Back to Products', callback_data: 'menu_products' }],
+            [{ text: t(lang, 'buy_notify_restock'), callback_data: `notify_back_${productId}` }],
+            [{ text: t(lang, 'buy_back_products'), callback_data: 'menu_products' }],
           ],
         },
       }
@@ -80,6 +82,8 @@ async function initiateBuy(bot, chatId, userId, productId, callbackQueryId) {
 async function handleQuantity(bot, msg) {
   const userId = msg.from.id;
   const chatId = msg.chat.id;
+  // Customer's language, so the whole purchase flow speaks it.
+  const lang = db.getUserLanguage ? db.getUserLanguage(userId) : 'en';
   const sess   = session.get(userId);
 
   // Re-check live stock before proceeding
@@ -89,13 +93,13 @@ async function handleQuantity(bot, msg) {
   const qty      = parseInt(raw, 10);
 
   if (isNaN(qty) || qty < 1) {
-    await bot.sendMessage(chatId, '❌ Enter a valid number (minimum 1).');
+    await bot.sendMessage(chatId, t(lang, 'buy_qty_invalid'));
     return;
   }
 
 
   if (qty > stockQty) {
-    await bot.sendMessage(chatId, `❌ Only <b>${stockQty}</b> available.`, { parse_mode: 'HTML' });
+    await bot.sendMessage(chatId, t(lang, 'buy_qty_max', { qty: stockQty }), { parse_mode: 'HTML' });
     return;
   }
 
@@ -124,7 +128,7 @@ async function handleQuantity(bot, msg) {
 
   if (sess.data.requiresEmail) {
     session.set(userId, States.BUY_EMAIL, session.get(userId).data);
-    await bot.sendMessage(chatId, '📧 <b>Enter your email address:</b>', {
+    await bot.sendMessage(chatId, t(lang, 'buy_enter_email'), {
       parse_mode: 'HTML', reply_markup: cancelKb('back_main'),
     });
   } else {
@@ -137,10 +141,12 @@ async function handleQuantity(bot, msg) {
 async function handleEmail(bot, msg) {
   const userId = msg.from.id;
   const chatId = msg.chat.id;
+  // Customer's language, so the whole purchase flow speaks it.
+  const lang = db.getUserLanguage ? db.getUserLanguage(userId) : 'en';
   const email  = (msg.text || '').trim();
 
   if (!email.includes('@') || !email.includes('.')) {
-    await bot.sendMessage(chatId, '❌ Invalid email. Example: <code>user@gmail.com</code>', { parse_mode: 'HTML' });
+    await bot.sendMessage(chatId, t(lang, 'buy_email_invalid'), { parse_mode: 'HTML' });
     return;
   }
   session.update(userId, { email });
@@ -209,11 +215,13 @@ async function createAndShowSummary(bot, chatId, userId, email) {
 // ── Confirm order ─────────────────────────────────────────────────────────────
 
 async function confirmOrder(bot, chatId, userId, messageId) {
+  // Customer's language, so the whole purchase flow speaks it.
+  const lang = db.getUserLanguage ? db.getUserLanguage(userId) : 'en';
   const sess = session.get(userId);
   if (!sess || !sess.data || !sess.data.productId) {
-    await bot.editMessageText('❌ Session expired. Please start again.', {
+    await bot.editMessageText(t(lang, 'buy_session_expired'), {
       chat_id: chatId, message_id: messageId,
-      reply_markup: { inline_keyboard: [[{ text: '🛍 Browse Products', callback_data: 'menu_products' }]] },
+      reply_markup: { inline_keyboard: [[{ text: t(lang, 'buy_browse_products'), callback_data: 'menu_products' }]] },
     });
     return;
   }
@@ -226,9 +234,9 @@ async function confirmOrder(bot, chatId, userId, messageId) {
 
   // Stock check (live) before creating order
   if (!product || (product.stock_quantity || 0) < data.quantity) {
-    await bot.editMessageText('❌ Stock changed. Please start again.',
+    await bot.editMessageText(t(lang, 'buy_stock_changed'),
       { chat_id: chatId, message_id: messageId, parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: [[{ text: '🛍 Browse Products', callback_data: 'menu_products' }]] } });
+        reply_markup: { inline_keyboard: [[{ text: t(lang, 'buy_browse_products'), callback_data: 'menu_products' }]] } });
     session.clear(userId);
     return;
   }
@@ -265,7 +273,7 @@ async function confirmOrder(bot, chatId, userId, messageId) {
     await bot.editMessageText(
       '⏳ <b>This order session has expired.</b>\n\nPlease start again from the product page.',
       { chat_id: chatId, message_id: messageId, parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: [[{ text: '🛍 Browse Products', callback_data: 'menu_products' }]] } }
+        reply_markup: { inline_keyboard: [[{ text: t(lang, 'buy_browse_products'), callback_data: 'menu_products' }]] } }
     ).catch(() => {});
     return;
   }
@@ -295,12 +303,14 @@ async function confirmOrder(bot, chatId, userId, messageId) {
 }
 
 async function cancelOrder(bot, chatId, orderId, userId, messageId) {
+  // Customer's language, so the whole purchase flow speaks it.
+  const lang = db.getUserLanguage ? db.getUserLanguage(userId) : 'en';
   // orderId may be 0 if user cancels before confirming (no DB order was created)
   if (orderId && orderId > 0) {
     db.updateOrderStatus(orderId, 'cancelled');
   }
   session.clear(userId);
-  await bot.editMessageText('❌ <b>Order cancelled.</b>', {
+  await bot.editMessageText(t(lang, 'buy_order_cancelled'), {
     chat_id: chatId, message_id: messageId,
     parse_mode: 'HTML', reply_markup: backKb('back_main'),
   });
@@ -312,9 +322,11 @@ async function cancelOrder(bot, chatId, orderId, userId, messageId) {
 const PROCESSING_ORDERS = new Set();
 
 async function payWithWallet(bot, chatId, userId, orderId, messageId) {
+  // Customer's language, so the whole purchase flow speaks it.
+  const lang = db.getUserLanguage ? db.getUserLanguage(userId) : 'en';
   // ATOMIC LOCK: prevent double-click race condition
   if (PROCESSING_ORDERS.has(orderId)) {
-    await bot.answerCallbackQuery && bot.answerCallbackQuery(messageId, { text: '⏳ Processing... please wait', show_alert: false }).catch(() => {});
+    await bot.answerCallbackQuery && bot.answerCallbackQuery(messageId, { text: t(lang, 'buy_processing'), show_alert: false }).catch(() => {});
     return;
   }
   PROCESSING_ORDERS.add(orderId);
@@ -324,7 +336,7 @@ async function payWithWallet(bot, chatId, userId, orderId, messageId) {
     const user  = db.getUser(userId);
 
     if (!order || order.status !== 'pending') {
-      await bot.editMessageText('❌ Order not found or already processed.', { chat_id: chatId, message_id: messageId }).catch(() => {});
+      await bot.editMessageText(t(lang, 'buy_order_not_found'), { chat_id: chatId, message_id: messageId }).catch(() => {});
       return;
     }
 
@@ -345,7 +357,7 @@ async function payWithWallet(bot, chatId, userId, orderId, messageId) {
     );
 
     if (manualResult.result === 'already_processed') {
-      await bot.editMessageText('❌ This order has already been processed.',
+      await bot.editMessageText(t(lang, 'buy_already_processed'),
         { chat_id: chatId, message_id: messageId }).catch(() => {});
       return;
     }
@@ -392,7 +404,7 @@ async function payWithWallet(bot, chatId, userId, orderId, messageId) {
   );
 
   if (walletResult && walletResult.result === 'already_processed') {
-    await bot.editMessageText('❌ This order has already been processed.', { chat_id: chatId, message_id: messageId }).catch(() => {});
+    await bot.editMessageText(t(lang, 'buy_already_processed'), { chat_id: chatId, message_id: messageId }).catch(() => {});
     return;
   }
   if (walletResult && walletResult.result === 'insufficient_balance') {
@@ -413,7 +425,7 @@ async function payWithWallet(bot, chatId, userId, orderId, messageId) {
     await bot.editMessageText(
       t(userLang, 'pay_out_of_stock'),
       { chat_id: chatId, message_id: messageId, parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: [[{ text: '🛍 Browse Products', callback_data: 'menu_products' }]] } }
+        reply_markup: { inline_keyboard: [[{ text: t(lang, 'buy_browse_products'), callback_data: 'menu_products' }]] } }
     ).catch(() => {});
     return;
   }
@@ -490,7 +502,7 @@ async function payWithWallet(bot, chatId, userId, orderId, messageId) {
 ` +
                 `Check back later or choose another product.`,
                 { parse_mode: 'HTML',
-                  reply_markup: { inline_keyboard: [[{ text: '🛍 Browse Products', callback_data: 'menu_products' }]] } }
+                  reply_markup: { inline_keyboard: [[{ text: t(lang, 'buy_browse_products'), callback_data: 'menu_products' }]] } }
               );
             } catch (e) { logger.warn(`Could not notify user ${stuck.user_id} of cancellation`); }
           }
@@ -505,7 +517,7 @@ async function payWithWallet(bot, chatId, userId, orderId, messageId) {
   }
   } catch (e) {
     logger.error(`payWithWallet error: ${e.message}`);
-    try { await bot.sendMessage(chatId, '❌ Payment processing error. Please try again.'); } catch (e2) {}
+    try { await bot.sendMessage(chatId, t(lang, 'buy_payment_error')); } catch (e2) {}
   } finally {
     PROCESSING_ORDERS.delete(orderId);
   }
@@ -514,9 +526,11 @@ async function payWithWallet(bot, chatId, userId, orderId, messageId) {
 // ── Pay with Binance Pay (Order ID) ──────────────────────────────────────────
 
 async function startBinancePayForOrder(bot, chatId, userId, orderId, messageId) {
+  // Customer's language, so the whole purchase flow speaks it.
+  const lang = db.getUserLanguage ? db.getUserLanguage(userId) : 'en';
   const order = db.getOrder(orderId);
   if (!order || order.user_id !== userId || order.status !== 'pending') {
-    await bot.editMessageText('❌ Order not found or already processed.', {
+    await bot.editMessageText(t(lang, 'buy_order_not_found'), {
       chat_id: chatId, message_id: messageId, parse_mode: 'HTML',
     });
     return;
@@ -529,7 +543,7 @@ async function startBinancePayForOrder(bot, chatId, userId, orderId, messageId) 
     await bot.editMessageText(
       `❌ <b>Out of Stock</b>\n\nThis product is no longer available.\n<i>No payment was taken.</i>`,
       { chat_id: chatId, message_id: messageId, parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: [[{ text: '🛍 Browse Products', callback_data: 'menu_products' }]] } }
+        reply_markup: { inline_keyboard: [[{ text: t(lang, 'buy_browse_products'), callback_data: 'menu_products' }]] } }
     ).catch(() => {});
     return;
   }
@@ -561,16 +575,18 @@ async function startBinancePayForOrder(bot, chatId, userId, orderId, messageId) 
 async function handleBinanceOrderId(bot, msg) {
   const userId  = msg.from.id;
   const chatId  = msg.chat.id;
+  // Customer's language, so the whole purchase flow speaks it.
+  const lang = db.getUserLanguage ? db.getUserLanguage(userId) : 'en';
   const orderId = (msg.text || '').trim();
   const sess    = session.get(userId);
   const internalOrderId = sess.data && sess.data.orderId;
 
   if (!internalOrderId) {
-    await bot.sendMessage(chatId, '❌ Session expired. Please start the order again.');
+    await bot.sendMessage(chatId, t(lang, 'buy_session_expired_order'));
     return;
   }
   if (db.isTxidUsed(orderId)) {
-    await bot.sendMessage(chatId, '❌ This Order ID has already been used.', { parse_mode: 'HTML' });
+    await bot.sendMessage(chatId, t(lang, 'buy_orderid_used'), { parse_mode: 'HTML' });
     return;
   }
 
@@ -585,7 +601,7 @@ async function handleBinanceOrderId(bot, msg) {
       await bot.sendMessage(chatId,
         `⏰ <b>Order Expired</b>\n\nThis order is older than ${PAYMENT_CONFIRM_VALIDITY_MIN} minutes and is no longer valid.\nPlease create a new order.`,
         { parse_mode: 'HTML',
-          reply_markup: { inline_keyboard: [[{ text: '🛍 Browse Products', callback_data: 'menu_products' }]] } });
+          reply_markup: { inline_keyboard: [[{ text: t(lang, 'buy_browse_products'), callback_data: 'menu_products' }]] } });
       return;
     }
   }
@@ -604,7 +620,7 @@ async function handleBinanceOrderId(bot, msg) {
     return;
   }
   if (String(result.currency).toUpperCase() !== 'USDT') {
-    await bot.sendMessage(chatId, `❌ Only USDT is accepted. Got ${result.currency}.`, { parse_mode: 'HTML' });
+    await bot.sendMessage(chatId, t(lang, 'buy_usdt_only', { currency: result.currency }), { parse_mode: 'HTML' });
     return;
   }
 
@@ -620,9 +636,11 @@ async function handleBinanceOrderId(bot, msg) {
 // ── Pay with USDT (TxID) ─────────────────────────────────────────────────────
 
 async function startUsdtPayForOrder(bot, chatId, userId, orderId, messageId) {
+  // Customer's language, so the whole purchase flow speaks it.
+  const lang = db.getUserLanguage ? db.getUserLanguage(userId) : 'en';
   const order = db.getOrder(orderId);
   if (!order || order.user_id !== userId || order.status !== 'pending') {
-    await bot.editMessageText('❌ Order not found or already processed.', {
+    await bot.editMessageText(t(lang, 'buy_order_not_found'), {
       chat_id: chatId, message_id: messageId, parse_mode: 'HTML',
     });
     return;
@@ -634,7 +652,7 @@ async function startUsdtPayForOrder(bot, chatId, userId, orderId, messageId) {
     await bot.editMessageText(
       `❌ <b>Out of Stock</b>\n\nThis product is no longer available.\n<i>No payment was taken.</i>`,
       { chat_id: chatId, message_id: messageId, parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: [[{ text: '🛍 Browse Products', callback_data: 'menu_products' }]] } }
+        reply_markup: { inline_keyboard: [[{ text: t(lang, 'buy_browse_products'), callback_data: 'menu_products' }]] } }
     ).catch(() => {});
     return;
   }
@@ -667,20 +685,22 @@ async function startUsdtPayForOrder(bot, chatId, userId, orderId, messageId) {
 async function handleUsdtTxIdForOrder(bot, msg) {
   const userId = msg.from.id;
   const chatId = msg.chat.id;
+  // Customer's language, so the whole purchase flow speaks it.
+  const lang = db.getUserLanguage ? db.getUserLanguage(userId) : 'en';
   const txid   = (msg.text || '').trim();
   const sess   = session.get(userId);
   const internalOrderId = sess.data && sess.data.orderId;
 
   if (!internalOrderId) {
-    await bot.sendMessage(chatId, '❌ Session expired. Please start the order again.');
+    await bot.sendMessage(chatId, t(lang, 'buy_session_expired_order'));
     return;
   }
   if (!TXID_RE.test(txid)) {
-    await bot.sendMessage(chatId, '❌ Invalid TxID format.', { parse_mode: 'HTML' });
+    await bot.sendMessage(chatId, t(lang, 'buy_txid_invalid'), { parse_mode: 'HTML' });
     return;
   }
   if (db.isTxidUsed(txid)) {
-    await bot.sendMessage(chatId, '❌ This TxID has already been used.', { parse_mode: 'HTML' });
+    await bot.sendMessage(chatId, t(lang, 'buy_txid_used'), { parse_mode: 'HTML' });
     return;
   }
 
@@ -695,7 +715,7 @@ async function handleUsdtTxIdForOrder(bot, msg) {
       await bot.sendMessage(chatId,
         `⏰ <b>Order Expired</b>\n\nThis order is older than ${PAYMENT_CONFIRM_VALIDITY_MIN} minutes and is no longer valid.\nPlease create a new order.`,
         { parse_mode: 'HTML',
-          reply_markup: { inline_keyboard: [[{ text: '🛍 Browse Products', callback_data: 'menu_products' }]] } });
+          reply_markup: { inline_keyboard: [[{ text: t(lang, 'buy_browse_products'), callback_data: 'menu_products' }]] } });
       return;
     }
   }
@@ -735,6 +755,8 @@ async function handleUsdtTxIdForOrder(bot, msg) {
  * For stock-out or underpayment: user must contact support with TxID.
  */
 async function settleDirectPayment(bot, chatId, userId, info) {
+  // Customer's language, so the whole purchase flow speaks it.
+  const lang = db.getUserLanguage ? db.getUserLanguage(userId) : 'en';
   // ATOMIC LOCK: prevent double-settle of same order
   const { internalOrderId, identifier, paidAmount, network, method } = info;
   const lockId = internalOrderId || (info && info.orderId);
@@ -761,7 +783,7 @@ async function settleDirectPayment(bot, chatId, userId, info) {
       network, asset: 'USDT', address: null,
     });
   } catch (e) {
-    await bot.sendMessage(chatId, '❌ This payment ID has already been used.', { parse_mode: 'HTML' });
+    await bot.sendMessage(chatId, t(lang, 'buy_payid_used'), { parse_mode: 'HTML' });
     return;
   }
 
@@ -798,7 +820,7 @@ async function settleDirectPayment(bot, chatId, userId, info) {
       order.id, order.product_id, order.quantity, method
     );
     if (settled.result === 'already_processed') {
-      await bot.sendMessage(chatId, '❌ This order has already been processed.');
+      await bot.sendMessage(chatId, t(lang, 'buy_already_processed'));
       return;
     }
 
@@ -1103,6 +1125,8 @@ async function sendDelivery(bot, chatId, order, content, messageId = null) {
 // ── Pay with CryptoBot (direct order payment) ─────────────────────────────────
 
 async function startCryptobotPayForOrder(bot, chatId, userId, orderId, messageId) {
+  // Customer's language, so the whole purchase flow speaks it.
+  const lang = db.getUserLanguage ? db.getUserLanguage(userId) : 'en';
   if (!config.cryptobotToken) {
     await bot.sendMessage(
       chatId,
@@ -1126,7 +1150,7 @@ async function startCryptobotPayForOrder(bot, chatId, userId, orderId, messageId
     await bot.sendMessage(chatId,
       `❌ <b>Out of Stock</b>\n\nThis product is no longer available.\n<i>No payment was taken.</i>`,
       { parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: [[{ text: '🛍 Browse Products', callback_data: 'menu_products' }]] } });
+        reply_markup: { inline_keyboard: [[{ text: t(lang, 'buy_browse_products'), callback_data: 'menu_products' }]] } });
     return;
   }
 

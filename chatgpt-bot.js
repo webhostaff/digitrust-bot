@@ -310,6 +310,7 @@ async function showMainMenu(chatId, userId, messageId = null) {
   rows.push([{ text: '📋 Details', callback_data: 'cgb_details_list' }]);
 
   const txt =
+    require('./services/notices').banner('cgb') +
     `🤖 <b>ChatGPT Business</b>\n\n` +
     (subs.length
       ? `You have <b>${subs.length}</b> active seat${subs.length === 1 ? '' : 's'}.\n` +

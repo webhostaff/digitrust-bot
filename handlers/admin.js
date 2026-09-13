@@ -24,6 +24,7 @@ const {
 const items = require('../database/items');
 const binance = require('../services/binance');
 const cgbCycles = require('../services/cgbCycles');
+const notices   = require('../services/notices');
 const { formatPrice, formatPriceExact, escapeHtml, expandPremiumEmojis, scaleTiersProportionally, productEmojiId } = require('../utils/format');
 const {
   publishToChannel, publishToGroup, broadcastToUsers, autoPublish, autoPublishWithPhoto,
@@ -1729,6 +1730,40 @@ async function handleAdminText(bot, msg) {
     return;
   }
 
+  // ── Announcement text ─────────────────────────────────────────────
+  if (s === States.ADMIN_NOTICE_TEXT) {
+    const b = sess.data.noticeBot;
+    const body = String(text || '').trim();
+    session.clear(userId);
+
+    if (body === '-' || !body) {
+      await bot.sendMessage(chatId, '❌ Cancelled.');
+      return;
+    }
+    if (body.length > 900) {
+      await bot.sendMessage(chatId, '❌ Too long — keep it under 900 characters so it does not push the menu off screen.');
+      return;
+    }
+
+    // Writing keeps whatever expiry was already set, so editing the wording of
+    // a timed notice does not silently make it permanent.
+    const prev = notices.peek(b);
+    notices.set(b, body, prev?.expires_at || null);
+
+    await bot.sendMessage(chatId,
+      `✅ <b>Announcement saved and switched on.</b>\n\n` +
+      `<b>Customers will see:</b>\n\n${notices.banner(b)}`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '📢 Announcements', callback_data: `admin_notice_${b}` }]] } })
+      .catch(async (e) => {
+        // Bad HTML in the text would otherwise fail silently and leave the admin
+        // thinking it saved wrong, when it saved fine and only the preview broke.
+        await bot.sendMessage(chatId,
+          `✅ Saved, but the preview could not be rendered — check your HTML tags.\n\n${e.message}`);
+      });
+    return;
+  }
+
   // ── TxID tracer: one id, the whole story ──────────────────────────
   if (s === States.ADMIN_TXID_SEARCH) {
     session.clear(userId);
@@ -2387,8 +2422,15 @@ async function handleAdminCallback(bot, query) {
         `<i>Tap any row to drop it on that number, or use the arrows above. ` +
         `Paging keeps it in your hand.</i>`;
     } else {
-      text += `\n<i>This is exactly the order customers see. Tap a product to pick ` +
-              `it up, then tap the position you want it in.</i>`;
+      const out = products.filter((p) => Number(p.stock_quantity || 0) <= 0).length;
+      text += `\n<i>Tap a product to pick it up, then tap the position you want it in.</i>`;
+      if (out) {
+        // Said plainly, because otherwise moving a sold-out product to #1 looks
+        // like the ordering screen is broken when the shop does not change.
+        text += `\n\n⚠️ <i>${out} of these are sold out. Customers always see ` +
+                `in-stock products first, whatever order you set here — this list ` +
+                `decides the order WITHIN each group.</i>`;
+      }
     }
 
     if (note) text += `\n\n${note}`;
@@ -7723,6 +7765,125 @@ async function handleAdminCallback(bot, query) {
         reply_markup: { inline_keyboard: [[{ text: '🔙 Suppliers', callback_data: 'admin_suppliers' }]] } }
     ).catch(() => {});
     return;
+  }
+
+  // ── In-bot announcements ──────────────────────────────────────────
+  if (data === 'admin_notices') {
+    const names = { store: '🛍 Main store bot', cgb: '🤖 ChatGPT Business bot', support: '🎫 Support bot' };
+    const rows = [];
+    let txt = `📢 <b>In-bot announcements</b>\n\n` +
+              `<i>Shown at the top of each bot's main screen — to whoever opens it, ` +
+              `for as long as it is relevant. Not a broadcast.</i>\n`;
+
+    for (const b of notices.BOTS) {
+      const n = notices.peek(b);
+      const live = notices.get(b);
+      let state;
+      if (!n || !n.text) state = '⚪️ none';
+      else if (live) state = '🟢 showing';
+      else if (n.expires_at && new Date(String(n.expires_at).replace(' ', 'T')) <= new Date()) state = '⏰ expired';
+      else state = '⏸ off';
+
+      txt += `\n${names[b]} — <b>${state}</b>\n`;
+      if (n && n.text) {
+        txt += `<i>${escapeHtml(String(n.text).slice(0, 90))}${String(n.text).length > 90 ? '…' : ''}</i>\n`;
+        if (n.expires_at) txt += `⏰ until ${escapeHtml(String(n.expires_at))}\n`;
+      }
+      rows.push([{ text: `${names[b]}`, callback_data: `admin_notice_${b}` }]);
+    }
+
+    rows.push([{ text: '🔙 Back', callback_data: 'admin_panel' }]);
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows },
+    }).catch(() => {});
+    return;
+  }
+
+  if (/^admin_notice_(store|cgb|support)$/.test(data)) {
+    const b = data.split('_').pop();
+    const n = notices.peek(b);
+    const names = { store: '🛍 Main store bot', cgb: '🤖 ChatGPT Business bot', support: '🎫 Support bot' };
+
+    const rows = [[{ text: n && n.text ? '✏️ Change text' : '✏️ Write announcement', callback_data: `admin_noticeset_${b}` }]];
+    if (n && n.text) {
+      rows.push([{ text: n.enabled ? '⏸ Turn off' : '▶️ Turn on', callback_data: `admin_noticetog_${b}` }]);
+      rows.push([{ text: '⏰ Auto-hide after…', callback_data: `admin_noticeexp_${b}` }]);
+      rows.push([{ text: '🗑 Delete', callback_data: `admin_noticedel_${b}` }]);
+    }
+    rows.push([{ text: '🔙 Back', callback_data: 'admin_notices' }]);
+
+    await bot.editMessageText(
+      `📢 <b>${names[b]}</b>\n\n` +
+      (n && n.text
+        ? `<b>Preview</b>\n${notices.banner(b) || '<i>(currently hidden)</i>\n'}` +
+          (n.expires_at ? `\n⏰ Hides automatically after <b>${escapeHtml(String(n.expires_at))}</b>` : '')
+        : `<i>No announcement set for this bot.</i>`),
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_noticeset_(store|cgb|support)$/.test(data)) {
+    const b = data.split('_').pop();
+    session.set(userId, States.ADMIN_NOTICE_TEXT, { noticeBot: b });
+    await bot.sendMessage(chatId,
+      `✏️ Send the announcement text.\n\n` +
+      `<i>HTML is allowed: <b>bold</b>, <i>italic</i>, <code>code</code>. ` +
+      `Send <code>-</code> to cancel.</i>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (/^admin_noticetog_(store|cgb|support)$/.test(data)) {
+    const b = data.split('_').pop();
+    notices.toggle(b);
+    return handleAdminCallback(bot, { ...query, data: `admin_notice_${b}` });
+  }
+
+  if (/^admin_noticedel_(store|cgb|support)$/.test(data)) {
+    const b = data.split('_').pop();
+    notices.clear(b);
+    return handleAdminCallback(bot, { ...query, data: 'admin_notices' });
+  }
+
+  if (/^admin_noticeexp_(store|cgb|support)$/.test(data)) {
+    const b = data.split('_').pop();
+    const n = notices.peek(b);
+    if (!n || !n.text) { await answer('❌ Write the announcement first'); return; }
+
+    const pad = (x) => String(x).padStart(2, '0');
+    const stamp = (hours) => {
+      const d = new Date(Date.now() + hours * 3600000);
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    };
+    const enc = (v) => Buffer.from(v).toString('base64url');
+
+    await bot.editMessageText(
+      `⏰ <b>Auto-hide</b>\n\nWhen should this announcement stop showing?\n\n` +
+      `<i>The text is kept either way, so it can be switched back on later.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+        [{ text: '6 hours',  callback_data: `admin_noticeexpv_${b}_${enc(stamp(6))}` },
+         { text: '24 hours', callback_data: `admin_noticeexpv_${b}_${enc(stamp(24))}` }],
+        [{ text: '3 days',   callback_data: `admin_noticeexpv_${b}_${enc(stamp(72))}` },
+         { text: '7 days',   callback_data: `admin_noticeexpv_${b}_${enc(stamp(168))}` }],
+        [{ text: '♾ Never',  callback_data: `admin_noticeexpv_${b}_none` }],
+        [{ text: '🔙 Back',  callback_data: `admin_notice_${b}` }],
+      ] } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_noticeexpv_(store|cgb|support)_/.test(data)) {
+    const rest = data.replace('admin_noticeexpv_', '');
+    const b = rest.split('_')[0];
+    const encoded = rest.slice(b.length + 1);
+    let when = null;
+    if (encoded !== 'none') {
+      try { when = Buffer.from(encoded, 'base64url').toString('utf8'); } catch (_) {}
+    }
+    const n = notices.peek(b);
+    if (n && n.text) notices.set(b, n.text, when);
+    return handleAdminCallback(bot, { ...query, data: `admin_notice_${b}` });
   }
 
   // ── TxID tracer ───────────────────────────────────────────────────

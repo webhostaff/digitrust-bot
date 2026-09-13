@@ -21,9 +21,13 @@ async function sendMainMenu(bot, chatId, userName = '', userId = null) {
   const greetText = t(lang, 'welcome_greeting').replace('{store}', storeName).replace('{greeting}', greeting);
   const chooseText = t(lang, 'welcome_choose');
 
+  // Notice first: it is the thing the shop needs read before anything else,
+  // and below the menu it would be scrolled past.
+  const notice = require('../services/notices').banner('store');
+
   await bot.sendMessage(
     chatId,
-    `${greetText}\n\n${welcomeKey}\n\n${chooseText}`,
+    `${notice}${greetText}\n\n${welcomeKey}\n\n${chooseText}`,
     { parse_mode: 'HTML', reply_markup: mainMenuKb(lang) }
   );
 

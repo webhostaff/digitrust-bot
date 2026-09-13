@@ -769,8 +769,28 @@ bot.on('message', async (msg) => {
   }
   else if (state === States.REFUND_ADDRESS) {
     const address = (msg.text || '').trim();
-    if (address.length < 10) {
-      await bot.sendMessage(chatId, '❌ Please send a valid wallet address.');
+    const method  = session.get(userId).data.refundMethod;
+
+    // One length rule was applied to two very different things. A Binance Pay
+    // ID is a 8–12 digit number; the check demanded 10+ characters, so a valid
+    // 9-digit ID was rejected with "invalid wallet address" — a message about a
+    // wallet, on a screen that had just asked for a Pay ID. The customer has no
+    // way to satisfy it and simply retypes the same correct number.
+    let problem = null;
+    if (method === 'binance') {
+      if (!/^\d{6,20}$/.test(address)) {
+        problem = '❌ A Binance Pay ID is numbers only, usually 8–12 digits.\n\n' +
+                  'Example: <code>263344433</code>\n\n' +
+                  'Find it in Binance under <b>Pay → Profile</b>.';
+      }
+    } else if (address.length < 10 || /\s/.test(address)) {
+      problem = '❌ That does not look like a wallet address.\n\n' +
+                'Paste the full address — BEP20 starts with <code>0x</code>, ' +
+                'TRC20 starts with <code>T</code>.';
+    }
+
+    if (problem) {
+      await bot.sendMessage(chatId, problem, { parse_mode: 'HTML' });
       return;
     }
     session.update(userId, { refundAddress: address });

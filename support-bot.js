@@ -83,7 +83,32 @@ const getCustomers = rawDb.prepare(`
     COUNT(CASE WHEN direction = 'in' AND is_read = 0 THEN 1 END) AS unread
   FROM support_messages m
   GROUP BY user_id
-  ORDER BY last_time DESC
+  -- Unread first, newest within that. Sorting purely by time buried a waiting
+  -- customer behind every conversation that had merely been touched more
+  -- recently, so answering them meant paging backwards to hunt for red dots.
+  ORDER BY (COUNT(CASE WHEN direction = 'in' AND is_read = 0 THEN 1 END) > 0) DESC,
+           last_time DESC
+`);
+
+/**
+ * Mark old unread messages as read.
+ *
+ * Unread state has accumulated since the bot was first created, so the badge
+ * counts conversations nobody will ever reply to now. A count that is always
+ * wrong is a count that stops being looked at — which defeats the point of
+ * having one.
+ */
+const markOldRead = rawDb.prepare(`
+  UPDATE support_messages
+  SET is_read = 1, read_at = datetime('now')
+  WHERE direction = 'in' AND is_read = 0
+    AND datetime(created_at) < datetime('now', '-' || ? || ' days')
+`);
+
+const countOldUnread = rawDb.prepare(`
+  SELECT COUNT(*) AS n FROM support_messages
+  WHERE direction = 'in' AND is_read = 0
+    AND datetime(created_at) < datetime('now', '-' || ? || ' days')
 `);
 
 const getMessagesPage = rawDb.prepare(`
@@ -529,9 +554,12 @@ async function showInbox(chatId, messageId = null, page = 0) {
   const currentPage = Math.max(0, Math.min(page, totalPages - 1));
   const slice = all.slice(currentPage * INBOX_PER_PAGE, (currentPage + 1) * INBOX_PER_PAGE);
 
+  const staleCount = countOldUnread.get(14)?.n || 0;
   const text =
+    require('./services/notices').banner('support') +
     `📥 <b>Support Inbox</b>\n` +
     (unreadThreads > 0 ? `🔴 <b>${unreadThreads}</b> conversation(s) unread\n` : '✅ All caught up\n') +
+    (staleCount ? `⏳ <i>${staleCount} of them are older than 2 weeks</i>\n` : '') +
     `💬 ${all.length} conversation(s) total\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
     `Tap a customer to open their chat:`;
@@ -545,6 +573,12 @@ async function showInbox(chatId, messageId = null, page = 0) {
       callback_data: `chat_${c.user_id}`,
     }];
   });
+
+  // Old unread cleanup, offered only when there is something to clean.
+  const stale = countOldUnread.get(14)?.n || 0;
+  if (stale > 0) {
+    rows.push([{ text: `🧹 Mark ${stale} message(s) older than 2 weeks as read`, callback_data: 'inbox_clean_14' }]);
+  }
 
   if (totalPages > 1) {
     const nav = [];
@@ -1233,6 +1267,16 @@ bot.on('callback_query', async (q) => {
     if (data === 'noop') return;
 
     if (data === 'inbox')           { await showInbox(chatId, msgId); return; }
+
+    // Clear the backlog that has built up since the bot was created.
+    if (/^inbox_clean_\d+$/.test(data)) {
+      const days = parseInt(data.split('_').pop(), 10);
+      const n = markOldRead.run(days).changes;
+      logger.info(`[SUPPORT] ${n} unread message(s) older than ${days} days marked read`);
+      await bot.answerCallbackQuery(q.id, { text: `✅ ${n} marked as read` }).catch(() => {});
+      await showInbox(chatId, msgId);
+      return;
+    }
     if (/^inbox_p_\d+$/.test(data)) { await showInbox(chatId, msgId, parseInt(data.split('_').pop(), 10)); return; }
 
     // ── Conversation ──────────────────────────────────────────────────────
