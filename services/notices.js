@@ -84,4 +84,73 @@ function peek(bot) {
   }
 }
 
-module.exports = { BOTS, get, banner, set, toggle, clear, peek };
+/**
+ * Send the notice as a real message to that bot's audience.
+ *
+ * A banner is read by whoever opens the bot; a message reaches people who are
+ * not thinking about the shop right now. Both matter, so the notice text is
+ * shared between them — write once, then choose whether to also push it.
+ *
+ * Audiences differ per bot and are NOT interchangeable: the ChatGPT bot must
+ * reach seat holders, not every customer who ever bought a Netflix code, or the
+ * message is spam to most of them.
+ *
+ * @param {object} bot     the Telegram bot instance to send with
+ * @param {string} which   'store' | 'cgb' | 'support'
+ * @param {function} onProgress optional (sent, total) callback
+ */
+async function push(bot, which, onProgress = null) {
+  const n = peek(which);
+  if (!n || !n.text) return { sent: 0, failed: 0, total: 0, error: 'no announcement set' };
+
+  let ids = [];
+  try {
+    if (which === 'cgb') {
+      ids = raw.prepare(`
+        SELECT DISTINCT user_id AS id FROM chatgpt_subscriptions
+        WHERE COALESCE(status, '') IN ('active', 'pending')
+      `).all().map((r) => r.id);
+    } else if (which === 'support') {
+      // Staff only — the support bot's users are the people who run it.
+      ids = raw.prepare('SELECT DISTINCT user_id AS id FROM support_threads').all().map((r) => r.id);
+      if (!ids.length) {
+        ids = raw.prepare('SELECT DISTINCT user_id AS id FROM support_messages').all().map((r) => r.id);
+      }
+    } else {
+      // Customers who actually bought something. Blasting every /start visitor
+      // includes bots and one-off curiosity clicks, which inflates the failure
+      // count and teaches nobody to read these.
+      ids = raw.prepare(`
+        SELECT DISTINCT user_id AS id FROM orders
+        WHERE status IN ('delivered', 'paid', 'completed')
+      `).all().map((r) => r.id);
+    }
+  } catch (e) {
+    return { sent: 0, failed: 0, total: 0, error: e.message };
+  }
+
+  ids = [...new Set(ids.filter(Boolean))];
+  const body = `📢 <b>Announcement</b>\n\n${n.text}`;
+
+  let sent = 0, failed = 0;
+  for (const id of ids) {
+    try {
+      await bot.sendMessage(id, body, { parse_mode: 'HTML', disable_web_page_preview: true });
+      sent++;
+    } catch (e) {
+      // Blocked the bot, deleted account, never started it — all normal and
+      // none of them should stop the rest of the run.
+      failed++;
+    }
+    if (onProgress && (sent + failed) % 25 === 0) await onProgress(sent + failed, ids.length);
+    await new Promise((r) => setTimeout(r, 60)); // stay under Telegram's rate limit
+  }
+
+  try {
+    raw.prepare("UPDATE bot_notices SET updated_at = datetime('now') WHERE bot = ?").run(which);
+  } catch (_) {}
+
+  return { sent, failed, total: ids.length };
+}
+
+module.exports = { BOTS, get, banner, set, toggle, clear, peek, push };

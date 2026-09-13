@@ -154,8 +154,20 @@ async function showCategories(bot, chatId, messageId = null) {
     rows.push([{ text: '━━━ 📦 Other Products ━━━', callback_data: 'noop' }]);
   }
 
-  // 3) Uncategorized products — one per row
-  for (const p of uncategorized) {
+  // 3) Uncategorized products — in stock first.
+  //
+  // This screen builds its own buttons instead of calling productsKb, which is
+  // why sorting there had no effect here: the "Other Products" list the customer
+  // actually sees is assembled right below. Same rule, applied where it lands.
+  const sortedUncategorized = uncategorized
+    .map((p, i) => {
+      const q = (typeof p.stock_quantity === 'number') ? p.stock_quantity : (p.stock_count || 0);
+      return { p, i, avail: q > 0 ? 0 : 1 };
+    })
+    .sort((a, b) => (a.avail - b.avail) || (a.i - b.i))
+    .map((x) => x.p);
+
+  for (const p of sortedUncategorized) {
     const qty = (typeof p.stock_quantity === 'number') ? p.stock_quantity : (p.stock_count || 0);
     const inStock = qty > 0;
     const stock = inStock ? `✅ ${qty}` : `❌ Out`;

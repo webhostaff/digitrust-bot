@@ -7806,7 +7806,8 @@ async function handleAdminCallback(bot, query) {
 
     const rows = [[{ text: n && n.text ? '✏️ Change text' : '✏️ Write announcement', callback_data: `admin_noticeset_${b}` }]];
     if (n && n.text) {
-      rows.push([{ text: n.enabled ? '⏸ Turn off' : '▶️ Turn on', callback_data: `admin_noticetog_${b}` }]);
+      rows.push([{ text: '📨 Send it as a message now', callback_data: `admin_noticepush_${b}` }]);
+      rows.push([{ text: n.enabled ? '⏸ Turn off banner' : '▶️ Turn on banner', callback_data: `admin_noticetog_${b}` }]);
       rows.push([{ text: '⏰ Auto-hide after…', callback_data: `admin_noticeexp_${b}` }]);
       rows.push([{ text: '🗑 Delete', callback_data: `admin_noticedel_${b}` }]);
     }
@@ -7831,6 +7832,76 @@ async function handleAdminCallback(bot, query) {
       `<i>HTML is allowed: <b>bold</b>, <i>italic</i>, <code>code</code>. ` +
       `Send <code>-</code> to cancel.</i>`,
       { parse_mode: 'HTML' });
+    return;
+  }
+
+  // ── Send the notice as a message ──────────────────────────────────
+  if (/^admin_noticepush_(store|cgb|support)$/.test(data)) {
+    const b = data.split('_').pop();
+    const n = notices.peek(b);
+    if (!n || !n.text) { await answer('❌ Write the announcement first'); return; }
+
+    const audience = {
+      store:   'customers who have bought at least once',
+      cgb:     'customers with an active ChatGPT Business seat',
+      support: 'support staff',
+    }[b];
+
+    // Confirmed before sending. A broadcast cannot be recalled, and the button
+    // sits next to ones that are harmless.
+    await bot.editMessageText(
+      `📨 <b>Send this as a message?</b>\n\n` +
+      `👥 To: <b>${audience}</b>\n\n` +
+      `<b>They will receive:</b>\n\n📢 <b>Announcement</b>\n\n${n.text}\n\n` +
+      `⚠️ <i>This cannot be undone.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+        [{ text: '✅ Send now', callback_data: `admin_noticepushgo_${b}` }],
+        [{ text: '❌ Cancel', callback_data: `admin_notice_${b}` }],
+      ] } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_noticepushgo_(store|cgb|support)$/.test(data)) {
+    const b = data.split('_').pop();
+
+    await bot.editMessageText('📨 Sending…', { chat_id: chatId, message_id: msgId }).catch(() => {});
+
+    // Each bot sends with its OWN token, so the message arrives in the chat the
+    // customer associates with it — a ChatGPT notice appearing in the store bot
+    // would be confusing and unattributable.
+    let sender = bot;
+    try {
+      // The two modules export differently — chatgpt-bot exports an object with
+      // a .bot property, support-bot exports the instance itself. Checked rather
+      // than assumed, because guessing wrong sends every announcement from the
+      // store bot with no error.
+      if (b === 'cgb') {
+        const m = require('../chatgpt-bot');
+        sender = (m && m.bot) || bot;
+      }
+      if (b === 'support') {
+        const m = require('../support-bot');
+        sender = (m && typeof m.sendMessage === 'function') ? m : ((m && m.bot) || bot);
+      }
+    } catch (e) {
+      logger.warn(`[NOTICE] could not load ${b} bot, sending with the store bot: ${e.message}`);
+    }
+
+    const r = await notices.push(sender, b, async (done, total) => {
+      await bot.editMessageText(`📨 Sending… ${done}/${total}`, { chat_id: chatId, message_id: msgId }).catch(() => {});
+    });
+
+    await bot.editMessageText(
+      r.error
+        ? `❌ ${escapeHtml(r.error)}`
+        : `✅ <b>Announcement sent</b>\n\n` +
+          `📨 Delivered: <b>${r.sent}</b>\n` +
+          (r.failed ? `🚫 Could not reach: <b>${r.failed}</b> <i>(blocked the bot or never started it)</i>\n` : '') +
+          `👥 Audience: ${r.total}`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '📢 Announcements', callback_data: 'admin_notices' }]] } }
+    ).catch(() => {});
     return;
   }
 
