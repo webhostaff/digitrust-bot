@@ -1552,7 +1552,11 @@ bot.on('message', async (msg) => {
         { parse_mode: 'HTML' });
 
       try {
-        const result = await verifyBinancePayOrder(text);
+        const payMaxAge = (() => {
+          try { return parseInt(db.prepare("SELECT value FROM settings WHERE key='deposit_max_age_minutes'").get()?.value || '15', 10) || 15; }
+          catch (e) { return 15; }
+        })();
+        const result = await verifyBinancePayOrder(text, { maxAgeMinutes: payMaxAge });
         if (!result.found) {
           await bot.sendMessage(chatId, '❌ ' + (result.message || 'Payment not found.'));
           return;

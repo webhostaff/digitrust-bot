@@ -25,7 +25,7 @@ const items = require('../database/items');
 const binance = require('../services/binance');
 const cgbCycles = require('../services/cgbCycles');
 const notices   = require('../services/notices');
-const { formatPrice, formatPriceExact, escapeHtml, expandPremiumEmojis, scaleTiersProportionally, productEmojiId } = require('../utils/format');
+const { formatPrice, formatPriceExact, escapeHtml, expandPremiumEmojis, scaleTiersProportionally, productEmojiId, calcOrderPrice } = require('../utils/format');
 const {
   publishToChannel, publishToGroup, broadcastToUsers, autoPublish, autoPublishWithPhoto,
   buildNewProductText, buildStockUpdateText,

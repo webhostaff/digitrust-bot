@@ -306,58 +306,61 @@ function productEmojiId(p) {
 
 
 // Format bulk tiers for display
+/**
+ * The price ladder as the customer will actually be charged it.
+ *
+ * Derived by asking calcOrderPrice for real quantities instead of listing the
+ * tier table. A product can carry BOTH a tier table and the older percentage
+ * rule, and this used to show the legacy rule only when there were no tiers.
+ * With both set the quote said "1 – 49 units $0.39" while an order of 20 was
+ * charged $0.36 — the customer reads one price and pays another, which looks
+ * like a trick even though the difference was in their favour.
+ *
+ * Building the display from the pricing function makes the two impossible to
+ * disagree: whatever checkout charges, this is what gets printed.
+ */
 function formatBulkTiersDisplay(product) {
   const basePrice = Number(product.price) || 0;
+  if (!basePrice) return '';
 
-  // Collect active tiers sorted by qty ascending
-  const rawTiers = [
-    { qty: Number(product.bulk_tier1_qty) || 0, price: Number(product.bulk_tier1_price) || 0 },
-    { qty: Number(product.bulk_tier2_qty) || 0, price: Number(product.bulk_tier2_price) || 0 },
-    { qty: Number(product.bulk_tier3_qty) || 0, price: Number(product.bulk_tier3_price) || 0 },
-  ].filter(t => t.qty > 0 && t.price > 0)
-   .sort((a, b) => a.qty - b.qty);
-
-  if (rawTiers.length === 0) {
-    // Fallback to legacy bulk_discount
-    if (product.bulk_min_qty > 0 && product.bulk_discount > 0) {
-      return `\n\n🎁 <b>Bulk Discount:</b> Buy <b>${product.bulk_min_qty}+</b> and save <b>${product.bulk_discount}%</b>!`;
-    }
-    return '';
+  // Every quantity at which any rule could start applying.
+  const breakpoints = [1];
+  for (const q of [
+    product.bulk_tier1_qty, product.bulk_tier2_qty,
+    product.bulk_tier3_qty, product.bulk_min_qty,
+  ]) {
+    const n = Number(q) || 0;
+    if (n > 1) breakpoints.push(n);
   }
 
-  // Build from-to ranges:
-  //   Base price row:  1 – (tier1.qty - 1)  →  $basePrice
-  //   Tier 1 row:      tier1.qty – (tier2.qty - 1)  →  $tier1.price
-  //   ...
-  //   Last tier row:   lastTier.qty+         →  $lastTier.price
-  const rows = [];
+  const points = [...new Set(breakpoints)].sort((a, b) => a - b);
+  if (points.length <= 1) return '';
 
-  // Base price row (always shown so the customer sees the full picture)
-  const baseTo = rawTiers[0].qty - 1;
-  const baseLabel = baseTo === 0
-    ? `1 unit`
-    : `1 – ${baseTo} ${baseTo === 1 ? 'unit' : 'units'}`;
-  rows.push({ label: baseLabel, price: basePrice, isBase: true });
-
-  // Tier rows
-  for (let i = 0; i < rawTiers.length; i++) {
-    const t    = rawTiers[i];
-    const next = rawTiers[i + 1];
-    const from = t.qty;
-    const to   = next ? next.qty - 1 : null;
-    const label = to ? `${from} – ${to} units` : `${from}+ units`;
-    rows.push({ label, price: t.price, isBase: false });
+  // Drop breakpoints that do not change the price. Two rules can overlap so
+  // that one never wins, and printing it would promise a discount that never
+  // arrives.
+  const steps = [];
+  for (const q of points) {
+    const unit = Number(calcOrderPrice(product, q).unitPrice.toFixed(4));
+    const last = steps[steps.length - 1];
+    if (last && Math.abs(last.unit - unit) < 0.00005) continue;
+    steps.push({ from: q, unit });
   }
+  if (steps.length <= 1) return '';
 
-  // Pad labels to same width for alignment
-  const maxLen = Math.max(...rows.map(r => r.label.length));
-  const lines  = rows.map(r => {
-    const pad     = ' '.repeat(maxLen - r.label.length);
-    const priceStr = `$${Number(r.price).toFixed(2)}/unit`;
-    if (r.isBase) {
-      return `  <code>${r.label}${pad}</code>  ${priceStr}`;
-    }
-    return `  <code>${r.label}${pad}</code>  <b>${priceStr}</b> 🔥`;
+  const labels = steps.map((st, i) => {
+    const next = steps[i + 1];
+    if (!next) return `${st.from}+ units`;
+    const to = next.from - 1;
+    return to === st.from ? `${st.from} unit${st.from === 1 ? '' : 's'}` : `${st.from} – ${to} units`;
+  });
+  const width = Math.max(...labels.map((l) => l.length));
+
+  const lines = steps.map((st, i) => {
+    const pad = ' '.repeat(width - labels[i].length);
+    const price = `$${st.unit.toFixed(2)}/unit`;
+    const best = i === steps.length - 1 && steps.length > 1;
+    return `  <code>${labels[i]}${pad}</code>  ${best ? `<b>${price}</b> 🔥` : price}`;
   });
 
   return `\n\n🎁 <b>Bulk Pricing — more = cheaper:</b>\n${lines.join('\n')}`;

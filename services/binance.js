@@ -319,7 +319,12 @@ async function verifyDepositByTxId(rawTxid, opts = {}) {
  *   PAY  = merchant payment
  *   PAY_REFUND, C2C_HOLDING, etc.
  */
-async function verifyBinancePayOrder(rawId) {
+/**
+ * @param {string} rawId Binance Pay order/transaction id
+ * @param {object} opts  { maxAgeMinutes } — same freshness rule the on-chain
+ *                       path already enforces.
+ */
+async function verifyBinancePayOrder(rawId, opts = {}) {
   if (!config.binanceApiKey || !config.binanceApiSecret) {
     logger.error('Binance API key/secret not configured.');
     return {
@@ -427,6 +432,37 @@ async function verifyBinancePayOrder(rawId) {
     }
   } catch (e) {
     logger.warn(`Binance Pay cutoff check error: ${e.message}`);
+  }
+
+  // ── FRESHNESS ────────────────────────────────────────────────────────────
+  // The on-chain paths reject a transfer older than deposit_max_age_minutes;
+  // this one only ever checked "before the bot existed", so a Binance Pay id
+  // stayed claimable for the full 180-day history window. That is not a
+  // theoretical gap: an id from two days ago is one a customer can re-send
+  // after already being credited elsewhere, or that a second person can submit.
+  try {
+    const dbq = require('../database/queries');
+    const maxAgeMinutes = Number(opts.maxAgeMinutes) > 0
+      ? Number(opts.maxAgeMinutes)
+      : (parseInt(dbq.getSetting('deposit_max_age_minutes', '15'), 10) || 0);
+
+    const txTime = Number(match.transactionTime || match.createTime || 0);
+    if (maxAgeMinutes > 0 && txTime > 0) {
+      const ageMin = Math.floor((Date.now() - txTime) / 60000);
+      if (ageMin > maxAgeMinutes) {
+        logger.warn(`[VERIFY-PAY] REJECTED — ${orderId} is ${ageMin} min old (limit ${maxAgeMinutes})`);
+        return {
+          found: false, reason: 'too_old', ageMinutes: ageMin, maxAgeMinutes,
+          message:
+            '⏰ <b>This transfer is too old to be claimed automatically.</b>\n\n' +
+            `It was made <b>${ageMin} minutes</b> ago; the limit is <b>${maxAgeMinutes} minutes</b>.\n\n` +
+            'Send a new transfer, or contact support with this Order ID and they ' +
+            'can credit it by hand.',
+        };
+      }
+    }
+  } catch (e) {
+    logger.warn(`Binance Pay age check error: ${e.message}`);
   }
 
   // Amount: positive = income, negative = expense. We want INCOMING transfers.

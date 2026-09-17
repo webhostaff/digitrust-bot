@@ -612,7 +612,10 @@ async function handleBinanceOrderId(bot, msg) {
     'This may take 10-30 seconds.\n\n' +
     '<i>Please wait, do not send another message.</i>',
     { parse_mode: 'HTML' });
-  const result = await verifyBinancePayOrder(orderId);
+  // Same freshness limit as the on-chain deposits, so one payment method is
+  // not quietly more forgiving than the others.
+  const payMaxAge = parseInt(db.getSetting('deposit_max_age_minutes', '15'), 10) || 15;
+  const result = await verifyBinancePayOrder(orderId, { maxAgeMinutes: payMaxAge });
   await bot.deleteMessage(chatId, wait.message_id).catch(() => {});
 
   if (!result.found) {

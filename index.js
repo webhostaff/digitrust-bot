@@ -512,6 +512,104 @@ bot.onText(/^\/(?:txid|trace)(?:\s+(.+))?$/i, async (msg, match) => {
   }
 });
 
+/**
+ * The shop's public address, from the first source that has one.
+ *
+ * A manual setting wins over the platform variable: a shop that moves to its own
+ * domain must not keep advertising the railway.app address it no longer uses.
+ *
+ * A placeholder here is not harmless — Telegram rejects a button whose URL is
+ * not a real address, and it rejects the WHOLE message with it, so an unset
+ * domain used to make the entire API screen vanish rather than show a dead link.
+ */
+function resolveApiBase() {
+  const manual = String(db.getSetting('api_base_url', '') || '').trim().replace(/\/+$/, '');
+  if (manual) return manual;
+
+  // Railway exposes the generated domain here. RAILWAY_STATIC_URL is the older
+  // name and is still set on some projects, so both are checked.
+  const railway = process.env.RAILWAY_PUBLIC_DOMAIN || process.env.RAILWAY_STATIC_URL || '';
+  if (railway) return railway.startsWith('http') ? railway.replace(/\/+$/, '') : `https://${railway}`;
+
+  return String(config.publicBaseUrl || '').trim().replace(/\/+$/, '');
+}
+
+/** Real enough for Telegram to accept as a URL — needs a dot in the host. */
+function isRealBase(v) {
+  return /^https?:\/\/[^\s/]+\.[^\s/]+/.test(String(v || ''));
+}
+
+/**
+ * Admin: what the shop's public address resolves to, and whether it answers.
+ *
+ * Fetches its own /docs page rather than only printing the URL. "Configured"
+ * and "reachable" are different claims, and only the second one matters to a
+ * customer trying to call the API.
+ */
+bot.onText(/^\/apicheck$/i, async (msg) => {
+  if (!adminHandler.isAdmin(msg.from.id)) return;
+  const chatId = msg.chat.id;
+  const base = resolveApiBase();
+
+  if (!isRealBase(base)) {
+    await bot.sendMessage(chatId,
+      `🔌 <b>API address</b>\n\n❌ <b>Not configured.</b>\n\n` +
+      `The API cannot be reached from outside, and customers have no working ` +
+      `base URL in their API screen.\n\n` +
+      `<b>Fix:</b> Railway → Settings → Networking → <b>Generate Domain</b>, then redeploy.\n` +
+      `Or set it by hand: <code>/apibase https://your-domain.com</code>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  const source = db.getSetting('api_base_url', '')
+    ? 'set by hand (api_base_url)'
+    : (process.env.RAILWAY_PUBLIC_DOMAIN || process.env.RAILWAY_STATIC_URL ? 'Railway domain' : 'config');
+
+  let live = '';
+  try {
+    const res = await fetch(`${base}/api/v2/docs`, { method: 'GET' });
+    const body = await res.text();
+    live = res.ok
+      ? `🟢 <b>Reachable</b> — HTTP ${res.status}, ${body.length} bytes`
+      : `🔴 <b>Responded ${res.status}</b> — the domain works but the docs route did not answer`;
+  } catch (e) {
+    live = `🔴 <b>Unreachable</b> — ${escapeHtml(e.message)}\n<i>The domain may still be starting up, or the deploy has not finished.</i>`;
+  }
+
+  await bot.sendMessage(chatId,
+    `🔌 <b>API address</b>\n\n` +
+    `<code>${escapeHtml(base)}</code>\n` +
+    `<i>Source: ${escapeHtml(source)}</i>\n\n${live}\n\n` +
+    `📖 Docs: ${escapeHtml(base)}/api/v2/docs`,
+    { parse_mode: 'HTML', disable_web_page_preview: true });
+});
+
+/** Set the public address by hand, for a custom domain. */
+bot.onText(/^\/apibase(?:\s+(\S+))?$/i, async (msg, match) => {
+  if (!adminHandler.isAdmin(msg.from.id)) return;
+  const v = String((match && match[1]) || '').trim();
+
+  if (!v) {
+    await bot.sendMessage(msg.chat.id,
+      `Usage: <code>/apibase https://your-domain.com</code>\n` +
+      `Send <code>/apibase clear</code> to fall back to the Railway domain.`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+  if (/^clear$/i.test(v)) {
+    db.setSetting('api_base_url', '');
+    await bot.sendMessage(msg.chat.id, `✅ Cleared. Now using: <code>${escapeHtml(resolveApiBase() || 'nothing')}</code>`, { parse_mode: 'HTML' });
+    return;
+  }
+  if (!isRealBase(v)) {
+    await bot.sendMessage(msg.chat.id, '❌ Must start with https:// and contain a real domain.');
+    return;
+  }
+  db.setSetting('api_base_url', v.replace(/\/+$/, ''));
+  await bot.sendMessage(msg.chat.id, `✅ Set to <code>${escapeHtml(v)}</code>\n\nRun /apicheck to test it.`, { parse_mode: 'HTML' });
+});
+
 // ── Text messages ─────────────────────────────────────────────────────────────
 bot.on('message', async (msg) => {
   // ── /emoji_id capture handler ──────────────────────────────────────
@@ -1148,9 +1246,8 @@ async function handleCallbackQuery(query) {
       : db.getOrCreateApiKey(userId);
 
     const me = await bot.getMe().catch(() => ({ username: '' }));
-    const base = db.getSetting('api_base_url', '') ||
-                 (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : '') ||
-                 config.publicBaseUrl || 'https://YOUR-DOMAIN';
+    const base = resolveApiBase();
+    const hasBase = isRealBase(base);
     const user = db.getUser(userId);
 
     await bot.editMessageText(
@@ -1161,11 +1258,14 @@ async function handleCallbackQuery(query) {
       `━━━━━━━━━━━━━━━━━━━━\n\n` +
       `💰 <b>Wallet balance:</b> ${formatPrice(user?.balance || 0)}\n` +
       `📊 <b>Requests made:</b> ${row.requests || 0}\n\n` +
-      `<b>Base URL</b>\n<code>${escapeHtml(base)}/api/v2</code>\n\n` +
+      (hasBase ? '' :
+        `⚠️ <i>The shop's public address is not set, so the documentation link ` +
+        `is hidden. Your key below works — ask support for the base URL.</i>\n\n`) +
+      `<b>Base URL</b>\n<code>${escapeHtml(base || 'https://your-shop-domain')}/api/v2</code>\n\n` +
       `<b>Quick start</b>\n` +
-      `<pre>curl -H "X-API-Key: ${escapeHtml(row.api_key)}" \\\n  ${escapeHtml(base)}/api/v2/products</pre>\n` +
+      `<pre>curl -H "X-API-Key: ${escapeHtml(row.api_key)}" \\\n  ${escapeHtml(base || 'https://your-shop-domain')}/api/v2/products</pre>\n` +
       `<b>Buy</b>\n` +
-      `<pre>curl -X POST ${escapeHtml(base)}/api/v2/purchase \\\n` +
+      `<pre>curl -X POST ${escapeHtml(base || 'https://your-shop-domain')}/api/v2/purchase \\\n` +
       `  -H "X-API-Key: ${escapeHtml(row.api_key)}" \\\n` +
       `  -H "Content-Type: application/json" \\\n` +
       `  -d '{"product_id":1,"quantity":1}'</pre>\n` +
@@ -1173,7 +1273,9 @@ async function handleCallbackQuery(query) {
       `🔒 <i>Treat this key like a password. Anyone holding it can spend your balance.</i>`,
       { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
         reply_markup: { inline_keyboard: [
-          [{ text: '📖 Full documentation', url: `${base}/api/v2/docs` }],
+          // Only offered when the URL is real. A button is better missing than
+          // taking the message down with it.
+          ...(hasBase ? [[{ text: '📖 Full documentation', url: `${base}/api/v2/docs` }]] : []),
           [{ text: '💰 Top Up Wallet', callback_data: 'wallet_topup' }],
           [{ text: '🔁 Generate new key', callback_data: 'api_regen_confirm' }],
           [{ text: '🔙 Back', callback_data: 'back_main' }],
@@ -1598,7 +1700,18 @@ app.listen(config.webhookPort, config.webhookHost, () => {
   logger.info(`HTTP server: http://${config.webhookHost}:${config.webhookPort}/`);
   logger.info(`Health:      http://${config.webhookHost}:${config.webhookPort}/health`);
   logger.info(`Reseller API: http://${config.webhookHost}:${config.webhookPort}/api/v1/docs`);
-  logger.info(`Customer API docs: http://${config.webhookHost}:${config.webhookPort}/api/v2/docs`);
+  {
+    const apiBase = resolveApiBase();
+    logger.info(`Customer API docs (local):  http://${config.webhookHost}:${config.webhookPort}/api/v2/docs`);
+    if (isRealBase(apiBase)) {
+      logger.info(`Customer API docs (PUBLIC): ${apiBase}/api/v2/docs`);
+    } else {
+      // Stated loudly: without this the API cannot be called by anyone, and the
+      // only symptom is customers quietly having no working base URL.
+      logger.warn('No public domain configured — the API is unreachable from outside.');
+      logger.warn('Fix: Railway → Settings → Networking → Generate Domain, or set api_base_url.');
+    }
+  }
   if (config.cryptobotToken) {
     logger.info(`CryptoBot:   http://${config.webhookHost}:${config.webhookPort}/cryptobot/webhook`);
   }

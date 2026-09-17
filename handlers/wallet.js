@@ -504,7 +504,8 @@ async function handleBinancePayOrderId(bot, msg) {
     );
     let result;
     try {
-      result = await Promise.race([verifyBinancePayOrder(orderId), timeoutPromise]);
+      const payMaxAge = parseInt(db.getSetting('deposit_max_age_minutes', '15'), 10) || 15;
+      result = await Promise.race([verifyBinancePayOrder(orderId, { maxAgeMinutes: payMaxAge }), timeoutPromise]);
     } catch (err) {
       if (waitMsgId) await bot.deleteMessage(chatId, waitMsgId).catch(() => {});
       await bot.sendMessage(chatId,
