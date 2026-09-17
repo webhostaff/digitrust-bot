@@ -882,9 +882,12 @@ bot.on('message', async (msg) => {
                   'Find it in Binance under <b>Pay → Profile</b>.';
       }
     } else if (address.length < 10 || /\s/.test(address)) {
+      // TON addresses start with UQ/EQ and are 48 characters, so the generic
+      // "looks like an address" rule is widened rather than a TON one bolted on.
       problem = '❌ That does not look like a wallet address.\n\n' +
                 'Paste the full address — BEP20 starts with <code>0x</code>, ' +
-                'TRC20 starts with <code>T</code>.';
+                'TRC20 starts with <code>T</code>, TON starts with ' +
+                '<code>UQ</code> or <code>EQ</code>.';
     }
 
     if (problem) {
@@ -1205,7 +1208,7 @@ async function handleCallbackQuery(query) {
   if (data === 'menu_wallet')          { await answer(); await walletHandler.showWallet(bot, chatId, userId, msgId); return; }
   if (data === 'wallet_topup')         { await answer(); await walletHandler.showTopupMethods(bot, chatId, userId, msgId); return; }
   // ── V3: USDT network choice + reservation cancel ──────────────────
-  if (/^topup_net_(TRC20|BEP20)$/.test(data)) {
+  if (/^topup_net_(TRC20|BEP20|TON)$/.test(data)) {
     await answer();
     await walletHandler.startUsdtAmount(bot, chatId, userId, msgId, data.split('_').pop());
     return;
@@ -1531,13 +1534,14 @@ async function handleCallbackQuery(query) {
         reply_markup: { inline_keyboard: [
           [{ text: 'TRC20 (Tron)',  callback_data: 'refund_net_TRC20' }],
           [{ text: 'BEP20 (BSC)',   callback_data: 'refund_net_BEP20' }],
+          [{ text: 'TON',           callback_data: 'refund_net_TON' }],
           [{ text: 'ERC20 (ETH)',   callback_data: 'refund_net_ERC20' }],
           [{ text: 'Polygon',       callback_data: 'refund_net_POLYGON' }],
         ] } }
     );
     return;
   }
-  if (/^refund_net_(TRC20|BEP20|ERC20|POLYGON)$/.test(data)) {
+  if (/^refund_net_(TRC20|BEP20|TON|ERC20|POLYGON)$/.test(data)) {
     const network = data.split('_').pop();
     await answer();
     session.update(userId, { refundNetwork: network });

@@ -1225,4 +1225,29 @@ db.exec(`
   );
 `);
 
+// ══════════════════════════════════════════════════════════════════════════════
+// V7 — TIME-LIMITED PRODUCTS
+//
+// An account that expires on a fixed date is worth less every day it waits. The
+// shop sets the end date once and the price falls on its own, because a price
+// that has to be edited daily is a price that will be wrong most days.
+//
+// Only the end date and a per-day rate are stored. The current price is derived
+// on read — a stored "today's price" would be stale the moment the process
+// sleeps through midnight, and there is no cron to depend on this way.
+// ══════════════════════════════════════════════════════════════════════════════
+try {
+  const cols = db.prepare('PRAGMA table_info(products)').all().map((c) => c.name);
+  if (!cols.includes('sub_end_date'))     db.exec('ALTER TABLE products ADD COLUMN sub_end_date TEXT DEFAULT NULL');
+  if (!cols.includes('sub_price_per_day'))db.exec('ALTER TABLE products ADD COLUMN sub_price_per_day REAL DEFAULT 0');
+  if (!cols.includes('sub_min_price'))    db.exec('ALTER TABLE products ADD COLUMN sub_min_price REAL DEFAULT 0');
+  if (!cols.includes('sub_base_title'))   db.exec('ALTER TABLE products ADD COLUMN sub_base_title TEXT DEFAULT NULL');
+  // Below this many days remaining the product stops selling itself.
+  if (!cols.includes('sub_min_days'))     db.exec('ALTER TABLE products ADD COLUMN sub_min_days INTEGER DEFAULT 3');
+  // Stock that never runs out — for a subscription the shop can issue at will.
+  if (!cols.includes('unlimited_stock'))  db.exec('ALTER TABLE products ADD COLUMN unlimited_stock INTEGER DEFAULT 0');
+} catch (e) {
+  console.error('[MIGRATION V7] subscription columns:', e.message);
+}
+
 module.exports = db;

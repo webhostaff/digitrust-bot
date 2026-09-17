@@ -91,6 +91,7 @@ async function startUsdtTopup(bot, chatId, userId, messageId) {
   const rows = [];
   if (config.usdtTrc20Address) rows.push([{ text: '🔴 USDT — TRC20 (TRON)', callback_data: 'topup_net_TRC20' }]);
   if (config.usdtBep20Address) rows.push([{ text: '🟡 USDT — BEP20 (BSC)',  callback_data: 'topup_net_BEP20' }]);
+  if (config.usdtTonAddress)   rows.push([{ text: '💎 USDT — TON',          callback_data: 'topup_net_TON'   }]);
   rows.push([{ text: '🔙 Back', callback_data: 'wallet_topup' }]);
 
   if (rows.length === 1) {
@@ -105,7 +106,8 @@ async function startUsdtTopup(bot, chatId, userId, messageId) {
     `💎 <b>Top Up via USDT</b>\n\n` +
     `Choose the network you will send from:\n\n` +
     `🔴 <b>TRC20</b> — TRON network\n` +
-    `🟡 <b>BEP20</b> — BNB Smart Chain\n\n` +
+    `🟡 <b>BEP20</b> — BNB Smart Chain\n` +
+    `💎 <b>TON</b> — The Open Network\n\n` +
     `⚠️ <i>Send only USDT on the network you pick. Anything else is lost.</i>`,
     { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }
   ).catch(() => {});
@@ -115,7 +117,7 @@ async function startUsdtTopup(bot, chatId, userId, messageId) {
  * STEP 2 — ask for the amount.
  */
 async function startUsdtAmount(bot, chatId, userId, messageId, network) {
-  const net = network === 'TRC20' ? 'TRC20' : 'BEP20';
+  const net = ['TRC20', 'BEP20', 'TON'].includes(network) ? network : 'BEP20';
   session.set(userId, States.WALLET_TOPUP_USDT_AMOUNT, { network: net, startedAt: Date.now() });
 
   await bot.editMessageText(
@@ -136,7 +138,8 @@ async function handleUsdtAmount(bot, msg) {
   const userId = msg.from.id;
   const chatId = msg.chat.id;
   const sess   = session.get(userId);
-  const net    = (sess.data && sess.data.network) === 'TRC20' ? 'TRC20' : 'BEP20';
+  const chosen = sess.data && sess.data.network;
+  const net    = ['TRC20', 'BEP20', 'TON'].includes(chosen) ? chosen : 'BEP20';
 
   const base = parseFloat(String(msg.text || '').replace(',', '.').trim());
   if (isNaN(base) || base < minDeposit()) {
@@ -155,7 +158,9 @@ async function handleUsdtAmount(bot, msg) {
     return;
   }
 
-  const address = net === 'TRC20' ? config.usdtTrc20Address : config.usdtBep20Address;
+  const address = net === 'TRC20' ? config.usdtTrc20Address
+                : net === 'TON'   ? config.usdtTonAddress
+                : config.usdtBep20Address;
   session.set(userId, States.WALLET_TOPUP_USDT_TX, {
     network: net, intentId: intent.id, startedAt: Date.now(),
   });

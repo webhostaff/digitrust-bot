@@ -584,6 +584,7 @@ const adminProductEditFieldsKb = (productId) =>
     [btn('✏️ Sales Count',    `admin_edit_field_${productId}_sales_count`)],
     // ── Bulk pricing (quantity tiers) ──────────────────────────────────
     [btn('📊 Bulk Pricing (by quantity)', `admin_bulkprice_${productId}`)],
+  [btn('⏳ Time-limited price', `admin_subexp_${productId}`)],
     // ── Stock management (direct from edit page) ──────────────────────
     [
       btn('➕ Add Stock Items',  `admin_stock_add_${productId}`),

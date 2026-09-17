@@ -31,10 +31,12 @@ const BASE_URL = 'https://api.binance.com';
 const ALLOWED_NETWORKS = {
   TRX: 'TRC20',
   BSC: 'BEP20',
+  TON: 'TON',
 };
 
 // TxID format: TRON = 64 hex, BSC = 0x + 64 hex
-const TXID_RE = /^(0x)?[a-fA-F0-9]{64}$/;
+// TRON = 64 hex, BSC = 0x + 64 hex, TON = 64 hex or a 44-char base64 hash.
+const TXID_RE = /^((0x)?[a-fA-F0-9]{64}|[A-Za-z0-9+/_-]{43,48}={0,2})$/;
 
 function eqAddr(a, b) {
   return String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();

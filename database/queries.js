@@ -1,6 +1,7 @@
 'use strict';
 
 const db = require('./db');
+const subPricing = require('../utils/subscriptionPricing');
 
 // ── USERS ─────────────────────────────────────────────────────────────────────
 
@@ -1943,7 +1944,9 @@ module.exports = {
   banUser:      (id, b) => banUser.run(b ? 1 : 0, id),
 
   // Products
-  getAllActiveProducts: () => getAllActiveProducts.all(),
+  // Every product leaves the database already re-priced for today, so no screen
+  // has to remember to do it — and none of them can disagree about the price.
+  getAllActiveProducts: () => getAllActiveProducts.all().map(subPricing.applySubscriptionPricing),
   getStaleProducts: (thresholdDays, cooldownHours) => getStaleProducts.all(thresholdDays, cooldownHours),
   markStaleReminderSent: (productId) => markStaleReminderSent.run(productId),
   // ─── Resellers ───
@@ -2059,7 +2062,9 @@ module.exports = {
   createCategory:      (name, emoji, order)     => cat_insert.run(name, emoji || '', order || 999),
   updateCategoryRow:   (id, name, emoji, order) => cat_update.run(name, emoji || '', order || 999, id),
   deleteCategory:      (id) => { cat_resetProducts.run(id); return cat_delete.run(id); },
-  getProductsByCategory: (catId) => cat_getProducts.all(catId),
+  getProductsByCategory: (catId) => cat_getProducts.all(catId).map(subPricing.applySubscriptionPricing),
+  /** Untouched row — for editing, where the stored price is what matters. */
+  getProductRaw:       (id) => getProduct.get(id),
   setProductCategory:  (productId, catId)       => cat_setProduct.run(catId, productId),
   getAllProductsForSorting: () => getAllProductsForSorting.all(),
 
@@ -2102,7 +2107,7 @@ module.exports = {
   incrementPreorderCount: (productId, qty) => incrementPreorderCount.run(qty, productId),
   getPreorderStats: () => getPreorderStats.get(),
   setDisplayOrder: (id, order) => updateDisplayOrder.run(order, id),
-  getProduct:          (id) => getProduct.get(id),
+  getProduct:          (id) => subPricing.applySubscriptionPricing(getProduct.get(id)),
   insertProduct: (data) => {
     const res = insertProduct.run({
       ...data,

@@ -23,6 +23,7 @@ const {
 } = require('../utils/keyboard');
 const items = require('../database/items');
 const binance = require('../services/binance');
+const subPricing = require('../utils/subscriptionPricing');
 const cgbCycles = require('../services/cgbCycles');
 const notices   = require('../services/notices');
 const { formatPrice, formatPriceExact, escapeHtml, expandPremiumEmojis, scaleTiersProportionally, productEmojiId, calcOrderPrice } = require('../utils/format');
@@ -1279,19 +1280,37 @@ async function handleAdminText(bot, msg) {
     const nextState = op === 'remove'
       ? States.ADMIN_BALANCE_AMOUNT_REMOVE
       : States.ADMIN_BALANCE_AMOUNT_ADD;
-    session.set(userId, nextState, { balanceOp: op, balanceTargetId: targetId });
+    session.set(userId, nextState, {
+      balanceOp: op, balanceTargetId: targetId,
+      // Carried from the payment trace, so an amount that was already read off
+      // Binance is not retyped — retyping is where a $12.83 becomes $12.38.
+      prefillAmount: d.prefillAmount || null,
+      prefillNote: d.prefillNote || null,
+    });
 
     const name = target.username ? `@${target.username}` : (target.first_name || `User ${targetId}`);
     const prompt = op === 'remove'
       ? '➖ <b>Remove User Balance</b>\n\n'
       : '➕ <b>Add User Balance</b>\n\n';
+
+    const rows = [];
+    if (d.prefillAmount) {
+      rows.push([{ text: `✅ ${op === 'remove' ? 'Remove' : 'Add'} ${formatPrice(d.prefillAmount)}`,
+                   callback_data: `admin_balgo_${targetId}_${Math.round(Number(d.prefillAmount) * 100)}` }]);
+    }
+    rows.push([{ text: '🔙 Back', callback_data: 'admin_panel' }]);
+
     await bot.sendMessage(
       chatId,
       prompt +
       `👤 Target: <b>${name}</b> (<code>${targetId}</code>)\n` +
       `💰 Current balance: <b>${formatPrice(target.balance || 0)}</b>\n\n` +
-      `Send the <b>amount</b> to ${op}:`,
-      { parse_mode: 'HTML', reply_markup: adminBackKb() }
+      (d.prefillAmount
+        ? `💵 From the trace: <b>${formatPrice(d.prefillAmount)}</b>\n` +
+          (d.prefillNote ? `<i>${escapeHtml(String(d.prefillNote))}</i>\n` : '') +
+          `\nTap below to confirm, or send a different amount:`
+        : `Send the <b>amount</b> to ${op}:`),
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }
     );
     return;
   }
@@ -1792,6 +1811,93 @@ async function handleAdminText(bot, msg) {
     return;
   }
 
+  // ── Time-limited product: end date + full price ───────────────────
+  if (s === States.ADMIN_SUB_EXPIRY) {
+    const productId = sess.data.productId;
+    const parts = String(text || '').trim().split(/\s+/);
+    const date = parts[0];
+    const total = parseFloat(String(parts[1] || '').replace(/[$,\s]/g, ''));
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(total) || total <= 0) {
+      await bot.sendMessage(chatId, '❌ Send it as <code>YYYY-MM-DD PRICE</code>, e.g. <code>2026-09-19 10</code>.', { parse_mode: 'HTML' });
+      return;
+    }
+
+    const left = subPricing.daysLeft(date);
+    if (!left || left <= 0) {
+      await bot.sendMessage(chatId, '❌ That date has already passed. Pick a future date.');
+      return;
+    }
+
+    const p = db.getProductRaw ? db.getProductRaw(productId) : db.getProduct(productId);
+    if (!p) { await bot.sendMessage(chatId, '❌ Product not found.'); return; }
+
+    // The base title is captured now, before any countdown suffix is added, so
+    // turning this off later can restore exactly what the admin wrote.
+    const baseTitle = p.sub_base_title || String(p.title || '')
+      .replace(/\s*[—-]\s*\d+\s*days?\s*left\s*$/i, '');
+    const perDay = Number((total / left).toFixed(4));
+
+    db.updateProductField(productId, 'sub_base_title', baseTitle);
+    db.updateProductField(productId, 'sub_end_date', date);
+    db.updateProductField(productId, 'sub_price_per_day', perDay);
+    session.clear(userId);
+
+    const live = db.getProduct(productId);
+    const tomorrow = Math.max(Number(p.sub_min_price) || 0, Math.ceil(perDay * (left - 1) * 100) / 100);
+
+    await bot.sendMessage(chatId,
+      `✅ <b>Time-limited pricing on</b>\n\n` +
+      `📅 Ends <b>${date}</b> · ⏳ <b>${left}</b> day(s) left\n` +
+      `💵 <b>${formatPrice(perDay)}</b> per day\n\n` +
+      `<b>Today:</b> ${escapeHtml(kbStripEmojiCodes(String(live?.title || '')).trim())} — <b>${formatPrice(live?.price || 0)}</b>\n` +
+      `<b>Tomorrow:</b> ${escapeHtml(baseTitle)} — ${left - 1} day(s) left — <b>${formatPrice(tomorrow)}</b>\n\n` +
+      `<i>Updates itself daily. No action needed from you.</i>`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '⏳ Settings', callback_data: `admin_subexp_${productId}` }]] } });
+    return;
+  }
+
+  if (s === States.ADMIN_SUB_MINDAYS) {
+    const productId = sess.data.productId;
+    const v = parseInt(String(text || '').replace(/[^0-9]/g, ''), 10);
+    if (!Number.isFinite(v) || v < 0 || v > 365) {
+      await bot.sendMessage(chatId, '❌ Send a whole number of days, e.g. 3 — or 0 to sell to the last day.');
+      return;
+    }
+    db.updateProductField(productId, 'sub_min_days', v);
+    session.clear(userId);
+    const live = db.getProduct(productId);
+    await bot.sendMessage(chatId,
+      v > 0
+        ? `✅ Goes OUT OF STOCK once fewer than <b>${v}</b> day(s) remain.\n\n` +
+          `Right now: <b>${live?.sub_days_left ?? 0}</b> day(s) — ` +
+          `${(live?.stock_quantity || 0) > 0 ? '🟢 still selling' : '🔴 out of stock'}`
+        : `✅ Will keep selling down to the last day.`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '⏳ Settings', callback_data: `admin_subexp_${productId}` }]] } });
+    return;
+  }
+
+  if (s === States.ADMIN_SUB_MIN) {
+    const productId = sess.data.productId;
+    const v = parseFloat(String(text || '').replace(/[$,\s]/g, ''));
+    if (!Number.isFinite(v) || v < 0) {
+      await bot.sendMessage(chatId, '❌ Send a number, e.g. 2 — or 0 for no floor.');
+      return;
+    }
+    db.updateProductField(productId, 'sub_min_price', v);
+    session.clear(userId);
+    const live = db.getProduct(productId);
+    await bot.sendMessage(chatId,
+      v > 0
+        ? `✅ Never drops below <b>${formatPrice(v)}</b>.\n\nRight now: <b>${formatPrice(live?.price || 0)}</b>`
+        : `✅ Floor removed — the price follows the days only.`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '⏳ Settings', callback_data: `admin_subexp_${productId}` }]] } });
+    return;
+  }
+
   // ── Spend ranks: edit one field / add a tier ──────────────────────
   if (s === States.ADMIN_RANK_EDIT) {
     const { rankId, field } = sess.data || {};
@@ -2134,12 +2240,16 @@ async function runTxidTrace(bot, chatId, rawText) {
       // "Not in my database" and "never arrived" are different answers, and
       // only Binance can tell them apart — so ask it before saying no.
       let chainLine = '';
+      // Remembered so the "add balance" button can carry the exact figure that
+      // was just read off Binance.
+      let chainAmount = 0;
       try {
         const chain = await binance.findDepositRaw(needle);
         if (!chain.ok) {
           chainLine = `\n\n⚠️ <i>Could not check Binance: ${escapeHtml(chain.error || 'unknown error')}</i>`;
         } else if (chain.matches.length) {
           const d = chain.matches[0];
+          chainAmount = Number(d.amount) || 0;
           const state = d.status === 1 ? '✅ Completed on Binance'
                       : d.status === 0 ? '⏳ Still pending on Binance'
                       : d.status === 6 ? '🔒 Credited but withdrawal-locked'
@@ -2164,6 +2274,7 @@ async function runTxidTrace(bot, chatId, rawText) {
             const pay = await binance.findPayTransactionRaw(needle);
             if (pay.ok && pay.matches.length) {
               const t = pay.matches[0];
+              chainAmount = Number(t.amount) || 0;
               payLine =
                 `\n\n🟡 <b>FOUND ON BINANCE PAY — but never credited here</b>\n` +
                 `💵 <b>$${Number(t.amount).toFixed(2)}</b> ${escapeHtml(t.currency || '')}\n` +
@@ -2194,7 +2305,8 @@ async function runTxidTrace(bot, chatId, rawText) {
         `Never credited, never queued, never held for review.` +
         chainLine,
         { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
-          [{ text: '➕ Add User Balance', callback_data: 'admin_add_balance' }],
+          [{ text: `➕ Add ${chainAmount ? money(chainAmount) : 'User Balance'} to a customer`,
+             callback_data: chainAmount ? `admin_addbal_${Math.round(chainAmount * 100)}` : 'admin_add_balance' }],
           [{ text: '🔎 Trace another', callback_data: 'admin_txid_search' }],
         ] } });
       return;
@@ -3215,6 +3327,138 @@ async function handleAdminCallback(bot, query) {
     return handleAdminCallback(bot, { ...query, data: `admin_bulkprice_${productId}` });
   }
 
+  // ── Time-limited product: price falls as the end date approaches ───
+  if (/^admin_subexp_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const p = db.getProductRaw ? db.getProductRaw(productId) : db.getProduct(productId);
+    if (!p) { await answer('❌ Product not found'); return; }
+
+    const live = db.getProduct(productId);
+    const rows = [[{ text: p.sub_end_date ? '📅 Change end date' : '📅 Set end date', callback_data: `admin_subset_${productId}` }]];
+    if (p.sub_end_date) {
+      rows.push([{ text: '💵 Price floor', callback_data: `admin_submin_${productId}` }]);
+      rows.push([{ text: `⛔ Stop selling below (${p.sub_min_days ?? 3} days)`, callback_data: `admin_submindays_${productId}` }]);
+      rows.push([{ text: '🗑 Turn off (fixed price again)', callback_data: `admin_subclear_${productId}` }]);
+    }
+    // Unlimited stock is offered only where it makes sense: a ChatGPT Business
+    // seat is issued on demand from a workspace, so there is no item to run out
+    // of. On an ordinary product it would just be a way to oversell.
+    if (Number(p.is_chatgpt_business) === 1 || Number(p.unlimited_stock) === 1) {
+      rows.push([{
+        text: Number(p.unlimited_stock) === 1 ? '♾ Unlimited stock: ON' : '♾ Unlimited stock: off',
+        callback_data: `admin_unlimited_${productId}`,
+      }]);
+    }
+    rows.push([{ text: '🔙 Back', callback_data: `admin_edit_p_${productId}` }]);
+
+    await bot.editMessageText(
+      `⏳ <b>Time-limited pricing</b>\n${escapeHtml(kbStripEmojiCodes(String(p.sub_base_title || p.title || '')).trim())}\n\n` +
+      (p.sub_end_date
+        ? `📅 Ends: <b>${escapeHtml(p.sub_end_date)}</b>\n` +
+          `⏳ Days left: <b>${live?.sub_days_left ?? 0}</b>\n` +
+          `💵 Per day: <b>${formatPrice(p.sub_price_per_day)}</b>\n` +
+          (Number(p.sub_min_price) > 0 ? `🛑 Never below: <b>${formatPrice(p.sub_min_price)}</b>\n` : '') +
+          `\n<b>Customers see right now</b>\n` +
+          `${escapeHtml(kbStripEmojiCodes(String(live?.title || '')).trim())}\n` +
+          `💰 <b>${formatPrice(live?.price || 0)}</b>\n\n` +
+          `<i>Tomorrow: ${formatPrice(Math.max(Number(p.sub_min_price) || 0, Math.ceil(Number(p.sub_price_per_day) * Math.max(0, (live?.sub_days_left || 0) - 1) * 100) / 100))}</i>`
+        : `<i>Not set — this product has a fixed price.</i>\n\n` +
+          `Set an end date and the price drops by itself every day, with the ` +
+          `title showing how many days are left. Use it for accounts that die ` +
+          `on a known date.`),
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_subset_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    session.set(userId, States.ADMIN_SUB_EXPIRY, { productId });
+    await bot.sendMessage(chatId,
+      `⏳ <b>End date and full price</b>\n\n` +
+      `Send them together:\n<code>YYYY-MM-DD PRICE</code>\n\n` +
+      `Example: <code>2026-09-19 10</code>\n` +
+      `<i>= the account dies on the 19th, and is worth $10 for the whole ` +
+      `remaining period as of today. The per-day rate is worked out from that, ` +
+      `so tomorrow it is one day cheaper.</i>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  // ── Stock that never runs out ─────────────────────────────────────
+  if (/^admin_unlimited_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const p = db.getProductRaw ? db.getProductRaw(productId) : db.getProduct(productId);
+    if (!p) { await answer('❌ Product not found'); return; }
+
+    const turningOn = Number(p.unlimited_stock) !== 1;
+
+    // Guarded here as well as in the keyboard: a stale button from an older
+    // message must not be able to switch this on for a normal product.
+    if (turningOn && Number(p.is_chatgpt_business) !== 1) {
+      await answer('❌ Only available on the ChatGPT Business product');
+      return;
+    }
+
+    // Unlimited stock and automatic delivery contradict each other: automatic
+    // delivery hands out a stored item and there is no endless supply of those.
+    // Refusing here is better than letting the first customer pay and then find
+    // nothing to deliver.
+    if (turningOn && p.delivery_type !== 'manual') {
+      await bot.editMessageText(
+        `♾ <b>Unlimited stock needs manual delivery</b>\n\n` +
+        `This product delivers automatically from stored items, and there is no ` +
+        `endless supply of those — the first order past the last item would take ` +
+        `the money and have nothing to hand over.\n\n` +
+        `Switch delivery to <b>Manual</b> first, then turn this on. You will get a ` +
+        `notification for each order and send the account yourself.`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+          [{ text: '🚚 Change delivery mode', callback_data: `admin_toggle_delivery_${productId}` }],
+          [{ text: '🔙 Back', callback_data: `admin_subexp_${productId}` }],
+        ] } }
+      ).catch(() => {});
+      return;
+    }
+
+    db.updateProductField(productId, 'unlimited_stock', turningOn ? 1 : 0);
+    logger.info(`[PRODUCT ${productId}] unlimited stock ${turningOn ? 'ON' : 'OFF'} by ${userId}`);
+    return handleAdminCallback(bot, { ...query, data: `admin_subexp_${productId}` });
+  }
+
+  if (/^admin_submindays_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    session.set(userId, States.ADMIN_SUB_MINDAYS, { productId });
+    await bot.sendMessage(chatId,
+      `⛔ <b>Stop selling below</b>\n\nHow many days must remain for this to stay on sale?\n\n` +
+      `Example: <code>3</code> — once fewer than 3 days are left it goes OUT OF STOCK ` +
+      `on its own.\n\n<i>Send <code>0</code> to keep selling to the last day.</i>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (/^admin_submin_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    session.set(userId, States.ADMIN_SUB_MIN, { productId });
+    await bot.sendMessage(chatId,
+      `🛑 <b>Price floor</b>\n\nSend the lowest price this product may ever drop to.\n\n` +
+      `<i>On the last day a per-day price can fall below what the sale is worth ` +
+      `handling. Send <code>0</code> for no floor.</i>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (/^admin_subclear_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const p = db.getProductRaw ? db.getProductRaw(productId) : null;
+    // Put the title back the way it was, or it keeps the "— 3 days left" suffix
+    // for good on a product that no longer counts down.
+    if (p && p.sub_base_title) db.updateProductField(productId, 'title', p.sub_base_title);
+    db.updateProductField(productId, 'sub_end_date', null);
+    db.updateProductField(productId, 'sub_price_per_day', 0);
+    db.updateProductField(productId, 'sub_base_title', null);
+    return handleAdminCallback(bot, { ...query, data: `admin_edit_p_${productId}` });
+  }
+
   // ── Bulk Pricing — edit one tier (combined qty + price prompt) ─────
   if (/^admin_bulkprice_edit_\d+_[123]$/.test(data)) {
     const parts     = data.split('_');
@@ -3390,12 +3634,24 @@ async function handleAdminCallback(bot, query) {
     const productId = parseInt(data.split('_').pop(), 10);
     const product   = db.getProduct(productId);
     session.set(userId, States.ADMIN_STOCK_SET_QTY, { stockProductId: productId });
+    const isManual = product.delivery_type === 'manual';
     await bot.editMessageText(
       `✏️ <b>Set Stock Manually</b>\n\n` +
-      `Product: <b>${product.title}</b>\n` +
-      `Current quantity: <b>${product.stock_quantity || 0}</b>\n\n` +
+      `Product: <b>${escapeHtml(kbStripEmojiCodes(String(product.title || '')).trim())}</b>\n` +
+      `Current quantity: <b>${product.stock_quantity || 0}</b>\n` +
+      `🚚 Delivery: <b>${isManual ? 'Manual' : 'Automatic'}</b>\n\n` +
       `Enter the <b>exact</b> new stock quantity (replaces current value):\n` +
-      `<i>Example: current=5, set=100 → new=100</i>`,
+      `<i>Example: current=5, set=100 → new=100</i>\n\n` +
+      (isManual
+        // Said explicitly because it is not obvious, and the alternative is the
+        // shop owner pasting 80 dummy lines to make a counter go up.
+        ? `✅ <i>This product delivers manually, so the number is all that is ` +
+          `needed — no account details. Each sale takes one off the counter and ` +
+          `opens a delivery task for you.</i>`
+        : `⚠️ <i>This product delivers automatically, so the number alone is not ` +
+          `enough — it must be backed by real stock items, or a customer will pay ` +
+          `and receive nothing. Use ➕ Add Stock Items instead, or switch delivery ` +
+          `to Manual.</i>`),
       { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: backToProductEditKb(productId) }
     );
     return;
@@ -8100,6 +8356,40 @@ async function handleAdminCallback(bot, query) {
   }
 
   // ── Manual balance management (Add / Remove) ─────────────────────
+  // Confirm a pre-filled amount straight from the trace.
+  if (/^admin_balgo_\d+_\d+$/.test(data)) {
+    const parts  = data.split('_');
+    const target = parseInt(parts[2], 10);
+    const cents  = parseInt(parts[3], 10);
+    const amount = cents / 100;
+
+    // Re-read the session rather than trusting the button alone: the amount is
+    // in the callback data, which the client supplies.
+    const sess = session.get(userId);
+    if (sess.state !== States.ADMIN_BALANCE_AMOUNT_ADD || Number(sess.data.balanceTargetId) !== target) {
+      await answer('❌ Session expired — start again');
+      return;
+    }
+
+    session.set(userId, States.ADMIN_BALANCE_AMOUNT_ADD, sess.data);
+    return handleAdminText(bot, {
+      from: { id: userId }, chat: { id: chatId }, text: String(amount),
+    });
+  }
+
+  if (/^admin_addbal_\d+$/.test(data)) {
+    const amount = parseInt(data.split('_').pop(), 10) / 100;
+    session.set(userId, States.ADMIN_BALANCE_USER_ID, {
+      balanceOp: 'add', prefillAmount: amount,
+      prefillNote: 'Amount taken from the payment trace',
+    });
+    await bot.sendMessage(chatId,
+      `➕ <b>Add ${formatPrice(amount)}</b>\n\n` +
+      `Who should receive it? Send their Telegram ID or <code>@username</code>.`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
   if (data === 'admin_add_balance') {
     session.set(userId, States.ADMIN_BALANCE_USER_ID, { balanceOp: 'add' });
     await bot.editMessageText(

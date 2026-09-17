@@ -14,6 +14,7 @@ const config = {
   // USDT deposit addresses (Binance Deposit addresses)
   usdtTrc20Address: process.env.USDT_TRC20_ADDRESS || '',
   usdtBep20Address: process.env.USDT_BEP20_ADDRESS || '',
+  usdtTonAddress:   process.env.USDT_TON_ADDRESS   || '',
 
   // Binance Spot API (Enable Reading only — for deposit history lookup)
   binanceId:        process.env.BINANCE_ID         || '',
