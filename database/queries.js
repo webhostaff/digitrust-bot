@@ -2130,10 +2130,23 @@ module.exports = {
       'wholesale_price','category_id',
       // V2
       'refund_enabled','delivery_type','low_stock_threshold',
+      // V7 — time-limited products and unlimited stock
+      'sub_end_date','sub_price_per_day','sub_min_price','sub_base_title',
+      'sub_min_days','unlimited_stock',
     ];
     if (!allowed.includes(field)) throw new Error(`Field ${field} not allowed`);
     db.prepare(`UPDATE products SET ${field} = ? WHERE id = ?`).run(value, id);
+
+    // A title change is the only way an icon is set, so this is where it gets
+    // captured. Doing it here rather than at each call site means a flow added
+    // later cannot forget to back it up.
+    if (field === 'title') {
+      try { require('../utils/emojiBackup').remember(id, value); } catch (_) {}
+    }
   },
+
+  /** Alias — several handlers call it by this name. */
+  updateProductField: (id, field, value) => module.exports.updateProduct(id, field, value),
   softDeleteProduct: (id) => softDeleteProduct.run(id),
 
   // Stock quantity (numeric counter on products)

@@ -2254,16 +2254,21 @@ async function runTxidTrace(bot, chatId, rawText) {
                       : d.status === 0 ? '⏳ Still pending on Binance'
                       : d.status === 6 ? '🔒 Credited but withdrawal-locked'
                       : `Status code ${d.status}`;
+          const isUsdt = String(d.coin || '').toUpperCase() === 'USDT';
           chainLine =
             `\n\n🟡 <b>FOUND ON BINANCE — but never credited here</b>\n` +
-            `💵 <b>$${Number(d.amount).toFixed(2)}</b> ${escapeHtml(d.coin || '')}\n` +
+            // Only USDT is shown with a dollar sign. Printing "$1.79" for 1.79
+            // TRX would invite crediting a dollar amount that was never sent.
+            `💵 <b>${isUsdt ? '$' : ''}${Number(d.amount).toFixed(isUsdt ? 2 : 6)}</b> ${escapeHtml(d.coin || '')}\n` +
+            (isUsdt ? '' : `⚠️ <b>This is ${escapeHtml(d.coin || 'another coin')}, not USDT.</b> Convert it before crediting.\n`) +
             `🌐 ${escapeHtml(d.network || '?')}\n` +
             `📥 To: <code>${escapeHtml(String(d.address || '—'))}</code>\n` +
             `📅 ${new Date(d.insertTime).toISOString().slice(0, 16).replace('T', ' ')}\n` +
             `📊 ${state}\n\n` +
             `<i>The money is in your Binance account. It was not added to any ` +
             `wallet — most often because it went to a different address than the ` +
-            `one the bot watches, or arrived without a matching deposit request. ` +
+            `one the bot watches, arrived in a coin the bot does not accept, or ` +
+            `came without a matching deposit request. ` +
             `Add it manually with ➕ Add User Balance once you know the customer.</i>`;
         } else {
           // Not an on-chain deposit — try Binance Pay. Money "sent on Binance"

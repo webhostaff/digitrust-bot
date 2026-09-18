@@ -610,6 +610,48 @@ bot.onText(/^\/apibase(?:\s+(\S+))?$/i, async (msg, match) => {
   await bot.sendMessage(msg.chat.id, `✅ Set to <code>${escapeHtml(v)}</code>\n\nRun /apicheck to test it.`, { parse_mode: 'HTML' });
 });
 
+/** Admin: inspect, re-save or force-restore the premium icons. */
+bot.onText(/^\/emoji(backup|restore|list)?$/i, async (msg, match) => {
+  if (!adminHandler.isAdmin(msg.from.id)) return;
+  const eb = require('./utils/emojiBackup');
+  const action = String((match && match[1]) || 'list').toLowerCase();
+  const chatId = msg.chat.id;
+
+  if (action === 'backup') {
+    const n = eb.backupAll();
+    await bot.sendMessage(chatId,
+      `💾 <b>${n}</b> product icon(s) saved.\n\n<i>They will be put back automatically if anything strips them.</i>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (action === 'restore') {
+    const done = eb.restoreMissing();
+    await bot.sendMessage(chatId,
+      done.length
+        ? `♻️ Restored icons on <b>${done.length}</b> product(s).\n<code>${done.join(', ')}</code>`
+        : `✅ Nothing to restore — every backed-up product still has its icon.`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  const rows = eb.list();
+  if (!rows.length) {
+    await bot.sendMessage(chatId,
+      `🎨 <b>Icon backup is empty.</b>\n\nSet an icon on a product, or run <code>/emojibackup</code> to save the ones already in place.`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+  const missing = rows.filter((r) => r.current_title && !/\[emoji:\d+\]/.test(r.current_title));
+  await bot.sendMessage(chatId,
+    `🎨 <b>Icon backup</b> — ${rows.length} product(s)\n` +
+    (missing.length ? `⚠️ <b>${missing.length}</b> currently missing their icon — run <code>/emojirestore</code>\n` : `✅ All present\n`) +
+    `\n` + rows.slice(0, 20).map((r) =>
+      `• <code>${r.product_id}</code> ${r.fallback || ''} ${escapeHtml(String(r.title_seen || '').replace(/\[emoji:\d+\]/g, '').trim().slice(0, 28))}`
+    ).join('\n'),
+    { parse_mode: 'HTML' });
+});
+
 // ── Text messages ─────────────────────────────────────────────────────────────
 bot.on('message', async (msg) => {
   // ── /emoji_id capture handler ──────────────────────────────────────
@@ -1820,6 +1862,14 @@ setInterval(runStaleProductCheck, STALE_CHECK_INTERVAL_MS);
 setTimeout(runStaleProductCheck, 60 * 1000);
 
 bot.on('callback_query', handleCallbackQuery);
+
+// Premium product icons: snapshot what is there, restore anything that has been
+// lost. Runs before the first customer message so nobody sees a stripped title.
+try {
+  require('./utils/emojiBackup').syncOnBoot();
+} catch (e) {
+  logger.error(`emoji backup sync: ${e.message}`);
+}
 
 // ── Start Support Bot ─────────────────────────────────────────────────
 require('./support-bot');

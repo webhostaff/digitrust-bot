@@ -67,8 +67,14 @@ async function signedGet(path, params = {}) {
   });
 }
 
+/**
+ * @param {object} opts coin — omit to fetch EVERY coin, which the tracer needs.
+ */
 async function fetchDepositHistory({ coin = 'USDT', startTime, endTime } = {}) {
-  const params = { coin };
+  // An explicit null means "all coins". Passing the key through as undefined
+  // would serialise to the literal string "undefined" and match nothing.
+  const params = {};
+  if (coin) params.coin = coin;
   if (startTime) params.startTime = String(startTime);
   if (endTime)   params.endTime   = String(endTime);
 
@@ -98,7 +104,7 @@ async function verifyDepositByTxId(rawTxid, opts = {}) {
       message: 'Deposit verification is not configured. Please contact support.',
     };
   }
-  if (!config.usdtTrc20Address && !config.usdtBep20Address) {
+  if (!config.usdtTrc20Address && !config.usdtBep20Address && !config.usdtTonAddress) {
     logger.error('No USDT deposit addresses configured.');
     return {
       found: false, reason: 'not_configured',
@@ -264,9 +270,17 @@ async function verifyDepositByTxId(rawTxid, opts = {}) {
   const networkLabel = ALLOWED_NETWORKS[network];
 
   // 8. Address
-  const expectedAddr = network === 'TRX'
-    ? config.usdtTrc20Address
-    : config.usdtBep20Address;
+  //
+  // Looked up by network rather than chosen with a two-way ternary. The old
+  // form sent everything that was not TRON to the BEP20 address, so a genuine
+  // TON deposit would be compared against a BSC address and rejected as "wrong
+  // address" — money that arrived, recorded as never having arrived.
+  const ADDRESS_BY_NETWORK = {
+    TRX: config.usdtTrc20Address,
+    BSC: config.usdtBep20Address,
+    TON: config.usdtTonAddress,
+  };
+  const expectedAddr = ADDRESS_BY_NETWORK[network];
 
   if (!expectedAddr) {
     return {
@@ -546,7 +560,11 @@ async function findDepositRaw(rawTxid) {
     // A failed window must not hide the other one: half an answer still tells
     // support more than an error does.
     try {
-      const batch = await fetchDepositHistory({ coin: 'USDT', ...w });
+      // Every coin, not just USDT. The tracer answers "did this arrive?", and a
+      // customer who sent TRX or BNB by mistake still sent something — reporting
+      // "never reached your account" about money sitting in the account is the
+      // worst possible answer, because it ends the investigation.
+      const batch = await fetchDepositHistory({ coin: null, ...w });
       rows.push(...batch);
     } catch (e) {
       logger.warn(`findDepositRaw window failed: ${e.message}`);
@@ -564,7 +582,7 @@ async function findDepositRaw(rawTxid) {
     matches: matches.map((d) => ({
       txId: d.txId,
       amount: Number(d.amount),
-      coin: d.coin,
+      coin: d.coin,   // may be TRX, BNB… not only USDT
       network: d.network,
       address: d.address,
       // 0 = pending, 6 = credited but withdrawal-locked, 1 = success.

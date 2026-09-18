@@ -662,19 +662,35 @@ async function startUsdtPayForOrder(bot, chatId, userId, orderId, messageId) {
 
   session.set(userId, States.BUY_USDT_TXID, { orderId });
 
-  const trc20 = config.usdtTrc20Address || '—';
-  const bep20 = config.usdtBep20Address || '—';
+  // Built from what is actually configured. The old version printed both
+  // addresses unconditionally and showed "—" for a missing one — a customer
+  // could read that as an address and send real money nowhere.
+  const nets = [
+    { key: 'TRC20', label: '🔴 <b>TRC20 (USDT):</b>', via: 'TRC20 → send via <b>TRON</b> network',       addr: config.usdtTrc20Address },
+    { key: 'BEP20', label: '🟡 <b>BEP20 (USDT):</b>', via: 'BEP20 → send via <b>BNB Smart Chain</b>',    addr: config.usdtBep20Address },
+    { key: 'TON',   label: '💎 <b>TON (USDT):</b>',   via: 'TON → send via <b>The Open Network</b>',     addr: config.usdtTonAddress },
+  ].filter((n) => n.addr && String(n.addr).trim());
+
+  if (!nets.length) {
+    await bot.editMessageText(
+      '❌ <b>USDT payments are not configured.</b>\n\nPlease choose another payment method or contact support.',
+      { chat_id: chatId, message_id: messageId, parse_mode: 'HTML',
+        reply_markup: cancelKb(`cancel_order_${order.id}`) }
+    ).catch(() => {});
+    return;
+  }
+
+  const addressBlock = nets.map((n) => `${n.label}\n<code>${n.addr}</code>`).join('\n\n');
+  const viaBlock = nets.map((n) => `• ${n.via}`).join('\n');
 
   await bot.editMessageText(
     `💎 <b>Pay with USDT</b>\n\n` +
     `📦 Order: <b>#${order.id}</b>\n` +
     `💵 Amount due: <b>${formatPrice(order.total_price)}</b>\n\n` +
-    `🔹 <b>TRC20 (USDT):</b> <code>${trc20}</code>\n` +
-    `🔹 <b>BEP20 (USDT):</b> <code>${bep20}</code>\n\n` +
-    `📌 Send <b>exactly ${formatPrice(order.total_price)}</b> to one of the addresses above, then send the bot the <b>TxID</b> (transaction hash).\n\n` +
-    `⚠️ <b>Important:</b>\n` +
-    `• TRC20 → send via TRON network\n` +
-    `• BEP20 → send via BNB Smart Chain\n\n` +
+    `${addressBlock}\n\n` +
+    `📌 Send <b>exactly ${formatPrice(order.total_price)}</b> to <b>one</b> of the addresses above, then send the bot the <b>TxID</b> (transaction hash).\n\n` +
+    `⚠️ <b>Important — the network must match the address:</b>\n` +
+    `${viaBlock}\n\n` +
     `💡 If something goes wrong (wrong amount / out of stock), funds are added to your wallet automatically.\n\n` +
     `<i>Example TxID:</i>\n<code>0x1234...abcd</code> (64 chars)\n\n` +
     `⏰ Valid for ${PAYMENT_CONFIRM_VALIDITY_MIN} minutes. TxID can only be used once.`,
