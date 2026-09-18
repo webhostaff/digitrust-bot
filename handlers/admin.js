@@ -1829,6 +1829,20 @@ async function handleAdminText(bot, msg) {
       return;
     }
 
+    // A date decades away is a typo, not an intention. Accepting it produced
+    // "— 20721 days — $13321.54": the price is per-day multiplied by the days
+    // left, so one wrong year turns a $10 product into a five-figure one that
+    // no customer can buy and the shop cannot explain.
+    if (left > 730) {
+      await bot.sendMessage(chatId,
+        `❌ That date is <b>${left}</b> days away (${date}).\n\n` +
+        `Time-limited pricing is for accounts that expire within about two ` +
+        `years. Check the year — <code>2083</code> instead of <code>2026</code> ` +
+        `is the usual slip.`,
+        { parse_mode: 'HTML' });
+      return;
+    }
+
     const p = db.getProductRaw ? db.getProductRaw(productId) : db.getProduct(productId);
     if (!p) { await bot.sendMessage(chatId, '❌ Product not found.'); return; }
 

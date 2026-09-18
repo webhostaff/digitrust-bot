@@ -74,8 +74,11 @@ function applySubscriptionPricing(product, from = new Date()) {
   // The suffix is stripped with a pattern that also matches the older
   // "— 8 days left" wording, so titles written before the change are cleaned up
   // instead of ending with two suffixes.
-  const baseTitle = product.sub_base_title || String(product.title || '')
-    .replace(/\s*[—-]\s*\d+\s*days?(\s*left)?\s*$/i, '');
+  // Repeated, so a title that already stacked two suffixes is cleaned fully
+  // rather than losing only the last one.
+  const baseTitle = (product.sub_base_title || String(product.title || ''))
+    .replace(/(\s*[—-]\s*\d+\s*days?(\s*left)?)+\s*$/i, '')
+    .trim();
 
   return {
     ...product,

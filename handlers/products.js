@@ -305,8 +305,15 @@ async function showProductDetail(bot, chatId, productId, messageId = null, userI
   // legacy column first showed the OLD emoji here while buttons already showed
   // the new one, because changing a product's emoji rewrites the title marker.
   const productEmoji = productEmojiId(product);
+  // The icon is shown ONCE. Prefixing it and then expanding a title that still
+  // contains the same marker printed it twice — the 🟢🟢 at the top of the
+  // product page. The marker is removed from the title when it is being used as
+  // the prefix.
+  const titleForDisplay = productEmoji
+    ? expandPremiumEmojis(String(product.title || '').replace(/\[emoji:\d+\]/, ''))
+    : expandPremiumEmojis(product.title);
   const titleHtml = productEmoji
-    ? `<tg-emoji emoji-id="${productEmoji}">🛍</tg-emoji> <b>${expandPremiumEmojis(product.title)}</b>`
+    ? `<tg-emoji emoji-id="${productEmoji}">🛍</tg-emoji> <b>${titleForDisplay}</b>`
     : `<b>${expandPremiumEmojis(product.title)}</b>`;
 
   // Manual products are fulfilled by a human — say so up-front so the buyer
@@ -393,7 +400,7 @@ async function showPreorderProductDetail(bot, chatId, productId, messageId = nul
   const remaining = Math.max(0, (product.preorder_max || 0) - (product.preorder_count || 0));
   const preorderEmoji = productEmojiId(product);
   const preorderTitle = preorderEmoji
-    ? `<tg-emoji emoji-id="${preorderEmoji}">🔜</tg-emoji> <b>${expandPremiumEmojis(product.title)}</b>`
+    ? `<tg-emoji emoji-id="${preorderEmoji}">🔜</tg-emoji> <b>${expandPremiumEmojis(String(product.title || '').replace(/\[emoji:\d+\]/, ''))}</b>`
     : `🔜 <b>${expandPremiumEmojis(product.title)}</b>`;
   const text =
     `${preorderTitle}\n\n` +
