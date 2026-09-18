@@ -1946,7 +1946,7 @@ module.exports = {
   // Products
   // Every product leaves the database already re-priced for today, so no screen
   // has to remember to do it — and none of them can disagree about the price.
-  getAllActiveProducts: () => getAllActiveProducts.all().map(subPricing.applySubscriptionPricing),
+  getAllActiveProducts: () => getAllActiveProducts.all().map((p) => subPricing.applySubscriptionPricing(p)),
   getStaleProducts: (thresholdDays, cooldownHours) => getStaleProducts.all(thresholdDays, cooldownHours),
   markStaleReminderSent: (productId) => markStaleReminderSent.run(productId),
   // ─── Resellers ───
@@ -2062,7 +2062,7 @@ module.exports = {
   createCategory:      (name, emoji, order)     => cat_insert.run(name, emoji || '', order || 999),
   updateCategoryRow:   (id, name, emoji, order) => cat_update.run(name, emoji || '', order || 999, id),
   deleteCategory:      (id) => { cat_resetProducts.run(id); return cat_delete.run(id); },
-  getProductsByCategory: (catId) => cat_getProducts.all(catId).map(subPricing.applySubscriptionPricing),
+  getProductsByCategory: (catId) => cat_getProducts.all(catId).map((p) => subPricing.applySubscriptionPricing(p)),
   /** Untouched row — for editing, where the stored price is what matters. */
   getProductRaw:       (id) => getProduct.get(id),
   setProductCategory:  (productId, catId)       => cat_setProduct.run(catId, productId),
