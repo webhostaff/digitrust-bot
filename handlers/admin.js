@@ -1137,6 +1137,33 @@ async function handleAdminText(bot, msg) {
         await bot.sendMessage(chatId, `🔔 Notified <b>${notified}</b> waiting user(s).`, { parse_mode: 'HTML' });
       }
     }
+
+    // Announce it, exactly as adding stock items does.
+    //
+    // This path was the only way to stock a manual-delivery product, and it was
+    // the one path that never posted — so every restock of a manually delivered
+    // product was silent while item-based ones were announced. The channel is
+    // where customers learn something is back; a restock nobody hears about is
+    // a restock that does not sell.
+    if (newQty > 0 && db.getSetting('stock_notifications_enabled', '1') === '1') {
+      try {
+        const fresh = db.getProduct(productId);
+        const me = await bot.getMe().catch(() => ({ username: '' }));
+        const kb = { inline_keyboard: [[{
+          text: '🛒 Buy now',
+          url: `https://t.me/${me.username}?start=p_${fresh.id}`,
+        }]] };
+        const published = await autoPublishWithPhoto(
+          bot, fresh, buildStockUpdateText(fresh, newQty), kb
+        );
+        await bot.sendMessage(chatId,
+          published
+            ? '📢 Posted to your channel and group.'
+            : '⚠️ Could not post — check /admin → Settings → 🩺 Broadcast Check.');
+      } catch (e) {
+        logger.warn(`stock set qty publish: ${e.message}`);
+      }
+    }
     return;
   }
 

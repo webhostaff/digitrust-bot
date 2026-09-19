@@ -668,7 +668,8 @@ async function startUsdtPayForOrder(bot, chatId, userId, orderId, messageId) {
   const nets = [
     { key: 'TRC20', label: '🔴 <b>TRC20 (USDT):</b>', via: 'TRC20 → send via <b>TRON</b> network',       addr: config.usdtTrc20Address },
     { key: 'BEP20', label: '🟡 <b>BEP20 (USDT):</b>', via: 'BEP20 → send via <b>BNB Smart Chain</b>',    addr: config.usdtBep20Address },
-    { key: 'TON',   label: '💎 <b>TON (USDT):</b>',   via: 'TON → send via <b>The Open Network</b>',     addr: config.usdtTonAddress },
+    { key: 'TON',   label: '💎 <b>TON (USDT):</b>',   via: 'TON → send via <b>The Open Network</b>',     addr: config.usdtTonAddress,
+      memo: String(config.usdtTonMemo || '').trim() },
   ].filter((n) => n.addr && String(n.addr).trim());
 
   if (!nets.length) {
@@ -680,7 +681,11 @@ async function startUsdtPayForOrder(bot, chatId, userId, orderId, messageId) {
     return;
   }
 
-  const addressBlock = nets.map((n) => `${n.label}\n<code>${n.addr}</code>`).join('\n\n');
+  const addressBlock = nets.map((n) =>
+    `${n.label}\n<code>${n.addr}</code>` +
+    // Shown right under the address it belongs to, never as a footnote.
+    (n.memo ? `\n🏷 <b>MEMO (required):</b> <code>${n.memo}</code>` : '')
+  ).join('\n\n');
   const viaBlock = nets.map((n) => `• ${n.via}`).join('\n');
 
   await bot.editMessageText(

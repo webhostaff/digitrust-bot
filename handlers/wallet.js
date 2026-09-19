@@ -165,12 +165,23 @@ async function handleUsdtAmount(bot, msg) {
     network: net, intentId: intent.id, startedAt: Date.now(),
   });
 
+  // TON on Binance is credited by MEMO: the address is shared, so a transfer
+  // without the memo lands nowhere identifiable and is NOT auto-credited. It is
+  // shown above the warnings, because a customer who misses it loses the money
+  // until Binance support recovers it by hand.
+  const memo = net === 'TON' ? String(config.usdtTonMemo || '').trim() : '';
+  const memoBlock = memo
+    ? `\n🏷 <b>MEMO / Comment (REQUIRED):</b>\n<code>${memo}</code>\n` +
+      `⚠️ <b>Without this memo the deposit cannot be credited.</b>\n`
+    : '';
+
   await bot.sendMessage(
     chatId,
     `💎 <b>Send exactly this amount</b>\n\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
     `💵 <b>Amount:</b>\n<code>${intent.unique_amount.toFixed(6)}</code>\n\n` +
     `📥 <b>${net} address:</b>\n<code>${address}</code>\n` +
+    memoBlock +
     `━━━━━━━━━━━━━━━━━━━━\n\n` +
     `⚠️ <b>The amount must match to the last decimal.</b>\n` +
     `That exact figure is reserved for you — it is how we know the deposit is yours. ` +

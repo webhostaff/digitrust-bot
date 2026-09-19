@@ -38,6 +38,55 @@ const ALLOWED_NETWORKS = {
 // TRON = 64 hex, BSC = 0x + 64 hex, TON = 64 hex or a 44-char base64 hash.
 const TXID_RE = /^((0x)?[a-fA-F0-9]{64}|[A-Za-z0-9+/_-]{43,48}={0,2})$/;
 
+/**
+ * Every spelling a transaction hash can arrive in.
+ *
+ * TON is the reason this exists. A TON wallet shows the hash as 64 hex
+ * characters; Binance stores the SAME hash base64-encoded (44 chars). Compared
+ * as text they never match, so a real deposit was reported as "never reached
+ * your account" — and the customer was told to keep waiting for money that had
+ * already arrived.
+ *
+ * Both forms are generated from whichever one is given, and matching succeeds
+ * if any form lines up.
+ */
+function txidForms(raw) {
+  const v = String(raw || '').trim();
+  if (!v) return [];
+
+  const forms = new Set();
+  const add = (x) => { if (x) forms.add(String(x).toLowerCase()); };
+
+  add(v);
+  add(v.replace(/^0x/i, ''));
+
+  const hex = v.replace(/^0x/i, '');
+  if (/^[a-f0-9]{64}$/i.test(hex)) {
+    // hex → base64, the form Binance uses for TON.
+    try {
+      const b64 = Buffer.from(hex, 'hex').toString('base64');
+      add(b64);
+      add(b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')); // url-safe
+    } catch (_) {}
+  } else if (/^[A-Za-z0-9+/_-]{43,48}={0,2}$/.test(v)) {
+    // base64 → hex, for when the customer pastes what Binance showed them.
+    try {
+      const norm = v.replace(/-/g, '+').replace(/_/g, '/');
+      const h = Buffer.from(norm, 'base64').toString('hex');
+      if (h.length === 64) add(h);
+    } catch (_) {}
+  }
+
+  return [...forms];
+}
+
+/** Do two hashes refer to the same transaction, in any encoding? */
+function sameTxid(a, b) {
+  const A = txidForms(a);
+  const B = txidForms(b);
+  return A.some((x) => B.includes(x));
+}
+
 function eqAddr(a, b) {
   return String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
 }
@@ -155,11 +204,7 @@ async function verifyDepositByTxId(rawTxid, opts = {}) {
   if (history.length > 0) {
     logger.info(`[VERIFY] First deposit TxId sample: ${history[0].txId || 'none'}`);
   }
-  const wanted = txid.toLowerCase().replace(/^0x/, '');
-  const match = history.find((d) => {
-    const got = String(d.txId || '').toLowerCase().replace(/^0x/, '');
-    return got && got === wanted;
-  });
+  const match = history.find((d) => d.txId && sameTxid(d.txId, txid));
   if (match) {
     logger.info(`[VERIFY] MATCH FOUND: amount=${match.amount} address=${match.address} status=${match.status} insertTime=${match.insertTime}`);
   } else {
@@ -174,9 +219,11 @@ async function verifyDepositByTxId(rawTxid, opts = {}) {
       // would let anyone fill that list with invented TxIDs.
       found: false, reason: 'not_found',
       message:
-        '⏳ This TxID was not found in our Binance deposit history yet.\n\n' +
-        'Binance usually credits deposits within 1–30 minutes after on-chain confirmation.\n' +
-        'Please wait a few minutes and resend the TxID.',
+        '⏳ This TxID is not in our Binance deposit history yet.\n\n' +
+        'Binance usually credits deposits within 1–30 minutes after on-chain ' +
+        'confirmation. Wait a few minutes and resend the TxID.\n\n' +
+        'If it still is not found after 30 minutes, send this TxID to support ' +
+        'and it will be checked by hand.',
     };
   }
 
@@ -574,6 +621,9 @@ async function findDepositRaw(rawTxid) {
   const matches = rows.filter((d) => {
     const tx = String(d.txId || '').toLowerCase();
     const id = String(d.id || '').toLowerCase();
+    // Exact match in any encoding first, then the partial search the tracer
+    // promises — a shop owner often pastes only the first few characters.
+    if (d.txId && sameTxid(d.txId, needle)) return true;
     return tx.includes(needle) || needle.includes(tx) || id === needle;
   });
 

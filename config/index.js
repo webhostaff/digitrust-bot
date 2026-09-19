@@ -15,6 +15,10 @@ const config = {
   usdtTrc20Address: process.env.USDT_TRC20_ADDRESS || '',
   usdtBep20Address: process.env.USDT_BEP20_ADDRESS || '',
   usdtTonAddress:   process.env.USDT_TON_ADDRESS   || '',
+  // Optional. Binance issues a unique TON address per account and needs no
+  // memo, so this is normally left empty — it exists for exchanges that do use
+  // one, and nothing is shown to the customer unless it is set.
+  usdtTonMemo:      process.env.USDT_TON_MEMO      || '',
 
   // Binance Spot API (Enable Reading only — for deposit history lookup)
   binanceId:        process.env.BINANCE_ID         || '',
