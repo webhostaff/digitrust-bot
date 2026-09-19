@@ -2284,8 +2284,10 @@ async function runTxidTrace(bot, chatId, rawText) {
       // Remembered so the "add balance" button can carry the exact figure that
       // was just read off Binance.
       let chainAmount = 0;
+      let chainScanned = 0;
       try {
         const chain = await binance.findDepositRaw(needle);
+        chainScanned = Number(chain.scanned) || 0;
         if (!chain.ok) {
           chainLine = `\n\n⚠️ <i>Could not check Binance: ${escapeHtml(chain.error || 'unknown error')}</i>`;
         } else if (chain.matches.length) {
@@ -2336,9 +2338,17 @@ async function runTxidTrace(bot, chatId, rawText) {
             logger.warn(`[TXID] Binance Pay lookup failed: ${e.message}`);
           }
 
+          // The count is the useful part: "searched 0 deposits" means the API
+          // call returned nothing at all — a key or permission problem — while
+          // "searched 214" means the money genuinely is not there.
           chainLine = payLine ||
-            `\n\n🔍 <i>Also checked Binance deposit history AND Binance Pay ` +
-            `(last 180 days) — nothing found. The money never reached your account.</i>`;
+            `\n\n🔍 <i>Searched <b>${chainScanned}</b> Binance deposit(s) and Binance Pay ` +
+            `(last 180 days) — nothing matched.</i>` +
+            (chainScanned === 0
+              ? `\n\n⚠️ <b>Binance returned no deposits at all.</b> Check the API key ` +
+                `has <i>Enable Reading</i> permission and that its IP allow-list ` +
+                `includes this server.`
+              : '');
         }
       } catch (e) {
         logger.warn(`[TXID] Binance lookup failed: ${e.message}`);

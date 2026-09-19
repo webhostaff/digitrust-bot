@@ -618,6 +618,14 @@ async function findDepositRaw(rawTxid) {
     }
   }
 
+  // Logged so a "nothing found" can be told apart from "the API call failed" or
+  // "the key has no permission" — three very different problems that all look
+  // identical from the chat.
+  logger.info(`[TRACE] searching ${rows.length} deposit(s) for "${String(needle).slice(0, 16)}…"`);
+  if (rows.length) {
+    logger.info(`[TRACE] newest sample: txId=${String(rows[0].txId || '').slice(0, 20)}… coin=${rows[0].coin} network=${rows[0].network}`);
+  }
+
   const matches = rows.filter((d) => {
     const tx = String(d.txId || '').toLowerCase();
     const id = String(d.id || '').toLowerCase();
@@ -627,8 +635,11 @@ async function findDepositRaw(rawTxid) {
     return tx.includes(needle) || needle.includes(tx) || id === needle;
   });
 
+  logger.info(`[TRACE] ${matches.length} match(es)`);
+
   return {
     ok: true,
+    scanned: rows.length,
     matches: matches.map((d) => ({
       txId: d.txId,
       amount: Number(d.amount),

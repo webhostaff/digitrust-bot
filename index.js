@@ -652,6 +652,42 @@ bot.onText(/^\/emoji(backup|restore|list)?$/i, async (msg, match) => {
     { parse_mode: 'HTML' });
 });
 
+/**
+ * Which build is actually running, and is TON wired up.
+ *
+ * Exists because a deploy that silently did not happen looks exactly like a fix
+ * that did not work, and the two need completely different responses.
+ */
+bot.onText(/^\/version$/i, async (msg) => {
+  if (!adminHandler.isAdmin(msg.from.id)) return;
+  let version = 'unknown';
+  try { version = require('./package.json').version; } catch (_) {}
+
+  // The marker below only exists in builds that carry the TON fix.
+  let tonFix = false;
+  try {
+    const src = require('fs').readFileSync(require('path').join(__dirname, 'services/binance.js'), 'utf8');
+    tonFix = src.includes('sameTxid(d.txId, txid)');
+  } catch (_) {}
+
+  const addr = {
+    TRC20: config.usdtTrc20Address,
+    BEP20: config.usdtBep20Address,
+    TON:   config.usdtTonAddress,
+  };
+
+  await bot.sendMessage(msg.chat.id,
+    `🏷 <b>Build v${escapeHtml(version)}</b>\n\n` +
+    `${tonFix ? '✅' : '❌'} TON hash matching (hex ⇄ base64)\n` +
+    `${resolveApiBase() ? '✅' : '❌'} Public API domain\n\n` +
+    `<b>Deposit addresses</b>\n` +
+    Object.entries(addr).map(([k, v]) =>
+      `${v ? '✅' : '⚪️'} ${k}: ${v ? `<code>${escapeHtml(String(v).slice(0, 18))}…</code>` : '<i>not set</i>'}`
+    ).join('\n') +
+    (tonFix ? '' : `\n\n⚠️ <b>This build predates the TON fix.</b> The deployment did not pick up the new files.`),
+    { parse_mode: 'HTML' });
+});
+
 // ── Text messages ─────────────────────────────────────────────────────────────
 bot.on('message', async (msg) => {
   // ── /emoji_id capture handler ──────────────────────────────────────
