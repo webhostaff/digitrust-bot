@@ -105,7 +105,44 @@ function productPayload(userId, product) {
           unlimited: allowance.unlimited,
         }
       : null,
+
+    // The bulk ladder, priced by the same engine that charges the order.
+    //
+    // Without this a caller sees one `price` field and assumes it is flat, so a
+    // reseller buying 50 units budgets at the single-unit rate and reports the
+    // discount as broken — it was applied at purchase, but nothing ever said it
+    // existed. Each step states the real per-unit price at that quantity.
+    bulk_pricing: buildBulkLadder(userId, product),
   };
+}
+
+/**
+ * Quantity breakpoints with the per-unit price each one unlocks.
+ * Returns null when the product has no quantity discounts at all.
+ */
+function buildBulkLadder(userId, product) {
+  const points = new Set([1]);
+  for (const q of [
+    product.bulk_tier1_qty, product.bulk_tier2_qty,
+    product.bulk_tier3_qty, product.bulk_min_qty,
+  ]) {
+    const n = Number(q) || 0;
+    if (n > 1) points.add(n);
+  }
+  if (points.size <= 1) return null;
+
+  const steps = [];
+  for (const qty of [...points].sort((a, b) => a - b)) {
+    const p = db.resolveCustomerPricing(userId, product, qty);
+    const unit = Number(Number(p.unitPrice).toFixed(6));
+    const last = steps[steps.length - 1];
+    // Breakpoints that do not actually change the price are dropped: two
+    // overlapping rules can leave one that never wins, and publishing it would
+    // promise a discount the caller will not receive.
+    if (last && Math.abs(last.unit_price - unit) < 0.0000005) continue;
+    steps.push({ min_quantity: qty, unit_price: unit });
+  }
+  return steps.length > 1 ? steps : null;
 }
 
 // ── GET /products ────────────────────────────────────────────────────────────
@@ -312,6 +349,48 @@ router.post(['/purchase', '/order'], requireKey, async (req, res) => {
   } finally {
     IN_FLIGHT.delete(req.apiKey);
   }
+});
+
+// ── GET /quote ───────────────────────────────────────────────────────────────
+/**
+ * What a given quantity would cost, without buying it.
+ *
+ * Added because the only way to discover the bulk price used to be to buy: the
+ * product listing showed a single figure and the discount appeared in the
+ * receipt. A reseller quoting a customer needs the number BEFORE committing
+ * money, and guessing it from the ladder by hand invites arithmetic errors.
+ */
+router.get('/quote', requireKey, (req, res) => {
+  const productId = parseInt(req.query.product_id, 10);
+  const quantity  = Math.max(1, parseInt(req.query.quantity, 10) || 1);
+
+  if (!Number.isFinite(productId)) {
+    return fail(res, 400, 'product_id is required');
+  }
+
+  const product = db.getProduct(productId);
+  if (!product || !product.is_active) {
+    return fail(res, 404, 'Product not found');
+  }
+
+  const pricing = db.resolveCustomerPricing(req.userId, product, quantity);
+  const total = Number(Number(pricing.total).toFixed(6));
+  const balance = Number(db.getUser(req.userId)?.balance || 0);
+  const single = db.resolveCustomerPricing(req.userId, product, 1);
+
+  res.json({
+    product_id: productId,
+    product: cleanTitle(product.title),
+    quantity,
+    unit_price: Number(Number(pricing.unitPrice).toFixed(6)),
+    total,
+    // Stated plainly so the caller does not have to derive it.
+    saved_vs_single: Number((Number(single.unitPrice) * quantity - total).toFixed(6)),
+    stock: Number(product.stock_quantity) || 0,
+    balance: Number(balance.toFixed(6)),
+    can_afford: balance >= total - 0.005,
+    bulk_pricing: buildBulkLadder(req.userId, product),
+  });
 });
 
 // ── Compatibility aliases ────────────────────────────────────────────────────

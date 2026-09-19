@@ -1268,6 +1268,53 @@ async function handleCallbackQuery(query) {
   if (data === 'wallet_transactions')  { await answer(); await walletHandler.showTransactions(bot, chatId, userId, msgId); return; }
 
   // ── API access (self-service, no application needed) ─────────────
+  // ── API documentation, inside the bot ─────────────────────────────
+  if (data === 'api_docs') {
+    await answer();
+    // getOrCreateApiKey, so the examples carry the reader's real key rather
+    // than a placeholder they have to go and substitute.
+    let key = 'YOUR_API_KEY';
+    try { key = db.getOrCreateApiKey(userId)?.api_key || key; } catch (_) {}
+    const b = resolveApiBase() || 'https://your-shop-domain';
+
+    const text =
+      `📖 <b>API — how to use it</b>\n\n` +
+      `Every call needs your key in the <code>X-API-Key</code> header. ` +
+      `Purchases are charged to your wallet balance.\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `<b>1. List products</b>\n` +
+      `<pre>GET ${escapeHtml(b)}/api/v2/products</pre>\n` +
+      `Returns each product with <code>price</code>, <code>stock</code> and ` +
+      `<code>bulk_pricing</code> — the quantity discounts.\n\n` +
+      `<b>2. Check a price before buying</b>\n` +
+      `<pre>GET ${escapeHtml(b)}/api/v2/quote?product_id=1&amp;quantity=50</pre>\n` +
+      `Tells you the unit price at that quantity, the total, and whether your ` +
+      `balance covers it.\n\n` +
+      `<b>3. Buy</b>\n` +
+      `<pre>POST ${escapeHtml(b)}/api/v2/purchase\n` +
+      `{"product_id": 1, "quantity": 50}</pre>\n` +
+      `Returns the delivered items immediately.\n\n` +
+      `<b>4. Your balance</b>\n` +
+      `<pre>GET ${escapeHtml(b)}/api/v2/balance</pre>\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `<b>Full example</b>\n` +
+      `<pre>curl -H "X-API-Key: ${escapeHtml(key)}" \\\n` +
+      `  "${escapeHtml(b)}/api/v2/quote?product_id=1&amp;quantity=50"</pre>\n\n` +
+      `⚠️ <b>Top up your wallet first</b> — the API spends your balance and ` +
+      `cannot take payments.\n` +
+      `🔑 Keep your key private. If it leaks, regenerate it from the API screen.`;
+
+    const kb = { inline_keyboard: [
+      [{ text: '🔙 Back', callback_data: 'menu_api' }],
+    ] };
+    try {
+      await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: kb });
+    } catch (e) {
+      await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: kb });
+    }
+    return;
+  }
+
   if (data === 'menu_api' || data === 'api_regen_confirm' || data === 'api_regen_do') {
     await answer();
 
@@ -1320,7 +1367,11 @@ async function handleCallbackQuery(query) {
         reply_markup: { inline_keyboard: [
           // Only offered when the URL is real. A button is better missing than
           // taking the message down with it.
-          ...(hasBase ? [[{ text: '📖 Full documentation', url: `${base}/api/v2/docs` }]] : []),
+          // In-bot docs always work. The web page needs a public domain, and
+          // tying the only documentation to that meant a shop without one had
+          // an API nobody could learn to use.
+          [{ text: '📖 How to use the API', callback_data: 'api_docs' }],
+          ...(hasBase ? [[{ text: '🌐 Full web documentation', url: `${base}/api/v2/docs` }]] : []),
           [{ text: '💰 Top Up Wallet', callback_data: 'wallet_topup' }],
           [{ text: '🔁 Generate new key', callback_data: 'api_regen_confirm' }],
           [{ text: '🔙 Back', callback_data: 'back_main' }],
