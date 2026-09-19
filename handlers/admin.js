@@ -2268,8 +2268,45 @@ async function runTxidTrace(bot, chatId, rawText) {
       return;
     }
 
-    const r = db.traceTxid(needle);
     const money = (n) => `$${Number(n || 0).toFixed(2)}`;
+
+    // An amount is a valid thing to trace, not only a hash. On TON it is the
+    // ONLY thing that identifies a deposit, so refusing it would leave the one
+    // network that needs this tool unable to use it.
+    if (/^\d+\.\d{2,8}$/.test(needle)) {
+      const want = Number(needle);
+      let found = null;
+      try {
+        const recent = await binance.listRecentDeposits({ days: 30, limit: 50, amount: want });
+        found = recent.ok ? recent.rows : [];
+      } catch (e) { found = []; }
+
+      const intent = (() => {
+        try { return db.findIntentForDeposit('TON', want) || db.findIntentForDeposit('BEP20', want); }
+        catch (e) { return null; }
+      })();
+
+      await bot.sendMessage(chatId,
+        `🔎 <b>Amount ${want}</b>\n\n` +
+        (found.length
+          ? `✅ <b>Found on Binance</b>\n` + found.slice(0, 5).map((d) => {
+              const when = new Date(Number(d.insertTime)).toISOString().slice(0, 16).replace('T', ' ');
+              return `• ${escapeHtml(String(d.amount))} ${escapeHtml(d.coin || '')} · ` +
+                     `${escapeHtml(d.network || '?')} · ${when}`;
+            }).join('\n')
+          : `❌ No Binance deposit of exactly this amount in the last 30 days.`) +
+        (intent
+          ? `\n\n🎯 <b>Reserved for user <code>${intent.user_id}</code></b> — status ${escapeHtml(intent.status)}`
+          : `\n\n<i>No open reservation matches this amount.</i>`),
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+          ...(found.length ? [[{ text: `➕ Add ${money(found[0].amount)} to a customer`,
+                                 callback_data: `admin_addbal_${Math.round(Number(found[0].amount) * 100)}` }]] : []),
+          [{ text: '🔎 Trace another', callback_data: 'admin_txid_search' }],
+        ] } });
+      return;
+    }
+
+    const r = db.traceTxid(needle);
     const short = (v) => {
       const x = String(v || '');
       // Hashes are 64 characters; printing them whole buries the answer.
@@ -2341,7 +2378,37 @@ async function runTxidTrace(bot, chatId, rawText) {
           // The count is the useful part: "searched 0 deposits" means the API
           // call returned nothing at all — a key or permission problem — while
           // "searched 214" means the money genuinely is not there.
-          chainLine = payLine ||
+          // A TON hash can never match: TON gives a transfer two different
+          // hashes, one shown by the sending wallet and another recorded by the
+          // receiver. Saying "the money never reached your account" about a TON
+          // id is therefore usually wrong — and it is the one answer that stops
+          // the search. Recent TON deposits are listed instead, so the amount
+          // can be matched by eye in seconds.
+          const looksTon = /^[A-Za-z0-9+/_-]{43,48}={0,2}$/.test(needle);
+          if (looksTon) {
+            let tonList = '';
+            try {
+              const recent = await binance.listRecentDeposits({ days: 7, limit: 8, network: 'TON' });
+              if (recent.ok && recent.rows.length) {
+                tonList = `\n\n📥 <b>Recent TON deposits</b> — find yours by AMOUNT:\n` +
+                  recent.rows.map((d) => {
+                    const when = new Date(Number(d.insertTime)).toISOString().slice(0, 16).replace('T', ' ');
+                    return `• <b>${escapeHtml(String(d.amount))}</b> ${escapeHtml(d.coin || '')} · ${when}`;
+                  }).join('\n');
+              }
+            } catch (e) { /* listing is a convenience, not the answer */ }
+
+            chainLine =
+              `\n\n🔷 <b>This looks like a TON hash — it cannot be matched.</b>\n\n` +
+              `<i>TON gives every transfer two different hashes: the one the ` +
+              `sending wallet shows, and the one Binance records. They are not ` +
+              `the same value, so searching by hash will never find a TON deposit ` +
+              `no matter how long you wait.</i>\n\n` +
+              `✅ <b>Search by amount instead:</b> <code>/deposits 7 TON</code>` +
+              tonList +
+              `\n\n<i>Deposits made through the bot are matched automatically by ` +
+              `their reserved amount — this only affects manual lookups.</i>`;
+          } else chainLine = payLine ||
             `\n\n🔍 <i>Searched <b>${chainScanned}</b> Binance deposit(s) and Binance Pay ` +
             `(last 180 days) — nothing matched.</i>` +
             (chainScanned === 0

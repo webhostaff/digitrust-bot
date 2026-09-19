@@ -204,7 +204,44 @@ async function verifyDepositByTxId(rawTxid, opts = {}) {
   if (history.length > 0) {
     logger.info(`[VERIFY] First deposit TxId sample: ${history[0].txId || 'none'}`);
   }
-  const match = history.find((d) => d.txId && sameTxid(d.txId, txid));
+  let match = history.find((d) => d.txId && sameTxid(d.txId, txid));
+
+  // ── TON: match by the reserved amount, not the hash ──────────────────────
+  //
+  // TON gives every transfer TWO different hashes: the sending wallet shows the
+  // message hash, while the receiver records the transaction hash. They are not
+  // encodings of each other — for the same transfer a customer sees
+  // 6d1bf675…a0bf and Binance stores 21042b5e…. Matching by hash therefore
+  // cannot work on TON, no matter how the strings are normalised.
+  //
+  // The unique amount already reserved for this customer is the identifier that
+  // does work: it was generated for them alone and is what the deposit screen
+  // told them to send to the last decimal.
+  if (!match) {
+    try {
+      const dbq = require('../database/queries');
+      const tonDeposits = history.filter((d) =>
+        String(d.network || '').toUpperCase() === 'TON' &&
+        String(d.coin || '').toUpperCase() === 'USDT');
+
+      for (const d of tonDeposits) {
+        const intent = dbq.findIntentForDeposit
+          ? dbq.findIntentForDeposit('TON', Number(d.amount))
+          : null;
+        if (intent) {
+          logger.info(
+            `[VERIFY] TON matched by reserved amount ${d.amount} ` +
+            `(intent #${intent.id}, user ${intent.user_id}); wallet hash ${txid.slice(0, 12)}… ` +
+            `differs from Binance hash ${String(d.txId || '').slice(0, 12)}… as TON always does`
+          );
+          match = d;
+          break;
+        }
+      }
+    } catch (e) {
+      logger.warn(`[VERIFY] TON amount fallback failed: ${e.message}`);
+    }
+  }
   if (match) {
     logger.info(`[VERIFY] MATCH FOUND: amount=${match.amount} address=${match.address} status=${match.status} insertTime=${match.insertTime}`);
   } else {
