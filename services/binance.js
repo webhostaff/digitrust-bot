@@ -721,7 +721,7 @@ async function findPayTransactionRaw(rawId) {
  * Binance says, so the shop owner can see with their own eyes whether the money
  * is there. If it is missing here, the problem is upstream of this bot entirely.
  */
-async function listRecentDeposits({ days = 7, limit = 15 } = {}) {
+async function listRecentDeposits({ days = 7, limit = 15, network = null, amount = null } = {}) {
   if (!config.binanceApiKey || !config.binanceApiSecret) {
     return { ok: false, error: 'Binance API keys not configured' };
   }
@@ -730,8 +730,28 @@ async function listRecentDeposits({ days = 7, limit = 15 } = {}) {
     const rows = await fetchDepositHistory({
       coin: null, startTime: now - days * 86400000, endTime: now,
     });
-    const sorted = [...rows].sort((a, b) => Number(b.insertTime) - Number(a.insertTime));
-    return { ok: true, total: rows.length, rows: sorted.slice(0, limit) };
+    // Filtering happens AFTER the full fetch, never in the request: the point of
+    // this command is to see everything Binance holds, and narrowing the query
+    // would hide the very rows being looked for. With hundreds of BSC deposits a
+    // day, a single TON transfer is invisible in a list of the newest fifteen.
+    let rows2 = rows;
+    if (network) {
+      const want = String(network).toUpperCase();
+      rows2 = rows2.filter((d) => String(d.network || '').toUpperCase() === want);
+    }
+    if (amount !== null && Number.isFinite(Number(amount))) {
+      const want = Number(amount);
+      rows2 = rows2.filter((d) => Math.abs(Number(d.amount) - want) < 0.000001);
+    }
+
+    const sorted = [...rows2].sort((a, b) => Number(b.insertTime) - Number(a.insertTime));
+    return {
+      ok: true,
+      total: rows.length,          // everything in the window
+      matched: rows2.length,       // everything after filtering
+      networks: [...new Set(rows.map((d) => String(d.network || '?').toUpperCase()))],
+      rows: sorted.slice(0, limit),
+    };
   } catch (e) {
     return { ok: false, error: e.message };
   }

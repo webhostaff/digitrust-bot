@@ -694,15 +694,29 @@ bot.onText(/^\/version$/i, async (msg) => {
  * The decisive test when a customer insists they paid: either their transfer is
  * in this list or it is not, and the two answers lead in opposite directions.
  */
-bot.onText(/^\/deposits(?:\s+(\d+))?$/i, async (msg, match) => {
+bot.onText(/^\/deposits(?:\s+(.+))?$/i, async (msg, match) => {
   if (!adminHandler.isAdmin(msg.from.id)) return;
   const chatId = msg.chat.id;
-  const days = Math.min(90, Math.max(1, parseInt((match && match[1]) || '7', 10)));
 
-  await bot.sendMessage(chatId, `⏳ Asking Binance for the last ${days} day(s)…`);
+  // "/deposits 30 TON" or "/deposits 30 1.180591" — days, then an optional
+  // network or exact amount. Needed because a shop taking hundreds of BSC
+  // deposits a day drowns any single transfer on another network.
+  const args = String((match && match[1]) || '').trim().split(/\s+/).filter(Boolean);
+  let days = 7, network = null, amount = null;
+  for (const a of args) {
+    if (/^\d+$/.test(a) && Number(a) <= 90 && days === 7) { days = Number(a); continue; }
+    if (/^[A-Za-z]{2,10}$/.test(a)) { network = a.toUpperCase(); continue; }
+    if (/^\d+\.\d+$/.test(a)) { amount = Number(a); continue; }
+  }
+
+  await bot.sendMessage(chatId,
+    `⏳ Asking Binance for ${days} day(s)` +
+    `${network ? ` · network ${escapeHtml(network)}` : ''}` +
+    `${amount !== null ? ` · amount ${amount}` : ''}…`,
+    { parse_mode: 'HTML' });
 
   const binanceSvc = require('./services/binance');
-  const r = await binanceSvc.listRecentDeposits({ days, limit: 15 });
+  const r = await binanceSvc.listRecentDeposits({ days, limit: 15, network, amount });
 
   if (!r.ok) {
     await bot.sendMessage(chatId,
@@ -713,11 +727,27 @@ bot.onText(/^\/deposits(?:\s+(\d+))?$/i, async (msg, match) => {
     return;
   }
 
-  if (!r.total) {
+  const head =
+    `📥 <b>Binance deposits</b> — last ${days} day(s)\n` +
+    `Total in window: <b>${r.total}</b>\n` +
+    `Networks seen: ${r.networks.map((n) => `<code>${escapeHtml(n)}</code>`).join(' ')}\n`;
+
+  if (!r.matched) {
+    // The network list above is the answer: if TON never appears among
+    // hundreds of deposits, Binance never received one — the transfer did not
+    // arrive, whatever the sending wallet shows.
     await bot.sendMessage(chatId,
-      `📭 <b>Binance reports no deposits at all in ${days} day(s).</b>\n\n` +
-      `<i>If you know money arrived, the key is reading a different account, or ` +
-      `the deposits are older than the window. Try <code>/deposits 30</code>.</i>`,
+      head +
+      `\n❌ <b>Nothing matched</b>` +
+      `${network ? ` for network <b>${escapeHtml(network)}</b>` : ''}` +
+      `${amount !== null ? ` at <b>${amount}</b>` : ''}.\n\n` +
+      (network && !r.networks.includes(network)
+        ? `⚠️ <b>Binance has received no ${escapeHtml(network)} deposits at all</b> in ` +
+          `this window — not one, out of ${r.total}.\n\n` +
+          `<i>That points at the transfer never reaching Binance, rather than at ` +
+          `the bot failing to match it. Check the receiving address the customer ` +
+          `used against your Binance ${escapeHtml(network)} deposit address.</i>`
+        : `<i>Try a wider window: <code>/deposits 90 ${escapeHtml(network || '')}</code></i>`),
       { parse_mode: 'HTML' });
     return;
   }
@@ -731,10 +761,9 @@ bot.onText(/^\/deposits(?:\s+(\d+))?$/i, async (msg, match) => {
   });
 
   await bot.sendMessage(chatId,
-    `📥 <b>Binance deposits</b> — last ${days} day(s), ${r.total} total\n\n` +
-    lines.join('\n\n') +
-    `\n\n<i>Compare the hash above with what the customer sent. TON hashes are ` +
-    `shown by wallets in hex and stored here base64 — the bot matches both.</i>`,
+    head +
+    `Matching: <b>${r.matched}</b>${r.matched > r.rows.length ? ` (showing ${r.rows.length})` : ''}\n\n` +
+    lines.join('\n\n'),
     { parse_mode: 'HTML' });
 });
 
