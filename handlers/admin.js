@@ -2359,7 +2359,13 @@ async function runTxidTrace(bot, chatId, rawText) {
         `🔎 <b>${escapeHtml(short(needle))}</b>\n\n` +
         `❌ <b>Not in the bot's records.</b>\n` +
         `Never credited, never queued, never held for review.` +
-        chainLine,
+        chainLine +
+        // Offered because a customer with proof should not wait for the cause
+        // to be found. Crediting them and investigating afterwards is the right
+        // order — the money is theirs either way.
+        `\n\n💡 <i>If the customer has shown you proof of the transfer, credit ` +
+        `them now with ➕ Add User Balance and investigate after. Run ` +
+        `<code>/deposits</code> to see what Binance actually has.</i>`,
         { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
           [{ text: `➕ Add ${chainAmount ? money(chainAmount) : 'User Balance'} to a customer`,
              callback_data: chainAmount ? `admin_addbal_${Math.round(chainAmount * 100)}` : 'admin_add_balance' }],

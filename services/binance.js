@@ -712,7 +712,33 @@ async function findPayTransactionRaw(rawId) {
   };
 }
 
+/**
+ * The raw deposit list, straight from Binance, with no filtering at all.
+ *
+ * Every other function here decides something — is it ours, is it fresh, does
+ * the address match. When a deposit "cannot be found", those decisions are
+ * exactly what is in question, so this makes none of them: it returns what
+ * Binance says, so the shop owner can see with their own eyes whether the money
+ * is there. If it is missing here, the problem is upstream of this bot entirely.
+ */
+async function listRecentDeposits({ days = 7, limit = 15 } = {}) {
+  if (!config.binanceApiKey || !config.binanceApiSecret) {
+    return { ok: false, error: 'Binance API keys not configured' };
+  }
+  const now = Date.now();
+  try {
+    const rows = await fetchDepositHistory({
+      coin: null, startTime: now - days * 86400000, endTime: now,
+    });
+    const sorted = [...rows].sort((a, b) => Number(b.insertTime) - Number(a.insertTime));
+    return { ok: true, total: rows.length, rows: sorted.slice(0, limit) };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
 module.exports = {
+  listRecentDeposits,
   verifyDepositByTxId,
   verifyBinancePayOrder,
   findDepositRaw,

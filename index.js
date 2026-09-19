@@ -688,6 +688,56 @@ bot.onText(/^\/version$/i, async (msg) => {
     { parse_mode: 'HTML' });
 });
 
+/**
+ * Show the last deposits Binance has, unfiltered.
+ *
+ * The decisive test when a customer insists they paid: either their transfer is
+ * in this list or it is not, and the two answers lead in opposite directions.
+ */
+bot.onText(/^\/deposits(?:\s+(\d+))?$/i, async (msg, match) => {
+  if (!adminHandler.isAdmin(msg.from.id)) return;
+  const chatId = msg.chat.id;
+  const days = Math.min(90, Math.max(1, parseInt((match && match[1]) || '7', 10)));
+
+  await bot.sendMessage(chatId, `⏳ Asking Binance for the last ${days} day(s)…`);
+
+  const binanceSvc = require('./services/binance');
+  const r = await binanceSvc.listRecentDeposits({ days, limit: 15 });
+
+  if (!r.ok) {
+    await bot.sendMessage(chatId,
+      `❌ <b>Binance call failed</b>\n\n<code>${escapeHtml(r.error)}</code>\n\n` +
+      `<i>Usually the API key lacks <b>Enable Reading</b>, or this server's IP is ` +
+      `not on the key's allow-list.</i>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (!r.total) {
+    await bot.sendMessage(chatId,
+      `📭 <b>Binance reports no deposits at all in ${days} day(s).</b>\n\n` +
+      `<i>If you know money arrived, the key is reading a different account, or ` +
+      `the deposits are older than the window. Try <code>/deposits 30</code>.</i>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  const lines = r.rows.map((d) => {
+    const when = new Date(Number(d.insertTime)).toISOString().slice(0, 16).replace('T', ' ');
+    const state = Number(d.status) === 1 ? '✅' : Number(d.status) === 0 ? '⏳' : `(${d.status})`;
+    return `${state} <b>${escapeHtml(String(d.amount))}</b> ${escapeHtml(d.coin || '')} · ` +
+           `${escapeHtml(d.network || '?')} · ${when}\n` +
+           `   <code>${escapeHtml(String(d.txId || '').slice(0, 44))}</code>`;
+  });
+
+  await bot.sendMessage(chatId,
+    `📥 <b>Binance deposits</b> — last ${days} day(s), ${r.total} total\n\n` +
+    lines.join('\n\n') +
+    `\n\n<i>Compare the hash above with what the customer sent. TON hashes are ` +
+    `shown by wallets in hex and stored here base64 — the bot matches both.</i>`,
+    { parse_mode: 'HTML' });
+});
+
 // ── Text messages ─────────────────────────────────────────────────────────────
 bot.on('message', async (msg) => {
   // ── /emoji_id capture handler ──────────────────────────────────────
