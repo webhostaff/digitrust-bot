@@ -2188,6 +2188,85 @@ module.exports = {
   salesByHour,
 
   /**
+   * Does the stock add up?
+   *
+   * Answers the question totals cannot: were the units that left actually sold,
+   * or did some simply disappear. Three independent records are compared —
+   * items added, items marked sold, and order quantities — and any gap between
+   * them is the thing worth investigating.
+   *
+   * Items are counted rather than trusted from the counter, because
+   * `stock_quantity` is a number anyone can overwrite by hand while the item
+   * rows are written one per unit and carry who took each one.
+   */
+  stockReconcile: (productId) => {
+    const p = db.prepare('SELECT id, title, stock_quantity FROM products WHERE id = ?').get(productId);
+    if (!p) return null;
+
+    const items = db.prepare(`
+      SELECT
+        COUNT(*)                                                   AS total_added,
+        SUM(CASE WHEN status = 'available' THEN 1 ELSE 0 END)      AS available,
+        SUM(CASE WHEN status = 'sold'      THEN 1 ELSE 0 END)      AS sold,
+        SUM(CASE WHEN status = 'sold' AND order_id IS NULL THEN 1 ELSE 0 END) AS sold_no_order,
+        SUM(CASE WHEN status NOT IN ('available','sold') THEN 1 ELSE 0 END)   AS other_status,
+        MIN(created_at)                                            AS first_added,
+        MAX(created_at)                                            AS last_added
+      FROM product_items WHERE product_id = ?
+    `).get(productId) || {};
+
+    const orders = db.prepare(`
+      SELECT COUNT(*) AS n, COALESCE(SUM(quantity), 0) AS units,
+             COALESCE(SUM(total_price), 0) AS revenue
+      FROM orders
+      WHERE product_id = ? AND status NOT IN ('cancelled', 'pending')
+    `).get(productId) || {};
+
+    // Items whose sale points at an order that no longer exists, or was
+    // cancelled — a unit consumed without a sale standing behind it.
+    const orphans = db.prepare(`
+      SELECT COUNT(*) AS n FROM product_items pi
+      WHERE pi.product_id = ? AND pi.status = 'sold'
+        AND (pi.order_id IS NULL
+             OR NOT EXISTS (SELECT 1 FROM orders o
+                            WHERE o.id = pi.order_id
+                              AND o.status NOT IN ('cancelled', 'pending')))
+    `).get(productId)?.n || 0;
+
+    const soldItems  = Number(items.sold) || 0;
+    const orderUnits = Number(orders.units) || 0;
+    const available  = Number(items.available) || 0;
+    const counter    = Number(p.stock_quantity) || 0;
+
+    return {
+      product: p,
+      counter,
+      items: {
+        added: Number(items.total_added) || 0,
+        available,
+        sold: soldItems,
+        other: Number(items.other_status) || 0,
+        first_added: items.first_added,
+        last_added: items.last_added,
+      },
+      orders: {
+        count: Number(orders.n) || 0,
+        units: orderUnits,
+        revenue: Number(orders.revenue) || 0,
+      },
+      gaps: {
+        // Sold items with no valid order behind them.
+        orphan_items: orphans,
+        // Counter disagreeing with the item rows: the counter was edited, or
+        // the product is sold without items (manual delivery).
+        counter_vs_items: counter - available,
+        // Orders that consumed no item, or items consumed by no order.
+        orders_vs_items: orderUnits - soldItems,
+      },
+    };
+  },
+
+  /**
    * Everything bought through the API: who, how much, and of what.
    *
    * Reads orders.source, which is stamped when the order is created. The

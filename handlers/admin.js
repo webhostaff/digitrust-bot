@@ -3521,6 +3521,82 @@ async function handleAdminCallback(bot, query) {
     return;
   }
 
+  // ── Does the stock add up? ────────────────────────────────────────
+  if (/^admin_reconcile_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const r = db.stockReconcile(productId);
+    if (!r) { await answer('❌ Product not found'); return; }
+
+    const isManual = db.getProduct(productId)?.delivery_type === 'manual';
+
+    let txt =
+      `🧮 <b>Stock reconciliation</b>\n` +
+      `${escapeHtml(kbStripEmojiCodes(String(r.product.title || '')).trim())}\n\n` +
+      `<b>Items added ever:</b> ${r.items.added}\n` +
+      `   🟢 still available: <b>${r.items.available}</b>\n` +
+      `   🔴 sold: <b>${r.items.sold}</b>\n` +
+      (r.items.other ? `   ❓ other status: ${r.items.other}\n` : '') +
+      `\n<b>Orders:</b> ${r.orders.count} · <b>${r.orders.units}</b> unit(s) · ` +
+      `${formatPrice(r.orders.revenue)}\n` +
+      `<b>Stock counter says:</b> ${r.counter}\n`;
+
+    const problems = [];
+
+    // The decisive check: units that left with no sale behind them.
+    if (r.gaps.orphan_items > 0) {
+      problems.push(
+        `🚨 <b>${r.gaps.orphan_items} item(s) marked sold with no valid order.</b>\n` +
+        `<i>Units left the shop without a sale standing behind them. This is the ` +
+        `one number that should never be above zero.</i>`
+      );
+    }
+
+    if (r.gaps.orders_vs_items !== 0 && !isManual) {
+      problems.push(
+        r.gaps.orders_vs_items > 0
+          ? `⚠️ <b>${r.gaps.orders_vs_items} more unit(s) ordered than items consumed.</b>\n` +
+            `<i>Usually orders placed while stock was set by hand, or recovered items.</i>`
+          : `⚠️ <b>${Math.abs(r.gaps.orders_vs_items)} more item(s) consumed than ordered.</b>\n` +
+            `<i>Items were taken without an order — check admin actions and refunds.</i>`
+      );
+    }
+
+    if (r.gaps.counter_vs_items !== 0 && !isManual) {
+      problems.push(
+        `ℹ️ <b>Counter is ${r.gaps.counter_vs_items > 0 ? 'ahead of' : 'behind'} the item rows by ` +
+        `${Math.abs(r.gaps.counter_vs_items)}.</b>\n` +
+        `<i>The counter was set by hand at some point. The item rows are the ` +
+        `reliable record.</i>`
+      );
+    }
+
+    if (isManual) {
+      problems.push(
+        `ℹ️ <i>This product delivers manually, so it sells by counter without ` +
+        `consuming items. Only the orders column is meaningful here.</i>`
+      );
+    }
+
+    txt += `\n` + (problems.length
+      ? problems.join('\n\n')
+      : `✅ <b>Everything adds up.</b>\n<i>Every unit that left the shop has an ` +
+        `order behind it. Nothing went missing.</i>`);
+
+    if (r.items.first_added) {
+      txt += `\n\n📅 <i>First stock added ${escapeHtml(String(r.items.first_added).slice(0, 16))}, ` +
+             `last ${escapeHtml(String(r.items.last_added || '').slice(0, 16))}.</i>`;
+    }
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: '🔍 Who bought it', callback_data: `admin_stockaudit_${productId}_30` }],
+        [{ text: '🔙 Back', callback_data: `admin_edit_p_${productId}` }],
+      ] },
+    }).catch(() => {});
+    return;
+  }
+
   // ── Where did the stock go? ───────────────────────────────────────
   if (/^admin_stockaudit_\d+(_\d+)?$/.test(data)) {
     const parts = data.split('_');

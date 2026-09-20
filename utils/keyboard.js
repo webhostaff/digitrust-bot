@@ -586,6 +586,7 @@ const adminProductEditFieldsKb = (productId) =>
     [btn('📊 Bulk Pricing (by quantity)', `admin_bulkprice_${productId}`)],
   [btn('⏳ Time-limited price', `admin_subexp_${productId}`)],
   [btn('🔍 Where did stock go?', `admin_stockaudit_${productId}`)],
+  [btn('🧮 Does stock add up?', `admin_reconcile_${productId}`)],
     // ── Stock management (direct from edit page) ──────────────────────
     [
       btn('➕ Add Stock Items',  `admin_stock_add_${productId}`),
