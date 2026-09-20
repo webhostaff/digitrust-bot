@@ -3456,6 +3456,127 @@ async function handleAdminCallback(bot, query) {
     return handleAdminCallback(bot, { ...query, data: `admin_bulkprice_${productId}` });
   }
 
+  // ── Everything sold through the API ───────────────────────────────
+  if (data === 'admin_apisales' || /^admin_apisales_\d+$/.test(data)) {
+    const days = /^admin_apisales_\d+$/.test(data) ? parseInt(data.split('_').pop(), 10) : 30;
+    const a = db.apiSales(days);
+    const who = (b) => b.username ? `@${escapeHtml(b.username)}` : escapeHtml(b.first_name || String(b.user_id));
+
+    let txt =
+      `🔌 <b>API sales</b> — last ${days} day(s)\n\n` +
+      `📦 Units: <b>${a.units}</b>\n` +
+      `🧾 Orders: <b>${a.orders}</b>\n` +
+      `💵 Revenue: <b>${formatPrice(a.revenue)}</b>\n`;
+
+    if (!a.orders) {
+      txt += `\n<i>Nothing bought through the API in this window.</i>\n\n` +
+             `<i>Note: orders placed before this tracking was added are counted ` +
+             `as bot purchases, because the source was not recorded then.</i>`;
+    } else {
+      txt += `\n<b>Who bought</b>\n` +
+        a.buyers.slice(0, 10).map((b) =>
+          `• ${who(b)} · <code>${b.user_id}</code>\n` +
+          `   <b>${b.units}</b> unit(s) · ${b.orders} order(s) · ${formatPrice(b.spent)}`
+        ).join('\n');
+      if (a.buyers.length > 10) txt += `\n<i>…and ${a.buyers.length - 10} more</i>`;
+
+      txt += `\n\n<b>What they bought</b>\n` +
+        a.products.slice(0, 8).map((p) =>
+          `• ${escapeHtml(kbStripEmojiCodes(String(p.title || '')).trim().slice(0, 30))} — ` +
+          `<b>${p.units}</b> · ${formatPrice(p.revenue)}`
+        ).join('\n');
+    }
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: `${days === 1 ? '✅ ' : ''}24h`,  callback_data: 'admin_apisales_1' },
+         { text: `${days === 7 ? '✅ ' : ''}7d`,   callback_data: 'admin_apisales_7' },
+         { text: `${days === 30 ? '✅ ' : ''}30d`, callback_data: 'admin_apisales_30' }],
+        [{ text: '🧾 Recent API orders', callback_data: `admin_apiorders_${days}` }],
+        [{ text: '🔙 Back', callback_data: 'admin_panel' }],
+      ] },
+    }).catch(() => {});
+    return;
+  }
+
+  if (/^admin_apiorders_\d+$/.test(data)) {
+    const days = parseInt(data.split('_').pop(), 10);
+    const a = db.apiSales(days);
+    const who = (r) => r.username ? `@${escapeHtml(r.username)}` : escapeHtml(r.first_name || String(r.user_id));
+
+    await bot.editMessageText(
+      `🧾 <b>Recent API orders</b> — last ${days} day(s)\n\n` +
+      (a.recent.length
+        ? a.recent.map((r) =>
+            `<b>#${r.id}</b> · ${who(r)}\n` +
+            `   ${escapeHtml(kbStripEmojiCodes(String(r.product_title || '')).trim().slice(0, 26))} ` +
+            `×${r.quantity} · ${formatPrice(r.total_price)} · ` +
+            `${escapeHtml(String(r.created_at || '').slice(0, 16))}`
+          ).join('\n')
+        : '<i>None.</i>'),
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: `admin_apisales_${days}` }]] } }
+    ).catch(() => {});
+    return;
+  }
+
+  // ── Where did the stock go? ───────────────────────────────────────
+  if (/^admin_stockaudit_\d+(_\d+)?$/.test(data)) {
+    const parts = data.split('_');
+    const productId = parseInt(parts[2], 10);
+    const days = parts[3] ? parseInt(parts[3], 10) : 7;
+
+    const p = db.getProduct(productId);
+    if (!p) { await answer('❌ Product not found'); return; }
+    const a = db.stockAudit(productId, days);
+
+    const who = (b) => b.username ? `@${escapeHtml(b.username)}` : escapeHtml(b.first_name || String(b.user_id));
+
+    let txt =
+      `🔍 <b>Stock audit</b>\n${escapeHtml(kbStripEmojiCodes(String(p.title || '')).trim())}\n\n` +
+      `📦 In stock now: <b>${p.stock_quantity || 0}</b>\n` +
+      `📉 Sold in ${days} day(s): <b>${a.units}</b> unit(s) across ${a.orders} order(s)\n` +
+      `💵 Revenue: <b>${formatPrice(a.revenue)}</b>\n`;
+
+    if (!a.orders) {
+      txt += `\n<i>No sales in this window. If stock fell anyway, it was changed by ` +
+             `hand or recovered — check the admin actions, not the orders.</i>`;
+    } else {
+      txt += `\n<b>Who took it</b>\n` +
+        a.buyers.slice(0, 10).map((b) =>
+          `${b.via_api ? '🔌' : '👤'} ${who(b)} · <code>${b.user_id}</code>\n` +
+          `   <b>${b.units}</b> unit(s) · ${b.orders} order(s) · ${formatPrice(b.spent)}` +
+          (b.api_units ? `\n   🔌 ${b.api_units} of those via API` : '')
+        ).join('\n');
+      if (a.buyers.length > 10) txt += `\n<i>…and ${a.buyers.length - 10} more buyers</i>`;
+
+      const apiUnits = a.buyers.reduce((x, b) => x + (b.api_units || 0), 0);
+      if (apiUnits) {
+        txt += `\n\n🔌 <b>${apiUnits}</b> of those unit(s) went to customers holding an API key.`;
+      }
+
+      const top = a.buyers[0];
+      if (top && a.units > 0 && top.units / a.units >= 0.5) {
+        // Worth stating outright: one buyer taking most of a product is the
+        // usual explanation for stock vanishing "for no reason".
+        txt += `\n\n⚠️ <b>${who(top)} alone took ${Math.round((top.units / a.units) * 100)}%</b> ` +
+               `of everything sold here.`;
+      }
+    }
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: `${days === 1 ? '✅ ' : ''}24h`, callback_data: `admin_stockaudit_${productId}_1` },
+         { text: `${days === 7 ? '✅ ' : ''}7d`,  callback_data: `admin_stockaudit_${productId}_7` },
+         { text: `${days === 30 ? '✅ ' : ''}30d`, callback_data: `admin_stockaudit_${productId}_30` }],
+        [{ text: '🔙 Back', callback_data: `admin_edit_p_${productId}` }],
+      ] },
+    }).catch(() => {});
+    return;
+  }
+
   // ── Time-limited product: price falls as the end date approaches ───
   if (/^admin_subexp_\d+$/.test(data)) {
     const productId = parseInt(data.split('_').pop(), 10);

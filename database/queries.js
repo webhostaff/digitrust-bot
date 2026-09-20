@@ -2187,6 +2187,117 @@ module.exports = {
   traceTxid,
   salesByHour,
 
+  /**
+   * Everything bought through the API: who, how much, and of what.
+   *
+   * Reads orders.source, which is stamped when the order is created. The
+   * earlier approach — treating every order from a key holder as an API sale —
+   * was wrong both ways round: a reseller who also buys inside the bot had
+   * those purchases miscounted, and issuing a key relabelled that customer's
+   * entire history.
+   *
+   * Orders placed before the column existed default to 'bot', so figures start
+   * from the day this shipped rather than pretending to know the past.
+   */
+  apiSales: (days = 30) => {
+    const rows = db.prepare(`
+      SELECT o.id, o.user_id, o.product_id, o.quantity, o.total_price,
+             o.status, o.created_at,
+             p.title AS product_title,
+             u.username, u.first_name
+      FROM orders o
+      LEFT JOIN products p ON p.id = o.product_id
+      LEFT JOIN users    u ON u.telegram_id = o.user_id
+      WHERE COALESCE(o.source, 'bot') = 'api'
+        AND o.created_at >= datetime('now', '-' || ? || ' days')
+        AND o.status NOT IN ('cancelled', 'pending')
+      ORDER BY datetime(o.created_at) DESC, o.id DESC
+    `).all(days);
+
+    const buyers = new Map();
+    const products = new Map();
+    let units = 0, revenue = 0;
+
+    for (const r of rows) {
+      const qty = Number(r.quantity) || 0;
+      const amt = Number(r.total_price) || 0;
+      units += qty; revenue += amt;
+
+      const bk = String(r.user_id);
+      if (!buyers.has(bk)) {
+        buyers.set(bk, { user_id: r.user_id, username: r.username,
+                         first_name: r.first_name, units: 0, spent: 0,
+                         orders: 0, last: r.created_at });
+      }
+      const b = buyers.get(bk);
+      b.units += qty; b.spent += amt; b.orders++;
+
+      const pk = String(r.product_id);
+      if (!products.has(pk)) {
+        products.set(pk, { product_id: r.product_id, title: r.product_title, units: 0, revenue: 0 });
+      }
+      const pr = products.get(pk);
+      pr.units += qty; pr.revenue += amt;
+    }
+
+    return {
+      days, units, revenue, orders: rows.length,
+      recent: rows.slice(0, 12),
+      buyers:   [...buyers.values()].sort((a, b) => b.units - a.units),
+      products: [...products.values()].sort((a, b) => b.units - a.units),
+    };
+  },
+
+  /**
+   * Where a product's stock went, and who took it.
+   *
+   * Built for the question "the stock is gone and I do not know how". Totals
+   * alone cannot answer it — one buyer taking fifty units and fifty buyers
+   * taking one each are the same number and completely different situations —
+   * so the buyers are listed, biggest first.
+   */
+  stockAudit: (productId, days = 7) => {
+    const rows = db.prepare(`
+      SELECT o.id, o.user_id, o.quantity, o.total_price, o.status,
+             o.payment_method, o.created_at, COALESCE(o.source, 'bot') AS source,
+             u.username, u.first_name
+      FROM orders o
+      LEFT JOIN users u ON u.telegram_id = o.user_id
+      WHERE o.product_id = ?
+        AND o.created_at >= datetime('now', '-' || ? || ' days')
+        AND o.status NOT IN ('cancelled', 'pending')
+      ORDER BY datetime(o.created_at) DESC, o.id DESC
+    `).all(productId, days);
+
+    const byBuyer = new Map();
+    let units = 0, revenue = 0;
+    for (const r of rows) {
+      const q = Number(r.quantity) || 0;
+      units += q;
+      revenue += Number(r.total_price) || 0;
+      const k = String(r.user_id);
+      if (!byBuyer.has(k)) {
+        byBuyer.set(k, {
+          user_id: r.user_id, username: r.username, first_name: r.first_name,
+          units: 0, spent: 0, orders: 0, last: r.created_at,
+        });
+      }
+      const b = byBuyer.get(k);
+      b.units += q; b.spent += Number(r.total_price) || 0; b.orders++;
+      // Counted per ORDER, not per buyer: the same customer can use both the
+      // bot and the API, and lumping them together hides exactly that.
+      if (r.source === 'api') b.api_units = (b.api_units || 0) + q;
+    }
+
+    return {
+      units, revenue, orders: rows.length,
+      recent: rows.slice(0, 15),
+      buyers: [...byBuyer.values()]
+        .map((b) => ({ ...b, api_units: b.api_units || 0, via_api: (b.api_units || 0) > 0 }))
+        .sort((a, b) => b.units - a.units),
+    };
+  },
+
   // ── Spend ranks ──
   getUserRank,
   resolveDiscountPct,

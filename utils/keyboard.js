@@ -335,7 +335,7 @@ const adminMainKb = () => mk([
   [btn('🔜 Pre-Orders',      'admin_preorders'),      btn('💳 Pending',      'admin_pending')],
   [btn('👥 Users',           'admin_users'),          btn('📣 Broadcast',    'admin_broadcast')],
   [btn('📊 Statistics',      'admin_stats'),          btn('📈 Profits',      'admin_profits')],
-  [btn('🕐 Best Selling Hours', 'admin_besttime')],
+  [btn('🕐 Best Selling Hours', 'admin_besttime'), btn('🔌 API Sales', 'admin_apisales')],
   [btn('🏦 Customer Wallets', 'admin_treasury')],
   [btn('🎫 Tickets',         'admin_tickets'),        btn('💸 Refund',       'admin_refund')],
   [btn('📢 Announcement',    'admin_announcement'),   btn('⚙️ Settings',     'admin_settings')],
@@ -585,6 +585,7 @@ const adminProductEditFieldsKb = (productId) =>
     // ── Bulk pricing (quantity tiers) ──────────────────────────────────
     [btn('📊 Bulk Pricing (by quantity)', `admin_bulkprice_${productId}`)],
   [btn('⏳ Time-limited price', `admin_subexp_${productId}`)],
+  [btn('🔍 Where did stock go?', `admin_stockaudit_${productId}`)],
     // ── Stock management (direct from edit page) ──────────────────────
     [
       btn('➕ Add Stock Items',  `admin_stock_add_${productId}`),

@@ -349,10 +349,15 @@ bot.on('message', async (msg) => {
       // Rather than duplicate them here — where the copy would drift the first
       // time either screen changed — the tap is replayed as the callback the
       // inline button would have sent.
+      // message_id is deliberately absent. It used to carry the CUSTOMER's own
+      // message id, and every screen that opens with editMessageText then tried
+      // to edit a message the bot does not own — which always fails. The
+      // handlers fall back to sending a fresh message when there is nothing to
+      // edit, which is the correct behaviour for a bar tap anyway.
       const fake = {
         id: `nav_${Date.now()}`,
         from: msg.from,
-        message: { chat: { id: chatId }, message_id: msg.message_id },
+        message: { chat: { id: chatId } },
         data: navKey === 'btn_refunds' ? 'refund_request_start' : 'menu_api',
       };
       await handleCallbackQuery(fake);
@@ -1457,7 +1462,9 @@ async function handleCallbackQuery(query) {
     const hasBase = isRealBase(base);
     const user = db.getUser(userId);
 
-    await bot.editMessageText(
+    // Built once, used by both the edit and the send below. Keeping two copies
+    // is how the fallback ended up with no buttons.
+    const apiScreenText =
       `🔌 <b>API Access</b>\n\n` +
       `Buy from the shop straight from your own code.\n\n` +
       `━━━━━━━━━━━━━━━━━━━━\n` +
@@ -1477,9 +1484,9 @@ async function handleCallbackQuery(query) {
       `  -H "Content-Type: application/json" \\\n` +
       `  -d '{"product_id":1,"quantity":1}'</pre>\n` +
       `⚠️ <b>Top up your wallet first</b> — the API spends your balance, it cannot take payments.\n\n` +
-      `🔒 <i>Treat this key like a password. Anyone holding it can spend your balance.</i>`,
-      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: [
+      `🔒 <i>Treat this key like a password. Anyone holding it can spend your balance.</i>`;
+
+    const apiScreenButtons = [
           // Only offered when the URL is real. A button is better missing than
           // taking the message down with it.
           // In-bot docs always work. The web page needs a public domain, and
@@ -1489,11 +1496,29 @@ async function handleCallbackQuery(query) {
           ...(hasBase ? [[{ text: '🌐 Full web documentation', url: `${base}/api/v2/docs` }]] : []),
           [{ text: '💰 Top Up Wallet', callback_data: 'wallet_topup' }],
           [{ text: '🔁 Generate new key', callback_data: 'api_regen_confirm' }],
-          [{ text: '🔙 Back', callback_data: 'back_main' }],
-        ] } }
-    ).catch(async () => {
-      await bot.sendMessage(chatId, `🔑 Your API key:\n<code>${escapeHtml(row.api_key)}</code>`,
-        { parse_mode: 'HTML' });
+          [{ text: '🔙 Back', callback_data: 'back_main' }],];
+
+    await bot.editMessageText(apiScreenText,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: apiScreenButtons } }
+    ).catch(async (err) => {
+      // The edit fails whenever there is no previous bot message to edit —
+      // which is exactly what happens when the screen is opened from the
+      // persistent bar rather than from an inline button. The fallback used to
+      // send the bare key with NO buttons at all, so the documentation the
+      // customer came for disappeared precisely on the most common route in.
+      logger.warn(`[API] edit failed, sending fresh: ${err.message}`);
+      await bot.sendMessage(chatId, apiScreenText, {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: apiScreenButtons },
+      }).catch(async (e2) => {
+        // Only if even a plain send fails — bad HTML in a title, say — do we
+        // fall back to the key alone, and the buttons still come with it.
+        logger.error(`[API] send failed too: ${e2.message}`);
+        await bot.sendMessage(chatId,
+          `🔑 <b>Your API key</b>\n<code>${escapeHtml(row.api_key)}</code>`,
+          { parse_mode: 'HTML', reply_markup: { inline_keyboard: apiScreenButtons } });
+      });
     });
     return;
   }

@@ -1250,4 +1250,22 @@ try {
   console.error('[MIGRATION V7] subscription columns:', e.message);
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// V8 — ORDER SOURCE
+//
+// Records HOW an order was placed. Inferring it from "does this customer hold
+// an API key" was wrong in both directions: a reseller who also buys in the bot
+// had every purchase counted as an API sale, and a key issued after a purchase
+// retroactively relabelled it. The order itself is the only thing that knows.
+// ══════════════════════════════════════════════════════════════════════════════
+try {
+  const cols = db.prepare('PRAGMA table_info(orders)').all().map((c) => c.name);
+  if (!cols.includes('source')) {
+    db.exec("ALTER TABLE orders ADD COLUMN source TEXT DEFAULT 'bot'");
+    db.exec('CREATE INDEX IF NOT EXISTS idx_orders_source ON orders(source)');
+  }
+} catch (e) {
+  console.error('[MIGRATION V8] order source:', e.message);
+}
+
 module.exports = db;

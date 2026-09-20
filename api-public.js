@@ -32,6 +32,7 @@ const express = require('express');
 const db      = require('./database/queries');
 const dbRaw   = require('./database/db');
 const logger  = require('./utils/logger');
+const config  = require('./config');
 
 const router = express.Router();
 router.use(express.json({ limit: '256kb' }));
@@ -194,6 +195,48 @@ router.get('/balance', requireKey, (req, res) => {
  * Charged to the caller's wallet. Top up in the bot first — the API cannot
  * accept payments, only spend what is already there.
  */
+
+/**
+ * Tell the admins about an API purchase, in the same shape as a bot purchase.
+ *
+ * API orders charge the wallet and consume stock exactly like any other sale,
+ * but they produced no notification at all — so the only visible trace was the
+ * stock going down. That is precisely the "my stock vanished and I do not know
+ * how" situation: the sales were real, they were simply silent.
+ *
+ * Marked 🔌 API so the two routes can be told apart at a glance.
+ */
+async function notifyAdminsApiOrder(req, { orderId, product, quantity, total, manual }) {
+  try {
+    const botRef = req.app && req.app.get('bot');
+    if (!botRef) return;   // no bot instance mounted — nothing to notify with
+
+    const u = db.getUser(req.userId);
+    const name = u?.username ? `@${u.username}` : (u?.first_name || `User ${req.userId}`);
+    const balance = Number(db.getUser(req.userId)?.balance || 0);
+
+    const msg =
+      `🔌 <b>New API Order Paid</b>\n\n` +
+      `🆔 <b>Order:</b> #${orderId}\n` +
+      `📦 <b>Product:</b> ${cleanTitle(product.title)}\n` +
+      `🔢 <b>Quantity:</b> ${quantity}\n` +
+      `💵 <b>Total:</b> $${Number(total).toFixed(2)}\n` +
+      `💳 <b>Payment:</b> Wallet (via API)\n` +
+      `🚚 <b>Delivery:</b> ${manual ? 'Manual — action needed' : 'Automatic'}\n\n` +
+      `👤 <b>Customer:</b> ${name}\n` +
+      `🆔 <b>User ID:</b> <code>${req.userId}</code>\n` +
+      `💰 <b>Remaining Balance:</b> $${balance.toFixed(2)}\n` +
+      `📦 <b>Stock left:</b> ${Number(db.getProduct(product.id)?.stock_quantity || 0)}`;
+
+    for (const adminId of (config.adminIds || [])) {
+      // Never let a failed notification undo a completed, paid-for sale.
+      botRef.sendMessage(adminId, msg, { parse_mode: 'HTML' }).catch(() => {});
+    }
+  } catch (e) {
+    logger.warn(`[API v2] admin notify failed for order ${orderId}: ${e.message}`);
+  }
+}
+
 router.post(['/purchase', '/order'], requireKey, async (req, res) => {
   if (IN_FLIGHT.has(req.apiKey)) {
     return fail(res, 429, 'Another purchase from this key is still processing');
@@ -248,6 +291,11 @@ router.post(['/purchase', '/order'], requireKey, async (req, res) => {
         .run(Number(pricing.specialUnits) || 0, orderId);
     } catch (e) { /* column added by migration; never fatal */ }
 
+    // Stamped at the point of creation, where the fact is known for certain.
+    try {
+      dbRaw.prepare("UPDATE orders SET source = 'api' WHERE id = ?").run(orderId);
+    } catch (e) { /* column added by migration; never fatal */ }
+
     // ── Manual products: take payment, queue a human delivery ───────────────
     if (product.delivery_type === 'manual') {
       const charged = db.chargeWalletForManualOrder(
@@ -281,6 +329,8 @@ router.post(['/purchase', '/order'], requireKey, async (req, res) => {
       } catch (e) {
         logger.warn(`[API v2] manual delivery task for order ${orderId}: ${e.message}`);
       }
+
+      await notifyAdminsApiOrder(req, { orderId, product, quantity, total, manual: true });
 
       return res.json({
         success: true,
@@ -328,6 +378,8 @@ router.post(['/purchase', '/order'], requireKey, async (req, res) => {
 
     const fresh = db.getUser(req.userId);
     logger.info(`[API v2] user ${req.userId} bought ${quantity}x product ${productId} for $${total}`);
+
+    await notifyAdminsApiOrder(req, { orderId, product, quantity, total, manual: false });
 
     res.json({
       success: true,
