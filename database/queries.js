@@ -2188,6 +2188,108 @@ module.exports = {
   salesByHour,
 
   /**
+   * Stock grouped into the batches it was added in.
+   *
+   * Items carry the minute they were inserted, and a paste of 500 lands in one
+   * transaction — so a gap in `created_at` is a real boundary between uploads.
+   * Grouping by it turns "24910 items ever" into the question actually being
+   * asked: the 500 added on Tuesday, where did those go?
+   *
+   * Two minutes of tolerance, because a very large paste can straddle a minute.
+   */
+  stockBatches: (productId, limit = 20) => {
+    const rows = db.prepare(`
+      SELECT id, status, order_id, sold_to_user_id, created_at, sold_at, supplier, unit_cost
+      FROM product_items
+      WHERE product_id = ?
+      ORDER BY datetime(created_at) ASC, id ASC
+    `).all(productId);
+    if (!rows.length) return [];
+
+    const batches = [];
+    let cur = null;
+    const GAP_MS = 2 * 60 * 1000;
+
+    for (const r of rows) {
+      const t = new Date(String(r.created_at).replace(' ', 'T') + 'Z').getTime();
+      if (!cur || (t - cur.lastMs) > GAP_MS) {
+        cur = {
+          added_at: r.created_at, lastMs: t, supplier: r.supplier,
+          unit_cost: r.unit_cost,
+          total: 0, available: 0, sold: 0,
+          first_id: r.id, last_id: r.id,
+          buyers: new Map(),
+          // Revenue is summed from the ORDERS the units belong to, never from
+          // the product's current price: a product repriced since the batch was
+          // sold would otherwise rewrite history.
+          revenue: 0,
+          countedOrders: new Set(),
+        };
+        batches.push(cur);
+      }
+      cur.lastMs = t;
+      cur.last_id = r.id;
+      cur.total++;
+
+      if (r.status === 'available') cur.available++;
+      else if (r.status === 'sold') {
+        cur.sold++;
+        // No per-item order lookup here. It ran one query per unit — tens of
+        // thousands of them on a busy product — to answer a question this
+        // screen does not ask. "Does stock add up?" covers that, once.
+        if (r.sold_to_user_id) {
+          const k = String(r.sold_to_user_id);
+          cur.buyers.set(k, (cur.buyers.get(k) || 0) + 1);
+        }
+
+        // Per unit, from the order it was part of. An order covering several
+        // units of this batch must not be counted once per unit, so the unit
+        // price is used rather than the order total.
+        if (r.order_id) {
+          const o = db.prepare(
+            "SELECT total_price, quantity FROM orders WHERE id = ? AND status NOT IN ('cancelled','pending')"
+          ).get(r.order_id);
+          if (o && Number(o.quantity) > 0) {
+            cur.revenue += Number(o.total_price) / Number(o.quantity);
+          }
+        }
+      }
+    }
+
+    // Newest batch first — the one just added is the one being asked about.
+    return batches.reverse().slice(0, limit).map((b) => {
+      const top = [...b.buyers.entries()].sort((x, y) => y[1] - x[1]).slice(0, 5);
+      const names = top.map(([uid, n]) => {
+        const u = db.prepare('SELECT username, first_name FROM users WHERE telegram_id = ?').get(uid);
+        return { user_id: uid, units: n, username: u?.username, first_name: u?.first_name };
+      });
+      const unitCost = (b.unit_cost === null || b.unit_cost === undefined)
+        ? null : Number(b.unit_cost);
+
+      // Cost is charged for the WHOLE batch — money already spent, whether the
+      // units sold or not. Counting only the sold ones would show a profit on a
+      // batch that has not yet earned back what it cost.
+      const spent    = unitCost === null ? null : Number((unitCost * b.total).toFixed(2));
+      const revenue  = Number(b.revenue.toFixed(2));
+      const costSold = unitCost === null ? null : Number((unitCost * b.sold).toFixed(2));
+
+      return {
+        added_at: b.added_at, supplier: b.supplier,
+        total: b.total, available: b.available, sold: b.sold,
+        buyers: names, distinct_buyers: b.buyers.size,
+        unit_cost: unitCost,
+        revenue,
+        spent,
+        // Profit so far: what the sold units earned minus what those same units
+        // cost. Kept separate from the batch's break-even position below.
+        profit_so_far: costSold === null ? null : Number((revenue - costSold).toFixed(2)),
+        // Where the batch stands overall, including stock still unsold.
+        net_vs_spend:  spent === null ? null : Number((revenue - spent).toFixed(2)),
+      };
+    });
+  },
+
+  /**
    * Does the stock add up?
    *
    * Answers the question totals cannot: were the units that left actually sold,

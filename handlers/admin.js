@@ -207,6 +207,11 @@ function stockConfirmRows(userId, productId, count) {
     rows.push([{ text: `🏷 Supplier: ${String(current).slice(0, 24)} — change`, callback_data: 'admin_stock_supplier' }]);
   }
 
+  const cost = sess?.data?.unitCost;
+  rows.push([{
+    text: cost != null ? `💰 Cost: $${Number(cost).toFixed(2)}/unit — change` : '💰 Set cost per unit',
+    callback_data: 'admin_stock_cost',
+  }]);
   rows.push([{ text: `✅ Add ${count} item(s)${current ? '' : ' without supplier'}`, callback_data: 'admin_stock_confirm_yes' }]);
   rows.push([{ text: '❌ Cancel', callback_data: `admin_edit_p_${productId}` }]);
   return rows;
@@ -845,6 +850,23 @@ async function handleAdminText(bot, msg) {
       return;
     }
 
+    // Cost per unit for this upload. Accepted at any point, like SUPPLIER —
+    // the number is often looked up mid-paste.
+    if (cmd.startsWith('COST')) {
+      const raw = text.trim().slice('COST'.length).trim().replace(/[$,\s]/g, '');
+      const v = parseFloat(raw);
+      if (!Number.isFinite(v) || v < 0) {
+        await bot.sendMessage(chatId, '❌ Send it as <code>COST 0.25</code>.', { parse_mode: 'HTML' });
+        return;
+      }
+      session.update(userId, { unitCost: v });
+      await bot.sendMessage(chatId,
+        `💰 Cost for this upload: <b>${formatPrice(v)}</b> per unit\n\n` +
+        `<i>Keep pasting, then send DONE.</i>`,
+        { parse_mode: 'HTML' });
+      return;
+    }
+
     // Cancel
     if (cmd === 'CANCEL') {
       session.clear(userId);
@@ -866,7 +888,7 @@ async function handleAdminText(bot, msg) {
       }
 
       const prevStock = product.stock_quantity || 0;
-      const count     = items.insertItems(productId, allItems, d.supplier || null);
+      const count     = items.insertItems(productId, allItems, d.supplier || null, d.unitCost ?? null);
       db.adjustStockQuantity(productId, count);
       session.clear(userId);
 
@@ -878,6 +900,9 @@ async function handleAdminText(bot, msg) {
         (d.supplier
           ? `🏷 Supplier: <b>${escapeHtml(d.supplier)}</b>\n`
           : `🏷 <i>No supplier recorded — you will not know who to chase if these fail.</i>\n`) +
+        (d.unitCost != null
+          ? `💰 Cost: <b>${formatPrice(d.unitCost)}</b>/unit · spent <b>${formatPrice(d.unitCost * count)}</b>\n`
+          : `💰 <i>No cost recorded — this batch's profit cannot be calculated.</i>\n`) +
         `📊 Previous stock: ${prevStock}\n` +
         `📊 New stock: <b>${prevStock + count}</b>`,
         { parse_mode: 'HTML', reply_markup: adminStockManageKb(productId) });
@@ -1728,6 +1753,23 @@ async function handleAdminText(bot, msg) {
       `<i>After that moment the day-of-month cycles take over again automatically.</i>`,
       { parse_mode: 'HTML',
         reply_markup: { inline_keyboard: [[{ text: '🕒 Cycle end', callback_data: 'admin_cgb_manual' }]] } });
+    return;
+  }
+
+  // ── Cost per unit for the pending batch ───────────────────────────
+  if (s === States.ADMIN_STOCK_COST) {
+    const v = parseFloat(String(text || '').replace(/[$,\s]/g, ''));
+    if (!Number.isFinite(v) || v < 0) {
+      await bot.sendMessage(chatId, '❌ Send a number, e.g. <code>0.25</code>.', { parse_mode: 'HTML' });
+      return;
+    }
+    session.set(userId, States.ADMIN_STOCK_CONFIRM, { ...d, unitCost: v });
+    const n = (d.stockItems || []).length;
+    await bot.sendMessage(chatId,
+      `💰 Cost set to <b>${formatPrice(v)}</b> per unit.\n` +
+      `Total for ${n} item(s): <b>${formatPrice(v * n)}</b>`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: stockConfirmRows(userId, d.stockProductId, n) } });
     return;
   }
 
@@ -3521,6 +3563,94 @@ async function handleAdminCallback(bot, query) {
     return;
   }
 
+  // ── Batch by batch: where did THIS upload go? ─────────────────────
+  if (/^admin_batches_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const batches = db.stockBatches(productId, 12);
+    const p = db.getProduct(productId);
+
+    if (!batches.length) {
+      await bot.editMessageText(
+        `📦 <b>No stock batches recorded</b> for this product.\n\n` +
+        `<i>Either nothing was ever added as items, or it sells by counter only.</i>`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: `admin_edit_p_${productId}` }]] } }
+      ).catch(() => {});
+      return;
+    }
+
+    const rows = batches.map((b, i) => [{
+      text: `${b.added_at.slice(0, 10)} · ${b.total} pcs → ${b.sold} sold, ${b.available} left`,
+      callback_data: `admin_batch_${productId}_${i}`,
+    }]);
+    rows.push([{ text: '🔙 Back', callback_data: `admin_edit_p_${productId}` }]);
+
+    await bot.editMessageText(
+      `📦 <b>Stock batches</b>\n${escapeHtml(kbStripEmojiCodes(String(p?.title || '')).trim())}\n\n` +
+      `<i>Each row is one upload. Tap it to see where those exact units went.</i>\n\n` +
+      batches.map((b, i) =>
+        `<b>${i === 0 ? '🆕 ' : ''}${b.added_at.slice(0, 16)}</b> — added <b>${b.total}</b> pcs\n` +
+        `   🔴 sold <b>${b.sold}</b> · 🟢 <b>${b.available}</b> left` +
+        (b.supplier ? ` · 🏷 ${escapeHtml(b.supplier)}` : '') +
+        (b.profit_so_far != null
+          ? `\n   💵 ${formatPrice(b.revenue)} in · ${formatPrice(b.spent)} spent · ` +
+            `<b>${b.net_vs_spend >= 0 ? '+' : ''}${formatPrice(b.net_vs_spend)}</b>`
+          : `\n   💰 <i>no cost recorded</i>`)
+      ).join('\n\n'),
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_batch_\d+_\d+$/.test(data)) {
+    const parts = data.split('_');
+    const productId = parseInt(parts[2], 10);
+    const idx = parseInt(parts[3], 10);
+    const batches = db.stockBatches(productId, 12);
+    const b = batches[idx];
+    if (!b) { await answer('❌ Batch not found'); return; }
+
+    const who = (x) => x.username ? `@${escapeHtml(x.username)}` : escapeHtml(x.first_name || String(x.user_id));
+
+    const soldPct = b.total ? Math.round((b.sold / b.total) * 100) : 0;
+
+    await bot.editMessageText(
+      `📦 <b>Batch of ${b.total}</b>\n` +
+      `📅 Added ${escapeHtml(b.added_at.slice(0, 16))}\n` +
+      (b.supplier ? `🏷 Supplier: <b>${escapeHtml(b.supplier)}</b>\n` : '') +
+      `\n🔴 Sold: <b>${b.sold}</b> of ${b.total} (${soldPct}%)\n` +
+      `🟢 Still available: <b>${b.available}</b>\n` +
+      `👥 Went to <b>${b.distinct_buyers}</b> different buyer(s)\n` +
+      (b.unit_cost != null
+        ? `\n💰 <b>Money</b>\n` +
+          `   Cost: ${formatPrice(b.unit_cost)}/unit · spent <b>${formatPrice(b.spent)}</b>\n` +
+          `   Earned so far: <b>${formatPrice(b.revenue)}</b>\n` +
+          `   Profit on sold units: <b>${b.profit_so_far >= 0 ? '+' : ''}${formatPrice(b.profit_so_far)}</b>\n` +
+          // Both figures are shown because they answer different questions:
+          // one is how the sold units performed, the other whether the batch
+          // has paid for itself yet.
+          `   ${b.net_vs_spend >= 0 ? '🟢' : '🔴'} Against full spend: ` +
+          `<b>${b.net_vs_spend >= 0 ? '+' : ''}${formatPrice(b.net_vs_spend)}</b>` +
+          (b.available > 0 && b.net_vs_spend < 0
+            ? `\n   <i>${b.available} unsold unit(s) worth ${formatPrice(b.unit_cost * b.available)} still to recover.</i>`
+            : '') + `\n`
+        : `\n💰 <i>No cost recorded for this batch, so profit cannot be worked out. ` +
+          `Set it on the next upload with the COST command.</i>\n`) +
+      `\n<b>Where it went</b>\n` +
+      (b.buyers.length
+        ? b.buyers.map((x) =>
+            `• ${who(x)} · <code>${x.user_id}</code> — <b>${x.units}</b> pcs` +
+            // The share matters more than the count: it is what tells you
+            // whether a batch was spread across the shop or taken by one buyer.
+            ` (${b.sold ? Math.round((x.units / b.sold) * 100) : 0}%)`
+          ).join('\n')
+        : '<i>None sold from this batch yet.</i>'),
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Batches', callback_data: `admin_batches_${productId}` }]] } }
+    ).catch(() => {});
+    return;
+  }
+
   // ── Does the stock add up? ────────────────────────────────────────
   if (/^admin_reconcile_\d+$/.test(data)) {
     const productId = parseInt(data.split('_').pop(), 10);
@@ -3929,6 +4059,9 @@ async function handleAdminCallback(bot, query) {
       `<code>item1AYMENitem2AYMENitem3</code>\n\n` +
       `🏷 To tag this batch with a supplier, send:\n` +
       `<code>SUPPLIER Ahmed Store</code>\n\n` +
+      `💰 To record what you paid per unit, send:\n` +
+      `<code>COST 0.25</code>\n` +
+      `<i>Used to work out this batch's profit later.</i>\n\n` +
       `When you've sent all batches, type <code>DONE</code> to save everything.\n` +
       `To cancel, type <code>CANCEL</code>.\n\n` +
       `📊 <b>Current stock:</b> ${product.stock_quantity}`,
@@ -4603,6 +4736,20 @@ async function handleAdminCallback(bot, query) {
     return;
   }
 
+  // ── What this batch cost ──────────────────────────────────────────
+  if (data === 'admin_stock_cost') {
+    const sess = session.get(userId);
+    if (sess.state !== States.ADMIN_STOCK_CONFIRM) { await answer('❌ Session expired.'); return; }
+    session.set(userId, States.ADMIN_STOCK_COST, sess.data);
+    await bot.sendMessage(chatId,
+      `💰 <b>Cost per unit</b>\n\nWhat did you pay for ONE unit of this batch?\n\n` +
+      `Example: <code>0.25</code>\n\n` +
+      `<i>Stored on these units only, so a later price change from your supplier ` +
+      `never rewrites this batch's profit.</i>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
   // ── Supplier for the batch being added ────────────────────────────
   if (data === 'admin_stock_supplier') {
     const sess = session.get(userId);
@@ -4644,7 +4791,7 @@ async function handleAdminCallback(bot, query) {
     const wasZero = prevStock === 0;
     logger.info(`Admin ${userId} CONFIRMED adding ${stockItems.length} stock items to product ${stockProductId}`);
 
-    const count = items.insertItems(stockProductId, stockItems, supplier || null);
+    const count = items.insertItems(stockProductId, stockItems, supplier || null, sess.data.unitCost ?? null);
     const newQty = db.adjustStockQuantity(stockProductId, count).after;
     session.clear(userId);
 

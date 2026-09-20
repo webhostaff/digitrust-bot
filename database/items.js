@@ -12,9 +12,9 @@ const db = require('./db');
 
 const insertItem = db.prepare(`
   INSERT INTO product_items
-    (product_id, item_type, raw_content, email, password, recovery, status, supplier)
+    (product_id, item_type, raw_content, email, password, recovery, status, supplier, unit_cost)
   VALUES
-    (@productId, 'key', @rawContent, NULL, NULL, NULL, 'available', @supplier)
+    (@productId, 'key', @rawContent, NULL, NULL, NULL, 'available', @supplier, @unitCost)
 `);
 
 const getAvailableItem = db.prepare(`
@@ -97,11 +97,15 @@ function validateLines(input) {
  * Insert validated items into product_items.
  * Returns number inserted.
  */
-const insertItems = db.transaction((productId, validItems, supplier = null) => {
+const insertItems = db.transaction((productId, validItems, supplier = null, unitCost = null) => {
   let count = 0;
   const who = supplier ? String(supplier).trim().slice(0, 60) : null;
+  // Stamped on every unit, so what each one cost survives any later change to
+  // the product's price or the supplier's.
+  const cost = (unitCost === null || unitCost === undefined || !Number.isFinite(Number(unitCost)))
+    ? null : Number(unitCost);
   for (const item of validItems) {
-    insertItem.run({ productId, rawContent: item.raw, supplier: who });
+    insertItem.run({ productId, rawContent: item.raw, supplier: who, unitCost: cost });
     count++;
   }
   return count;

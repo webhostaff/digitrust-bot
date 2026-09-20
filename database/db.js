@@ -1268,4 +1268,21 @@ try {
   console.error('[MIGRATION V8] order source:', e.message);
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// V9 — PER-BATCH COST
+//
+// products.cost_price is one number for the product's whole life, so the moment
+// a supplier changes their price every past batch is silently re-valued and the
+// profit figures rewrite themselves. Cost belongs to the units it was paid for,
+// which is the batch.
+// ══════════════════════════════════════════════════════════════════════════════
+try {
+  const cols = db.prepare('PRAGMA table_info(product_items)').all().map((c) => c.name);
+  if (!cols.includes('unit_cost')) {
+    db.exec('ALTER TABLE product_items ADD COLUMN unit_cost REAL DEFAULT NULL');
+  }
+} catch (e) {
+  console.error('[MIGRATION V9] unit_cost:', e.message);
+}
+
 module.exports = db;
