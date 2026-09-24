@@ -1150,6 +1150,8 @@ try {
   ins.run('cgb_renew_discounts', '3:3,6:5,12:8');
   // 23:59 includes the end day, which is what "until the 25th" means to a buyer.
   ins.run('cgb_cycle_end_time', '23:59');
+  // Guard against typos, not a sales limit. Real stock is the true cap.
+  ins.run('max_qty_per_order', '500');
 } catch (e) {
   console.error('[SEED] cgb renewal settings:', e.message);
 }

@@ -364,4 +364,41 @@ function installEmojiLayer(bot, label = 'bot') {
   return bot;
 }
 
-module.exports = { installEmojiLayer, isChannel, prepareText, prepareMarkup };
+/**
+ * Why premium emoji are or are not being sent right now.
+ *
+ * Icons disappearing "suddenly" has three possible causes and they are
+ * invisible from the chat: a whole-account breaker, individual quarantined ids,
+ * or the button-icons setting being off. Guessing between them wastes days, so
+ * the state is simply reported.
+ */
+function emojiStatus() {
+  const now = Date.now();
+  const quarantined = [];
+  for (const [id, until] of badIds.entries()) {
+    if (until > now) quarantined.push({ id, minutes_left: Math.ceil((until - now) / 60000) });
+  }
+  return {
+    account_blocked: now < accountBreakerUntil,
+    account_minutes_left: now < accountBreakerUntil
+      ? Math.ceil((accountBreakerUntil - now) / 60000) : 0,
+    quarantined,
+    icons_enabled: iconsEnabled(),
+    recent_failures: recentFailures.length,
+  };
+}
+
+/** Clear the breaker and the quarantine, for when the cause has been fixed. */
+function resetEmojiState() {
+  const n = badIds.size;
+  badIds.clear();
+  accountBreakerUntil = 0;
+  recentFailures = [];
+  logger.info(`[emoji] state reset — ${n} quarantined id(s) cleared`);
+  return n;
+}
+
+module.exports = {
+  installEmojiLayer, isChannel, prepareText, prepareMarkup,
+  emojiStatus, resetEmojiState,
+};

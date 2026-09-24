@@ -615,6 +615,56 @@ bot.onText(/^\/apibase(?:\s+(\S+))?$/i, async (msg, match) => {
   await bot.sendMessage(msg.chat.id, `✅ Set to <code>${escapeHtml(v)}</code>\n\nRun /apicheck to test it.`, { parse_mode: 'HTML' });
 });
 
+/**
+ * Why are the premium icons off right now?
+ *
+ * The layer silences custom emoji by itself when Telegram refuses them, which
+ * is correct — but the reason lives in memory and never reached the admin, so
+ * the icons simply vanished and came back with no explanation.
+ */
+bot.onText(/^\/emojistatus$/i, async (msg) => {
+  if (!adminHandler.isAdmin(msg.from.id)) return;
+  const layer = require('./utils/emojiLayer');
+  const st = layer.emojiStatus();
+
+  let txt = `🎨 <b>Premium emoji status</b>\n\n`;
+
+  if (!st.icons_enabled) {
+    txt += `🔴 <b>Button icons are switched OFF</b> in settings.\n` +
+           `<i>Nothing will show premium icons until this is turned back on.</i>\n\n`;
+  }
+
+  if (st.account_blocked) {
+    txt += `🔴 <b>All custom emoji are paused</b> for ${st.account_minutes_left} more minute(s).\n\n` +
+           `<i>Telegram refused emoji that all exist, which means the bot owner's ` +
+           `Telegram Premium is not active. Icons return by themselves once it is, ` +
+           `or immediately with /emojireset.</i>\n\n`;
+  }
+
+  if (st.quarantined.length) {
+    txt += `🟡 <b>${st.quarantined.length} emoji id(s) quarantined</b>\n` +
+           st.quarantined.slice(0, 10).map((q) =>
+             `• <code>${q.id}</code> — ${q.minutes_left} min left`).join('\n') +
+           `\n<i>These specific ids were rejected by Telegram. Every other icon ` +
+           `still works. They are retried automatically.</i>\n\n`;
+  }
+
+  if (st.icons_enabled && !st.account_blocked && !st.quarantined.length) {
+    txt += `✅ <b>Everything is working.</b>\n` +
+           `<i>If icons still look plain, the sender account has no active ` +
+           `Telegram Premium — run /emojicheck in the admin panel to confirm.</i>`;
+  }
+
+  await bot.sendMessage(msg.chat.id, txt, { parse_mode: 'HTML' });
+});
+
+bot.onText(/^\/emojireset$/i, async (msg) => {
+  if (!adminHandler.isAdmin(msg.from.id)) return;
+  const n = require('./utils/emojiLayer').resetEmojiState();
+  await bot.sendMessage(msg.chat.id,
+    `♻️ Cleared the pause and ${n} quarantined id(s). Icons will be tried again on the next message.`);
+});
+
 /** Admin: inspect, re-save or force-restore the premium icons. */
 bot.onText(/^\/emoji(backup|restore|list)?$/i, async (msg, match) => {
   if (!adminHandler.isAdmin(msg.from.id)) return;
@@ -760,9 +810,13 @@ bot.onText(/^\/deposits(?:\s+(.+))?$/i, async (msg, match) => {
   const lines = r.rows.map((d) => {
     const when = new Date(Number(d.insertTime)).toISOString().slice(0, 16).replace('T', ' ');
     const state = Number(d.status) === 1 ? '✅' : Number(d.status) === 0 ? '⏳' : `(${d.status})`;
+    // Shown in FULL. A truncated hash cannot be copied, pasted or compared
+    // against what a customer sends — which is the entire purpose of this
+    // screen. A 64-character hash wraps on a phone; that is a far smaller cost
+    // than an id nobody can use.
     return `${state} <b>${escapeHtml(String(d.amount))}</b> ${escapeHtml(d.coin || '')} · ` +
            `${escapeHtml(d.network || '?')} · ${when}\n` +
-           `   <code>${escapeHtml(String(d.txId || '').slice(0, 44))}</code>`;
+           `   <code>${escapeHtml(String(d.txId || ''))}</code>`;
   });
 
   await bot.sendMessage(chatId,

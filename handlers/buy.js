@@ -158,7 +158,20 @@ async function handleEmail(bot, msg) {
 // In-memory cooldown map: userId → last order timestamp
 const ORDER_COOLDOWN = new Map();
 const COOLDOWN_MS = 10 * 1000; // 10 seconds between orders
-const MAX_QTY_PER_ORDER = 50;  // Hard cap
+/**
+ * Largest quantity one order may contain.
+ *
+ * Was hardcoded at 50, which turned a customer ready to buy 90 into a customer
+ * told to place two orders — the shop had 300 in stock and refused the sale
+ * anyway. The real limit is what is actually available; this is only a guard
+ * against a typo or a runaway script, so it is configurable and generous.
+ *
+ * 0 means no cap at all: real stock is the only limit.
+ */
+function maxQtyPerOrder() {
+  const v = parseInt(db.getSetting('max_qty_per_order', '500'), 10);
+  return Number.isFinite(v) && v >= 0 ? v : 500;
+}
 
 async function createAndShowSummary(bot, chatId, userId, email) {
   const data    = session.get(userId).data;
@@ -183,9 +196,10 @@ async function createAndShowSummary(bot, chatId, userId, email) {
   }
 
   // 2) Quantity cap
-  if (data.quantity > MAX_QTY_PER_ORDER) {
+  const maxQty = maxQtyPerOrder();
+  if (maxQty > 0 && data.quantity > maxQty) {
     await bot.sendMessage(chatId,
-      `❌ Maximum ${MAX_QTY_PER_ORDER} items per order.\nYou requested ${data.quantity}. Please split into multiple orders.`,
+      `❌ Maximum <b>${maxQty}</b> items per order.\nYou asked for ${data.quantity}.`,
       { parse_mode: 'HTML' });
     session.clear(userId);
     return;

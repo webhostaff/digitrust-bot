@@ -121,12 +121,23 @@ function outOfStockMessage() {
  */
 const BAND_RED   = '🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥';
 const BAND_GREEN = '🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩';
+// Paid ahead of the cycle it belongs to. Red would say "act now" about a seat
+// that must NOT be touched yet, and green would say "done" about one that still
+// needs activating — neither is true, so it gets its own colour.
+const BAND_BLUE  = '🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦';
 
-function orderCard(d, activated = false) {
-  const band = activated ? BAND_GREEN : BAND_RED;
+/**
+ * @param {object} d
+ * @param {boolean} activated
+ * @param {boolean} scheduled paid early — activate when the cycle opens
+ */
+function orderCard(d, activated = false, scheduled = false) {
+  const band = activated ? BAND_GREEN : (scheduled ? BAND_BLUE : BAND_RED);
   const head = activated
     ? '🟢 <b>ACTIVATED</b> — customer notified'
-    : '🔴 <b>NOT ACTIVATED YET</b> — action needed';
+    : scheduled
+      ? '🔵 <b>PAID EARLY</b> — activate when the new cycle starts'
+      : '🔴 <b>NOT ACTIVATED YET</b> — action needed';
 
   return (
     `${band}\n` +
@@ -142,7 +153,11 @@ function orderCard(d, activated = false) {
     `🔗 ${d.refLabel}: <code>${d.ref}</code>\n\n` +
     (activated
       ? `✅ <i>Activated on ${d.activatedAt || 'now'}. The customer has been told.</i>\n`
-      : `⬇️ <b>Activate the seat, then press the button below.</b>\n`) +
+      : scheduled
+        ? `🗓 <i>Their current seat runs to ${d.startDate}. Activate this one when ` +
+          `that date arrives — pressing the button now tells them it is live ` +
+          `before it is.</i>\n`
+        : `⬇️ <b>Activate the seat, then press the button below.</b>\n`) +
     `${band}`
   );
 }
@@ -673,6 +688,29 @@ bot.onText(/^\/renewals?$/i, async (msg) => {
   const who = (r) => r.username ? `@${escapeHtml(r.username)}` : escapeHtml(r.first_name || String(r.user_id));
 
   let txt = `🔄 <b>Renewals</b>\n\n`;
+
+  // Paid early — listed first because they are the ones that need holding back,
+  // and the ones easiest to activate by mistake.
+  const scheduled = queries.getCgbScheduled();
+  const dueNow    = queries.getCgbDueNow();
+
+  if (dueNow.length) {
+    txt += `🟢 <b>Ready to activate now — ${dueNow.length}</b>\n` +
+      dueNow.slice(0, 10).map((r) =>
+        `• ${who(r)} — <code>${escapeHtml(r.email || '')}</code>\n` +
+        `  starts ${escapeHtml(r.start_date || '')} · until ${escapeHtml(r.end_date || '')}`
+      ).join('\n') + `\n\n`;
+  }
+
+  if (scheduled.length) {
+    txt += `🔵 <b>Paid early — do NOT activate yet (${scheduled.length})</b>\n` +
+      scheduled.slice(0, 10).map((r) =>
+        `• ${who(r)} — <code>${escapeHtml(r.email || '')}</code>\n` +
+        `  current seat ends ${escapeHtml(r.prev_end || r.start_date || '')} → ` +
+        `new period ${escapeHtml(r.start_date || '')} to ${escapeHtml(r.end_date || '')}`
+      ).join('\n') +
+      `\n<i>Activating these now would cut short days the customer already paid for.</i>\n\n`;
+  }
 
   if (paid.length) {
     const total = paid.reduce((a, r) => a + Number(r.paid || r.final_price || 0), 0);
@@ -1705,7 +1743,11 @@ async function confirmPayment(chatId, userId, orderId, txid, sessionData) {
       refLabel:  paymentMethod === 'pay_balance' ? 'Wallet' : 'TxID',
       ref:       escapeHtml(txid),
     };
-    await bot.sendMessage(ADMIN_ID, orderCard(card, false), {
+    // Paid before its period opens — the start date is still in the future.
+    const scheduled = !!(card.startDate &&
+      new Date(`${card.startDate}T00:00:00`) > new Date(new Date().toDateString()));
+
+    await bot.sendMessage(ADMIN_ID, orderCard(card, false, scheduled), {
       parse_mode: 'HTML',
       reply_markup: orderCardButtons(card),
     });
@@ -1791,7 +1833,11 @@ async function confirmCryptobotPayment(invoiceId, paidAmount, orderId, userId) {
       refLabel:  'Invoice',
       ref:       escapeHtml(String(invoiceId)),
     };
-    await bot.sendMessage(ADMIN_ID, orderCard(card, false), {
+    // Paid before its period opens — the start date is still in the future.
+    const scheduled = !!(card.startDate &&
+      new Date(`${card.startDate}T00:00:00`) > new Date(new Date().toDateString()));
+
+    await bot.sendMessage(ADMIN_ID, orderCard(card, false, scheduled), {
       parse_mode: 'HTML',
       reply_markup: orderCardButtons(card),
     });

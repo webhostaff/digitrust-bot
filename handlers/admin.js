@@ -2441,11 +2441,15 @@ async function runTxidTrace(bot, chatId, rawText) {
             } catch (e) { /* listing is a convenience, not the answer */ }
 
             chainLine =
-              `\n\n🔷 <b>This looks like a TON hash — it cannot be matched.</b>\n\n` +
-              `<i>TON gives every transfer two different hashes: the one the ` +
-              `sending wallet shows, and the one Binance records. They are not ` +
-              `the same value, so searching by hash will never find a TON deposit ` +
-              `no matter how long you wait.</i>\n\n` +
+              `\n\n🔷 <b>This looks like a TON hash, and it did not match.</b>\n\n` +
+              // Not "cannot" — Binance records the wallet's own hash for some
+              // TON deposits and a different one for others, so a failed match
+              // means this particular transfer is one of the latter, not that
+              // TON lookups never work.
+              `<i>TON transfers can carry two different hashes: the one the ` +
+              `sending wallet shows, and the one Binance records. They sometimes ` +
+              `match and sometimes do not — when they do not, no amount of ` +
+              `waiting will help.</i>\n\n` +
               `✅ <b>Search by amount instead:</b> <code>/deposits 7 TON</code>` +
               tonList +
               `\n\n<i>Deposits made through the bot are matched automatically by ` +

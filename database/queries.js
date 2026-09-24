@@ -2012,6 +2012,42 @@ module.exports = {
   markCgbReminded:    (id) => cgb_markReminded.run(id).changes,
   getCgbReserved:     () => cgb_getReserved.all(),
   getCgbRenewals:     (limit = 20) => cgb_getRenewals.all(limit),
+
+  /**
+   * Seats paid for but whose period has not started yet.
+   *
+   * These are the ones that must NOT be activated: the customer is still using
+   * their current seat, and switching them over early cuts short days they have
+   * already paid for.
+   */
+  getCgbScheduled: () => {
+    try {
+      return db.prepare(`
+        SELECT cs.*, u.username, u.first_name,
+               prev.end_date AS prev_end
+        FROM chatgpt_subscriptions cs
+        LEFT JOIN users u ON cs.user_id = u.telegram_id
+        LEFT JOIN chatgpt_subscriptions prev ON cs.renewed_from = prev.id
+        WHERE COALESCE(cs.status, '') IN ('active', 'pending')
+          AND date(cs.start_date) > date('now')
+        ORDER BY date(cs.start_date) ASC
+      `).all();
+    } catch (e) { return []; }
+  },
+
+  /** Seats whose paid period has begun but are still waiting on activation. */
+  getCgbDueNow: () => {
+    try {
+      return db.prepare(`
+        SELECT cs.*, u.username, u.first_name
+        FROM chatgpt_subscriptions cs
+        LEFT JOIN users u ON cs.user_id = u.telegram_id
+        WHERE COALESCE(cs.status, '') = 'pending'
+          AND date(cs.start_date) <= date('now')
+        ORDER BY date(cs.start_date) ASC
+      `).all();
+    } catch (e) { return []; }
+  },
   getCgbPendingRenewals: () => cgb_getPendingRenewals.all(),
   setCgbWorkspace:    (id, ws) => cgb_setWorkspace.run(ws, id).changes,
   linkCgbRenewal:     (prevId, newId) => cgb_linkRenewal.run(prevId, newId).changes,
