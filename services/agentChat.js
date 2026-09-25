@@ -171,7 +171,7 @@ function pickTier(text, mode) {
 
 // ── Persona & context ────────────────────────────────────────────────────────
 
-const PERSONA = `You are Sahbi ("my friend" in Tunisian) — the right hand of the owner of a Telegram digital-goods shop (three bots: the store, the support bot, the ChatGPT Business bot, one shared database). You work for the OWNER only.
+const PERSONA = `You are Yamen (يمان) — the right hand of the owner of a Telegram digital-goods shop (three bots: the store, the support bot, the ChatGPT Business bot, one shared database). You work for the OWNER only.
 
 WHO YOU ARE
 - A sharp, loyal business partner who has been in the shop from day one. You remember things, you notice things, you protect the owner's money and time.
@@ -213,6 +213,30 @@ YOU LEARN — every day you should be a little better at this shop
 - Notice the owner's way of working (what they check every morning, how they phrase replies, the format they paste stock in) and adapt without being told twice.
 - Before an action (stock, a reply draft), check MEMORY for lessons about it.
 - You have your own personality: loyal, sharp, a bit of humour, honest opinions when asked ("my view: raise Canva to $2.5, it sells out every time"). You are not a generic assistant.
+
+MANUAL-FILL PRODUCTS AND POSTS — also prepared by you, confirmed by the owner's tap
+- "زيد في Claude Team Standard 5 حبات" for a product filled by hand → find_product, then propose_stock_count. If it turns out to be an account-list product, say so and ask for the accounts.
+- After preparing, one line: what the card does and to tap to confirm.
+
+NEW PRODUCTS AND EDITS — "زيد منتج جديد…", "بدّل السعر…", "خبّي المنتج…"
+- products_list first to copy the shop's naming style, then propose_product with everything a buyer needs: clean title ("Name — Duration | Type"), a price, a selling description, warranty, delivery (auto from accounts / manual / unlimited), the after-purchase instruction, category (list_categories), requires_email only for invites/activations, the icon of a similar product if it has one, the owner's photo if attached.
+- Description layout: one hook line, then 3–5 emoji bullets (✅ what you get · ⏳ duration · 🛡 warranty · ⚡ delivery · 🌍 works anywhere), short and scannable. No walls of text.
+- Edits: propose_product_update with only the fields that change.
+- After a product is created: offer stock (propose_stock / propose_stock_count) and a launch post.
+
+POST DESIGN — every post should look made by a designer ("واو")
+- Pick the format for the goal:
+  🚀 LAUNCH — "🆕 NEW IN STORE" headline · what it is · 3 benefit bullets · price · CTA
+  📦 RESTOCK — "🔥 BACK IN STOCK" · product · quantity · "limited" urgency · CTA
+  ⚡ FLASH SALE — "⚡ FLASH SALE — 24H ONLY" · old price <s>$X</s> → <b>$Y</b> · deadline · CTA
+  💸 PRICE DROP / BUNDLE / WEEKLY DEALS — a short list, one line per product with its price
+  📢 NEWS / MAINTENANCE / RULES — calm, clear, no hype
+- Layout: a strong first line (it is the preview in the chat list), then air — blank lines between blocks. Emoji as bullets, not confetti: 1 per line. <b>bold</b> for product and price only. A thin separator like ━━━━━━━━ between sections in longer posts. <blockquote> for a highlight or a customer quote. End with ONE clear call to action.
+- Keep it short: most great posts are 5–9 lines. Photo posts: the text is a caption, under ~900 characters.
+- Buttons (buttons field): "🛒 Buy now|product:ID", "💬 Support|https://t.me/…", "🤖 Open the shop|bot". Two short ones share a row.
+- Premium emoji: product icons ([emoji:ID] from product titles) render in the group and in customer DMs; in the channel they fall back to the plain emoji automatically — use them.
+- target: channel / group / both (default) / users (every customer's DM — only when the owner clearly asks, it reaches everyone) / all. schedule_at for "tomorrow at 10", on the shop clock.
+- Customer-facing posts are in English unless the owner says otherwise. If the owner asks for "something wow" or does not like it, offer another style instead of small tweaks.
 
 ADDING STOCK — you prepare it, the owner confirms with one tap
 - The owner pastes accounts in any format ("add these to Notion", a list, a screenshot, email/password pairs on two lines, with or without separators). Understand what ONE account is and how they are separated.
@@ -396,7 +420,10 @@ const TOOL_LABEL = {
   search_past_chats: '🧠 يلوّج في كلامنا', txid_check: '🔗 يثبّت الـ TxID في Binance',
   recent_deposits: '🏦 يشوف الإيداعات في Binance', cgb_cycle_now: '🗓 الدورة توا',
   cgb_renewals: '🔄 التجديدات', cgb_find_seat: '📧 يلوّج على الإيميل', order_lookup: '🧾 الطلب',
-  find_product: '🔎 يلوّج على المنتج', propose_stock: '📦 يحضّر المخزون', view_customer_media: '🖼 يشوف الصور',
+  emoji_status: '🎨 يثبّت الأيقونات', find_product: '🔎 يلوّج على المنتج',
+  propose_stock_count: '📦 يحضّر التعبئة', propose_post: '🎨 يصمّم المنشور',
+  propose_product: '🆕 يحضّر المنتج', propose_product_update: '✏️ يحضّر التعديل', list_categories: '📁 الأقسام',
+  scheduled_posts: '⏰ المنشورات المبرمجة', propose_stock: '📦 يحضّر المخزون', view_customer_media: '🖼 يشوف الصور',
 };
 
 /**
@@ -415,12 +442,15 @@ async function runTools(calls, ctx) {
     // The owner's own pasted text, so a long list of accounts is split on the
     // server instead of being re-typed by the model.
     if (c.name === 'propose_stock') args.__owner_text = ctx.text;
+    // Photos the owner attached, for a product picture or a post.
+    if (/^propose_(post|product|product_update)$/.test(c.name)) args.__owner_images = ctx.images;
     const out = await runTool(c.name, args);
     if (out && Array.isArray(out.__images)) { images.push(...out.__images); delete out.__images; }
     if (c.name === 'propose_reply' && out && out.draft_id) {
       ctx.drafts.push(out);
       ctx.emit({ type: 'draft', draft: out });
     }
+    if (out && out.action_id) ctx.emit({ type: 'action', action: out });
     if (c.name === 'propose_stock' && out && out.stock_draft_id) {
       ctx.drafts.push({ ...out, kind: 'stock' });
       ctx.emit({ type: 'stock_draft', draft: out });
@@ -713,7 +743,7 @@ router.post('/approve', requireToken, async (req, res) => {
 /** The owner's tap on "Add to stock" — the only way stock is ever written from here. */
 router.post('/stock/approve', requireToken, async (req, res) => {
   const d = require('./agentTools').takeStockDraft(String(req.body.draft_id || ''));
-  if (!d) return res.status(400).json({ error: 'Draft expired or already used — ask Sahbi again.' });
+  if (!d) return res.status(400).json({ error: 'Draft expired or already used — اطلب من يمان من جديد.' });
   try {
     const bot = req.app && (req.app.get('storeBot') || req.app.get('bot'));
     const r = await require('./stockUpload').applyStockUpload(bot, d.productId, d.accounts,
@@ -723,6 +753,22 @@ router.post('/stock/approve', requireToken, async (req, res) => {
     res.json(r);
   } catch (e) {
     logger.error(`[agent] stock approve: ${e.message}`);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/** The owner's tap on any other prepared action (manual stock, a post). */
+router.post('/action/approve', requireToken, async (req, res) => {
+  const tools = require('./agentTools');
+  const a = tools.takeAction(String(req.body.action_id || ''));
+  if (!a) return res.status(400).json({ error: 'انتهت صلاحيتو ولا تعمل قبل — اطلب من يمان من جديد.' });
+  try {
+    const bot = req.app && (req.app.get('storeBot') || req.app.get('bot'));
+    const r = await tools.performAction(a, bot);
+    if (r.ok) mem.logChat('event', r.message);
+    res.status(r.ok ? 200 : 400).json(r);
+  } catch (e) {
+    logger.error(`[agent] action: ${e.message}`);
     res.status(500).json({ error: e.message });
   }
 });
@@ -794,12 +840,18 @@ router.post('/tts', requireToken, async (req, res) => {
   if (!text) return res.status(400).json({ error: 'empty' });
   for (const model of TTS_MODELS) {
     try {
-      const r = await fetch('https://api.openai.com/v1/audio/speech', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${OPENAI_KEY}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ model, voice: 'alloy', input: text, format: 'mp3',
-          instructions: 'Warm, natural, friendly. If the text is Tunisian Arabic, speak it the Tunisian way.' }),
-      });
+      const body = { model, voice: 'alloy', input: text, format: 'mp3', speed: 1.1,
+        instructions: 'Quick, lively, natural pace — like a friend talking, not an announcer. ' +
+          'If the text is Tunisian Arabic, speak it the Tunisian way.' };
+      let r = await fetch('https://api.openai.com/v1/audio/speech', {
+        method: 'POST', headers: { Authorization: `Bearer ${OPENAI_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify(body) });
+      if (r.status === 400) { // a model that refuses speed/instructions: plain request
+        delete body.speed; delete body.instructions;
+        r = await fetch('https://api.openai.com/v1/audio/speech', {
+          method: 'POST', headers: { Authorization: `Bearer ${OPENAI_KEY}`, 'content-type': 'application/json' },
+          body: JSON.stringify(body) });
+      }
       if (r.status === 404) continue;
       if (!r.ok) return res.status(r.status).json({ error: `HTTP ${r.status}` });
       const audio = Buffer.from(await r.arrayBuffer());
@@ -872,12 +924,16 @@ const PAGE = require('fs').readFileSync(require('path').join(__dirname, 'agentPa
 // module — nothing to upload, nothing to keep in sync.
 
 const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-<rect width="512" height="512" rx="112" fill="#0f1115"/>
-<circle cx="256" cy="212" r="92" fill="none" stroke="#3b82f6" stroke-width="26"/>
-<circle cx="224" cy="196" r="13" fill="#3b82f6"/><circle cx="288" cy="196" r="13" fill="#3b82f6"/>
-<path d="M214 244q42 30 84 0" stroke="#3b82f6" stroke-width="18" fill="none" stroke-linecap="round"/>
-<rect x="150" y="330" width="212" height="26" rx="13" fill="#3b82f6" opacity=".9"/>
-<rect x="150" y="382" width="150" height="26" rx="13" fill="#3b82f6" opacity=".55"/>
+<defs>
+<linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#4f46e5"/><stop offset=".55" stop-color="#7c3aed"/><stop offset="1" stop-color="#06b6d4"/></linearGradient>
+<radialGradient id="gl" cx=".3" cy=".22" r=".8"><stop offset="0" stop-color="#fff" stop-opacity=".35"/><stop offset=".6" stop-color="#fff" stop-opacity="0"/></radialGradient>
+</defs>
+<rect width="512" height="512" rx="120" fill="url(#bg)"/>
+<rect width="512" height="512" rx="120" fill="url(#gl)"/>
+<path d="M150 132 L256 270 L362 132" fill="none" stroke="#fff" stroke-width="54" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M256 270 V392" stroke="#fff" stroke-width="54" stroke-linecap="round"/>
+<path d="M388 318 l14 34 34 14 -34 14 -14 34 -14 -34 -34 -14 34 -14z" fill="#fde68a"/>
+<circle cx="142" cy="372" r="16" fill="#a5f3fc"/>
 </svg>`;
 
 router.get('/icon.svg', (req, res) => {
@@ -887,8 +943,8 @@ router.get('/icon.svg', (req, res) => {
 router.get('/manifest.json', (req, res) => {
   const t = req.query.t || '';
   res.type('application/manifest+json').json({
-    name: 'Sahbi · صاحبي',
-    short_name: 'Sahbi',
+    name: 'Yamen · يمان',
+    short_name: 'Yamen',
     // The token travels in start_url so the installed icon opens straight into
     // an authenticated session — otherwise every launch would be a 401.
     start_url: `./?t=${t}`,

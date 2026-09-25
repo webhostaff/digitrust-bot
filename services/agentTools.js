@@ -1007,6 +1007,80 @@ async function transcribeBuffer(buf, type) {
   return '';
 }
 
+// ── More actions the owner confirms with one tap ─────────────────────────────
+// Same rule as stock: the model prepares, the app shows a card, only the
+// owner's tap performs it (POST /agent/action/approve).
+
+const ACTIONS = new Map(); // id → { kind, payload, at }
+const ACTION_TTL = 60 * 60 * 1000;
+function newAction(kind, payload) {
+  const id = `act_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+  ACTIONS.set(id, { kind, payload, at: Date.now() });
+  for (const [k, v] of ACTIONS) if (Date.now() - v.at > ACTION_TTL) ACTIONS.delete(k);
+  return id;
+}
+function takeAction(id) {
+  const a = ACTIONS.get(id);
+  if (!a || Date.now() - a.at > ACTION_TTL) return null;
+  ACTIONS.delete(id);
+  return a;
+}
+
+TOOLS.propose_stock_count = {
+  description:
+    'For products filled BY HAND (manual delivery / counter stock, e.g. "Claude Team Standard"): prepare adding N ' +
+    'to the available quantity. The owner confirms with a tap. For products whose stock is a list of accounts, ' +
+    'use propose_stock instead.',
+  input: { product_id: 'product id (find_product)', quantity: 'how many to add, 1-1000' },
+  run: ({ product_id, quantity }) => {
+    const p = raw.prepare('SELECT * FROM products WHERE id = ?').get(Number(product_id));
+    if (!p) return { error: 'product not found — use find_product' };
+    const n = parseInt(quantity, 10);
+    if (!Number.isFinite(n) || n < 1 || n > 1000) return { error: 'quantity must be 1-1000' };
+    const items = raw.prepare(`SELECT COUNT(*) AS n FROM product_items WHERE product_id = ?`).get(p.id).n;
+    if (items > 0 && p.delivery_type !== 'manual') {
+      return { error: `"${clean(p.title)}" is sold from a list of accounts — paste the accounts and use propose_stock` };
+    }
+    const now = Number(p.stock_quantity || 0);
+    const id = newAction('stock_count', { productId: p.id, n });
+    return { action_id: id, kind: 'stock_count', title: `📦 ${clean(p.title)}`,
+      summary: `➕ ${n} (manual fill) · stock ${now} → ${now + n}`, confirm: `➕ زيد ${n}` };
+  },
+};
+
+// Products, posts, broadcasts and scheduling live in the studio.
+require('./agentStudio').register(TOOLS, { newAction });
+
+/** Perform a confirmed action. Called only from the owner's tap. */
+async function performAction(a, bot) {
+  if (a.kind === 'stock_count') {
+    const db2 = require('../database/queries');
+    const { productId, n } = a.payload;
+    const was = Number(db2.getProduct(productId)?.stock_quantity || 0);
+    const r = db2.adjustStockQuantity(productId, n);
+    const out = { ok: true, message: `✅ تزادو ${n} — المخزون توا ${r.after}` };
+    if (bot) {
+      try { await require('./stockAlerts').evaluateStock(bot, productId); } catch (_) {}
+      if (was === 0 && r.after > 0) {
+        try {
+          const k = await require('../handlers/buy').notifyBackInStockSubscribers(bot, productId);
+          if (k) out.message += ` · ${k} يستناو تعلمو`;
+        } catch (_) {}
+      }
+    }
+    return out;
+  }
+  const r = await require('./agentStudio').perform(a, bot);
+  if (r) return r;
+  return { ok: false, error: 'unknown action' };
+}
+
+TOOLS.emoji_status = {
+  description: 'Why premium emoji icons are or are not showing on the bot buttons right now, with recent events.',
+  input: {},
+  run: () => { try { return require('../utils/emojiLayer').emojiStatus(); } catch (e) { return { error: e.message }; } },
+};
+
 /** Shape the model needs to know what it may call. */
 function toolSchemas() {
   return Object.entries(TOOLS).map(([name, t]) => ({
@@ -1115,4 +1189,4 @@ async function sendApprovedReply(draftId, bot) {
   }
 }
 
-module.exports = { TOOLS, toolSchemas, runTool, sendApprovedReply, liveSnapshot, takeStockDraft, splitAccounts };
+module.exports = { TOOLS, toolSchemas, runTool, sendApprovedReply, liveSnapshot, takeStockDraft, splitAccounts, takeAction, performAction };

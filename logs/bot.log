@@ -57,3 +57,15 @@
 2026-09-25T22:41:08.715Z [INFO] [agent] propose_stock({"product_id":"11","split_by":"auto","__owner_text":"1. vickroylilleberg0172@out)
 2026-09-25T22:41:08.717Z [INFO] [agent] propose_stock({"product_id":"11","split_by":"auto","__owner_text":"1. vickroylilleberg0172@out)
 2026-09-25T22:41:08.718Z [INFO] [agent] propose_stock({"product_id":"11","split_by":"auto","__owner_text":"1. vickroylilleberg0172@out)
+2026-09-25T23:06:13.250Z [INFO] [emoji:t1] outgoing emoji layer installed
+2026-09-25T23:06:13.683Z [INFO] [emoji] state reset — 0 quarantined id(s) cleared
+2026-09-25T23:06:13.683Z [INFO] [emoji:t2] outgoing emoji layer installed
+2026-09-25T23:06:13.684Z [ERROR] [emoji:t2] Telegram refused valid custom emoji 3 times in 2 minutes — pausing them for 15 minutes. Most likely the bot owner's Telegram Premium is not active. Cause: ETELEGRAM: 400 Bad Request: DOCUMENT_INVALID
+2026-09-25T23:06:13.684Z [INFO] [emoji] state reset — 0 quarantined id(s) cleared
+2026-09-25T23:06:13.685Z [INFO] [emoji:t3] outgoing emoji layer installed
+2026-09-25T23:22:43.734Z [INFO] [agent] propose_product({"title":"Claude Pro — 1 Month | Private Account","price":"$6.5","description":")
+2026-09-25T23:22:43.738Z [INFO] [agent] propose_product_update({"product_id":"21","changes":"{\"price\":\"5.9\",\"warranty\":\"2 months\"}"})
+2026-09-25T23:22:43.740Z [INFO] [agent] propose_post({"target":"both","product_id":"21","image":"1","__owner_images":["data:image/jpe)
+2026-09-25T23:22:43.742Z [INFO] [agent] propose_post({"target":"channel","text":"⚡ <b>FLASH SALE</b> tonight!","schedule_at":"2026-09)
+2026-09-25T23:22:43.743Z [INFO] [agent] scheduled_posts({})
+2026-09-25T23:22:43.743Z [INFO] [agent] propose_post({"target":"users","text":"🎁 Weekend deal for our customers!"})

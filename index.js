@@ -662,6 +662,14 @@ bot.onText(/^\/emojistatus$/i, async (msg) => {
            `still works. They are retried automatically.</i>\n\n`;
   }
 
+  if (st.incidents && st.incidents.length) {
+    const label = { paused_15min: '⛔ paused all icons', refused: '⚠️ refused', plain_retry: '↩️ one message sent plain',
+      boot_ok: '🚀 boot check OK', boot_missing: '🚀 boot: icons missing', boot_error: '🚀 boot check failed' };
+    txt += `🕓 <b>Last events</b>\n` + st.incidents.map((i) =>
+      `• ${escapeHtml(i.at.slice(5, 10))} ${escapeHtml(i.at.slice(11, 16))} UTC — ${label[i.kind] || i.kind} · <code>${escapeHtml(i.method)}</code>\n` +
+      `  <i>${escapeHtml(i.reason.slice(0, 120))}</i>`).join('\n') + `\n\n`;
+  }
+
   if (st.icons_enabled && !st.account_blocked && !st.quarantined.length) {
     txt += `✅ <b>Everything is working.</b>\n` +
            `<i>If icons still look plain, the sender account has no active ` +
@@ -2141,6 +2149,7 @@ try { require('./services/agentWatch').start(bot); } catch (e) { logger.warn(`sa
 // lost. Runs before the first customer message so nobody sees a stripped title.
 try {
   require('./utils/emojiBackup').syncOnBoot();
+  setTimeout(() => require('./utils/emojiLayer').bootCheck(bot, 'store').catch(() => {}), 20000);
 } catch (e) {
   logger.error(`emoji backup sync: ${e.message}`);
 }

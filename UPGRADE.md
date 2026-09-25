@@ -1215,3 +1215,58 @@ panel marks cycles that have not started yet.
 * Sahbi asks "where does one account start and end?" when the format is new or
   something looks odd, then saves the answer as a "format" note per product and
   stops asking.
+
+# Part 33 — Premium icons no longer switched off by one bad message
+
+`utils/emojiLayer.js` treated any "can't parse entities" / "entity" /
+"media_empty" error as a custom-emoji failure. When the emoji in that message
+all verified as valid, it concluded Premium was off and paused EVERY icon in
+the bot for 15 minutes — after a single failure, often caused by a stray "<"
+in an unrelated message.
+
+* Errors are split: strong (DOCUMENT_INVALID, custom emoji, emoji/stickerset
+  invalid) vs weak (parse/entity/media). A weak error only retries that one
+  message without custom emoji; no quarantine, no pause.
+* The 15-minute pause now needs 3 refusals of valid emoji within 2 minutes.
+* The last events (what happened, which bot/method, Telegram's message) are
+  kept and shown in /emojistatus; Sahbi's `emoji_status` tool reads them and
+  the watcher alerts in the app when icons are paused or switched off.
+
+# Part 34 — Yamen
+
+* The assistant is now **Yamen · يمان**, with its own icon (app, header, call
+  screen, home-screen install).
+* `propose_stock_count` — add N to a manual-fill product's counter (e.g. Claude
+  Team Standard); `propose_post` — a post for the channel, group or both, with
+  the product photo and a Buy button when a product is attached; the HTML is
+  limited to Telegram's tags. Both are confirmed by the owner's tap through
+  `POST /agent/action/approve` (single use, 1 h expiry); manual stock runs the
+  low-stock check and back-in-stock pings like the panel.
+* Voice: in 📞 calls the reply is spoken sentence by sentence while it is still
+  being written; talking over Yamen interrupts it; the listener calibrates to
+  the room's noise and ends a turn after 0.85 s of silence; speech is a little
+  faster (server TTS speed 1.1, playback 1.08, phone voices 1.12).
+* Premium icons: the emoji event log is stored in settings (`emoji_incidents`)
+  so it survives a redeploy, and every boot verifies all product icons with
+  Telegram (no message sent) and records the result — /emojistatus shows it.
+
+# Part 35 — Yamen's studio
+
+`services/agentStudio.js` — everything prepared, applied only on the owner's tap:
+
+* `propose_product` — a new product (title, price, description, warranty,
+  after-purchase instruction, category, auto/manual/unlimited delivery, email
+  requirement, premium icon, the owner's attached photo, unit cost). The photo
+  is uploaded once to the owner's chat to get a reusable Telegram file id.
+* `propose_product_update` — price, title, description, warranty,
+  instruction, hide/show, category, delivery, cost/wholesale, icon, photo;
+  shown as before → after.
+* `propose_post` (replaces the V100 one) — channel / group / both / users (every
+  customer's DM, sent in the background with a report) / all; product photo or
+  the owner's own photo; up to 6 buttons ("Label|url", "Label|product:ID",
+  "Label|bot", short ones paired); `schedule_at` on the shop clock. Long text
+  with a photo goes as photo + message (caption limit).
+* `scheduled_posts` — list or cancel; the watcher publishes due posts every
+  minute. `list_categories`.
+* Persona: a post-design playbook (launch, restock, flash sale, price drop,
+  bundle, news) and a product-writing guide.

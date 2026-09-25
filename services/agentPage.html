@@ -4,11 +4,11 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="Sahbi">
+<meta name="apple-mobile-web-app-title" content="Yamen">
 <meta name="theme-color" content="#0b0e14">
 <link rel="manifest" href="manifest.json?t=__TOKEN__">
 <link rel="apple-touch-icon" href="icon.svg?t=__TOKEN__">
-<title>Sahbi · صاحبي</title>
+<title>Yamen · يمان</title>
 <style>
 :root{
   --bg:#0b0e14;--card:#151a23;--card2:#10151d;--line:#242b38;--fg:#eef1f6;--dim:#8b95a7;
@@ -32,7 +32,7 @@ header{
   background:rgba(11,14,20,.85);backdrop-filter:blur(14px);border-bottom:1px solid var(--line)
 }
 .orb{width:38px;height:38px;border-radius:12px;display:grid;place-items:center;font-size:19px;flex:none;
-  background:linear-gradient(135deg,var(--accent),var(--accent2));box-shadow:0 4px 16px #6366f166;position:relative}
+  box-shadow:0 4px 16px #6366f166;position:relative}
 .orb.busy::after{content:"";position:absolute;inset:-3px;border-radius:14px;border:2px solid #a5b4fc;
   animation:pulse 1.2s ease-in-out infinite}
 @keyframes pulse{0%,100%{opacity:.2;transform:scale(.96)}50%{opacity:1;transform:scale(1.04)}}
@@ -207,8 +207,8 @@ header .sub{font-size:11.5px;color:var(--dim);white-space:nowrap;overflow:hidden
 </style></head>
 <body>
 <header>
-  <div class="orb" id="orb">🤝</div>
-  <div class="who"><h1>صاحبي</h1><div class="sub" id="sub">…</div></div>
+  <div class="orb" id="orb"><img src="icon.svg?t=__TOKEN__" alt="" style="width:100%;height:100%;border-radius:12px"></div>
+  <div class="who"><h1>يمان</h1><div class="sub" id="sub">…</div></div>
   <button class="hbtn" id="mode" title="Mode">Auto</button>
   <button class="hbtn" id="callb" title="Talk directly">📞</button>
   <button class="hbtn" id="spk" title="Read replies aloud">🔇</button>
@@ -225,6 +225,8 @@ header .sub{font-size:11.5px;color:var(--dim);white-space:nowrap;overflow:hidden
   <button>📦 شنوة قرب يوفى من المخزون؟</button>
   <button>📈 كيفاش المبيعات هالجمعة؟</button>
   <button>🤖 تجديدات ChatGPT</button>
+  <button>🎨 صمّملي منشور واو</button>
+  <button>🆕 نحب نزيد منتج جديد</button>
   <button>📦 نحب نزيد مخزون</button>
   <button>💡 عطيني أفكار باش نزيد نبيع</button>
   <button>🚨 فما حاجة مريبة؟</button>
@@ -244,7 +246,7 @@ header .sub{font-size:11.5px;color:var(--dim);white-space:nowrap;overflow:hidden
   <div class="tabs"><button id="tabm" class="on">🧠 الذاكرة</button><button id="tabs">🔔 التنبيهات</button></div>
   <div id="pm" style="display:flex;flex-direction:column;gap:10px;min-height:0">
     <h3>🧠 الذاكرة <span id="mcount"></span></h3>
-    <div class="small">الحاجات الي صاحبي حافظها عليك وعلى الحرفاء والمورّدين. يزيد وحدو، وتنجم تزيد ولا تفسخ.</div>
+    <div class="small">الحاجات الي يمان حافظها عليك وعلى الحرفاء والمورّدين. يزيد وحدو، وتنجم تزيد ولا تفسخ.</div>
     <div class="addrow"><input id="madd" dir="auto" placeholder="مثال: ما نرجّعش فلوس Canva بعد 7 أيام"><button id="maddb">＋</button></div>
     <div id="mlist"></div>
   </div>
@@ -254,7 +256,7 @@ header .sub{font-size:11.5px;color:var(--dim);white-space:nowrap;overflow:hidden
       <span>🧠 نسمحلو يستعمل الموديل الغالي للحوصلات والتحليل</span><input type="checkbox" class="sw" id="s_deep">
     </div>
     <div class="small" id="usage"></div>
-    <div class="small">صاحبي يراقب المحل كل 5 دقايق وكي يلقى حاجة يقلك هوني في التطبيق برك — ما يكتب شي في البوتات (مجاني، بلاش AI).</div>
+    <div class="small">يمان يراقب المحل كل 5 دقايق وكي يلقى حاجة يقلك هوني في التطبيق برك — ما يكتب شي في البوتات (مجاني، بلاش AI).</div>
     <div class="set"><span>📳 إشعار في التليفون كي يجي تنبيه</span><button id="notif" style="background:var(--card);border:1px solid var(--line);color:#c3cbd9;border-radius:9px;padding:6px 10px">شغّل</button></div>
     <div class="set">
       <span>🔔 التنبيهات (حرفاء يستناو، تسليم، مخزون، استرجاع…)</span><input type="checkbox" class="sw" id="s_watch">
@@ -281,7 +283,7 @@ header .sub{font-size:11.5px;color:var(--dim);white-space:nowrap;overflow:hidden
     <button id="mclose" style="background:var(--card);border:1px solid var(--line)">سكّر</button>
   </div>
 </div></div>
-<div id="call"><div class="ring" id="ring">🤝</div><div class="st" id="cst">…</div><div class="said" id="csaid" dir="auto"></div>
+<div id="call"><div class="ring" id="ring"><img src="icon.svg?t=__TOKEN__" alt="" style="width:92px;height:92px;border-radius:24px"></div><div class="st" id="cst">…</div><div class="said" id="csaid" dir="auto"></div>
   <button id="cend" title="End">✕</button><div class="small" style="color:#a5b4fc">احكي عادي — كي تسكت يجاوبك، ومبعد يسمع فيك من جديد</div></div>
 <div id="how"><div><h3 style="margin:0 0 10px">📲 زيدو للشاشة الرئيسية</h3><ol id="steps"></ol><button id="close">فهمت</button></div></div>
 
@@ -343,7 +345,7 @@ const PRO={morning:'☀️ حوصلة الصباح',evening:'🌙 حوصلة ا�
 function addAlert(text,at){
   clearTip();
   const d=document.createElement('div'); d.className='alert'; d.dir='auto';
-  d.innerHTML='<div class="h"><span>🤝 صاحبي نبّهك</span><span></span></div><div class="b"></div>';
+  d.innerHTML='<div class="h"><span>🤝 يمان نبّهك</span><span></span></div><div class="b"></div>';
   d.querySelector('.h span:last-child').textContent=timeOf(at); d.querySelector('.b').textContent=text;
   log.appendChild(d);
 }
@@ -351,7 +353,7 @@ function addBot(text,meta,at){
   clearTip();
   const r=document.createElement('div'); r.className='row bot';
   const m=document.createElement('div'); m.className='msg'; m.dir='auto';
-  m.innerHTML=(meta&&meta.proactive?'<div class="badge">'+(PRO[meta.proactive]||'🤝 من صاحبي')+'</div>':'')+md(text);
+  m.innerHTML=(meta&&meta.proactive?'<div class="badge">'+(PRO[meta.proactive]||'🤝 من يمان')+'</div>':'')+md(text);
   r.appendChild(m); r.appendChild(metaLine(text,meta,at));
   log.appendChild(r); return r;
 }
@@ -407,6 +409,26 @@ function showStock(dr){
   log.appendChild(box); toBottom();
 }
 
+function showAction(a){
+  const box=document.createElement('div'); box.className='stock';
+  box.innerHTML='<div class="h"></div><div class="n"></div>'+(a.preview?'<div class="pv" dir="auto"></div>':'')+
+    '<div class="acts"><button class="yes"></button><button class="no">✕ لا</button></div><div class="state"></div>';
+  box.querySelector('.h').textContent=a.title||'⚡';
+  box.querySelector('.n').textContent=a.summary||'';
+  if(a.preview){ const pv=box.querySelector('.pv'); pv.style.fontFamily='inherit'; pv.style.fontSize='14px'; pv.style.maxHeight='280px';
+    // Server-sanitised Telegram HTML; premium emoji markers show as ✨ here.
+    pv.innerHTML=a.preview.replace(/\[emoji:\d+\]/g,'✨').replace(/<blockquote>/g,'<blockquote style="margin:6px 0;padding:4px 10px;border-inline-start:3px solid #4ade80;opacity:.9">').replace(/\n/g,'<br>'); }
+  if(a.summary && a.summary.includes('\n')) box.querySelector('.n').style.whiteSpace='pre-line';
+  const yes=box.querySelector('.yes'); yes.textContent=a.confirm||'✅ أكّد'; const st=box.querySelector('.state');
+  yes.onclick=async()=>{ yes.disabled=true; st.textContent='⏳ …';
+    try{ const r=await post('action/approve',{action_id:a.action_id}); const j=await r.json();
+      if(j.ok){ box.classList.add('done'); st.style.color='#86efac'; st.textContent=j.message||'✅'; loadBrief(); }
+      else { yes.disabled=false; st.style.color='#fca5a5'; st.textContent='❌ '+(j.error||'فشل'); }
+    }catch(e){ yes.disabled=false; st.style.color='#fca5a5'; st.textContent='❌ '+e.message; } };
+  box.querySelector('.no').onclick=()=>{ box.classList.add('done'); st.style.color='var(--dim)'; st.textContent='تفسخ'; };
+  log.appendChild(box); toBottom();
+}
+
 // ── Brief & header ───────────────────────────────────────────
 function setMode(m){mode=m; localStorage.setItem('mode',m);
   $('mode').innerHTML=m==='fast'?'⚡ <b>سريع</b>':m==='deep'?'🧠 <b>عميق</b>':'✨ Auto';}
@@ -437,7 +459,7 @@ async function loadHistory(){
   try{
     const j=await (await fetch(api('history?limit=80'))).json(); const items=j.items||[];
     if(!items.length){
-      log.innerHTML='<div class="tip"><span class="big">🤝</span>أهلا! أنا <b>صاحبي</b>.<br>نقرا المحادثات والطلبات والمخزون الكل،<br>ونحفظ كل شي تقولهولي.<br><br>اسألني أي حاجة، بأي لغة.</div>';
+      log.innerHTML='<div class="tip"><span class="big"><img src="icon.svg?t='+T+'" style="width:72px;height:72px;border-radius:20px"></span>أهلا! أنا <b>يمان</b>.<br>نقرا المحادثات والطلبات والمخزون الكل،<br>ونحفظ كل شي تقولهولي.<br><br>اسألني أي حاجة، بأي لغة.</div>';
       return;
     }
     for(const it of items) renderItem(it);
@@ -463,7 +485,7 @@ async function pollNew(){
     for(const it of j.items||[]) lastId=Math.max(lastId,it.id||0);
     for(const it of fresh) renderItem(it);
     if(fresh.length){ if(near) toBottom(true); if(navigator.vibrate) navigator.vibrate(60);
-      const f=fresh[fresh.length-1]; notifyPhone('🤝 صاحبي', String(f.content||'').replace(/\s+/g,' ')); }
+      const f=fresh[fresh.length-1]; notifyPhone('🤝 يمان', String(f.content||'').replace(/\s+/g,' ')); }
   }catch(e){}
 }
 
@@ -504,9 +526,10 @@ async function send(text){
         let ev; try{ev=JSON.parse(line.slice(5));}catch(_){continue;}
         if(ev.type==='start'){ st.querySelector('span').textContent=(ev.tier==='deep'?'🧠 يفكّر بالعمق… ':'⚡ ')+ev.model; }
         else if(ev.type==='status'){ st.querySelector('span').textContent=ev.text+'…'; }
-        else if(ev.type==='delta'){ full+=ev.text; if(!raf) raf=requestAnimationFrame(paint); }
+        else if(ev.type==='delta'){ full+=ev.text; if(!raf) raf=requestAnimationFrame(paint); if(inCall) feedSpeech(full,false); }
         else if(ev.type==='draft'){ showDraft(ev.draft); }
         else if(ev.type==='stock_draft'){ showStock(ev.draft); }
+        else if(ev.type==='action'){ showAction(ev.action); }
         else if(ev.type==='done'){ meta=ev; }
         else if(ev.type==='error'){ failed=true; addErr(ev.error); }
       }
@@ -521,6 +544,7 @@ async function send(text){
   else { m.innerHTML=md(full||'…'); r.appendChild(metaLine(full,meta,new Date().toISOString())); if(!failed && !inCall) speak(full); }
   ctrl=null; setBusy(false); toBottom(); loadBrief();
   lastReply=failed?'':full;
+  if(inCall && !failed) feedSpeech(full,true);
   try{ const j=await (await fetch(api('history?limit=5'))).json(); for(const it of j.items||[]) lastId=Math.max(lastId,it.id||0);}catch(_){}
 }
 
@@ -623,7 +647,42 @@ mic.onclick=()=>{
 let speakOn=localStorage.getItem('speak')==='1', audioEl=null;
 const spk=$('spk'); const paintSpk=()=>{spk.textContent=speakOn?'🔊':'🔇';}; paintSpk();
 spk.onclick=()=>{ speakOn=!speakOn; localStorage.setItem('speak',speakOn?'1':'0'); paintSpk(); if(!speakOn) stopSpeaking(); };
-function stopSpeaking(){ try{speechSynthesis.cancel();}catch(_){} if(audioEl){audioEl.pause(); audioEl=null;} }
+function stopSpeaking(){ try{speechSynthesis.cancel();}catch(_){} if(audioEl){audioEl.pause(); audioEl=null;} sq.length=0; sqSpoken=0; sqBusy=false; }
+
+// Sentence-by-sentence speech: the first sentence is spoken while the rest is
+// still being written, so the answer starts in about a second, not after it.
+const sq=[]; let sqSpoken=0, sqBusy=false;
+function cleanSpeech(t){ return t.replace(/```[\s\S]*?```/g,'').replace(/[*`#>_]/g,'').replace(/https?:\/\/\S+/g,'').trim(); }
+function feedSpeech(full,final){
+  const txt=cleanSpeech(full);
+  let upto=sqSpoken;
+  const re=/[.!?؟…\n]+/g; let m, cut=-1;
+  re.lastIndex=sqSpoken;
+  while((m=re.exec(txt))){ if(m.index+m[0].length-sqSpoken>=18) { cut=m.index+m[0].length; break; } }
+  if(cut>0){ sq.push(txt.slice(sqSpoken,cut)); sqSpoken=cut; }
+  if(final && sqSpoken<txt.length){ sq.push(txt.slice(sqSpoken)); sqSpoken=txt.length; }
+  if(cut>0 && !final) feedSpeech(full,false); // more whole sentences may be waiting
+  playQueue();
+}
+async function playQueue(){
+  if(sqBusy||!sq.length) return; sqBusy=true;
+  while(sq.length && inCall){
+    const part=sq.shift(); if(!part.trim()) continue;
+    await sayOnce(part);
+  }
+  sqBusy=false;
+}
+function sayOnce(text){
+  return new Promise(async(done)=>{
+    const lang=langOf(text); const voices=(window.speechSynthesis&&speechSynthesis.getVoices())||[];
+    const v=voices.find(x=>x.lang&&x.lang.toLowerCase().startsWith(lang));
+    if(v && lang!=='ar'){ const u=new SpeechSynthesisUtterance(text); u.voice=v; u.lang=v.lang; u.rate=1.12; u.onend=u.onerror=()=>done(); speechSynthesis.speak(u); return; }
+    try{ const r=await fetch(api('tts'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
+      if(!r.ok) throw 0; audioEl=new Audio(URL.createObjectURL(await r.blob())); audioEl.playbackRate=1.08;
+      audioEl.onended=audioEl.onerror=()=>done(); audioEl.play().catch(()=>done());
+    }catch(_){ done(); }
+  });
+}
 function langOf(t){ if(/[\u0600-\u06FF]/.test(t)) return 'ar'; if(/[éèàçùâêîôû]|\b(le|la|les|est|pas|je|tu)\b/i.test(t)) return 'fr'; return 'en'; }
 async function speak(text){
   if(!speakOn||!text) return;
@@ -632,11 +691,11 @@ async function speak(text){
   const voices=(window.speechSynthesis&&speechSynthesis.getVoices())||[];
   const v=voices.find(x=>x.lang&&x.lang.toLowerCase().startsWith(lang));
   // Arabic voices are missing on many phones; the server voice covers them.
-  if(v && lang!=='ar'){ const u=new SpeechSynthesisUtterance(plain); u.voice=v; u.lang=v.lang; speechSynthesis.speak(u); return; }
+  if(v && lang!=='ar'){ const u=new SpeechSynthesisUtterance(plain); u.voice=v; u.lang=v.lang; u.rate=1.12; speechSynthesis.speak(u); return; }
   try{
     const r=await fetch(api('tts'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:plain})});
     if(!r.ok) throw new Error('tts');
-    audioEl=new Audio(URL.createObjectURL(await r.blob())); audioEl.play().catch(()=>{});
+    audioEl=new Audio(URL.createObjectURL(await r.blob())); audioEl.playbackRate=1.08; audioEl.play().catch(()=>{});
   }catch(_){ if(v){ const u=new SpeechSynthesisUtterance(plain); u.voice=v; speechSynthesis.speak(u);} }
 }
 if(window.speechSynthesis) speechSynthesis.onvoiceschanged=()=>{};
@@ -670,14 +729,18 @@ function listenOnce(){
   const type=['audio/webm;codecs=opus','audio/webm','audio/mp4'].find(t=>MediaRecorder.isTypeSupported(t))||'';
   callRec=new MediaRecorder(callStream,type?{mimeType:type}:undefined); const parts=[];
   callRec.ondataavailable=e=>{ if(e.data.size) parts.push(e.data); };
-  let spoke=false, quietSince=0; const t0=Date.now();
+  // The room's own noise is measured for the first moment, and speech is
+  // anything clearly above it — a quiet room and a café both work.
+  let spoke=false, quietSince=0, floor=0.01, samples=0; const t0=Date.now();
   const tick=()=>{
     if(!inCall||callRec.state==='inactive') return;
     an.getByteTimeDomainData(buf); let sum=0; for(const v of buf){ const x=(v-128)/128; sum+=x*x; }
     const rms=Math.sqrt(sum/buf.length); ring.style.transform=`scale(${1+Math.min(.25,rms*3)})`;
-    if(rms>0.035){ spoke=true; quietSince=0; } else if(spoke){ quietSince=quietSince||Date.now(); }
     const long=Date.now()-t0;
-    if((spoke&&quietSince&&Date.now()-quietSince>1100)||long>45000||(!spoke&&long>12000)){ callRec.stop(); return; }
+    if(long<350){ floor=(floor*samples+rms)/(++samples); requestAnimationFrame(tick); return; }
+    const th=Math.max(0.022, floor*2.6);
+    if(rms>th){ spoke=true; quietSince=0; } else if(spoke){ quietSince=quietSince||Date.now(); }
+    if((spoke&&quietSince&&Date.now()-quietSince>850)||long>45000||(!spoke&&long>15000)){ callRec.stop(); return; }
     requestAnimationFrame(tick);
   };
   callRec.onstop=async()=>{
@@ -691,15 +754,38 @@ function listenOnce(){
       const j=await r.json();
       if(!j.text){ cst.textContent='ما سمعتكش مليح، عاود'; setTimeout(listenOnce,900); return; }
       csaid.textContent='🗣 '+j.text;
+      stopSpeaking();
+      cst.textContent='💬 …'; ring.className='ring';
+      const bi=bargeIn();
       await send(j.text);
-      if(!inCall) return;
-      cst.textContent='🔊 …'; ring.className='ring';
-      await speakAndWait(lastReply);
+      if(!inCall){ bi.stop(); return; }
+      cst.textContent='🔊 … (احكي باش تقاطعو)';
+      await waitQueue();
+      bi.stop();
     }catch(e){ cst.textContent='❌ '+e.message; await new Promise(r=>setTimeout(r,1500)); }
     listenOnce();
   };
   callRec.start(); requestAnimationFrame(tick);
 }
+/** Talk over Yamen to cut him off, like a real conversation. */
+function bargeIn(){
+  let on=true, loud=0;
+  try{
+    const src=callCtx.createMediaStreamSource(callStream), an=callCtx.createAnalyser(); an.fftSize=1024; src.connect(an);
+    const buf=new Uint8Array(an.fftSize);
+    const tick=()=>{ if(!on) { src.disconnect(); return; }
+      an.getByteTimeDomainData(buf); let sum=0; for(const v of buf){ const x=(v-128)/128; sum+=x*x; }
+      const rms=Math.sqrt(sum/buf.length);
+      const talking=(audioEl&&!audioEl.paused)||(window.speechSynthesis&&speechSynthesis.speaking);
+      loud = talking && rms>0.09 ? loud+1 : 0;
+      if(loud>12){ stopSpeaking(); on=false; src.disconnect(); return; }
+      requestAnimationFrame(tick); };
+    requestAnimationFrame(tick);
+  }catch(_){}
+  return { stop(){ on=false; } };
+}
+function waitQueue(){ return new Promise((done)=>{ const w=()=>{ const talking=sqBusy||sq.length||(audioEl&&!audioEl.paused&&!audioEl.ended)||(window.speechSynthesis&&speechSynthesis.speaking);
+  if(!inCall||!talking) done(); else setTimeout(w,200); }; setTimeout(w,300); }); }
 function speakAndWait(text){
   return new Promise(async(done)=>{
     if(!text){ done(); return; }
@@ -721,7 +807,7 @@ async function loadMemory(){
   const j=await (await fetch(api('memory'))).json(); const items=j.items||[];
   $('mcount').textContent=items.length+' ملاحظة';
   const L=$('mlist'); L.innerHTML='';
-  if(!items.length){ L.innerHTML='<div class="small" style="text-align:center;padding:16px">فارغة — صاحبي باش يعمّرها وحدو كي تحكيو.</div>'; return; }
+  if(!items.length){ L.innerHTML='<div class="small" style="text-align:center;padding:16px">فارغة — يمان باش يعمّرها وحدو كي تحكيو.</div>'; return; }
   for(const n of items){
     const d=document.createElement('div'); d.className='note';
     d.innerHTML='<span class="tag"></span><span class="t" dir="auto"></span><button title="delete">🗑</button>';

@@ -29,6 +29,7 @@ const logger = require('../utils/logger');
 const mem = require('./agentMemory');
 
 const TICK_MS = 5 * 60 * 1000;
+const POST_TICK_MS = 60 * 1000; // scheduled posts go out within a minute of their time
 
 // ── Settings (in agent_state, editable from the app) ────────────────────────
 
@@ -98,7 +99,7 @@ function mdToHtml(s) {
 function openButton() {
   try {
     const cfg = require('./agentChat').agentConfig();
-    return cfg.url ? { inline_keyboard: [[{ text: '🤝 افتح صاحبي', url: cfg.url }]] } : undefined;
+    return cfg.url ? { inline_keyboard: [[{ text: '🤝 افتح يمان', url: cfg.url }]] } : undefined;
   } catch (_) { return undefined; }
 }
 
@@ -250,6 +251,24 @@ const RULES = [
     return [];
   },
 
+  function premiumIconsPaused() {
+    let st;
+    try { st = require('../utils/emojiLayer').emojiStatus(); } catch (_) { return []; }
+    const out = [];
+    if (!st.icons_enabled) {
+      out.push({ key: `icons_off_${ymd(new Date())}`, weight: 2,
+        line: `🎨 أيقونات الأزرار المدفوعة <b>مطفية</b> من الإعدادات (/admin ← Settings ← 🎨 Button Icons)` });
+    }
+    if (st.account_blocked) {
+      const why = (st.incidents || []).find((i) => i.kind === 'refused');
+      out.push({ key: `icons_paused_${Math.floor(Date.now() / (15 * 60000))}`, weight: 3,
+        line: `🎨 الأيقونات المدفوعة <b>واقفة ${st.account_minutes_left} دقيقة</b> — تيليجرام رفضها 3 مرات. ` +
+          `الأغلب Telegram Premium متاع صاحب البوت موش شغّال.${why ? ` السبب: «${esc(why.reason.slice(0, 80))}»` : ''} ` +
+          `كي تصلّحها ابعث /emojireset` });
+    }
+    return out;
+  },
+
   function lapsedGoodCustomers() {
     return q(`
       SELECT o.user_id, u.username, u.first_name, COUNT(*) AS n, ROUND(SUM(o.total_price), 2) AS spent,
@@ -290,7 +309,7 @@ async function runRules() {
   const urgent = fresh.filter((f) => !f.idea);
   const ideas = fresh.filter((f) => f.idea);
   const html =
-    `🤝 <b>صاحبي ينبّهك</b>\n\n` +
+    `🤝 <b>يمان ينبّهك</b>\n\n` +
     urgent.map((f) => f.line).join('\n') +
     (ideas.length ? `${urgent.length ? '\n\n' : ''}${ideas.map((f) => f.line).join('\n')}` : '') +
     `\n\n<i>قلّي ونحضّرلك الردود ولا نفسّرلك أكثر.</i>`;
@@ -344,6 +363,7 @@ async function runBriefsIfDue() {
 }
 
 async function tick() {
+  try { await require('./agentStudio').runScheduled(BOT); } catch (e) { logger.warn(`[yamen] scheduled posts: ${e.message}`); }
   try { await runRules(); } catch (e) { logger.warn(`[sahbi] rules: ${e.message}`); }
   try { await runBriefsIfDue(); } catch (e) { logger.warn(`[sahbi] briefs: ${e.message}`); }
 }
@@ -353,6 +373,7 @@ function start(bot) {
   // First pass one minute after boot, so a redeploy does not wait five.
   setTimeout(tick, 60 * 1000);
   setInterval(tick, TICK_MS);
+  setInterval(() => require('./agentStudio').runScheduled(BOT).catch(() => {}), POST_TICK_MS);
   logger.info('[sahbi] watcher started');
 }
 

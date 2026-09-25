@@ -109,15 +109,28 @@ function iconsEnabled() {
  * the retry never fired and the customer got nothing.
  */
 function isCustomEmojiError(err) {
+  return isStrongEmojiError(err) || isWeakEmojiError(err);
+}
+
+/** Errors only a custom emoji can cause. */
+function isStrongEmojiError(err) {
   const msg = String(err && err.message || '').toLowerCase();
   return msg.includes('document_invalid')
       || msg.includes('custom_emoji')
       || msg.includes('custom emoji')
       || msg.includes('emoji_invalid')
-      || msg.includes('stickerset_invalid')
-      || msg.includes('media_empty')
-      || msg.includes("can't parse entities")
-      || msg.includes('entity');
+      || msg.includes('stickerset_invalid');
+}
+
+/**
+ * Errors a custom emoji MIGHT cause, but that a stray "<" in any message causes
+ * just as well. These used to count as proof that Premium was off: one badly
+ * escaped message — nothing to do with emoji — switched every icon in the bot
+ * off for 15 minutes. Now they only get a plain retry of that one message.
+ */
+function isWeakEmojiError(err) {
+  const msg = String(err && err.message || '').toLowerCase();
+  return msg.includes('media_empty') || msg.includes("can't parse entities") || msg.includes('entity');
 }
 
 // ── Bad-emoji quarantine ──────────────────────────────────────────────────────
@@ -137,10 +150,56 @@ const badIds = new Map(); // emoji id -> timestamp when it may be retried
 // EVERY id fails and quarantining them one at a time would mean one failed
 // request per message. Many distinct ids failing in quick succession is the
 // signal for that, and only then is everything switched off.
-const ACCOUNT_FAIL_WINDOW_MS = 60 * 1000;
-const ACCOUNT_FAIL_THRESHOLD = 5;
+const ACCOUNT_FAIL_WINDOW_MS = 2 * 60 * 1000;
+// With Premium really off EVERY message fails, so three in two minutes comes
+// fast. One odd failure is not the account and must not blank the whole bot.
+const ACCOUNT_FAIL_THRESHOLD = 3;
 let recentFailures = [];
 let accountBreakerUntil = 0;
+// Why the icons were last switched off, so /emojistatus can say it plainly.
+// Kept in the settings table too, so what happened just before a redeploy is
+// still readable after it — "the icons vanish when we update" can only be
+// explained if the events survive the update.
+const incidents = loadIncidents(); // { at, method, reason, kind }
+function loadIncidents() {
+  try {
+    const v = require('../database/queries').getSetting('emoji_incidents', '[]');
+    const a = JSON.parse(v || '[]');
+    return Array.isArray(a) ? a.slice(0, 15) : [];
+  } catch (_) { return []; }
+}
+function noteIncident(kind, method, reason) {
+  incidents.unshift({ at: new Date().toISOString(), kind, method, reason: String(reason || '').slice(0, 200) });
+  incidents.length = Math.min(incidents.length, 15);
+  try { require('../database/queries').setSetting('emoji_incidents', JSON.stringify(incidents)); } catch (_) {}
+}
+
+/**
+ * At boot: ask Telegram whether every product icon still exists. No message is
+ * sent; the answer is recorded, so after a deploy /emojistatus says whether
+ * the icons were fine when the new version started.
+ */
+async function bootCheck(bot, label = 'store') {
+  try {
+    const raw = require('../database/db');
+    const ids = [...new Set(raw.prepare(`SELECT title FROM products`).all()
+      .map((p) => (String(p.title || '').match(/\[emoji:(\d+)\]/) || [])[1]).filter(Boolean))];
+    if (!ids.length) return null;
+    const ok = new Set();
+    for (let i = 0; i < ids.length; i += 200) {
+      const res = await bot.getCustomEmojiStickers(ids.slice(i, i + 200));
+      (Array.isArray(res) ? res : []).forEach((st) => ok.add(String(st.custom_emoji_id)));
+    }
+    const missing = ids.filter((id) => !ok.has(id));
+    noteIncident(missing.length ? 'boot_missing' : 'boot_ok', label,
+      missing.length ? `${missing.length}/${ids.length} product icons unknown to Telegram: ${missing.slice(0, 5).join(', ')}`
+        : `all ${ids.length} product icons exist`);
+    return { total: ids.length, missing };
+  } catch (e) {
+    noteIncident('boot_error', label, e.message);
+    return null;
+  }
+}
 
 function isQuarantined(id) {
   const until = badIds.get(String(id));
@@ -200,14 +259,19 @@ async function quarantineFrom(bot, label, payload, reason) {
 
   recentFailures = recentFailures.filter((t) => now - t < ACCOUNT_FAIL_WINDOW_MS);
   recentFailures.push(now);
+  noteIncident('refused', label, reason);
 
-  if (valid || recentFailures.length >= ACCOUNT_FAIL_THRESHOLD) {
+  // Only repeated refusals of emoji that all exist mean the account lost
+  // Premium. A single one used to be enough, which is how the icons "suddenly"
+  // vanished for 15 minutes after one unlucky message.
+  if (recentFailures.length >= ACCOUNT_FAIL_THRESHOLD) {
     accountBreakerUntil = now + 15 * 60 * 1000;
     recentFailures = [];
+    noteIncident('paused_15min', label, reason);
     logger.error(
-      `[emoji:${label}] Telegram refused custom emoji that all exist — disabling ` +
-      `them for 15 minutes. This means the bot owner's Telegram Premium is not ` +
-      `active. Check /admin → Settings → Emoji Check. Cause: ${reason}`
+      `[emoji:${label}] Telegram refused valid custom emoji ${ACCOUNT_FAIL_THRESHOLD} times in ` +
+      `2 minutes — pausing them for 15 minutes. Most likely the bot owner's Telegram ` +
+      `Premium is not active. Cause: ${reason}`
     );
   }
 }
@@ -288,6 +352,25 @@ function installEmojiLayer(bot, label = 'bot') {
         // chat type, or the bot owner's Premium lapsed). Resend as plain emoji
         // rather than dropping the message.
         if (!isCustomEmojiError(err)) throw err;
+
+        // A parse error is usually the message's own HTML, not an emoji: retry
+        // this one message without custom emoji, and leave every other message
+        // — and the account — alone.
+        if (!isStrongEmojiError(err)) {
+          const o = (args[spec.optsArg] && typeof args[spec.optsArg] === 'object') ? args[spec.optsArg] : null;
+          const hadCustom = (o && o.reply_markup && Array.isArray(o.reply_markup.inline_keyboard) &&
+              o.reply_markup.inline_keyboard.flat().some((b) => b && b.icon_custom_emoji_id))
+            || /<tg-emoji/i.test(String(spec.textKey ? (o && o[spec.textKey]) : args[spec.textArg]));
+          if (!hadCustom) throw err; // nothing custom in it — not ours to fix
+          const plainT = (t) => stripEmojiMarkers(String(t).replace(/<tg-emoji[^>]*>(.*?)<\/tg-emoji>/gi, '$1'));
+          if (spec.textKey && o && typeof o[spec.textKey] === 'string') o[spec.textKey] = plainT(o[spec.textKey]);
+          else if (!spec.textKey && spec.textArg >= 0 && typeof args[spec.textArg] === 'string') args[spec.textArg] = plainT(args[spec.textArg]);
+          if (o && o.reply_markup && Array.isArray(o.reply_markup.inline_keyboard)) {
+            for (const row of o.reply_markup.inline_keyboard) for (const b of row) { if (b) delete b.icon_custom_emoji_id; }
+          }
+          noteIncident('plain_retry', `${label}.${spec.name}`, err.message);
+          return await original.apply(this, args);
+        }
 
         // Everything in this message that could be the culprit gets quarantined.
         const failedOpts = (args[spec.optsArg] && typeof args[spec.optsArg] === 'object') ? args[spec.optsArg] : null;
@@ -385,6 +468,7 @@ function emojiStatus() {
     quarantined,
     icons_enabled: iconsEnabled(),
     recent_failures: recentFailures.length,
+    incidents: incidents.slice(0, 5),
   };
 }
 
@@ -399,6 +483,7 @@ function resetEmojiState() {
 }
 
 module.exports = {
+  bootCheck,
   installEmojiLayer, isChannel, prepareText, prepareMarkup,
   emojiStatus, resetEmojiState,
 };
