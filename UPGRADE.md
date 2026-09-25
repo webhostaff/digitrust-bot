@@ -1063,3 +1063,50 @@ tools with reasoning_effort are not supported … use /v1/responses"). Reasoning
 models now go through `/v1/responses` with `reasoning.effort = high`, chained
 with `previous_response_id` so reasoning carries across tool calls and messages.
 The gpt-4 family stays on chat/completions.
+
+# Part 24 — Sahbi: fast, remembers, streams
+
+* **Two tiers, chosen per message** (`services/agentChat.js → pickTier`): fast
+  (`gpt-6-sol`, reasoning low) for look-ups and chat; deep (`gpt-6-astra`,
+  reasoning high) for summaries, analysis, advice, long messages. The app's mode
+  button forces ⚡ / 🧠 or leaves ✨ Auto. Each tier falls back on its own chain.
+* **Streaming** (`POST /agent/chat/stream`, server-sent events): words appear as
+  they are written, each tool step is shown live, ■ stops the answer and cancels
+  the upstream request. `/agent/chat` (non-streaming) still works.
+* **Memory** (`services/agentMemory.js`, tables `agent_memory`, `agent_chat`,
+  `agent_state`): the assistant's notebook, the only thing it may write. Tools
+  `remember`, `update_memory`, `forget`, `recall_memory`, `search_past_chats`.
+  Notes are injected into every prompt; the chat log survives restarts and is
+  reloaded when the app opens; the OpenAI chain id is persisted and rebuilt from
+  the local log if it expires.
+* **Awareness**: a live snapshot (waiting chats, manual deliveries, seats to
+  activate, refunds, deposit reviews, out-of-stock, today's sales) goes into every
+  prompt and into the brief bar at the top of the app — no AI call needed.
+* New tool `recent_activity`: one merged timeline across all three bots.
+* **Persona**: "Sahbi" — loyal, direct, answers in the owner's own dialect.
+* **App**: input grows with the text (Enter = new line on phones), voice input
+  (Tunisian / Arabic / French / English), memory panel, copy buttons, markdown,
+  new-chat divider, Arabic UI. Page moved to `services/agentPage.html`.
+
+# Part 25 — Sahbi speaks first
+
+`services/agentWatch.js`, started from `index.js`, runs every 5 minutes:
+
+* **Rules (no AI, free)**: customer waiting for a reply longer than N minutes
+  (default 30); manual delivery stuck > 30 min; ChatGPT seat due today; deposit
+  review pending > 1 h; a product selling fast enough to run out within 24 h (or
+  already out while selling); a customer with ≥3 refund requests in 30 days (or
+  refunds ≥ half their purchases); the shop silent for 3 h at an hour that
+  normally sells; good customers (≥5 orders) who stopped buying 14–60 days ago,
+  with a win-back idea. All findings of one tick go out as ONE Telegram message
+  from the store bot to the admins, each only once, held back in quiet hours.
+* **Briefs (AI, deep tier)**: morning (09:00) and evening (22:30) on the shop's
+  clock — what happened, what needs action, 💡 ideas grounded in the data. They
+  continue the same conversation, so the owner can reply "tell me more about 2".
+* Everything is also shown in the app (amber alert cards, ☀️/🌙 badges), polled
+  every 45 s and when the app returns to the foreground.
+* Sahbi's prompt now includes the alerts it sent, and it ends answers with one
+  data-grounded 💡 idea when it has a good one.
+* App → 🧠 → 🔔: toggles, wait threshold, quiet hours, brief times,
+  "☀️ brief now" and "🔍 check now". Routes: `/agent/settings`,
+  `/agent/brief/now`, `/agent/watch/now`.

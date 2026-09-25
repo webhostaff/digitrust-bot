@@ -487,6 +487,152 @@ const TOOLS = {
   },
 };
 
+// ── Memory & awareness ───────────────────────────────────────────────────────
+// The assistant's notebook is the one place it may write. See agentMemory.js
+// for why that keeps the read-only boundary intact.
+const mem = require('./agentMemory');
+
+const safe = (fn, fallback = []) => { try { return fn(); } catch (_) { return fallback; } };
+
+TOOLS.remember = {
+  description:
+    'Save a lasting fact to your own memory: an owner preference or rule, something about a ' +
+    'customer, supplier or product, a decision, a recurring problem. Use it without being asked ' +
+    'whenever you learn something worth knowing next week. One fact per call, short and specific.',
+  input: {
+    text: 'the fact, self-contained (include names/ids/emails so it makes sense later)',
+    category: 'owner | customer | supplier | product | rule | issue | note',
+  },
+  run: ({ text, category }) => {
+    const id = mem.addMemory(text, category || 'note', 'assistant');
+    return id ? { saved: true, id } : { error: 'empty' };
+  },
+};
+
+TOOLS.update_memory = {
+  description: 'Correct or replace one of your memory notes by id (when a fact changed).',
+  input: { id: 'the note id (#N in your memory)', text: 'the corrected fact' },
+  run: ({ id, text }) => ({ updated: mem.updateMemory(id, text) }),
+};
+
+TOOLS.forget = {
+  description: 'Delete a memory note by id — when it is wrong, outdated, or the owner asks.',
+  input: { id: 'the note id' },
+  run: ({ id }) => ({ deleted: mem.deleteMemory(id) }),
+};
+
+TOOLS.recall_memory = {
+  description: 'Search ALL your memory notes (the prompt shows only the newest).',
+  input: { query: 'word, name, email or topic' },
+  run: ({ query }) => mem.searchMemory(query),
+};
+
+TOOLS.search_past_chats = {
+  description: 'Search your earlier conversations with the owner — "what did we say about X".',
+  input: { query: 'word or phrase' },
+  run: ({ query }) => mem.searchChat(query),
+};
+
+/**
+ * One timeline of what happened across all three bots.
+ *
+ * "What's going on?" should not need six tools. Orders, wallet movements,
+ * refund requests, manual deliveries, ChatGPT seats, deposit reviews and the
+ * admin notification feed, merged newest first.
+ */
+TOOLS.recent_activity = {
+  description:
+    'Everything that happened in the shop in the last N hours, across the store, support and ' +
+    'ChatGPT bots: orders, payments/deposits, refunds, manual deliveries, seats, deposit reviews, ' +
+    'admin alerts — one merged timeline, newest first.',
+  input: { hours: 'default 24, max 720' },
+  run: ({ hours = 24 }) => {
+    const h = Math.min(720, Math.max(1, Number(hours) || 24));
+    const since = `-${h} hours`;
+    const ev = [];
+    const push = (kind, rows, fmt) => rows.forEach((r) => ev.push({ kind, at: r.created_at, ...fmt(r) }));
+
+    push('order', safe(() => raw.prepare(`
+      SELECT o.id, o.user_id, o.quantity, o.total_price, o.payment_method, o.status, o.source,
+             o.created_at, p.title, u.username
+      FROM orders o LEFT JOIN products p ON p.id = o.product_id
+      LEFT JOIN users u ON u.telegram_id = o.user_id
+      WHERE o.created_at >= datetime('now', ?) ORDER BY o.id DESC LIMIT 60`).all(since)),
+      (r) => ({ id: r.id, who: r.username ? '@' + r.username : r.user_id,
+                what: `${r.quantity}× ${clean(r.title)} $${r.total_price} ${r.status} via ${r.payment_method}${r.source ? ' (' + r.source + ')' : ''}` }));
+
+    push('wallet', safe(() => raw.prepare(`
+      SELECT t.id, t.user_id, t.type, t.amount, t.description, t.status, t.created_at, u.username
+      FROM transactions t LEFT JOIN users u ON u.telegram_id = t.user_id
+      WHERE t.created_at >= datetime('now', ?) ORDER BY t.id DESC LIMIT 60`).all(since)),
+      (r) => ({ id: r.id, who: r.username ? '@' + r.username : r.user_id,
+                what: `${r.type} $${r.amount} ${r.status || ''} ${clean(r.description || '')}`.trim() }));
+
+    push('refund_request', safe(() => raw.prepare(`
+      SELECT id, user_id, order_id, status, amount, reason, created_at FROM refund_requests
+      WHERE created_at >= datetime('now', ?) ORDER BY id DESC LIMIT 30`).all(since)),
+      (r) => ({ id: r.id, who: r.user_id, what: `order #${r.order_id} ${r.status} ${r.amount ? '$' + r.amount : ''} — ${String(r.reason || '').slice(0, 120)}` }));
+
+    push('manual_delivery', safe(() => raw.prepare(`
+      SELECT id, order_id, user_id, status, email, created_at FROM manual_deliveries
+      WHERE created_at >= datetime('now', ?) ORDER BY id DESC LIMIT 30`).all(since)),
+      (r) => ({ id: r.id, who: r.user_id, what: `order #${r.order_id} ${r.status}${r.email ? ' ' + r.email : ''}` }));
+
+    push('chatgpt_seat', safe(() => raw.prepare(`
+      SELECT id, user_id, email, start_date, end_date, status, final_price, created_at
+      FROM chatgpt_subscriptions WHERE created_at >= datetime('now', ?) ORDER BY id DESC LIMIT 30`).all(since)),
+      (r) => ({ id: r.id, who: r.user_id, what: `${r.email} ${r.status} ${r.start_date}→${r.end_date} $${r.final_price}` }));
+
+    push('deposit_review', safe(() => raw.prepare(`
+      SELECT id, user_id, amount, network, status, reason, created_at FROM deposit_reviews
+      WHERE created_at >= datetime('now', ?) ORDER BY id DESC LIMIT 30`).all(since)),
+      (r) => ({ id: r.id, who: r.user_id, what: `$${r.amount} ${r.network} ${r.status} — ${r.reason || ''}` }));
+
+    push('admin_alert', safe(() => raw.prepare(`
+      SELECT id, type, title, body, is_read, created_at FROM admin_notifications
+      WHERE created_at >= datetime('now', ?) ORDER BY id DESC LIMIT 40`).all(since)),
+      (r) => ({ id: r.id, what: `${r.type}: ${clean(r.title)} ${r.is_read ? '' : '(unread)'} — ${clean(String(r.body || '')).slice(0, 160)}` }));
+
+    ev.sort((a, b) => String(b.at).localeCompare(String(a.at)));
+    return { hours: h, events: ev.length, timeline: ev.slice(0, 150) };
+  },
+};
+
+/**
+ * The shop at a glance, computed with no AI — cheap enough to run on every
+ * message and on every page open. This is what makes the assistant "know what
+ * the owner is doing" before a single tool is called.
+ */
+function liveSnapshot() {
+  const one = (sql, ...a) => safe(() => raw.prepare(sql).get(...a), {}) || {};
+  const waiting = safe(() => raw.prepare(`
+    SELECT COUNT(*) AS n FROM (
+      SELECT m.user_id, (SELECT direction FROM support_messages x
+                         WHERE x.user_id = m.user_id AND x.deleted_at IS NULL
+                         ORDER BY x.id DESC LIMIT 1) AS last_dir
+      FROM support_messages m GROUP BY m.user_id) WHERE last_dir = 'in'`).get().n, 0);
+  return {
+    support_waiting: waiting,
+    support_unread: one(`SELECT COUNT(DISTINCT user_id) AS n FROM support_messages
+                         WHERE direction='in' AND is_read=0`).n || 0,
+    manual_deliveries_pending: one(`SELECT COUNT(*) AS n FROM manual_deliveries
+                         WHERE status IN ('pending','open','waiting','claimed')`).n || 0,
+    refund_requests_open: one(`SELECT COUNT(*) AS n FROM refund_requests WHERE status='pending'`).n || 0,
+    deposit_reviews_open: one(`SELECT COUNT(*) AS n FROM deposit_reviews WHERE status='pending'`).n || 0,
+    chatgpt_to_activate: one(`SELECT COUNT(*) AS n FROM chatgpt_subscriptions
+                         WHERE status='pending' AND date(start_date) <= date('now')`).n || 0,
+    orders_today: one(`SELECT COUNT(*) AS n, COALESCE(SUM(total_price),0) AS rev FROM orders
+                       WHERE status='delivered' AND date(created_at) = date('now')`),
+    out_of_stock: safe(() => raw.prepare(`
+      SELECT p.id FROM products p WHERE COALESCE(p.is_active,1)=1
+        AND COALESCE(p.unlimited_stock,0)=0 AND COALESCE(p.is_chatgpt_business,0)=0
+        AND COALESCE(p.delivery_type,'auto') <> 'manual'
+        AND (SELECT COUNT(*) FROM product_items i WHERE i.product_id=p.id AND i.status='available') = 0
+        AND (SELECT COUNT(*) FROM stock s WHERE s.product_id=p.id AND COALESCE(s.is_sold,0)=0) = 0
+    `).all().length, 0),
+  };
+}
+
 /** Shape the model needs to know what it may call. */
 function toolSchemas() {
   return Object.entries(TOOLS).map(([name, t]) => ({
@@ -594,4 +740,4 @@ async function sendApprovedReply(draftId, bot) {
   }
 }
 
-module.exports = { TOOLS, toolSchemas, runTool, sendApprovedReply };
+module.exports = { TOOLS, toolSchemas, runTool, sendApprovedReply, liveSnapshot };

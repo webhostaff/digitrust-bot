@@ -2132,6 +2132,10 @@ setTimeout(runStaleProductCheck, 60 * 1000);
 
 bot.on('callback_query', handleCallbackQuery);
 
+// Sahbi's watcher: follow-up alerts, patterns, ideas and daily briefs,
+// pushed to the admins through the store bot.
+try { require('./services/agentWatch').start(bot); } catch (e) { logger.warn(`sahbi watcher: ${e.message}`); }
+
 // Premium product icons: snapshot what is there, restore anything that has been
 // lost. Runs before the first customer message so nobody sees a stripped title.
 try {

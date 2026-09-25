@@ -7,3 +7,11 @@
 2026-09-25T01:36:57.101Z [INFO] [agent] support_digest({"hours":"24"})
 2026-09-25T01:43:53.666Z [INFO] [agent] support_digest({"hours":"24"})
 2026-09-25T01:43:53.681Z [INFO] [agent] support_digest({"hours":"24"})
+2026-09-25T01:58:38.394Z [INFO] [agent] remember({"text":"Ali prefers English","category":"customer","query":"Ali","hours":"48"})
+2026-09-25T01:58:38.394Z [INFO] [agent] recall_memory({"text":"Ali prefers English","category":"customer","query":"Ali","hours":"48"})
+2026-09-25T01:58:38.395Z [INFO] [agent] recent_activity({"text":"Ali prefers English","category":"customer","query":"Ali","hours":"48"})
+2026-09-25T01:58:38.395Z [INFO] [agent] search_past_chats({"text":"Ali prefers English","category":"customer","query":"Ali","hours":"48"})
+2026-09-25T02:03:46.622Z [WARN] [agent] gpt-6-astra unavailable — deep tier now uses gpt-6-sol
+2026-09-25T02:03:46.623Z [INFO] [agent] support_digest({"hours":"24"})
+2026-09-25T02:03:46.624Z [INFO] [agent] remember({"text":"Owner wants daily digest in Derja","category":"owner"})
+2026-09-25T02:03:46.634Z [WARN] [agent] conversation chain expired — rebuilding from local history
