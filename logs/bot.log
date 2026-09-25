@@ -2,3 +2,6 @@
 2026-08-26T12:47:43.657Z [INFO] [emoji:t] outgoing emoji layer installed
 2026-09-03T20:07:43.089Z [INFO] [emoji:t] outgoing emoji layer installed
 2026-09-03T20:07:43.093Z [WARN] [emoji:t] quarantined invalid id(s) 6666666666666666666 for 6h: ETELEGRAM: 400 Bad Request: DOCUMENT_INVALID
+2026-09-25T01:36:57.100Z [WARN] [agent] model gpt-6-astra unavailable on this account — using gpt-6-sol
+2026-09-25T01:36:57.101Z [WARN] [agent] gpt-6-sol refused reasoning_effort; retrying without it
+2026-09-25T01:36:57.101Z [INFO] [agent] support_digest({"hours":"24"})

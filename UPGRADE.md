@@ -1041,3 +1041,17 @@ Now, in `services/cgbCycles.js`:
   first occurrence. The chat's copy stayed as the literal `__TOKEN__`, so the
   page opened but every message returned "Invalid or missing token". Fixed with
   split/join; the page also prefers the token from its own address bar.
+
+# Part 22 — Smarter assistant, speaks the owner's language
+
+* Replies to the owner in the language and dialect of their last message
+  (Tunisian Derja stays Derja). Drafts for customers are English unless the
+  owner names another language.
+* Strongest model by default: `gpt-6-astra` → `gpt-6-sol` → `gpt-5.6-sol` →
+  `gpt-5.5` → `gpt-4o` (Anthropic: `claude-opus-5-5` → `claude-sonnet-5` →
+  `claude-sonnet-4-6`). A model the account cannot use is skipped once and the
+  working one is remembered. Reasoning effort `high`; refused parameters are
+  dropped and retried.
+* New tool `support_digest`: every conversation of the last N hours in one call,
+  with waiting/unread flags — used for "read the chats and summarise".
+* Up to 16 tool rounds per answer (was 8); threads readable up to 300 messages.

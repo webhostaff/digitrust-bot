@@ -251,15 +251,82 @@ const TOOLS = {
   },
 
   support_thread: {
-    description: 'The recent messages of one support conversation.',
-    input: { user_id: 'required', limit: 'default 30' },
-    run: ({ user_id, limit = 30 }) => {
+    description: 'The messages of one support conversation, oldest first.',
+    input: { user_id: 'required', limit: 'default 60, max 300' },
+    run: ({ user_id, limit = 60 }) => {
       try {
         return raw.prepare(`
           SELECT direction, content AS body, created_at FROM support_messages
           WHERE user_id = ? ORDER BY id DESC LIMIT ?
-        `).all(Number(user_id), Math.min(100, Number(limit) || 30)).reverse();
+        `).all(Number(user_id), Math.min(300, Number(limit) || 60)).reverse();
       } catch (e) { return []; }
+    },
+  },
+
+  /**
+   * Every conversation of a period, in full — what "read all the chats and
+   * summarise them for me" needs.
+   *
+   * support_unread only counts, and support_thread reads one customer at a
+   * time; a digest of the day would take dozens of calls and still miss the
+   * threads that were already answered. This returns every thread that had any
+   * message in the window, with its messages in order, in one call.
+   */
+  support_digest: {
+    description:
+      'ALL support conversations with activity in the last N hours, every thread ' +
+      'with its messages in order. Use for "summarise the chats", "what happened ' +
+      'today", "who is waiting", or before answering anything about support as a whole.',
+    input: {
+      hours: 'how far back, default 24 (max 720)',
+      max_customers: 'default 60',
+    },
+    run: ({ hours = 24, max_customers = 60 }) => {
+      const h = Math.min(720, Math.max(1, Number(hours) || 24));
+      const cap = Math.min(150, Math.max(1, Number(max_customers) || 60));
+      try {
+        const users = raw.prepare(`
+          SELECT m.user_id,
+                 MAX(COALESCE(m.username, u.username))     AS username,
+                 MAX(COALESCE(m.first_name, u.first_name)) AS first_name,
+                 COUNT(*) AS messages,
+                 COUNT(CASE WHEN m.direction='in' AND m.is_read=0 THEN 1 END) AS unread,
+                 MAX(m.id) AS last_id
+          FROM support_messages m LEFT JOIN users u ON u.telegram_id = m.user_id
+          WHERE m.created_at >= datetime('now', '-' || ? || ' hours')
+            AND m.deleted_at IS NULL
+          GROUP BY m.user_id
+          ORDER BY last_id DESC
+          LIMIT ?
+        `).all(h, cap);
+
+        const msgs = raw.prepare(`
+          SELECT direction, content, media_type, created_at FROM support_messages
+          WHERE user_id = ? AND created_at >= datetime('now', '-' || ? || ' hours')
+            AND deleted_at IS NULL
+          ORDER BY id DESC LIMIT 80
+        `);
+
+        const threads = users.map((u) => {
+          const rows = msgs.all(u.user_id, h).reverse();
+          const last = rows[rows.length - 1];
+          return {
+            user_id: u.user_id,
+            customer: u.username ? `@${u.username}` : (u.first_name || String(u.user_id)),
+            unread: u.unread,
+            // The customer spoke last: someone is waiting for an answer.
+            waiting_for_reply: !!(last && last.direction === 'in'),
+            messages: rows.map((r) => ({
+              from: r.direction === 'in' ? 'customer' : 'support',
+              at: r.created_at,
+              text: String(r.content || (r.media_type ? `[${r.media_type}]` : '')).slice(0, 600),
+            })),
+          };
+        });
+        return { hours: h, conversations: threads.length, threads };
+      } catch (e) {
+        return { error: e.message };
+      }
     },
   },
 

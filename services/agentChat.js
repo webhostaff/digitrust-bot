@@ -34,29 +34,59 @@ const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
 const PROVIDER = (process.env.AGENT_PROVIDER || '').toLowerCase()
   || (ANTHROPIC_KEY ? 'anthropic' : (OPENAI_KEY ? 'openai' : ''));
 
-const DEFAULT_MODEL = PROVIDER === 'openai' ? 'gpt-4o' : 'claude-sonnet-4-6';
+/**
+ * Strongest model first, each followed by the next best.
+ *
+ * Not every account can use the newest model on day one, and a model an
+ * account cannot use answers 404 on every message. Rather than failing, the
+ * next model down is tried, and whichever answers is remembered for the rest
+ * of the process — so the price of a miss is paid once, not per message.
+ */
+const MODEL_CHAIN = {
+  openai: ['gpt-6-astra', 'gpt-6-sol', 'gpt-5.6-sol', 'gpt-5.5', 'gpt-4o'],
+  anthropic: ['claude-opus-5-5', 'claude-sonnet-5', 'claude-sonnet-4-6'],
+};
 
 /**
- * AGENT_MODEL, unless it names the other provider's model.
- *
- * A Claude model name sent to OpenAI (or a GPT name sent to Anthropic) comes
- * back as a 404 "model not found" on every single message, which reads as the
- * assistant itself being missing. The provider is decided by which key is set,
- * so a mismatched model is always a configuration slip — fall back and warn.
+ * AGENT_MODEL goes to the front of the chain, unless it names the other
+ * provider's model — a Claude name sent to OpenAI (or the reverse) is a 404 on
+ * every message, which reads as the assistant itself being missing.
  */
-function pickModel() {
+function buildChain() {
+  const chain = [...(MODEL_CHAIN[PROVIDER] || [])];
   const want = String(process.env.AGENT_MODEL || '').trim();
-  if (!want) return DEFAULT_MODEL;
+  if (!want) return chain;
   const looksClaude = /^claude/i.test(want);
   const looksOpenAI = /^(gpt|o\d|chatgpt)/i.test(want);
   if ((PROVIDER === 'openai' && looksClaude) || (PROVIDER === 'anthropic' && looksOpenAI)) {
-    logger.warn(`[agent] AGENT_MODEL=${want} does not belong to ${PROVIDER}; using ${DEFAULT_MODEL}`);
-    return DEFAULT_MODEL;
+    logger.warn(`[agent] AGENT_MODEL=${want} does not belong to ${PROVIDER}; ignoring it`);
+    return chain;
   }
-  return want;
+  return [want, ...chain.filter((m) => m !== want)];
 }
 
-const MODEL = pickModel();
+const CHAIN = buildChain();
+let MODEL = CHAIN[0] || '';
+
+/** Move to the next model after a "model not found". False when none are left. */
+function stepDownModel(failed) {
+  const i = CHAIN.indexOf(failed);
+  const next = CHAIN[i + 1];
+  if (!next) return false;
+  logger.warn(`[agent] model ${failed} unavailable on this account — using ${next}`);
+  MODEL = next;
+  return true;
+}
+
+/** Newer OpenAI models reason; the old gpt-4 family does not. */
+const isReasoningOpenAI = (m) => !/^gpt-4/i.test(m);
+
+/**
+ * Parameters the model refused. Some models reject reasoning_effort, some
+ * reject max_tokens in favour of max_completion_tokens; a refused parameter is
+ * dropped and the call retried rather than failing the whole message.
+ */
+const droppedParams = new Set();
 
 const API_KEY = PROVIDER === 'openai' ? OPENAI_KEY : ANTHROPIC_KEY;
 
@@ -65,9 +95,14 @@ const SYSTEM = `You are the assistant for a Telegram digital-goods shop. You hel
 You have read-only tools over the shop's live database: sales, stock, batches, suppliers, customers, support threads, payments and ChatGPT Business seats. Use them before answering anything factual — never guess a number.
 
 LANGUAGE — two separate decisions, never confuse them:
-- To the OWNER: always English, whatever language they write to you in. They write to you in Arabic, French, anything; you answer in English.
-- In a DRAFT for a customer: the language the CUSTOMER used in their thread. A customer writing Arabic gets Arabic. A customer writing English gets English. If the owner names a language, that wins.
-The owner switching language does not change the customer's. Check the thread, not this chat.
+- To the OWNER: answer in exactly the language and register the owner used in their LAST message. Tunisian Arabic (Derja) gets Tunisian Derja back — the same words and spelling style, Arabic script or Latin/Arabizi as they wrote it, not formal Modern Standard Arabic. French gets French, English gets English. If they mix languages, mix the same way. Numbers, @usernames, emails, order ids and product names stay exactly as they are in the data.
+- In a DRAFT for a customer (propose_reply): ENGLISH, always, unless the owner explicitly names another language for that reply. The owner writing to you in Arabic does NOT make the draft Arabic.
+
+THINKING — you are the owner's sharpest analyst, not a lookup box:
+- Before answering, decide what the owner really needs, then fetch EVERYTHING that bears on it in the same turn — several tools at once is normal.
+- "Read the chats" / "summarise" / "what's new" / "هل في رسالة" / "شنوة صار": call support_digest (24h by default, longer if they name a period), read every thread, then give a real summary: who wrote, what each one wants, what was answered and what was not, what needs action now — most urgent first. Group repeated issues ("3 people report Canva login failing"). End with the concrete next steps.
+- Cross-check: when a thread mentions an order, email or payment, look it up (customer_lookup, trace_payment, cgb_seats_of) instead of repeating the customer's claim.
+- Keep going until the answer is complete; do not stop after the first tool if the question needs more.
 
 How to be useful here:
 - Lead with the answer. Numbers first, explanation after, and only if it adds something.
@@ -135,6 +170,44 @@ function requireToken(req, res, next) {
   next();
 }
 
+// A digest of every chat plus look-ups on what it finds takes more steps than
+// a single question; 8 cut such answers off half-way.
+const MAX_ROUNDS = 16;
+
+/**
+ * One provider call that survives the two recoverable failures:
+ *  - 404 / model_not_found → the next model in the chain;
+ *  - 400 naming a parameter this model refuses → drop it, same model again.
+ */
+async function callWithFallback(send) {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try {
+      return await send();
+    } catch (e) {
+      const status = e.response?.status;
+      const err = e.response?.data?.error || {};
+      const msg = String(err.message || '');
+      const notFound = status === 404 || err.code === 'model_not_found' ||
+        /model.*(not found|does not exist|not have access)/i.test(msg);
+      if (notFound && stepDownModel(MODEL)) continue;
+
+      if (status === 400) {
+        const bad = ['reasoning_effort', 'max_completion_tokens', 'max_tokens']
+          .find((p) => msg.includes(p) && !droppedParams.has(p));
+        if (bad) {
+          droppedParams.add(bad);
+          // A model refusing max_completion_tokens wants the older name.
+          if (bad === 'max_completion_tokens') droppedParams.delete('max_tokens');
+          logger.warn(`[agent] ${MODEL} refused ${bad}; retrying without it`);
+          continue;
+        }
+      }
+      throw e;
+    }
+  }
+  throw new Error('Could not reach a working model');
+}
+
 /** The same tools, in the shape each provider expects. */
 function openaiTools() {
   return toolSchemas().map((t) => ({
@@ -149,17 +222,17 @@ function openaiTools() {
 async function converseAnthropic(history, drafts) {
   const tools = toolSchemas();
 
-  for (let round = 0; round < 8; round++) {
-    const res = await axios.post('https://api.anthropic.com/v1/messages', {
-      model: MODEL, max_tokens: 2000, system: SYSTEM, tools, messages: history,
+  for (let round = 0; round < MAX_ROUNDS; round++) {
+    const res = await callWithFallback(() => axios.post('https://api.anthropic.com/v1/messages', {
+      model: MODEL, max_tokens: 8000, system: SYSTEM, tools, messages: history,
     }, {
       headers: {
         'x-api-key': API_KEY,
         'anthropic-version': '2023-06-01',
         'content-type': 'application/json',
       },
-      timeout: 60000,
-    });
+      timeout: 240000,
+    }));
 
     const msg = res.data;
     history.push({ role: 'assistant', content: msg.content });
@@ -192,12 +265,19 @@ async function converseOpenAI(history, drafts) {
   const tools = openaiTools();
   const messages = [{ role: 'system', content: SYSTEM }, ...history];
 
-  for (let round = 0; round < 8; round++) {
-    const res = await axios.post('https://api.openai.com/v1/chat/completions', {
-      model: MODEL, max_tokens: 2000, messages, tools, tool_choice: 'auto',
-    }, {
-      headers: { Authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
-      timeout: 60000,
+  for (let round = 0; round < MAX_ROUNDS; round++) {
+    const res = await callWithFallback(() => {
+      const body = { model: MODEL, messages, tools, tool_choice: 'auto' };
+      if (isReasoningOpenAI(MODEL)) {
+        if (!droppedParams.has('max_completion_tokens')) body.max_completion_tokens = 16000;
+        if (!droppedParams.has('reasoning_effort')) body.reasoning_effort = 'high';
+      } else if (!droppedParams.has('max_tokens')) {
+        body.max_tokens = 4000;
+      }
+      return axios.post('https://api.openai.com/v1/chat/completions', body, {
+        headers: { Authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        timeout: 240000,
+      });
     });
 
     const msg = res.data.choices[0].message;
