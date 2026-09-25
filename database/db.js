@@ -585,6 +585,12 @@ if (config.updatesGroupId)      upsertSetting.run('updates_group_id',      confi
 
 // ── Seed defaults for ChatGPT Business ─────────────
 try {
+  // Renewal time of each cycle on its start day ("14:32"), recorded by the
+  // admin pressing the button when the workspace is actually billed. NULL =
+  // the cycle opens at 00:00, as before.
+  const cycleCols = db.prepare('PRAGMA table_info(billing_cycles)').all().map((c) => c.name);
+  if (!cycleCols.includes('start_time')) db.exec('ALTER TABLE billing_cycles ADD COLUMN start_time TEXT DEFAULT NULL');
+
   const cycleCount = db.prepare('SELECT COUNT(*) AS n FROM billing_cycles').get().n;
   if (cycleCount === 0) {
     db.prepare('INSERT INTO billing_cycles (start_day, end_day) VALUES (?, ?)').run(26, 25);

@@ -42,9 +42,17 @@ function tzOffsetMinutes() {
 }
 
 /** `from`, expressed in the shop's local time. */
+/**
+ * `from` as a Date whose LOCAL getters read the shop's wall clock.
+ *
+ * The server's own timezone is taken out first. On a UTC server (Railway's
+ * default) this is the same shift as before; on a server with TZ set, the old
+ * version shifted twice — a renewal pressed at 14:32 was recorded as 15:32.
+ */
 function localNow(from = new Date()) {
   const off = tzOffsetMinutes();
-  return off ? new Date(from.getTime() + off * 60000) : new Date(from);
+  const serverOff = -new Date(from).getTimezoneOffset();
+  return new Date(from.getTime() + (off - serverOff) * 60000);
 }
 
 function boundaryTime() {
@@ -126,6 +134,38 @@ function dayIn(y, m, d, h = 0, min = 0) {
 
 const DAY_MS = 86400000;
 
+/** A cycle's recorded renewal time as [h, m]; [0, 0] when none was recorded. */
+function startTimeOf(cycle) {
+  const m = String(cycle && cycle.start_time || '').match(/^(\d{1,2}):(\d{2})$/);
+  return m ? [Math.min(23, +m[1]), Math.min(59, +m[2])] : [0, 0];
+}
+
+/**
+ * Record NOW as the renewal time of a cycle — the admin's one press on the
+ * cycle's start day, at the moment the workspace was billed.
+ *
+ * Refused on any other day: the time only means something if it was taken on
+ * the start day itself, and a press on the wrong day would silently move the
+ * boundary of every future cycle.
+ */
+function recordStartTime(cycleId, at = new Date()) {
+  const cycle = db.getBillingCycleById(cycleId);
+  if (!cycle) return { ok: false, reason: 'not_found' };
+  const now = localNow(at);
+  const lastDay = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+  const startDayThisMonth = Math.min(cycle.start_day, lastDay);
+  if (now.getDate() !== startDayThisMonth) {
+    return { ok: false, reason: 'wrong_day', start_day: startDayThisMonth, today: now.getDate() };
+  }
+  const t = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+  db.setBillingCycleStartTime(cycleId, t);
+  return { ok: true, time: t, cycle };
+}
+
+function clearStartTime(cycleId) {
+  db.setBillingCycleStartTime(cycleId, null);
+}
+
 /**
  * The period a purchase made at `from` belongs to, for one cycle.
  *
@@ -150,15 +190,19 @@ function evaluateCycle(cycle, from, bh, bm) {
   let endDate = dayIn(today.getFullYear(), today.getMonth(), cycle.end_day, bh, bm);
   if (endDate < from) endDate = dayIn(today.getFullYear(), today.getMonth() + 1, cycle.end_day, bh, bm);
 
-  // The start of the period that end closes: the latest start day before it.
-  let periodStart = dayIn(endDate.getFullYear(), endDate.getMonth(), cycle.start_day);
-  if (periodStart >= endDate) periodStart = dayIn(endDate.getFullYear(), endDate.getMonth() - 1, cycle.start_day);
+  // The start of the period that end closes: the latest start day before it,
+  // at the cycle's own renewal time when one was recorded.
+  const [sh, sm] = startTimeOf(cycle);
+  let periodStart = dayIn(endDate.getFullYear(), endDate.getMonth(), cycle.start_day, sh, sm);
+  if (periodStart >= endDate) periodStart = dayIn(endDate.getFullYear(), endDate.getMonth() - 1, cycle.start_day, sh, sm);
 
-  const inGap = periodStart > today;
-  const startDate = inGap ? periodStart : today;
+  // Compared with the moment, not the day: on the 26th at 10:00 a cycle that
+  // renews at 14:30 has not opened yet, and the buyer joins the running one.
+  const inGap = periodStart > from;
+  const startDate = inGap ? new Date(new Date(periodStart).setHours(0, 0, 0, 0)) : today;
 
   const cycleLength = Math.max(1, Math.ceil((endDate - periodStart) / DAY_MS));
-  const daysRemaining = Math.max(1, Math.ceil((endDate - startDate) / DAY_MS));
+  const daysRemaining = Math.min(cycleLength, Math.max(1, Math.ceil((endDate - (inGap ? periodStart : startDate)) / DAY_MS)));
 
   return { cycle, endDate, startDate, periodStart, inGap, cycleLength, daysRemaining };
 }
@@ -183,8 +227,14 @@ function calculateBestCycle(from = new Date()) {
   const evaluated = getCycles().map((cycle) => evaluateCycle(cycle, from, bh, bm));
   if (!evaluated.length) return null;
 
-  let best = evaluated[0];
-  for (const e of evaluated) if (e.daysRemaining > best.daysRemaining) best = e;
+  // A cycle that is running today wins over one that has not started yet: a
+  // buyer on the 25th joins the cycle already in progress (22 -> 20) from
+  // today, rather than waiting for the one that opens tomorrow. A cycle that
+  // has not started is used only when no cycle is running at all.
+  const running = evaluated.filter((e) => !e.inGap);
+  const pool = running.length ? running : evaluated;
+  let best = pool[0];
+  for (const e of pool) if (e.daysRemaining > best.daysRemaining) best = e;
 
   best.all = evaluated;
   return best;
@@ -286,4 +336,4 @@ function globalMonthlyPrice() {
   }
 }
 
-module.exports = { getCycles, calculateBestCycle, priceFor, pricePeriod, oneMoreCycle, getMonthlyPrice, manualCycle, nextCycleAfterCurrent, boundaryTime, localNow, tzOffsetMinutes };
+module.exports = { recordStartTime, clearStartTime, startTimeOf, getCycles, calculateBestCycle, priceFor, pricePeriod, oneMoreCycle, getMonthlyPrice, manualCycle, nextCycleAfterCurrent, boundaryTime, localNow, tzOffsetMinutes };

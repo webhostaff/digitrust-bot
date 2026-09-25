@@ -205,7 +205,12 @@ header .sub{font-size:11.5px;color:var(--dim);white-space:nowrap;overflow:hidden
     <div id="mlist"></div>
   </div>
   <div id="ps" style="display:none;flex-direction:column;gap:10px;overflow-y:auto">
-    <div class="small">صاحبي يراقب المحل كل 5 دقايق ويبعثلك على تيليجرام كي يلقى حاجة، ويبعثلك حوصلة الصباح والعشية مع أفكار.</div>
+    <div class="set">
+      <span>💸 الحد اليومي للصرف ($) — كي يوصلو يوقف الـ AI لين غدوة</span><input type="number" min="0" max="100" step="0.1" id="s_budget">
+      <span>🧠 نسمحلو يستعمل الموديل الغالي للحوصلات والتحليل</span><input type="checkbox" class="sw" id="s_deep">
+    </div>
+    <div class="small" id="usage"></div>
+    <div class="small">صاحبي يراقب المحل كل 5 دقايق ويبعثلك على تيليجرام كي يلقى حاجة (مجاني، بلاش AI).</div>
     <div class="set">
       <span>🔔 التنبيهات (حرفاء يستناو، تسليم، مخزون، استرجاع…)</span><input type="checkbox" class="sw" id="s_watch">
       <span>⏱ نبّهني كي حريف يستنى أكثر من (دقيقة)</span><input type="number" min="5" max="1440" id="s_wait">
@@ -213,9 +218,9 @@ header .sub{font-size:11.5px;color:var(--dim);white-space:nowrap;overflow:hidden
       <span>… لين</span><input type="time" id="s_qe">
     </div>
     <div class="set">
-      <span>📋 حوصلة الصباح والعشية + أفكار (AI)</span><input type="checkbox" class="sw" id="s_brief">
+      <span>📋 حوصلة يومية + أفكار (AI — فيها كلفة صغيرة)</span><input type="checkbox" class="sw" id="s_brief">
       <span>☀️ حوصلة الصباح</span><input type="time" id="s_bm">
-      <span>🌙 حوصلة العشية</span><input type="time" id="s_be">
+      <span>🌙 حوصلة العشية (فرّغها باش تنحّيها)</span><input type="time" id="s_be">
     </div>
     <div class="addrow">
       <button id="bnow" style="flex:1;padding:11px">☀️ حوصلة توا</button>
@@ -340,7 +345,8 @@ setMode(mode);
 async function loadBrief(){
   try{
     const j=await (await fetch(api('brief'))).json(); const s=j.snapshot||{}; models=j.models||{};
-    sub.textContent=`⚡ ${models.fast||'?'} · 🧠 ${models.deep||'?'} · ${j.memory||0} ذكرى`;
+    const u=j.usage||{};
+    sub.textContent=`💸 $${(u.cost||0).toFixed(3)}/$${Number(j.budget||0).toFixed(2)} اليوم · ⚡ ${models.fast||'?'} · ${j.memory||0} ذكرى`;
     const pills=[];
     const P=(n,cls,label,q)=>{ if(n>0) pills.push([cls,label,q]); };
     P(s.support_waiting,'hot',`📨 ${s.support_waiting} يستناو رد`,'شكون يستنى رد؟ حضّرلي الردود');
@@ -495,15 +501,23 @@ async function loadSettings(){
   const s=await (await fetch(api('settings'))).json();
   $('s_watch').checked=s.watch_enabled==='1'; $('s_brief').checked=s.briefs_enabled==='1';
   $('s_wait').value=s.wait_minutes; $('s_qs').value=s.quiet_start.padStart(5,'0'); $('s_qe').value=s.quiet_end.padStart(5,'0');
-  $('s_bm').value=s.brief_morning.padStart(5,'0'); $('s_be').value=s.brief_evening.padStart(5,'0');
+  const t5=v=>v?String(v).padStart(5,'0'):'';
+  $('s_bm').value=t5(s.brief_morning); $('s_be').value=t5(s.brief_evening);
+  $('s_budget').value=s.daily_budget_usd; $('s_deep').checked=s.allow_deep==='1';
+  showUsage(s.usage_today, parseFloat(s.daily_budget_usd));
+}
+function showUsage(u,b){
+  u=u||{}; const tok=(u.input||0)+(u.output||0);
+  $('usage').textContent=`📊 اليوم: $${(u.cost||0).toFixed(3)} من $${(b||0).toFixed(2)} · ${u.calls||0} طلب · ${(tok/1000).toFixed(1)}k توكن (${((u.cached||0)/1000).toFixed(1)}k مخزّن ورخيص)`;
 }
 async function saveSettings(){
   await post('settings',{watch_enabled:$('s_watch').checked?'1':'0',briefs_enabled:$('s_brief').checked?'1':'0',
     wait_minutes:$('s_wait').value,quiet_start:$('s_qs').value,quiet_end:$('s_qe').value,
-    brief_morning:$('s_bm').value,brief_evening:$('s_be').value});
+    brief_morning:$('s_bm').value,brief_evening:$('s_be').value,
+    daily_budget_usd:$('s_budget').value,allow_deep:$('s_deep').checked?'1':'0'});
   $('sstate').textContent='✅ تسجّل';
 }
-['s_watch','s_brief','s_wait','s_qs','s_qe','s_bm','s_be'].forEach(id=>$(id).addEventListener('change',saveSettings));
+['s_watch','s_brief','s_wait','s_qs','s_qe','s_bm','s_be','s_budget','s_deep'].forEach(id=>$(id).addEventListener('change',saveSettings));
 $('bnow').onclick=async()=>{ $('sstate').textContent='⏳ يكتب في الحوصلة… (تجيك في تيليجرام وهوني)';
   const r=await post('brief/now',{kind:new Date().getHours()<15?'morning':'evening'}); const j=await r.json();
   $('sstate').textContent=j.ok?'✅ وصلت':'❌ '+(j.error||''); pollNew(); };

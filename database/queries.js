@@ -1094,6 +1094,7 @@ const cgb_insertCycle  = db.prepare(`INSERT INTO billing_cycles (start_day, end_
 const cgb_deleteCycle  = db.prepare(`DELETE FROM billing_cycles WHERE id=?`);
 const cgb_updateCycle  = db.prepare(`UPDATE billing_cycles SET start_day=?, end_day=? WHERE id=?`);
 const cgb_getCycleById = db.prepare(`SELECT * FROM billing_cycles WHERE id=?`);
+const cgb_setCycleTime = db.prepare(`UPDATE billing_cycles SET start_time=? WHERE id=?`);
 /**
  * A subscription row is created the moment a payment METHOD is chosen, because
  * the CryptoBot webhook arrives later and needs a row to attach to. So it
@@ -1967,6 +1968,8 @@ module.exports = {
   addBillingCycle:     (s, e) => cgb_insertCycle.run(s, e),
   removeBillingCycle:  (id) => cgb_deleteCycle.run(id),
   updateBillingCycle:  (id, s, e) => cgb_updateCycle.run(s, e, id),
+  setBillingCycleStartTime: (id, t) => cgb_setCycleTime.run(t, id),
+  getBillingCycleById: (id) => cgb_getCycleById.get(id),
   getBillingCycle:     (id) => cgb_getCycleById.get(id),
   // Returns the new row id so a renewal can be linked to the seat it replaces.
   createCgbSubscription: (orderId, userId, email, start, end, days, base, extra, final) =>

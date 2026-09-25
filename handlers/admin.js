@@ -7254,7 +7254,9 @@ async function handleAdminCallback(bot, query) {
     const cur = String(db.getSetting('cgb_timezone_offset', '0'));
     const serverNow = new Date();
     const shopNow = cgbCycles.localNow(serverNow);
-    const fmt = (d) => d.toISOString().slice(0, 16).replace('T', ' ');
+    const p2 = (n) => String(n).padStart(2, '0');
+    const fmt = (d) => `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`;
+    const fmtUtc = (d) => d.toISOString().slice(0, 16).replace('T', ' ');
 
     const opts = ['-5', '-3', '0', '1', '2', '3', '4', '5.5', '8'];
     const rows = [];
@@ -7268,7 +7270,7 @@ async function handleAdminCallback(bot, query) {
 
     await bot.editMessageText(
       `🌍 <b>Your timezone</b>\n\n` +
-      `🖥 Server clock: <b>${fmt(serverNow)}</b> (UTC)\n` +
+      `🖥 Server clock: <b>${fmtUtc(serverNow)}</b> (UTC)\n` +
       `🏠 Shop clock: <b>${fmt(shopNow)}</b>\n\n` +
       `<i>The server runs on UTC. If your day starts before the server's does, ` +
       `a cycle beginning on the 5th stays on the 4th for the bot during those ` +
@@ -7470,18 +7472,25 @@ async function handleAdminCallback(bot, query) {
         txt += `<b>All active cycles</b>\n` +
           best.all.map((e) =>
             `${e === best ? '👉' : '  '} Day ${e.cycle.start_day} → ${e.cycle.end_day} — ` +
-            `${e.daysRemaining} day(s)`
+            `${e.daysRemaining} day(s)` +
+            (e.cycle.start_time ? ` · renews ${e.cycle.start_time}` : '') +
+            (e.inGap ? ` <i>(not started yet — opens ${ymd(e.startDate)}${e.cycle.start_time ? ' ' + e.cycle.start_time : ''})</i>` : '')
           ).join('\n') +
-          `\n\n⚠️ <i>The bot always uses the cycle with the MOST days. Adding a ` +
-          `cycle does not replace the others — delete the ones you no longer want, ` +
-          `or the old one keeps winning.</i>\n`;
+          `\n\n⚠️ <i>The bot uses the cycle RUNNING today with the most days left. ` +
+          `A cycle that has not started yet is used only when none is running. ` +
+          `Adding a cycle does not replace the others — delete the ones you no longer want.</i>\n`;
       }
     }
 
-    const rows = cycles.map(c => [{
-      text: `🗑 Delete: Day ${c.start_day} → Day ${c.end_day}`,
-      callback_data: `admin_cgb_delcycle_${c.id}`
-    }]);
+    const rows = [];
+    for (const c of cycles) {
+      rows.push([{ text: `🗑 Delete: Day ${c.start_day} → Day ${c.end_day}`, callback_data: `admin_cgb_delcycle_${c.id}` }]);
+      // One press on the start day records the renewal time; after that the
+      // button shows it and offers to clear it.
+      rows.push([c.start_time
+        ? { text: `⏱ Day ${c.start_day} renews at ${c.start_time} · reset`, callback_data: `admin_cgb_ctclr_${c.id}` }
+        : { text: `⏱ Day ${c.start_day}: press at billing time`, callback_data: `admin_cgb_ctrec_${c.id}` }]);
+    }
     rows.push([{ text: '⏭ Start next cycle now', callback_data: 'admin_cgb_nextcycle' }]);
     rows.push([{ text: '🕒 Set exact end time', callback_data: 'admin_cgb_manual' }]);
     rows.push([{ text: '➕ Add Cycle', callback_data: 'admin_cgb_addcycle' }]);
@@ -7501,6 +7510,44 @@ async function handleAdminCallback(bot, query) {
       'Example: <code>1-30</code> (cycle from day 1 to day 30)',
       { parse_mode: 'HTML' });
     return;
+  }
+
+  // answer() shows a toast that cuts long text; these need a readable alert.
+  const alertAns = (text) => bot.answerCallbackQuery(query.id, { text, show_alert: true }).catch(() => {});
+  // ── Renewal time of a cycle: recorded by one press on its start day ──
+  if (/^admin_cgb_ctrec_\d+$/.test(data)) {
+    const cycleId = parseInt(data.split('_').pop(), 10);
+    const r = cgbCycles.recordStartTime(cycleId);
+    if (!r.ok && r.reason === 'wrong_day') {
+      await alertAns(`⏱ Press this on day ${r.start_day}, at the moment the workspace is billed.\n` +
+        `Today is day ${r.today}.`, true);
+      return;
+    }
+    if (!r.ok) { await alertAns('Cycle not found', true); return; }
+    await alertAns(`✅ Day ${r.cycle.start_day} now renews at ${r.time}.\n` +
+      `Before ${r.time} buyers join the running cycle; from ${r.time} they join the new one.`, true);
+    return await handleAdminCallback(bot, { ...query, data: 'admin_cgb_cycles' });
+  }
+
+  if (/^admin_cgb_ctclr_\d+$/.test(data)) {
+    const cycleId = parseInt(data.split('_').pop(), 10);
+    const c = db.getBillingCycleById(cycleId);
+    await bot.editMessageText(
+      `⏱ <b>Reset renewal time?</b>\n\n` +
+      `Day ${c ? c.start_day : '?'} → ${c ? c.end_day : '?'} renews at <b>${escapeHtml(c && c.start_time || '—')}</b>.\n\n` +
+      `After a reset the cycle opens at 00:00 again, until you press ` +
+      `"⏱ press at billing time" on its next start day.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+        [{ text: '🔄 Yes, reset', callback_data: `admin_cgb_ctclrok_${cycleId}` }],
+        [{ text: '🔙 Keep it', callback_data: 'admin_cgb_cycles' }],
+      ] } }).catch(() => {});
+    return;
+  }
+
+  if (/^admin_cgb_ctclrok_\d+$/.test(data)) {
+    cgbCycles.clearStartTime(parseInt(data.split('_').pop(), 10));
+    await alertAns('🔄 Reset — opens at 00:00 until recorded again', true);
+    return await handleAdminCallback(bot, { ...query, data: 'admin_cgb_cycles' });
   }
 
   if (/^admin_cgb_delcycle_\d+$/.test(data)) {

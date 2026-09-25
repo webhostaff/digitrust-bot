@@ -34,9 +34,9 @@ const TICK_MS = 5 * 60 * 1000;
 
 const DEFAULTS = {
   watch_enabled: '1',      // rule alerts
-  briefs_enabled: '1',     // AI morning/evening briefs
+  briefs_enabled: '0',     // AI briefs — off by default, they cost tokens
   brief_morning: '09:00',
-  brief_evening: '22:30',
+  brief_evening: '',       // empty = no evening brief; one a day is enough
   quiet_start: '01:00',
   quiet_end: '08:30',
   wait_minutes: '30',      // support reply follow-up
@@ -52,7 +52,7 @@ function saveSettings(patch) {
   for (const [k, v] of Object.entries(patch || {})) {
     if (!(k in DEFAULTS)) continue;
     let val = String(v);
-    if (/^(brief_|quiet_)/.test(k) && !/^\d{1,2}:\d{2}$/.test(val)) continue;
+    if (/^(brief_|quiet_)/.test(k) && val !== '' && !/^\d{1,2}:\d{2}$/.test(val)) continue;
     if (k === 'wait_minutes') val = String(Math.min(1440, Math.max(5, parseInt(val, 10) || 30)));
     if (/_enabled$/.test(k)) val = val === '1' || val === 'true' ? '1' : '0';
     mem.setState(`watch_${k}`, val);
@@ -331,7 +331,7 @@ async function runRules() {
 const BRIEF_PROMPTS = {
   morning:
     'MORNING BRIEF (you are writing first, the owner did not ask). In the owner\'s Tunisian Derja. ' +
-    'Use recent_activity (since last night, ~12h) and support_digest (12h). Structure: ' +
+    'Call recent_activity (hours 12) ONCE and support_digest (hours 12) ONCE, nothing else. Structure: ' +
     '1) one-line greeting with the headline; 2) what happened overnight in numbers; ' +
     '3) what needs action today, most urgent first, with names; ' +
     '4) 💡 2–3 concrete ideas to sell more or save time, each grounded in the data ' +
@@ -339,7 +339,7 @@ const BRIEF_PROMPTS = {
     'Save anything worth remembering. Keep it tight — a phone screen, not a report.',
   evening:
     'EVENING WRAP (you are writing first, the owner did not ask). In the owner\'s Tunisian Derja. ' +
-    'Use sales_summary (1 day), recent_activity (24h) and support_digest (24h). Structure: ' +
+    'Call sales_summary (1 day) ONCE and recent_activity (hours 12) ONCE, nothing else. Structure: ' +
     '1) the day in one line with revenue and orders vs yesterday; 2) what is still open tonight; ' +
     '3) 💡 one idea for tomorrow grounded in today\'s data; 4) a short warm sign-off. ' +
     'Save anything worth remembering. Short.',
@@ -364,6 +364,7 @@ async function runBriefsIfDue() {
   const now = local();
   const today = ymd(now);
   for (const kind of ['morning', 'evening']) {
+    if (!setting(`brief_${kind}`)) continue;
     const at = toMin(setting(`brief_${kind}`));
     const t = hm(now);
     // Fire in the first tick at or after the set time, once per day.

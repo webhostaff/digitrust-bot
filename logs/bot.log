@@ -15,3 +15,4 @@
 2026-09-25T02:03:46.623Z [INFO] [agent] support_digest({"hours":"24"})
 2026-09-25T02:03:46.624Z [INFO] [agent] remember({"text":"Owner wants daily digest in Derja","category":"owner"})
 2026-09-25T02:03:46.634Z [WARN] [agent] conversation chain expired — rebuilding from local history
+2026-09-25T10:12:57.318Z [ERROR] [agent] 💸 وصلت للحد اليومي ($0.01 — صرفت $0.01 اليوم). التنبيهات المجانية تكمّل تخدم. تنجم تزيد الحد من 🧠 ← 💸.

@@ -43,9 +43,12 @@ const API_KEY = PROVIDER === 'openai' ? OPENAI_KEY : ANTHROPIC_KEY;
  * costs one request per process, not one per message.
  */
 const CHAINS = {
+  // Cost first. Luna ($0.10 / $0.50 per 1M) answers everyday questions; Sol
+  // ($2 / $10) handles summaries and analysis. Astra ($10 / $50) is never used
+  // unless pinned with AGENT_MODEL_DEEP=gpt-6-astra — it burned the budget.
   openai: {
-    fast: ['gpt-6-sol', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-5.5', 'gpt-4o'],
-    deep: ['gpt-6-astra', 'gpt-6-sol', 'gpt-5.6-sol', 'gpt-5.5', 'gpt-4o'],
+    fast: ['gpt-6-luna', 'gpt-5.6-luna', 'gpt-6-sol', 'gpt-4o-mini'],
+    deep: ['gpt-6-sol', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-4o'],
   },
   anthropic: {
     fast: ['claude-sonnet-5', 'claude-sonnet-4-6'],
@@ -53,7 +56,8 @@ const CHAINS = {
   },
 };
 
-const EFFORT = { fast: 'low', deep: 'high' };
+// Reasoning tokens are billed as output. Medium is plenty for shop analysis.
+const EFFORT = { fast: 'low', deep: 'medium' };
 
 function belongsToProvider(m) {
   if (PROVIDER === 'openai') return !/^claude/i.test(m);
@@ -93,6 +97,48 @@ function stepDown(tier) {
 /** The gpt-4 family does not reason and lives on chat/completions. */
 const isReasoningOpenAI = (m) => !/^gpt-4/i.test(m);
 
+// ── Token budget ─────────────────────────────────────────────────────────────
+//
+// Every call's usage is added to today's total. Past the daily budget, Sahbi
+// stops calling the AI (the free rule alerts keep running) until tomorrow or
+// until the owner raises the budget in the app.
+
+const PRICES = { // $ per 1M tokens: [input, cached input, output]
+  'gpt-6-astra': [10, 1, 50], 'gpt-6-sol': [2, 0.2, 10], 'gpt-6-luna': [0.1, 0.01, 0.5],
+  'gpt-5.6-sol': [4, 0.4, 20], 'gpt-5.6-luna': [0.25, 0.025, 1.2], 'gpt-4o': [2.5, 1.25, 10],
+  'gpt-4o-mini': [0.15, 0.075, 0.6],
+  'claude-opus-5-5': [15, 1.5, 75], 'claude-sonnet-5': [3, 0.3, 15], 'claude-sonnet-4-6': [3, 0.3, 15],
+  'claude-haiku-4-5-20251001': [1, 0.1, 5],
+};
+
+const todayKey = () => `usage_${new Date().toISOString().slice(0, 10)}`;
+
+function usageToday() {
+  try { return JSON.parse(mem.getState(todayKey(), '') || '{}'); } catch (_) { return {}; }
+}
+
+function addUsage(model, inTok, cachedTok, outTok) {
+  const u = usageToday();
+  const [pi, pc, po] = PRICES[model] || [2, 0.2, 10];
+  const fresh = Math.max(0, (inTok || 0) - (cachedTok || 0));
+  u.input = (u.input || 0) + (inTok || 0);
+  u.cached = (u.cached || 0) + (cachedTok || 0);
+  u.output = (u.output || 0) + (outTok || 0);
+  u.calls = (u.calls || 0) + 1;
+  u.cost = Number(((u.cost || 0) + (fresh * pi + (cachedTok || 0) * pc + (outTok || 0) * po) / 1e6).toFixed(4));
+  mem.setState(todayKey(), JSON.stringify(u));
+  return u;
+}
+
+/** Daily spend ceiling in dollars, set from the app. 0 = no AI at all. */
+const budget = () => {
+  const v = parseFloat(mem.getState('daily_budget_usd', '0.50'));
+  return Number.isFinite(v) ? v : 0.5;
+};
+const overBudget = () => (usageToday().cost || 0) >= budget();
+
+class BudgetError extends Error {}
+
 /** Parameters a model refused, dropped from later calls to that model. */
 const refused = new Map(); // model → Set(param)
 const isRefused = (m, p) => (refused.get(m) || new Set()).has(p);
@@ -108,19 +154,18 @@ function refuse(m, p) {
  * look-ups and chat. Cheap to decide and right almost always — and the owner
  * can force either from the app.
  */
+// Deep only when the message clearly asks for reading a lot or reasoning —
+// everything else (greetings, look-ups, "who is waiting") goes to the cheap tier.
 const DEEP_HINTS = new RegExp([
-  'حوصل', 'لخص', 'ملخص', 'اقرا', 'إقرا', 'حلل', 'تحليل', 'قارن', 'علاش', 'لماذا', 'ليش',
-  'المحادثات', 'الكل', 'تقرير', 'خطة', 'استراتيج', 'نصيحة', 'تنصح', 'فكر', 'راجع',
-  'شهر', 'جمعة', 'أسبوع', 'اسبوع', 'احتيال', 'مشكل', 'مشاكل', 'توقع', 'ربح', 'خسار',
-  'summar', 'analy', 'report', 'compare', 'why', 'strategy', 'plan', 'advice', 'review',
-  'all (the )?(chats|conversations|messages)', 'week', 'month', 'fraud', 'profit', 'forecast',
-  'résum', 'analys', 'pourquoi', 'conseil',
+  'حوصل', 'لخص', 'ملخص', 'حلل', 'تحليل', 'قارن', 'تقرير', 'خطة', 'استراتيج', 'فكر بالعمق',
+  'summar', 'analy', 'report', 'compare', 'strategy', 'résum', 'analys',
 ].join('|'), 'i');
 
 function pickTier(text, mode) {
   if (mode === 'fast' || mode === 'deep') return mode;
   const t = String(text || '');
-  if (t.length > 280 || DEEP_HINTS.test(t)) return 'deep';
+  if (mem.getState('allow_deep', '1') !== '1') return 'fast';
+  if (t.length > 600 || DEEP_HINTS.test(t)) return 'deep';
   return 'fast';
 }
 
@@ -146,7 +191,7 @@ MEMORY — you are the one who never forgets
 - Older notes: recall_memory. Earlier talks with the owner: search_past_chats.
 
 HOW YOU WORK
-- Never guess a number. The LIVE SNAPSHOT below is real and current; for anything beyond it, call tools — several at once when the answer needs them.
+- Never guess a number. The LIVE SNAPSHOT below is real and current — answer from it WITHOUT tools whenever it is enough (greetings, "any messages?", "what's waiting"). Call tools only for what the snapshot does not show, and ask for small windows (hours: 12–24, not 720).
 - "Any messages?" / "summarise" / "what's new" / "هل في رسالة" / "شنوة صار": support_digest (24h unless they name a period) and recent_activity when useful. Then a real summary: who wrote, what each one wants, answered or not, what needs action now — most urgent first; group repeated issues; end with concrete next steps.
 - Cross-check claims: when a thread mentions an order, email or payment, look it up (customer_lookup, trace_payment, cgb_seats_of).
 - When the owner describes a customer from memory ("the guy asking about Canva yesterday"), find them with support_search — do not ask who. If several match, list them briefly and ask which. Say what you found before drafting anything.
@@ -174,15 +219,15 @@ function localNowString() {
 
 function buildInstructions(tier) {
   const snap = (() => { try { return liveSnapshot(); } catch (e) { return { error: e.message }; } })();
-  const m = mem.memoryForPrompt(tier === 'deep' ? 9000 : 5000);
+  const m = mem.memoryForPrompt(tier === 'deep' ? 3500 : 2000);
   let alerts = [];
-  try { alerts = require('./agentWatch').recentAlerts(5); } catch (_) {}
+  try { alerts = require('./agentWatch').recentAlerts(2); } catch (_) {}
   return `${PERSONA}
 
 NOW: ${localNowString()}
 
 RECENT ALERTS YOU SENT
-${alerts.length ? alerts.map((a) => `[${a.created_at}] ${String(a.content).slice(0, 600)}`).join('\n') : '(none)'}
+${alerts.length ? alerts.map((a) => `[${a.created_at}] ${String(a.content).slice(0, 400)}`).join('\n') : '(none)'}
 
 LIVE SNAPSHOT (computed this second from the database)
 ${JSON.stringify(snap)}
@@ -193,9 +238,9 @@ ${m.lines.length ? m.lines.join('\n') : '(empty — start filling it)'}`;
 
 /** The last turns as plain messages — for a fresh chain or a stateless provider. */
 function recap(excludeLastUser = true) {
-  const turns = mem.turnsSinceDivider(16);
+  const turns = mem.turnsSinceDivider(6);
   if (excludeLastUser && turns.length && turns[turns.length - 1].role === 'user') turns.pop();
-  return turns.map((t) => ({ role: t.role, content: String(t.content || '').slice(0, 4000) }));
+  return turns.map((t) => ({ role: t.role, content: String(t.content || '').slice(0, 1200) }));
 }
 
 // ── Access ───────────────────────────────────────────────────────────────────
@@ -210,7 +255,7 @@ function requireToken(req, res, next) {
 
 // ── Provider calls ───────────────────────────────────────────────────────────
 
-const MAX_ROUNDS = 16;
+const MAX_ROUNDS = 8;
 
 /** Read an axios error whose body is a stream, so its message can be inspected. */
 async function readErrorBody(e) {
@@ -325,7 +370,8 @@ function runTools(calls, emit, drafts, used) {
       drafts.push(out);
       emit({ type: 'draft', draft: out });
     }
-    return { id: c.id, output: JSON.stringify(out === undefined ? null : out).slice(0, 60000) };
+    // Tool results are the biggest input cost; 12k characters is ~3k tokens.
+    return { id: c.id, output: JSON.stringify(out === undefined ? null : out).slice(0, 12000) };
   });
 }
 
@@ -339,14 +385,16 @@ async function turnOpenAIResponses(text, tier, emit, signal, drafts, used) {
   let previous = mem.getState('openai_prev') || null;
   let input = previous ? [{ role: 'user', content: text }] : [...recap(), { role: 'user', content: text }];
   let reply = '';
+  let lastInput = 0;
 
   for (let round = 0; round < MAX_ROUNDS; round++) {
+    if (overBudget()) throw new BudgetError('budget');
     let response;
     try {
       response = await callWithFallback(tier, (model) => {
         const body = { model, instructions: buildInstructions(tier), input, tools };
         if (previous) body.previous_response_id = previous;
-        if (!isRefused(model, 'max_output_tokens')) body.max_output_tokens = tier === 'deep' ? 20000 : 6000;
+        if (!isRefused(model, 'max_output_tokens')) body.max_output_tokens = tier === 'deep' ? 6000 : 2500;
         if (!isRefused(model, 'reasoning')) body.reasoning = { effort: EFFORT[tier] };
         return streamResponse(body, (ev) => { if (ev.type === 'delta') reply += ev.text; emit(ev); }, signal);
       });
@@ -365,11 +413,17 @@ async function turnOpenAIResponses(text, tier, emit, signal, drafts, used) {
     }
 
     previous = response.id;
+    const us = response.usage || {};
+    addUsage(response.model || modelFor(tier), us.input_tokens, us.input_tokens_details?.cached_tokens, us.output_tokens);
+    lastInput = us.input_tokens || lastInput;
     const calls = (response.output || []).filter((o) => o.type === 'function_call')
       .map((c) => ({ id: c.call_id, name: c.name, args: parseArgs(c.arguments) }));
 
     if (!calls.length) {
-      mem.setState('openai_prev', previous);
+      // A chained conversation re-bills its whole history as input on every
+      // call. Once it grows past ~25k tokens, close it: the next message starts
+      // a fresh chain from a short recap (memory and snapshot carry the rest).
+      mem.setState('openai_prev', lastInput > 25000 ? null : previous);
       if (!reply) {
         reply = (response.output || []).filter((o) => o.type === 'message')
           .flatMap((o) => o.content || []).filter((c) => c.type === 'output_text')
@@ -392,9 +446,12 @@ async function turnOpenAIChat(text, tier, emit, signal, drafts, used) {
   }));
   const messages = [{ role: 'system', content: buildInstructions(tier) }, ...recap(), { role: 'user', content: text }];
   for (let round = 0; round < MAX_ROUNDS; round++) {
+    if (overBudget()) throw new BudgetError('budget');
     const res = await callWithFallback(tier, (model) => axios.post('https://api.openai.com/v1/chat/completions', {
-      model, messages, tools, tool_choice: 'auto', max_tokens: 4000,
+      model, messages, tools, tool_choice: 'auto', max_tokens: 1500,
     }, { headers: { Authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' }, timeout: 240000, signal }));
+    const u = res.data.usage || {};
+    addUsage(res.data.model || modelFor(tier), u.prompt_tokens, u.prompt_tokens_details?.cached_tokens, u.completion_tokens);
     const msg = res.data.choices[0].message;
     messages.push(msg);
     const calls = (msg.tool_calls || []).map((c) => ({ id: c.id, name: c.function.name, args: parseArgs(c.function.arguments) }));
@@ -419,12 +476,16 @@ async function turnAnthropic(text, tier, emit, signal, drafts, used) {
   }
 
   for (let round = 0; round < MAX_ROUNDS; round++) {
+    if (overBudget()) throw new BudgetError('budget');
     const res = await callWithFallback(tier, (model) => axios.post('https://api.anthropic.com/v1/messages', {
-      model, max_tokens: tier === 'deep' ? 12000 : 4000, system: buildInstructions(tier), tools, messages,
+      model, max_tokens: tier === 'deep' ? 4000 : 1500, system: buildInstructions(tier), tools, messages,
     }, {
       headers: { 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
       timeout: 240000, signal,
     }));
+    const u = res.data.usage || {};
+    addUsage(res.data.model || modelFor(tier), (u.input_tokens || 0) + (u.cache_read_input_tokens || 0),
+      u.cache_read_input_tokens, u.output_tokens);
     const content = res.data.content || [];
     messages.push({ role: 'assistant', content });
     const calls = content.filter((c) => c.type === 'tool_use').map((c) => ({ id: c.id, name: c.name, args: c.input }));
@@ -439,7 +500,7 @@ async function turnAnthropic(text, tier, emit, signal, drafts, used) {
 
 /** One owner message, end to end. */
 async function runTurn({ text, mode, emit, signal, proactive = null }) {
-  const tier = proactive ? 'deep' : pickTier(text, mode);
+  const tier = pickTier(text, mode);
   const drafts = [];
   const used = [];
   emit({ type: 'start', tier, model: modelFor(tier) });
@@ -459,10 +520,11 @@ async function runTurn({ text, mode, emit, signal, proactive = null }) {
 /** Sahbi speaking first (briefs). Continues the same conversation. */
 let proactiveBusy = false;
 async function proactiveTurn(prompt, kind) {
-  if (!API_KEY || proactiveBusy) return '';
+  if (!API_KEY || proactiveBusy || overBudget()) return '';
   proactiveBusy = true;
   try {
-    const r = await runTurn({ text: prompt, mode: 'deep', emit: () => {}, signal: undefined, proactive: kind });
+    // Briefs run on the cheap tier: they summarise data the tools already shaped.
+    const r = await runTurn({ text: prompt, mode: 'fast', emit: () => {}, signal: undefined, proactive: kind });
     return r.reply;
   } finally {
     proactiveBusy = false;
@@ -470,6 +532,11 @@ async function proactiveTurn(prompt, kind) {
 }
 
 function explainError(e) {
+  if (e instanceof BudgetError) {
+    const u = usageToday();
+    return `💸 وصلت للحد اليومي ($${budget().toFixed(2)} — صرفت $${(u.cost || 0).toFixed(2)} اليوم). ` +
+      `التنبيهات المجانية تكمّل تخدم. تنجم تزيد الحد من 🧠 ← 💸.`;
+  }
   const status = e.response?.status;
   const detail = e.agentMessage || e.response?.data?.error?.message || e.message;
   if (status === 401) return `مفتاح ${PROVIDER} مرفوض — ثبّت ${PROVIDER === 'openai' ? 'OPENAI_API_KEY' : 'ANTHROPIC_API_KEY'} في Railway. (${detail})`;
@@ -553,12 +620,24 @@ router.post('/reset', requireToken, (req, res) => {
 router.get('/brief', requireToken, (req, res) => {
   let snap = {};
   try { snap = liveSnapshot(); } catch (_) {}
-  res.json({ snapshot: snap, memory: mem.listMemory(1000).length,
+  res.json({ snapshot: snap, memory: mem.listMemory(1000).length, usage: usageToday(), budget: budget(),
     models: { fast: modelFor('fast'), deep: modelFor('deep') }, provider: PROVIDER, now: localNowString() });
 });
 
-router.get('/settings', requireToken, (req, res) => res.json(require('./agentWatch').allSettings()));
-router.post('/settings', requireToken, (req, res) => res.json(require('./agentWatch').saveSettings(req.body || {})));
+function costSettings() {
+  return { daily_budget_usd: String(budget()), allow_deep: mem.getState('allow_deep', '1'), usage_today: usageToday() };
+}
+router.get('/settings', requireToken, (req, res) =>
+  res.json({ ...require('./agentWatch').allSettings(), ...costSettings() }));
+router.post('/settings', requireToken, (req, res) => {
+  const b = req.body || {};
+  if (b.daily_budget_usd !== undefined) {
+    const v = Math.max(0, Math.min(100, parseFloat(b.daily_budget_usd) || 0));
+    mem.setState('daily_budget_usd', String(v));
+  }
+  if (b.allow_deep !== undefined) mem.setState('allow_deep', b.allow_deep === '1' || b.allow_deep === true ? '1' : '0');
+  res.json({ ...require('./agentWatch').saveSettings(b), ...costSettings() });
+});
 
 /** "Give me the brief now" from the app — same brief, on demand. */
 router.post('/brief/now', requireToken, async (req, res) => {

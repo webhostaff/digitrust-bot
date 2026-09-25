@@ -56,8 +56,17 @@ function escapeHtml(s) {
   return String(s == null ? '' : s).replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
 }
 
+/**
+ * The calendar day as written on the Date, never shifted.
+ *
+ * toISOString() converts to UTC first. Cycle dates are wall-clock midnights,
+ * so on a server whose TZ is not UTC (TZ=Africa/Tunis, say) "26 Sep 00:00"
+ * came out as "2026-09-25" — a seat bought between cycles was recorded as
+ * starting today instead of on the cycle's start day.
+ */
 function formatDate(d) {
-  return d.toISOString().slice(0, 10);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
 /**

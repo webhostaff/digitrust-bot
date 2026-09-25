@@ -1110,3 +1110,50 @@ The gpt-4 family stays on chat/completions.
 * App → 🧠 → 🔔: toggles, wait threshold, quiet hours, brief times,
   "☀️ brief now" and "🔍 check now". Routes: `/agent/settings`,
   `/agent/brief/now`, `/agent/watch/now`.
+
+# Part 26 — Token diet
+
+* Models: fast = `gpt-6-luna` ($0.10/$0.50 per 1M), deep = `gpt-6-sol` ($2/$10).
+  Astra ($10/$50) is no longer in any chain — pin `AGENT_MODEL_DEEP` to use it.
+  Reasoning effort: fast low, deep medium.
+* Deep tier only for explicit summary/analysis words (or long messages, or the
+  🧠 button); can be disabled entirely in the app.
+* Conversation chain closed once its input passes 25k tokens (a chained
+  response re-bills the whole history every call).
+* Smaller everything: 8 tool rounds, tool results capped at 12k chars,
+  support_digest 25 threads × 8 messages × 220 chars, recap 6 turns, memory
+  2–3.5k chars, 2 recent alerts, output caps 2.5k / 6k.
+* Snapshot answers greetings and "what's waiting" with no tool call.
+* Usage and cost tracked per day (`agent_state usage_YYYY-MM-DD`); daily cap
+  (default $0.50) stops every AI call once reached — rule alerts keep running.
+  Shown in the app header and in 🧠 → 🔔.
+* AI briefs are opt-in, one per day, on the cheap tier, with a fixed tool budget.
+
+# Part 27 — Seat start date shifted a day on non-UTC servers
+
+`chatgpt-bot.js formatDate` used `toISOString()`, which converts to UTC first.
+Cycle dates are wall-clock midnights, so with `TZ` set to anything east of UTC
+(e.g. `Africa/Tunis`) a seat bought between cycles was stored as starting
+today (25) instead of the cycle start (26), and its card was red instead of
+blue. It now formats the calendar day as written. Verified under UTC,
+Africa/Tunis, Europe/Paris and America/New_York.
+
+# Part 28 — The running cycle wins
+
+`calculateBestCycle` picked the cycle with the most days even if it had not
+started yet, so a buyer on the 25th was pushed to the cycle opening on the 26th.
+Now a cycle running today always wins (most days left among the running ones);
+a cycle that has not started is used only when none is running. The cycles
+panel marks cycles that have not started yet.
+
+# Part 29 — Each cycle's renewal time
+
+* `billing_cycles.start_time` ("HH:MM", shop clock; NULL = 00:00).
+* Cycles panel: under each cycle, "⏱ Day N: press at billing time". Pressed on
+  the cycle's start day, it records the current time; on any other day it
+  refuses. Afterwards the button reads "⏱ Day N renews at 14:32 · reset".
+* Before the recorded time on the start day, the new cycle has not opened:
+  buyers join the running cycle. From that minute on, they join the new one.
+* `localNow` now removes the server's own timezone before applying the shop
+  offset, so shop time is right whatever `TZ` the server has (it was shifted
+  twice on non-UTC servers).

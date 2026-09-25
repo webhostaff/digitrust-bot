@@ -278,12 +278,14 @@ const TOOLS = {
       'with its messages in order. Use for "summarise the chats", "what happened ' +
       'today", "who is waiting", or before answering anything about support as a whole.',
     input: {
-      hours: 'how far back, default 24 (max 720)',
-      max_customers: 'default 60',
+      hours: 'how far back, default 24 (max 168)',
+      max_customers: 'default 25',
     },
-    run: ({ hours = 24, max_customers = 60 }) => {
-      const h = Math.min(720, Math.max(1, Number(hours) || 24));
-      const cap = Math.min(150, Math.max(1, Number(max_customers) || 60));
+    run: ({ hours = 24, max_customers = 25 }) => {
+      // Kept small on purpose: this is the most expensive tool by far, and the
+      // newest messages of each thread carry the story.
+      const h = Math.min(168, Math.max(1, Number(hours) || 24));
+      const cap = Math.min(40, Math.max(1, Number(max_customers) || 25));
       try {
         const users = raw.prepare(`
           SELECT m.user_id,
@@ -304,7 +306,7 @@ const TOOLS = {
           SELECT direction, content, media_type, created_at FROM support_messages
           WHERE user_id = ? AND created_at >= datetime('now', '-' || ? || ' hours')
             AND deleted_at IS NULL
-          ORDER BY id DESC LIMIT 80
+          ORDER BY id DESC LIMIT 8
         `);
 
         const threads = users.map((u) => {
@@ -319,7 +321,7 @@ const TOOLS = {
             messages: rows.map((r) => ({
               from: r.direction === 'in' ? 'customer' : 'support',
               at: r.created_at,
-              text: String(r.content || (r.media_type ? `[${r.media_type}]` : '')).slice(0, 600),
+              text: String(r.content || (r.media_type ? `[${r.media_type}]` : '')).slice(0, 220),
             })),
           };
         });
@@ -476,7 +478,11 @@ const TOOLS = {
     run: () => ({
       cycle: (() => {
         const c = require('../services/cgbCycles').calculateBestCycle();
-        return c ? { ends: c.endDate.toISOString().slice(0, 16), days_left: c.daysRemaining } : null;
+        if (!c) return null;
+        const p2 = (n) => String(n).padStart(2, '0');
+        const f = (d) => `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`;
+        return { starts: f(c.startDate || new Date()), ends: f(c.endDate), days_left: c.daysRemaining,
+                 cycle_days: c.cycleLength, between_cycles: !!c.inGap };
       })(),
       monthly_price: require('../services/cgbCycles').getMonthlyPrice(),
       paid_renewals: db.getCgbRenewals(10),
@@ -594,7 +600,7 @@ TOOLS.recent_activity = {
       (r) => ({ id: r.id, what: `${r.type}: ${clean(r.title)} ${r.is_read ? '' : '(unread)'} — ${clean(String(r.body || '')).slice(0, 160)}` }));
 
     ev.sort((a, b) => String(b.at).localeCompare(String(a.at)));
-    return { hours: h, events: ev.length, timeline: ev.slice(0, 150) };
+    return { hours: h, events: ev.length, timeline: ev.slice(0, 60) };
   },
 };
 
