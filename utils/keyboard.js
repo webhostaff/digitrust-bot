@@ -336,6 +336,7 @@ const adminMainKb = () => mk([
   [btn('👥 Users',           'admin_users'),          btn('📣 Broadcast',    'admin_broadcast')],
   [btn('📊 Statistics',      'admin_stats'),          btn('📈 Profits',      'admin_profits')],
   [btn('🕐 Best Selling Hours', 'admin_besttime'), btn('🔌 API Sales', 'admin_apisales')],
+  [btn('🤖 AI Assistant', 'admin_assistant')],
   [btn('🏦 Customer Wallets', 'admin_treasury')],
   [btn('🎫 Tickets',         'admin_tickets'),        btn('💸 Refund',       'admin_refund')],
   [btn('📢 Announcement',    'admin_announcement'),   btn('⚙️ Settings',     'admin_settings')],

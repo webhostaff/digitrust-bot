@@ -1,6 +1,6 @@
 {
   "name": "digitrust-bot",
-  "version": "61.0.0",
+  "version": "86.0.0",
   "description": "Digital products store Telegram bot with manual USDT BEP20 deposits verified via Etherscan API V2",
   "main": "index.js",
   "scripts": {

@@ -101,12 +101,66 @@ function manualCycleLocal(localFrom) {
     // Hours matter here, but a subscription is still sold in whole days, so a
     // part-day is rounded up — never down, which would short the customer.
     daysRemaining: Math.max(1, Math.ceil((end - localFrom) / 86400000)),
+    startDate: new Date(new Date(localFrom).setHours(0, 0, 0, 0)),
+    inGap: false,
+    cycleLength: 30,
   };
 }
 
 /** Public form: converts to shop-local time first. */
 function manualCycle(from = new Date()) {
   return manualCycleLocal(localNow(from));
+}
+
+/**
+ * A calendar day, clamped to the month's last day.
+ *
+ * A cycle on day 31 has no 31st in September; JavaScript would silently roll
+ * that over to October 1st and quote a period a day off. Clamping keeps it on
+ * the last day of the month, which is what "day 31" means to a person.
+ */
+function dayIn(y, m, d, h = 0, min = 0) {
+  const last = new Date(y, m + 1, 0).getDate();
+  return new Date(y, m, Math.min(d, last), h, min, 0, 0);
+}
+
+const DAY_MS = 86400000;
+
+/**
+ * The period a purchase made at `from` belongs to, for one cycle.
+ *
+ * Both ends of the cycle are used. The old code read only end_day, so a cycle
+ * of 26 -> 24 was treated as "ends on the 24th" and a buyer on the 25th — a day
+ * that belongs to no cycle — was sold a period starting that same day. Now:
+ *
+ *   - inside a cycle: the period runs from today to the cycle end;
+ *   - in the gap between two cycles: it starts on the next start day, and the
+ *     customer gets (and pays for) the whole cycle.
+ *
+ * cycleLength is the real length of THIS cycle (29 days for 26 Sep -> 24 Oct),
+ * so the price is the monthly rate split over the days the cycle actually has,
+ * not over a fixed 30.
+ */
+function evaluateCycle(cycle, from, bh, bm) {
+  const today = new Date(from);
+  today.setHours(0, 0, 0, 0);
+
+  // Next boundary at or after `from`. Compared against `from`, not midnight: on
+  // the boundary day itself the cycle is open until the chosen time.
+  let endDate = dayIn(today.getFullYear(), today.getMonth(), cycle.end_day, bh, bm);
+  if (endDate < from) endDate = dayIn(today.getFullYear(), today.getMonth() + 1, cycle.end_day, bh, bm);
+
+  // The start of the period that end closes: the latest start day before it.
+  let periodStart = dayIn(endDate.getFullYear(), endDate.getMonth(), cycle.start_day);
+  if (periodStart >= endDate) periodStart = dayIn(endDate.getFullYear(), endDate.getMonth() - 1, cycle.start_day);
+
+  const inGap = periodStart > today;
+  const startDate = inGap ? periodStart : today;
+
+  const cycleLength = Math.max(1, Math.ceil((endDate - periodStart) / DAY_MS));
+  const daysRemaining = Math.max(1, Math.ceil((endDate - startDate) / DAY_MS));
+
+  return { cycle, endDate, startDate, periodStart, inGap, cycleLength, daysRemaining };
 }
 
 /**
@@ -126,24 +180,7 @@ function calculateBestCycle(from = new Date()) {
   }
 
   const [bh, bm] = boundaryTime();
-  const today = new Date(from);
-  today.setHours(0, 0, 0, 0);
-
-  const evaluated = getCycles().map((cycle) => {
-    let endDate = new Date(today.getFullYear(), today.getMonth(), cycle.end_day, bh, bm, 0, 0);
-    // Compare against `from`, not midnight: on the boundary day itself the
-    // cycle is still open until the chosen time, and treating it as already
-    // past would silently roll every buyer into next month.
-    if (endDate < from) {
-      endDate = new Date(today.getFullYear(), today.getMonth() + 1, cycle.end_day, bh, bm, 0, 0);
-    }
-    return {
-      cycle,
-      endDate,
-      daysRemaining: Math.max(1, Math.ceil((endDate - today) / 86400000)),
-    };
-  });
-
+  const evaluated = getCycles().map((cycle) => evaluateCycle(cycle, from, bh, bm));
   if (!evaluated.length) return null;
 
   let best = evaluated[0];
@@ -151,6 +188,41 @@ function calculateBestCycle(from = new Date()) {
 
   best.all = evaluated;
   return best;
+}
+
+/**
+ * What `days` of this period cost at a monthly rate.
+ *
+ * The rate is split over the cycle's real length, so a full cycle always costs
+ * exactly the monthly price whether that cycle has 28, 29, 30 or 31 days.
+ * Periods with no cycle behind them (a manual end) fall back to 30.
+ */
+function priceFor(days, cycleLength, monthly) {
+  const len = cycleLength > 0 ? cycleLength : 30;
+  return Number(((days / len) * monthly).toFixed(2));
+}
+
+/** Price of the period `best` describes. */
+function pricePeriod(best, monthly) {
+  if (!best) return 0;
+  return priceFor(best.daysRemaining, best.cycleLength, monthly);
+}
+
+/**
+ * One more whole cycle after `endDate` — the "Add a full month" option.
+ *
+ * Lands on the cycle's own end day a month later rather than adding a flat 30
+ * days, which drifted off the cycle and left the seat ending mid-cycle.
+ */
+function oneMoreCycle(best) {
+  const [bh, bm] = boundaryTime();
+  if (best.cycle && best.cycle.end_day && best.cycle.start_day) {
+    // The cycle that follows, measured on its own days — a gap day between the
+    // two cycles belongs to neither and is not counted as sold.
+    const next = evaluateCycle(best.cycle, new Date(best.endDate.getTime() + 60000), bh, bm);
+    return { endDate: next.endDate, days: next.cycleLength };
+  }
+  return { endDate: new Date(best.endDate.getTime() + 30 * DAY_MS), days: 30 };
 }
 
 /**
@@ -180,6 +252,7 @@ function nextCycleAfterCurrent(from = new Date()) {
   return {
     endDate: next,
     daysRemaining: Math.max(1, Math.ceil((next - now) / 86400000)),
+    cycleLength: Math.max(1, Math.round((next - end) / 86400000)),
     replaces: current,
   };
 }
@@ -213,4 +286,4 @@ function globalMonthlyPrice() {
   }
 }
 
-module.exports = { getCycles, calculateBestCycle, getMonthlyPrice, manualCycle, nextCycleAfterCurrent, boundaryTime, localNow, tzOffsetMinutes };
+module.exports = { getCycles, calculateBestCycle, priceFor, pricePeriod, oneMoreCycle, getMonthlyPrice, manualCycle, nextCycleAfterCurrent, boundaryTime, localNow, tzOffsetMinutes };

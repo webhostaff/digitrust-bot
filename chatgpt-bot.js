@@ -154,9 +154,9 @@ function orderCard(d, activated = false, scheduled = false) {
     (activated
       ? `✅ <i>Activated on ${d.activatedAt || 'now'}. The customer has been told.</i>\n`
       : scheduled
-        ? `🗓 <i>Their current seat runs to ${d.startDate}. Activate this one when ` +
-          `that date arrives — pressing the button now tells them it is live ` +
-          `before it is.</i>\n`
+        ? `🗓 <i>This seat starts on ${d.startDate} (a renewal, or bought between ` +
+          `two cycles). Activate it when that date arrives — pressing the button ` +
+          `now tells them it is live before it is.</i>\n`
         : `⬇️ <b>Activate the seat, then press the button below.</b>\n`) +
     `${band}`
   );
@@ -232,11 +232,14 @@ async function showCalculation(chatId, userId, extraMonth = false) {
 
   // Per-customer rate when one is set, otherwise the shop rate.
   const monthlyPrice = getMonthlyPrice(userId);
-  const basePrice = Number(((best.daysRemaining / 30) * monthlyPrice).toFixed(2));
+  // Split over the cycle's real length, so a full cycle costs exactly the
+  // monthly price. The extra month is the NEXT whole cycle, not a flat 30 days.
+  const basePrice = cgbCycles.pricePeriod(best, monthlyPrice);
+  const extra = cgbCycles.oneMoreCycle(best);
   const finalPrice = extraMonth ? Number((basePrice + monthlyPrice).toFixed(2)) : basePrice;
-  const endDate = extraMonth
-    ? new Date(best.endDate.getTime() + 30 * 24 * 60 * 60 * 1000)
-    : best.endDate;
+  const endDate = extraMonth ? extra.endDate : best.endDate;
+  // A purchase between two cycles starts on the next start day, not today.
+  const startDate = best.startDate || new Date();
 
   const upcoming = calculateNextCycleStarts();
   const upcomingTxt = upcoming.slice(0, 3).map(u =>
@@ -244,12 +247,14 @@ async function showCalculation(chatId, userId, extraMonth = false) {
   ).join('\n');
 
   const today = new Date();
-  const totalDays = extraMonth ? best.daysRemaining + 30 : best.daysRemaining;
+  const totalDays = extraMonth ? best.daysRemaining + extra.days : best.daysRemaining;
 
   const txt =
     `👋 <b>ChatGPT Business Subscription</b>\n\n` +
     `📦 <b>Product:</b> ChatGPT Business Seat\n` +
-    `📅 <b>Today:</b> ${formatDisplayDate(today)}\n` +
+    (best.inGap
+      ? `📅 <b>Subscription starts:</b> ${formatDisplayDate(startDate)} <i>(start of the next cycle)</i>\n`
+      : `📅 <b>Starts:</b> today, ${formatDisplayDate(today)}\n`) +
     `📅 <b>Subscription ends:</b> ${formatDisplayDate(endDate)}\n` +
     `⏳ <b>Days you'll get:</b> ${totalDays} day${totalDays === 1 ? '' : 's'}\n` +
     `💰 <b>Price:</b> $${finalPrice.toFixed(2)}\n\n` +
@@ -261,16 +266,19 @@ async function showCalculation(chatId, userId, extraMonth = false) {
     // purchase that needs no delaying, on the screen where they were about to
     // buy. 28 rather than 30, because a day or two short is not worth waiting
     // a month for either.
-    (totalDays >= 28 || extraMonth
+    // Measured against the cycle's own length: February's cycle is 27 days,
+    // and a fixed 28 would tell someone buying all of it to wait for more.
+    (best.daysRemaining >= (best.cycleLength || 30) - 2 || extraMonth
       ? ''
       : `💡 <i>For a full month at $${monthlyPrice}, wait for one of these dates:</i>\n${upcomingTxt}`);
 
   setSession(userId, 'AWAITING_ACTION', {
     daysRemaining: best.daysRemaining,
     extraMonth,
+    extraDays: extra.days,
     basePrice,
     finalPrice,
-    startDate: formatDate(today),
+    startDate: formatDate(startDate),
     endDate: formatDate(endDate),
     monthlyPrice,
   });
@@ -801,7 +809,7 @@ bot.onText(/^\/setprice(?:\s+(.+))?$/i, async (msg, match) => {
     queries.setCgbUserPrice(target, price, note, msg.from.id);
 
     const best = cgbCycles.calculateBestCycle();
-    const now  = best ? (best.daysRemaining / 30) * price : 0;
+    const now  = best ? cgbCycles.pricePeriod(best, price) : 0;
     const u = db.prepare('SELECT username, first_name FROM users WHERE telegram_id = ?').get(target);
 
     await bot.sendMessage(chatId,
@@ -1260,7 +1268,7 @@ bot.on('callback_query', async (q) => {
       try {
         const newSubId = queries.createCgbSubscription(
           orderId, userId, s.email, s.startDate, s.endDate,
-          s.daysRemaining + (s.extraMonth ? 30 : 0),
+          s.daysRemaining + (s.extraMonth ? (s.extraDays || 30) : 0),
           s.basePrice, s.extraMonth ? 1 : 0, s.finalPrice
         );
         // Records which seat this renews, so the history of one email stays
@@ -1366,7 +1374,7 @@ bot.on('callback_query', async (q) => {
       try {
         const newSubId = queries.createCgbSubscription(
           orderId, userId, s.email, s.startDate, s.endDate,
-          s.daysRemaining + (s.extraMonth ? 30 : 0),
+          s.daysRemaining + (s.extraMonth ? (s.extraDays || 30) : 0),
           s.basePrice, s.extraMonth ? 1 : 0, s.finalPrice
         );
         // Records which seat this renews, so the history of one email stays
@@ -1564,7 +1572,7 @@ bot.on('message', async (msg) => {
       `📧 Email: <code>${escapeHtml(text)}</code>\n` +
       `📅 From: ${s.startDate}\n` +
       `📅 To: ${s.endDate}\n` +
-      `⏳ Duration: ${s.daysRemaining + (s.extraMonth ? 30 : 0)} days\n` +
+      `⏳ Duration: ${s.daysRemaining + (s.extraMonth ? (s.extraDays || 30) : 0)} days\n` +
       `💰 <b>Total: $${s.finalPrice.toFixed(2)}</b>\n` +
       `👛 Your balance: <b>$${balance.toFixed(2)}</b>\n\n` +
       `Select payment method:`;
@@ -1737,7 +1745,7 @@ async function confirmPayment(chatId, userId, orderId, txid, sessionData) {
   try {
     const user = db.prepare('SELECT username, first_name FROM users WHERE telegram_id=?').get(userId);
     const name = user?.username ? '@' + user.username : (user?.first_name || `User ${userId}`);
-    const totalDays = sessionData.daysRemaining + (sessionData.extraMonth ? 30 : 0);
+    const totalDays = sessionData.daysRemaining + (sessionData.extraMonth ? (sessionData.extraDays || 30) : 0);
 
     // Payment method label
     const paymentMethod = sessionData.paymentMethod || 'unknown';

@@ -527,8 +527,15 @@ bot.onText(/^\/(?:txid|trace)(?:\s+(.+))?$/i, async (msg, match) => {
  * not a real address, and it rejects the WHOLE message with it, so an unset
  * domain used to make the entire API screen vanish rather than show a dead link.
  */
+/** Scheme + host only: every caller appends its own path (/api/v2, /agent). */
+function originOnly(v) {
+  const t = String(v || '').trim();
+  if (!t) return '';
+  try { return new URL(t).origin; } catch (_) { return t.replace(/\/+$/, ''); }
+}
+
 function resolveApiBase() {
-  const manual = String(db.getSetting('api_base_url', '') || '').trim().replace(/\/+$/, '');
+  const manual = originOnly(db.getSetting('api_base_url', ''));
   if (manual) return manual;
 
   // Railway exposes the generated domain here. RAILWAY_STATIC_URL is the older
@@ -611,8 +618,14 @@ bot.onText(/^\/apibase(?:\s+(\S+))?$/i, async (msg, match) => {
     await bot.sendMessage(msg.chat.id, '❌ Must start with https:// and contain a real domain.');
     return;
   }
-  db.setSetting('api_base_url', v.replace(/\/+$/, ''));
-  await bot.sendMessage(msg.chat.id, `✅ Set to <code>${escapeHtml(v)}</code>\n\nRun /apicheck to test it.`, { parse_mode: 'HTML' });
+  // Paths are dropped: the API and the assistant add their own, and a saved
+  // /api/v2 turned the assistant link into /api/v2/agent — a "Not found".
+  const clean = originOnly(v);
+  db.setSetting('api_base_url', clean);
+  await bot.sendMessage(msg.chat.id,
+    `✅ Set to <code>${escapeHtml(clean)}</code>` +
+    (clean !== v.replace(/\/+$/, '') ? `\n<i>(path removed — only the domain is needed)</i>` : '') +
+    `\n\nRun /apicheck to test it.`, { parse_mode: 'HTML' });
 });
 
 /**

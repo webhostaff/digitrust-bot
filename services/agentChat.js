@@ -34,8 +34,29 @@ const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
 const PROVIDER = (process.env.AGENT_PROVIDER || '').toLowerCase()
   || (ANTHROPIC_KEY ? 'anthropic' : (OPENAI_KEY ? 'openai' : ''));
 
-const MODEL = process.env.AGENT_MODEL
-  || (PROVIDER === 'openai' ? 'gpt-4o' : 'claude-sonnet-4-6');
+const DEFAULT_MODEL = PROVIDER === 'openai' ? 'gpt-4o' : 'claude-sonnet-4-6';
+
+/**
+ * AGENT_MODEL, unless it names the other provider's model.
+ *
+ * A Claude model name sent to OpenAI (or a GPT name sent to Anthropic) comes
+ * back as a 404 "model not found" on every single message, which reads as the
+ * assistant itself being missing. The provider is decided by which key is set,
+ * so a mismatched model is always a configuration slip — fall back and warn.
+ */
+function pickModel() {
+  const want = String(process.env.AGENT_MODEL || '').trim();
+  if (!want) return DEFAULT_MODEL;
+  const looksClaude = /^claude/i.test(want);
+  const looksOpenAI = /^(gpt|o\d|chatgpt)/i.test(want);
+  if ((PROVIDER === 'openai' && looksClaude) || (PROVIDER === 'anthropic' && looksOpenAI)) {
+    logger.warn(`[agent] AGENT_MODEL=${want} does not belong to ${PROVIDER}; using ${DEFAULT_MODEL}`);
+    return DEFAULT_MODEL;
+  }
+  return want;
+}
+
+const MODEL = pickModel();
 
 const API_KEY = PROVIDER === 'openai' ? OPENAI_KEY : ANTHROPIC_KEY;
 
@@ -219,6 +240,7 @@ router.post('/chat', requireToken, async (req, res) => {
   if (!text) return res.status(400).json({ error: 'Empty message' });
 
   const history = sessions.get(sid) || [];
+  const before = history.length;
   history.push({ role: 'user', content: text });
 
   try {
@@ -229,7 +251,19 @@ router.post('/chat', requireToken, async (req, res) => {
     sessions.set(sid, history);
     res.json({ reply, drafts });
   } catch (e) {
-    const detail = e.response?.data?.error?.message || e.message;
+    const status = e.response?.status;
+    let detail = e.response?.data?.error?.message || e.message;
+    // A 404 from the AI provider means the MODEL was not found, not this page.
+    if (status === 404) {
+      detail = `The ${PROVIDER} model "${MODEL}" was not found. Fix or remove AGENT_MODEL ` +
+               `in Railway → Variables, then redeploy. (${detail})`;
+    } else if (status === 401) {
+      detail = `The ${PROVIDER} API key was rejected. Check ${PROVIDER === 'openai' ? 'OPENAI_API_KEY' : 'ANTHROPIC_API_KEY'}. (${detail})`;
+    }
+    // Roll the failed turn back entirely — the question and any half-finished
+    // tool calls — so the next message starts from a clean, valid history.
+    history.length = before;
+    sessions.set(sid, history);
     logger.error(`[agent] ${detail}`);
     res.status(500).json({ error: detail });
   }
@@ -314,11 +348,37 @@ self.addEventListener('fetch', e => {
 // ── The phone interface ──────────────────────────────────────────────────────
 // Served as one self-contained page so it can be added to a home screen and
 // opened like an app, with no build step and nothing to install.
+// Reachability probe for the admin panel. Carries no data and needs no token.
+router.get('/ping', (req, res) => res.json({ ok: true, service: 'shop-assistant' }));
+
 router.get('/', (req, res) => {
+  // The page calls chat, approve, manifest.json… by RELATIVE path. Opened as
+  // /agent (no slash) those resolve to /chat, /approve at the site root, which
+  // do not exist — every message fails. Force the slash so they stay under
+  // /agent/ whatever the browser did to the link.
+  const [pathPart, query] = req.originalUrl.split('?');
+  if (!pathPart.endsWith('/')) {
+    return res.redirect(302, `${pathPart}/${query ? `?${query}` : ''}`);
+  }
   if ((req.query.t || '') !== ACCESS_TOKEN) {
+    // Reached by typing the domain by hand, or by an installed app whose token
+    // changed on a redeploy. The old message said only "token required", which
+    // explains nothing about how to get one.
+    const generated = !process.env.AGENT_TOKEN;
     return res.status(401).type('html').send(
-      '<body style="font:16px system-ui;padding:2rem;background:#0f1115;color:#e6e6e6">' +
-      '<h3>🔒 Token required</h3><p>Open the link from /agent in your bot.</p></body>'
+      `<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{font:16px/1.7 -apple-system,system-ui,sans-serif;margin:0;padding:32px 24px;
+background:#0b0e14;color:#eef1f6}h3{margin:0 0 6px}p{color:#8b95a7;margin:14px 0}
+code{background:#151a23;border:1px solid #242b38;border-radius:6px;padding:2px 7px;font-size:14px}
+b{color:#eef1f6}</style></head><body>
+<h3>🔒 This link needs its access token</h3>
+<p>Open it from your bot: <b>/admin → 🤖 AI Assistant → Open Assistant</b>.
+The link there carries the token.</p>
+${generated ? `<p>⚠️ Your token is regenerated on every deploy, so an installed
+app stops working after each one. Add <code>AGENT_TOKEN</code> in Railway with
+any long random text to fix that permanently, then reinstall from the fresh link.</p>` : ''}
+</body></html>`
     );
   }
   res.type('html').send(PAGE.replace('__TOKEN__', ACCESS_TOKEN));
@@ -574,4 +634,62 @@ document.getElementById('reset').onclick=async()=>{
 };
 </script></body></html>`;
 
-module.exports = { router, ACCESS_TOKEN };
+/**
+ * Everything the admin panel needs to decide what to show.
+ *
+ * The base URL is resolved here rather than passed in, so the link the panel
+ * offers and the link the app opens are built from the same source and cannot
+ * drift apart.
+ */
+function originOf(v) {
+  const t = String(v || '').trim();
+  if (!t) return '';
+  try { return new URL(/^https?:\/\//i.test(t) ? t : `https://${t}`).origin; } catch (_) { return ''; }
+}
+
+/**
+ * Ask the public address whether it really serves the assistant.
+ *
+ * "Configured" and "reachable" are different claims. The link can point at a
+ * domain that belongs to another service, an old deploy without /agent, or a
+ * domain Railway no longer routes — all of which open "Not found". Checking
+ * from the server turns that into a reason on the admin screen.
+ */
+async function probeAgent(base) {
+  if (!base) return { ok: false, reason: 'no base' };
+  try {
+    const r = await axios.get(`${base}/agent/ping`, { timeout: 6000, validateStatus: () => true });
+    if (r.status === 200 && r.data && r.data.service === 'shop-assistant') return { ok: true };
+    return { ok: false, status: r.status, reason: `HTTP ${r.status}` };
+  } catch (e) {
+    return { ok: false, reason: e.code || e.message };
+  }
+}
+
+function agentConfig() {
+  const manual = String(require('../database/queries').getSetting('api_base_url', '') || '')
+    .trim().replace(/\/+$/, '');
+  const railway = process.env.RAILWAY_PUBLIC_DOMAIN || process.env.RAILWAY_STATIC_URL || '';
+  const fromEnv = railway
+    ? (railway.startsWith('http') ? railway.replace(/\/+$/, '') : `https://${railway}`)
+    : String(config.publicBaseUrl || '').trim().replace(/\/+$/, '');
+
+  // Only the origin is kept. A base saved with a path — /apibase
+  // https://x.up.railway.app/api/v2, say — produced /api/v2/agent/, which is
+  // not a route, and the button opened a "Not found" page.
+  const base = originOf(manual || fromEnv);
+  const real = /^https?:\/\/[^\s/]+\.[^\s/]+/.test(base);
+
+  return {
+    base: real ? base : '',
+    url: real ? `${base}/agent/?t=${ACCESS_TOKEN}` : '',
+    hasKey: !!API_KEY,
+    provider: PROVIDER,
+    model: MODEL,
+    // A generated token changes on every deploy, so an installed app would stop
+    // working after each one — worth warning about before that happens.
+    fixedTok: !!process.env.AGENT_TOKEN,
+  };
+}
+
+module.exports = { router, ACCESS_TOKEN, agentConfig, probeAgent };

@@ -1009,3 +1009,31 @@ Two layers:
 Centralising it in the verifier is the important half: a guard each caller has
 to remember will eventually be forgotten again — that is exactly how this one
 got through.
+
+---
+
+# Part 21 — Billing cycles use both ends; AI Assistant "Not found"
+
+## Cycles
+`calculateBestCycle` read only `end_day`. A cycle of 26 → 24 was treated as
+"ends on the 24th", so a buyer on the 25th (a day in no cycle) was sold a
+period starting that same day, and every price was split over a fixed 30.
+
+Now, in `services/cgbCycles.js`:
+* Inside a cycle: the period runs from today to the cycle end.
+* Between two cycles: it starts on the next start day, at full price. The order
+  card is blue (paid early) until that day.
+* Price = monthly × days ÷ **the cycle's real length** (29 days for 26 Sep → 24 Oct),
+  so a whole cycle always costs exactly the monthly price.
+* "Add a full month" adds the next whole cycle, not a flat 30 days.
+* Day 31 clamps to the month's last day instead of rolling into the next month.
+
+## AI Assistant
+* The admin button now tests `<domain>/agent/ping` before showing the link, and
+  says why it fails (wrong `/apibase`, domain on another service, old deploy).
+* `/apibase` and the assistant keep only the domain — a saved path such as
+  `/api/v2` produced `/api/v2/agent/`, a Not found page.
+* `/agent` without a trailing slash redirects to `/agent/`; otherwise the page's
+  relative calls went to `/chat` at the site root.
+* `AGENT_MODEL` naming the other provider's model is ignored with a warning,
+  and a provider 404 is reported as "model not found" rather than a bare 404.

@@ -3502,6 +3502,81 @@ async function handleAdminCallback(bot, query) {
     return handleAdminCallback(bot, { ...query, data: `admin_bulkprice_${productId}` });
   }
 
+  // ── The AI assistant: open it, or explain what is missing ─────────
+  if (data === 'admin_assistant') {
+    const agentChat = require('../services/agentChat');
+    const cfg = agentChat.agentConfig ? agentChat.agentConfig() : {};
+
+    // Both requirements are checked and reported together. Telling someone to
+    // fix one thing, then meeting a second wall, is two trips for no reason.
+    const problems = [];
+    if (!cfg.base)     problems.push('🌐 <b>No public domain.</b>\nRailway → Settings → Networking → <b>Generate Domain</b>, then redeploy.');
+    if (!cfg.hasKey)   problems.push('🔑 <b>No AI key.</b>\nAdd <code>OPENAI_API_KEY</code> in Railway → Variables, then redeploy.');
+    if (!cfg.fixedTok) problems.push('🔗 <b>Link changes on every deploy.</b>\nAdd <code>AGENT_TOKEN</code> with any long random text so it stays the same.');
+
+    if (!cfg.base || !cfg.hasKey) {
+      await bot.editMessageText(
+        `🤖 <b>AI Assistant</b>\n\n` +
+        `Ask about sales, stock, customers and support in plain language, and ` +
+        `draft replies you approve before they send.\n\n` +
+        `<b>Needs setting up first:</b>\n\n${problems.join('\n\n')}`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'admin_panel' }]] } }
+      ).catch(() => {});
+      return;
+    }
+
+    // Check the link really opens the assistant before handing it over. A
+    // wrong domain, a stale /apibase or an old deploy all end at "Not found",
+    // and without this the admin only finds out after tapping.
+    const probe = agentChat.probeAgent ? await agentChat.probeAgent(cfg.base) : { ok: true };
+    if (!probe.ok) {
+      const manualBase = db.getSetting('api_base_url', '');
+      await bot.editMessageText(
+        `🤖 <b>AI Assistant</b>\n\n` +
+        `❌ <b>The link does not reach the assistant.</b>\n\n` +
+        `Tried: <code>${escapeHtml(cfg.base)}/agent/ping</code>\n` +
+        `Result: <b>${escapeHtml(String(probe.reason || 'no answer'))}</b>\n\n` +
+        `<b>Likely causes:</b>\n` +
+        (manualBase
+          ? `• The address was set by hand with <code>/apibase</code> (<code>${escapeHtml(manualBase)}</code>). ` +
+            `If it is wrong, send <code>/apibase clear</code> to use the Railway domain.\n`
+          : '') +
+        `• The domain belongs to a different Railway service, or is not attached to this one ` +
+        `(Railway → this service → Settings → Networking).\n` +
+        `• The running deploy is older than the assistant — redeploy.\n\n` +
+        `<i>Link that would be opened:</i>\n<code>${escapeHtml(cfg.base)}/agent/</code>`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', disable_web_page_preview: true,
+          reply_markup: { inline_keyboard: [
+            [{ text: '🔄 Test again', callback_data: 'admin_assistant' }],
+            [{ text: '🤖 Open anyway', url: cfg.url }],
+            [{ text: '🔙 Back', callback_data: 'admin_panel' }],
+          ] } }
+      ).catch(() => {});
+      return;
+    }
+
+    await bot.editMessageText(
+      `🤖 <b>AI Assistant</b>\n\n` +
+      `✅ Link tested — the assistant is reachable.\n` +
+      `🧠 Model: <b>${escapeHtml(cfg.model)}</b>\n` +
+      `🔒 Read-only — it cannot change balances, stock or send anything ` +
+      `without your approval.\n\n` +
+      `📱 <b>To install it as an app:</b>\n` +
+      `1. Tap <b>Open Assistant</b> below\n` +
+      `2. A blue bar appears at the top — tap <b>How</b>\n` +
+      `3. Follow the two steps for your phone\n\n` +
+      (problems.length ? `⚠️ ${problems.join('\n\n')}\n\n` : '') +
+      `⚠️ <i>Anyone with this link can read your shop data. Do not forward it.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', disable_web_page_preview: true,
+        reply_markup: { inline_keyboard: [
+          [{ text: '🤖 Open Assistant', url: cfg.url }],
+          [{ text: '🔙 Back', callback_data: 'admin_panel' }],
+        ] } }
+    ).catch(() => {});
+    return;
+  }
+
   // ── Everything sold through the API ───────────────────────────────
   if (data === 'admin_apisales' || /^admin_apisales_\d+$/.test(data)) {
     const days = /^admin_apisales_\d+$/.test(data) ? parseInt(data.split('_').pop(), 10) : 30;
@@ -7131,8 +7206,8 @@ async function handleAdminCallback(bot, query) {
       `<b>Changes:</b>\n` +
       `• Current period closes immediately\n` +
       `• New customers get <b>${next.daysRemaining}</b> day(s), ending <b>${escapeHtml(stamp)}</b>\n` +
-      `• They pay <b>${formatPrice((next.daysRemaining / 30) * monthly)}</b> instead of ` +
-      `${formatPrice((next.replaces.daysRemaining / 30) * monthly)}\n\n` +
+      `• They pay <b>${formatPrice(cgbCycles.priceFor(next.daysRemaining, next.cycleLength, monthly))}</b> instead of ` +
+      `${formatPrice(cgbCycles.pricePeriod(next.replaces, monthly))}\n\n` +
       `<b>Does NOT change:</b>\n` +
       `• Seats already sold — every existing customer keeps the end date they ` +
       `paid for. Cutting those short would take back time people bought.\n\n` +
@@ -7379,11 +7454,16 @@ async function handleAdminCallback(bot, query) {
              `⚠️ <i>The cycles below are IGNORED while this is set.</i>\n\n`;
     } else if (best) {
       const d = best.endDate;
-      const price = ((best.daysRemaining / 30) * monthly).toFixed(2);
+      const price = cgbCycles.pricePeriod(best, monthly).toFixed(2);
+      const ymd = (x) => `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}`;
       txt += `🟢 <b>In use right now</b>\n` +
              `Day ${best.cycle.start_day} → Day ${best.cycle.end_day}` +
-             `${best.cycle.is_default ? ' <i>(built-in default)</i>' : ''}\n` +
-             `📅 A purchase today ends: <b>${d.toISOString().slice(0, 10)}</b>\n` +
+             `${best.cycle.is_default ? ' <i>(built-in default)</i>' : ''}` +
+             ` — ${best.cycleLength} days this cycle\n` +
+             (best.inGap
+               ? `📅 Today is between cycles: a purchase starts <b>${ymd(best.startDate)}</b> at full price\n`
+               : '') +
+             `📅 A purchase today ends: <b>${ymd(d)}</b>\n` +
              `⏳ Days given: <b>${best.daysRemaining}</b>  💰 Price: <b>$${price}</b>\n\n`;
 
       if (best.all.length > 1) {
