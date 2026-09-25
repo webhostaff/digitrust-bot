@@ -192,7 +192,7 @@ async function callWithFallback(send) {
       if (notFound && stepDownModel(MODEL)) continue;
 
       if (status === 400) {
-        const bad = ['reasoning_effort', 'max_completion_tokens', 'max_tokens']
+        const bad = ['reasoning_effort', 'max_completion_tokens', 'max_tokens', 'reasoning']
           .find((p) => msg.includes(p) && !droppedParams.has(p));
         if (bad) {
           droppedParams.add(bad);
@@ -303,8 +303,74 @@ async function converseOpenAI(history, drafts) {
   return 'That took too many steps. Try asking something narrower.';
 }
 
-const converse = (history, drafts = []) =>
-  (PROVIDER === 'openai' ? converseOpenAI : converseAnthropic)(history, drafts);
+/**
+ * OpenAI through the Responses API — the only endpoint where GPT-5/GPT-6 can
+ * use tools AND reason at the same time. On /v1/chat/completions OpenAI
+ * refuses that combination outright ("Function tools with reasoning_effort
+ * are not supported"), and the only way to make it work there is to switch
+ * reasoning off, which is exactly the intelligence we want.
+ *
+ * The conversation is chained with previous_response_id, so OpenAI keeps the
+ * reasoning between tool calls and between the owner's messages; we only keep
+ * the id of the last answer per chat. It is stored only after a success, so a
+ * failed turn leaves the chat where it was.
+ */
+const lastResponse = new WeakMap(); // history array → last OpenAI response id
+
+async function converseOpenAIResponses(history, drafts) {
+  const tools = toolSchemas().map((t) => ({
+    type: 'function', name: t.name, description: t.description, parameters: t.input_schema,
+  }));
+  const userText = history[history.length - 1]?.content || '';
+  let previous = lastResponse.get(history) || null;
+  let input = [{ role: 'user', content: userText }];
+
+  for (let round = 0; round < MAX_ROUNDS; round++) {
+    const res = await callWithFallback(() => {
+      const body = {
+        model: MODEL,
+        instructions: SYSTEM, // not inherited through previous_response_id
+        input, tools,
+        max_output_tokens: 16000,
+      };
+      if (previous) body.previous_response_id = previous;
+      if (!droppedParams.has('reasoning')) body.reasoning = { effort: 'high' };
+      return axios.post('https://api.openai.com/v1/responses', body, {
+        headers: { Authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+        timeout: 240000,
+      });
+    });
+
+    const out = res.data.output || [];
+    previous = res.data.id;
+    const calls = out.filter((o) => o.type === 'function_call');
+
+    if (!calls.length) {
+      lastResponse.set(history, previous);
+      const text = out.filter((o) => o.type === 'message')
+        .flatMap((o) => o.content || [])
+        .filter((c) => c.type === 'output_text')
+        .map((c) => c.text).join('\n');
+      history.push({ role: 'assistant', content: text });
+      return text || res.data.output_text || '';
+    }
+
+    input = calls.map((c) => {
+      let args = {};
+      try { args = JSON.parse(c.arguments || '{}'); } catch (_) {}
+      const result = runTool(c.name, args);
+      if (c.name === 'propose_reply' && result && result.draft_id) drafts.push(result);
+      return { type: 'function_call_output', call_id: c.call_id, output: JSON.stringify(result).slice(0, 60000) };
+    });
+  }
+  return 'That took too many steps. Try asking something narrower.';
+}
+
+// The old gpt-4 family has no reasoning and works fine on chat/completions.
+const converse = (history, drafts = []) => {
+  if (PROVIDER !== 'openai') return converseAnthropic(history, drafts);
+  return (isReasoningOpenAI(MODEL) ? converseOpenAIResponses : converseOpenAI)(history, drafts);
+};
 
 router.use(express.json({ limit: '1mb' }));
 

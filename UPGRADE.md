@@ -1055,3 +1055,11 @@ Now, in `services/cgbCycles.js`:
 * New tool `support_digest`: every conversation of the last N hours in one call,
   with waiting/unread flags — used for "read the chats and summarise".
 * Up to 16 tool rounds per answer (was 8); threads readable up to 300 messages.
+
+# Part 23 — OpenAI Responses API
+
+GPT-6 refused tools + `reasoning_effort` on `/v1/chat/completions` ("Function
+tools with reasoning_effort are not supported … use /v1/responses"). Reasoning
+models now go through `/v1/responses` with `reasoning.effort = high`, chained
+with `previous_response_id` so reasoning carries across tool calls and messages.
+The gpt-4 family stays on chat/completions.

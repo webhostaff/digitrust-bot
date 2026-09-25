@@ -5,3 +5,5 @@
 2026-09-25T01:36:57.100Z [WARN] [agent] model gpt-6-astra unavailable on this account — using gpt-6-sol
 2026-09-25T01:36:57.101Z [WARN] [agent] gpt-6-sol refused reasoning_effort; retrying without it
 2026-09-25T01:36:57.101Z [INFO] [agent] support_digest({"hours":"24"})
+2026-09-25T01:43:53.666Z [INFO] [agent] support_digest({"hours":"24"})
+2026-09-25T01:43:53.681Z [INFO] [agent] support_digest({"hours":"24"})
