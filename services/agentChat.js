@@ -207,8 +207,20 @@ BE THE PARTNER WHO THINKS AHEAD
 - Ideas you can find in the data: products to restock before they run out, best hours to post an offer, good customers who stopped buying, products with many refunds (supplier problem?), price points that sell, bundles bought together, slow products to discount.
 - When the owner seems stressed or it is late, be brief and kind. When a win happens (a record day), say it.
 
+WHAT YOU CAN SEE (all read-only)
+- The store bot: orders, products, stock, wallets, refunds, deposits, suppliers, API sales.
+- The support bot: every conversation.
+- The ChatGPT Business bot: seats, cycles and the price right now (cgb_cycle_now), the renewal round — paid / said yes unpaid / no answer / declined / to activate (cgb_renewals), seats by email (cgb_find_seat).
+- Binance, LIVE: txid_check verifies any TxID or Binance Pay id on Binance AND in the shop (already used? by whom? credited?); recent_deposits lists what arrived. For "check this txid" always use txid_check and give a clear verdict first.
+- You write only in this app. You never message customers or post in the bots; drafts go out only when the owner taps Send.
+
+HOW YOU TALK
+- Like a chat app with a friend who knows the business: natural, flowing sentences, the way people actually text. No report layout, no headings, no "Summary:" labels.
+- Short by default — 1 to 4 lines for most things. Lists only when there are several items to scan.
+- Voice messages arrive transcribed and may have small errors; understand the intent, do not comment on the transcription.
+
 FORMAT
-- Plain text with light markdown: **bold** for key numbers/names, short "- " bullet lists, no tables, no headings for short answers.`;
+- Light markdown only: **bold** for the key number or name, "- " for a real list. No tables.`;
 
 function localNowString() {
   let off = 0;
@@ -358,21 +370,24 @@ const TOOL_LABEL = {
   top_customers: '👑 أحسن الحرفاء', cgb_seats_of: '🤖 مقاعد ChatGPT', trace_payment: '💳 يتبّع الدفعة',
   refund_requests: '🔄 طلبات الاسترجاع', cgb_overview: '🤖 ChatGPT Business', propose_reply: '✍️ يكتب رد',
   remember: '📝 يحفظ', update_memory: '📝 يصلّح ملاحظة', forget: '🗑 ينسى', recall_memory: '🧠 يتفكّر',
-  search_past_chats: '🧠 يلوّج في كلامنا',
+  search_past_chats: '🧠 يلوّج في كلامنا', txid_check: '🔗 يثبّت الـ TxID في Binance',
+  recent_deposits: '🏦 يشوف الإيداعات في Binance', cgb_cycle_now: '🗓 الدورة توا',
+  cgb_renewals: '🔄 التجديدات', cgb_find_seat: '📧 يلوّج على الإيميل', order_lookup: '🧾 الطلب',
 };
 
-function runTools(calls, emit, drafts, used) {
-  return calls.map((c) => {
+async function runTools(calls, emit, drafts, used) {
+  // In parallel: a live Binance check should not wait for a database query.
+  return Promise.all(calls.map(async (c) => {
     emit({ type: 'status', text: TOOL_LABEL[c.name] || `⚙️ ${c.name}` });
     used.push(c.name);
-    const out = runTool(c.name, c.args);
+    const out = await runTool(c.name, c.args);
     if (c.name === 'propose_reply' && out && out.draft_id) {
       drafts.push(out);
       emit({ type: 'draft', draft: out });
     }
     // Tool results are the biggest input cost; 12k characters is ~3k tokens.
     return { id: c.id, output: JSON.stringify(out === undefined ? null : out).slice(0, 12000) };
-  });
+  }));
 }
 
 const parseArgs = (s) => { try { return JSON.parse(s || '{}'); } catch (_) { return {}; } };
@@ -433,7 +448,7 @@ async function turnOpenAIResponses(text, tier, emit, signal, drafts, used) {
       return reply;
     }
     if (reply && !reply.endsWith('\n')) { reply += '\n\n'; emit({ type: 'delta', text: '\n\n' }); }
-    input = runTools(calls, emit, drafts, used)
+    input = (await runTools(calls, emit, drafts, used))
       .map((r) => ({ type: 'function_call_output', call_id: r.id, output: r.output }));
   }
   return reply || 'That took too many steps. Try asking something narrower.';
@@ -456,7 +471,7 @@ async function turnOpenAIChat(text, tier, emit, signal, drafts, used) {
     messages.push(msg);
     const calls = (msg.tool_calls || []).map((c) => ({ id: c.id, name: c.function.name, args: parseArgs(c.function.arguments) }));
     if (!calls.length) { emit({ type: 'delta', text: msg.content || '' }); return msg.content || ''; }
-    for (const r of runTools(calls, emit, drafts, used)) messages.push({ role: 'tool', tool_call_id: r.id, content: r.output });
+    for (const r of await runTools(calls, emit, drafts, used)) messages.push({ role: 'tool', tool_call_id: r.id, content: r.output });
   }
   return 'That took too many steps. Try asking something narrower.';
 }
@@ -492,7 +507,7 @@ async function turnAnthropic(text, tier, emit, signal, drafts, used) {
     const said = content.filter((c) => c.type === 'text').map((c) => c.text).join('\n');
     if (said) emit({ type: 'delta', text: said + (calls.length ? '\n\n' : '') });
     if (!calls.length) return said;
-    messages.push({ role: 'user', content: runTools(calls, emit, drafts, used)
+    messages.push({ role: 'user', content: (await runTools(calls, emit, drafts, used))
       .map((r) => ({ type: 'tool_result', tool_use_id: r.id, content: r.output })) });
   }
   return 'That took too many steps. Try asking something narrower.';
@@ -627,6 +642,81 @@ router.get('/brief', requireToken, (req, res) => {
 function costSettings() {
   return { daily_budget_usd: String(budget()), allow_deep: mem.getState('allow_deep', '1'), usage_today: usageToday() };
 }
+// ── Voice ────────────────────────────────────────────────────────────────────
+//
+// The browser's own speech recognition barely knows Tunisian Derja, so the app
+// records the voice note and the server transcribes it with OpenAI's cheap
+// transcription model (about $0.003 a minute), hinted with the shop's words.
+// Spoken replies use the phone's own voice when it has one for the language
+// (free) and fall back to OpenAI's TTS here.
+
+const TRANSCRIBE_MODELS = ['gpt-4o-mini-transcribe', 'whisper-1'];
+const TTS_MODELS = ['gpt-4o-mini-tts', 'tts-1'];
+const VOICE_HINT = 'Tunisian Arabic (Derja) mixed with French and English. Shop words: ChatGPT, Business, ' +
+  'Canva, Netflix, Gemini, TxID, Binance, USDT, TRC20, BEP20, TON, stock, refund, renew, email, order.';
+
+router.post('/transcribe', requireToken, express.raw({ type: () => true, limit: '15mb' }), async (req, res) => {
+  if (!OPENAI_KEY) return res.status(503).json({ error: 'voice needs OPENAI_API_KEY', fallback: true });
+  if (overBudget()) return res.status(429).json({ error: explainError(new BudgetError('budget')) });
+  const buf = req.body;
+  if (!buf || !buf.length) return res.status(400).json({ error: 'no audio' });
+  const type = String(req.get('content-type') || 'audio/webm').split(';')[0];
+  const ext = type.includes('mp4') || type.includes('m4a') ? 'm4a' : type.includes('ogg') ? 'ogg' : type.includes('wav') ? 'wav' : 'webm';
+  const seconds = Math.max(1, Number(req.query.sec) || buf.length / 16000);
+  for (const model of TRANSCRIBE_MODELS) {
+    try {
+      const form = new FormData();
+      form.append('file', new Blob([buf], { type }), `voice.${ext}`);
+      form.append('model', model);
+      form.append('prompt', VOICE_HINT);
+      const r = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+        method: 'POST', headers: { Authorization: `Bearer ${OPENAI_KEY}` }, body: form,
+      });
+      const j = await r.json().catch(() => ({}));
+      if (r.status === 404 || /model/i.test(j?.error?.message || '') && r.status === 400) continue;
+      if (!r.ok) return res.status(r.status).json({ error: j?.error?.message || `HTTP ${r.status}` });
+      addAudioCost(seconds * 0.003 / 60);
+      return res.json({ text: String(j.text || '').trim(), model });
+    } catch (e) {
+      logger.warn(`[agent] transcribe ${model}: ${e.message}`);
+    }
+  }
+  res.status(502).json({ error: 'transcription failed', fallback: true });
+});
+
+router.post('/tts', requireToken, async (req, res) => {
+  if (!OPENAI_KEY) return res.status(503).json({ error: 'no OpenAI key' });
+  if (overBudget()) return res.status(429).json({ error: 'budget' });
+  const text = String(req.body.text || '').replace(/[*`#>_]/g, '').slice(0, 1500);
+  if (!text) return res.status(400).json({ error: 'empty' });
+  for (const model of TTS_MODELS) {
+    try {
+      const r = await fetch('https://api.openai.com/v1/audio/speech', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${OPENAI_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ model, voice: 'alloy', input: text, format: 'mp3',
+          instructions: 'Warm, natural, friendly. If the text is Tunisian Arabic, speak it the Tunisian way.' }),
+      });
+      if (r.status === 404) continue;
+      if (!r.ok) return res.status(r.status).json({ error: `HTTP ${r.status}` });
+      const audio = Buffer.from(await r.arrayBuffer());
+      addAudioCost(text.length * 0.012 / 1000); // ~ $0.012 per 1k characters
+      res.set('Content-Type', 'audio/mpeg');
+      return res.send(audio);
+    } catch (e) {
+      logger.warn(`[agent] tts ${model}: ${e.message}`);
+    }
+  }
+  res.status(502).json({ error: 'tts failed' });
+});
+
+function addAudioCost(usd) {
+  const u = usageToday();
+  u.cost = Number(((u.cost || 0) + usd).toFixed(4));
+  u.audio = Number(((u.audio || 0) + usd).toFixed(4));
+  mem.setState(todayKey(), JSON.stringify(u));
+}
+
 router.get('/settings', requireToken, (req, res) =>
   res.json({ ...require('./agentWatch').allSettings(), ...costSettings() }));
 router.post('/settings', requireToken, (req, res) => {
@@ -720,6 +810,14 @@ self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
 self.addEventListener('fetch', e => {
   if (e.request.method !== 'GET') return;          // never cache chat calls
   e.respondWith(fetch(e.request).catch(() => caches.match(e.request)));
+});
+// Tapping an alert notification brings the app to the front.
+self.addEventListener('notificationclick', e => {
+  e.notification.close();
+  e.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(list => {
+    for (const c of list) if ('focus' in c) return c.focus();
+    return self.registration.scope && self.clients.openWindow(self.registration.scope + '?t=' + (new URL(self.location).searchParams.get('t') || ''));
+  }));
 });
 `);
 });

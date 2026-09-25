@@ -16,3 +16,24 @@
 2026-09-25T02:03:46.624Z [INFO] [agent] remember({"text":"Owner wants daily digest in Derja","category":"owner"})
 2026-09-25T02:03:46.634Z [WARN] [agent] conversation chain expired — rebuilding from local history
 2026-09-25T10:12:57.318Z [ERROR] [agent] 💸 وصلت للحد اليومي ($0.01 — صرفت $0.01 اليوم). التنبيهات المجانية تكمّل تخدم. تنجم تزيد الحد من 🧠 ← 💸.
+2026-09-25T18:39:19.263Z [INFO] [emoji:cgb] outgoing emoji layer installed
+2026-09-25T18:39:19.263Z [INFO] 🤖 ChatGPT Business Bot started
+2026-09-25T18:39:19.263Z [ERROR] CGB polling: EPARSE: Error parsing response: Host not in allowlist: api.telegram.org. Add this host to your network egress settings to allow access.
+2026-09-25T18:39:19.263Z [WARN] CGB admin setMyCommands: EPARSE: Error parsing response: Host not in allowlist: api.telegram.org. Add this host to your network egress settings to allow access.
+2026-09-25T18:39:19.263Z [WARN] CGB setMyCommands: EPARSE: Error parsing response: Host not in allowlist: api.telegram.org. Add this host to your network egress settings to allow access.
+2026-09-25T18:39:32.456Z [INFO] [emoji:cgb] outgoing emoji layer installed
+2026-09-25T18:39:32.456Z [INFO] 🤖 ChatGPT Business Bot started
+2026-09-25T18:39:32.456Z [ERROR] CGB polling: EPARSE: Error parsing response: Host not in allowlist: api.telegram.org. Add this host to your network egress settings to allow access.
+2026-09-25T18:39:32.456Z [WARN] CGB setMyCommands: EPARSE: Error parsing response: Host not in allowlist: api.telegram.org. Add this host to your network egress settings to allow access.
+2026-09-25T18:39:32.456Z [WARN] CGB admin setMyCommands: EPARSE: Error parsing response: Host not in allowlist: api.telegram.org. Add this host to your network egress settings to allow access.
+2026-09-23T10:00:00.000Z [INFO] [CGB] 4 renewal reminder(s) sent
+2026-09-24T10:00:00.000Z [INFO] [CGB] 3 renewal reminder(s) sent
+2026-09-25T10:00:00.000Z [INFO] [CGB] 2 renewal reminder(s) sent
+2026-09-26T10:00:00.000Z [INFO] [CGB] 2 renewal reminder(s) sent
+2026-09-25T18:40:56.020Z [INFO] [agent] cgb_renewals({})
+2026-09-25T18:40:56.022Z [INFO] [agent] cgb_cycle_now({})
+2026-09-25T18:40:56.023Z [INFO] [agent] cgb_find_seat({"email":"pay"})
+2026-09-25T18:40:56.023Z [INFO] [agent] order_lookup({"order_id":"101"})
+2026-09-25T18:40:56.025Z [INFO] [agent] txid_check({"id":"456323181328080896"})
+2026-09-25T18:40:56.025Z [INFO] [agent] recent_deposits({})
+2026-09-25T18:42:54.660Z [INFO] [agent] txid_check({"id":"456323181328080896"})

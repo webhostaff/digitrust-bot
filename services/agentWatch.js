@@ -19,9 +19,9 @@
  *     - morning: what happened overnight, what needs doing, ideas to sell more
  *     - evening: the day in numbers, what is still open, one idea for tomorrow
  *
- * Every alert is sent once (deduped in agent_state), held back during quiet
- * hours, written in the owner's Derja, and copied into the app so Sahbi can
- * be asked about it afterwards.
+ * Every alert is raised once (deduped in agent_state), held back during quiet
+ * hours, written in the owner's Derja, and shown in the app only — never in
+ * the Telegram bots.
  */
 
 const raw = require('../database/db');
@@ -102,39 +102,13 @@ function openButton() {
   } catch (_) { return undefined; }
 }
 
-async function push(html) {
-  if (!BOT) return false;
-  let targets = [];
-  try { targets = require('./adminNotify').adminTargets(); } catch (_) {}
-  const markup = openButton();
-  // Telegram caps a message at 4096 characters.
-  const parts = [];
-  let rest = html;
-  while (rest.length > 3900) {
-    let cut = rest.lastIndexOf('\n', 3900);
-    if (cut < 1000) cut = 3900;
-    parts.push(rest.slice(0, cut));
-    rest = rest.slice(cut);
-  }
-  parts.push(rest);
-  let ok = false;
-  for (const t of targets) {
-    for (let i = 0; i < parts.length; i++) {
-      try {
-        await BOT.sendMessage(t, parts[i], {
-          parse_mode: 'HTML', disable_web_page_preview: true,
-          reply_markup: i === parts.length - 1 ? markup : undefined,
-        });
-        ok = true;
-      } catch (e) {
-        // Broken HTML from the model must not lose the message: resend plain.
-        try { await BOT.sendMessage(t, parts[i].replace(/<[^>]+>/g, '')); ok = true; } catch (_) {}
-        logger.warn(`[sahbi] push to ${t}: ${e.message}`);
-      }
-    }
-  }
-  return ok;
-}
+/**
+ * Sahbi talks in the app only — the owner asked that it never write in the
+ * Telegram bots. Alerts and briefs are stored in the app's chat (see the
+ * logChat calls) and the app shows them, with a phone notification when the
+ * app is installed and allowed to notify.
+ */
+async function push() { return false; }
 
 /** Once per key. Returns false if this alert was already sent. */
 function firstTime(key) {
@@ -319,7 +293,7 @@ async function runRules() {
     `🤝 <b>صاحبي ينبّهك</b>\n\n` +
     urgent.map((f) => f.line).join('\n') +
     (ideas.length ? `${urgent.length ? '\n\n' : ''}${ideas.map((f) => f.line).join('\n')}` : '') +
-    `\n\n<i>افتحني ونحضّرلك الردود ولا نفسّرلك أكثر.</i>`;
+    `\n\n<i>قلّي ونحضّرلك الردود ولا نفسّرلك أكثر.</i>`;
 
   await push(html);
   const plain = html.replace(/<[^>]+>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
@@ -349,11 +323,8 @@ async function runBrief(kind) {
   const chat = require('./agentChat');
   if (!chat.proactiveTurn || !chat.agentConfig().hasKey) return;
   try {
-    const text = await chat.proactiveTurn(BRIEF_PROMPTS[kind], kind);
-    if (text && text.trim()) {
-      const title = kind === 'morning' ? '☀️ <b>صباح الخير — حوصلة الصباح</b>' : '🌙 <b>حوصلة النهار</b>';
-      await push(`${title}\n\n${mdToHtml(text)}`);
-    }
+    // Logged into the app's chat by the turn itself — nothing to send.
+    await chat.proactiveTurn(BRIEF_PROMPTS[kind], kind);
   } catch (e) {
     logger.warn(`[sahbi] ${kind} brief failed: ${e.agentMessage || e.message}`);
   }

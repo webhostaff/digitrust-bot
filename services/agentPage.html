@@ -40,7 +40,7 @@ header{
 header h1{font-size:16px;margin:0;font-weight:700;letter-spacing:.2px}
 header .sub{font-size:11.5px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .hbtn{background:var(--card);border:1px solid var(--line);color:#c3cbd9;border-radius:10px;
-  padding:7px 10px;font-size:13px;transition:.15s;flex:none}
+  padding:7px 9px;font-size:13px;transition:.15s;flex:none}
 .hbtn:active{transform:scale(.93)}
 #mode b{color:#fff}
 
@@ -137,6 +137,10 @@ header .sub{font-size:11.5px;color:var(--dim);white-space:nowrap;overflow:hidden
 #send.stop{background:#3f1d1d;color:#fecaca;box-shadow:none}
 #mic{background:var(--card);border:1px solid var(--line);color:#c3cbd9;display:none}
 #mic.on{background:#3f1d1d;border-color:#7f1d1d;color:#fecaca;animation:pulse 1.2s infinite}
+#mic.wait{opacity:.6}
+#rec{display:none;align-items:center;gap:8px;flex:1;min-height:46px;padding:0 14px;border-radius:16px;
+  background:#2a1215;border:1px solid #7f1d1d;color:#fecaca;font-size:15px}
+#rec i{width:9px;height:9px;border-radius:50%;background:#ef4444;animation:pulse 1s infinite}
 #count{position:absolute;font-size:10.5px;color:var(--dim);margin-top:-16px}
 
 #drawer{position:fixed;inset:0;background:#000000b3;display:none;z-index:9;backdrop-filter:blur(3px)}
@@ -171,8 +175,9 @@ header .sub{font-size:11.5px;color:var(--dim);white-space:nowrap;overflow:hidden
 <body>
 <header>
   <div class="orb" id="orb">🤝</div>
-  <div class="who"><h1>Sahbi · صاحبي</h1><div class="sub" id="sub">…</div></div>
+  <div class="who"><h1>صاحبي</h1><div class="sub" id="sub">…</div></div>
   <button class="hbtn" id="mode" title="Mode">Auto</button>
+  <button class="hbtn" id="spk" title="Read replies aloud">🔇</button>
   <button class="hbtn" id="memb" title="Memory">🧠</button>
   <button class="hbtn" id="newc" title="New chat">＋</button>
 </header>
@@ -192,7 +197,8 @@ header .sub{font-size:11.5px;color:var(--dim);white-space:nowrap;overflow:hidden
 </div>
 <div id="composer">
   <button class="cbtn" id="mic" title="Voice">🎙</button>
-  <textarea id="i" rows="1" dir="auto" placeholder="اكتب أي حاجة…" enterkeyhint="send"></textarea>
+  <textarea id="i" rows="1" dir="auto" placeholder="اكتب ولا احكي 🎙…" enterkeyhint="send"></textarea>
+  <div id="rec"><i></i><span id="rect">0:00</span><span style="flex:1;opacity:.8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">يسمع فيك… 🎙 باش تكمّل</span></div>
   <button class="cbtn" id="send" title="Send">➤</button>
 </div>
 
@@ -210,7 +216,8 @@ header .sub{font-size:11.5px;color:var(--dim);white-space:nowrap;overflow:hidden
       <span>🧠 نسمحلو يستعمل الموديل الغالي للحوصلات والتحليل</span><input type="checkbox" class="sw" id="s_deep">
     </div>
     <div class="small" id="usage"></div>
-    <div class="small">صاحبي يراقب المحل كل 5 دقايق ويبعثلك على تيليجرام كي يلقى حاجة (مجاني، بلاش AI).</div>
+    <div class="small">صاحبي يراقب المحل كل 5 دقايق وكي يلقى حاجة يقلك هوني في التطبيق برك — ما يكتب شي في البوتات (مجاني، بلاش AI).</div>
+    <div class="set"><span>📳 إشعار في التليفون كي يجي تنبيه</span><button id="notif" style="background:var(--card);border:1px solid var(--line);color:#c3cbd9;border-radius:9px;padding:6px 10px">شغّل</button></div>
     <div class="set">
       <span>🔔 التنبيهات (حرفاء يستناو، تسليم، مخزون، استرجاع…)</span><input type="checkbox" class="sw" id="s_watch">
       <span>⏱ نبّهني كي حريف يستنى أكثر من (دقيقة)</span><input type="number" min="5" max="1440" id="s_wait">
@@ -391,7 +398,8 @@ async function pollNew(){
     const near=nearBottom();
     for(const it of j.items||[]) lastId=Math.max(lastId,it.id||0);
     for(const it of fresh) renderItem(it);
-    if(fresh.length){ if(near) toBottom(true); if(navigator.vibrate) navigator.vibrate(60); }
+    if(fresh.length){ if(near) toBottom(true); if(navigator.vibrate) navigator.vibrate(60);
+      const f=fresh[fresh.length-1]; notifyPhone('🤝 صاحبي', String(f.content||'').replace(/\s+/g,' ')); }
   }catch(e){}
 }
 
@@ -438,7 +446,7 @@ async function send(text){
   if(raf) cancelAnimationFrame(raf);
   st.remove();
   if(!full && failed){ r.remove(); }
-  else { m.innerHTML=md(full||'…'); r.appendChild(metaLine(full,meta,new Date().toISOString())); }
+  else { m.innerHTML=md(full||'…'); r.appendChild(metaLine(full,meta,new Date().toISOString())); if(!failed) speak(full); }
   ctrl=null; setBusy(false); toBottom(); loadBrief();
   try{ const j=await (await fetch(api('history?limit=5'))).json(); for(const it of j.items||[]) lastId=Math.max(lastId,it.id||0);}catch(_){}
 }
@@ -458,21 +466,87 @@ inp.setAttribute('enterkeyhint', touch?'enter':'send');
 
 $('newc').onclick=async()=>{ if(busy) return; await post('reset'); addNote('divider','— محادثة جديدة —'); toBottom(true); };
 
-// ── Voice ────────────────────────────────────────────────────
+// ── Voice ────────────────────────────────────────────────
+// Tap 🎙, talk, tap again: the note is transcribed on the server (it knows
+// Derja far better than the phone does) and sent. With 🔊 on, replies are read
+// aloud — the phone's own voice when it has one, the server's otherwise.
 const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
 const vsel=$('vlang'); vsel.value=localStorage.getItem('vlang')||'ar-TN';
 vsel.onchange=()=>localStorage.setItem('vlang',vsel.value);
-if(SR){
-  const mic=$('mic'); mic.style.display='grid'; let rec=null, base='';
-  mic.onclick=()=>{
-    if(rec){ rec.stop(); return; }
-    rec=new SR(); rec.lang=vsel.value; rec.interimResults=true; rec.continuous=true;
-    base=inp.value?inp.value+' ':'';
-    rec.onresult=(e)=>{ let t=''; for(let x=0;x<e.results.length;x++) t+=e.results[x][0].transcript; inp.value=base+t; grow(); };
-    rec.onend=()=>{ rec=null; mic.classList.remove('on'); };
-    rec.onerror=()=>{ rec=null; mic.classList.remove('on'); };
-    mic.classList.add('on'); rec.start();
-  };
+const mic=$('mic'), recBox=$('rec');
+const canRecord=!!(navigator.mediaDevices&&window.MediaRecorder);
+if(canRecord||SR) mic.style.display='grid';
+let rec=null, chunks=[], recStart=0, recTimer=0, srRec=null;
+
+function recUI(on){
+  mic.classList.toggle('on',on); inp.style.display=on?'none':''; recBox.style.display=on?'flex':'none';
+  clearInterval(recTimer);
+  if(on){ recStart=Date.now(); recTimer=setInterval(()=>{const t=Math.floor((Date.now()-recStart)/1000); $('rect').textContent=Math.floor(t/60)+':'+String(t%60).padStart(2,'0');},250); }
+}
+async function startRecording(){
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({audio:true});
+    const type=['audio/webm;codecs=opus','audio/webm','audio/mp4','audio/ogg'].find(t=>MediaRecorder.isTypeSupported&&MediaRecorder.isTypeSupported(t))||'';
+    rec=new MediaRecorder(stream, type?{mimeType:type}:undefined); chunks=[];
+    rec.ondataavailable=e=>{ if(e.data&&e.data.size) chunks.push(e.data); };
+    rec.onstop=async()=>{
+      stream.getTracks().forEach(t=>t.stop()); recUI(false);
+      const secs=Math.max(1,Math.round((Date.now()-recStart)/1000));
+      const blob=new Blob(chunks,{type:rec.mimeType||'audio/webm'}); rec=null;
+      if(secs<1||blob.size<800) return;
+      mic.classList.add('wait'); sub.textContent='🎧 يسمع في الصوت…';
+      try{
+        const r=await fetch(api('transcribe?sec='+secs),{method:'POST',headers:{'Content-Type':blob.type},body:blob});
+        const j=await r.json();
+        if(j.text){ const before=inp.value.trim(); if(before){ inp.value=before+' '+j.text; grow(); } else send(j.text); }
+        else if(j.fallback && SR) browserDictate();
+        else addErr('🎙 '+(j.error||'ما فهمتش الصوت'));
+      }catch(e){ addErr('🎙 '+e.message); }
+      mic.classList.remove('wait'); loadBrief();
+    };
+    rec.start(); recUI(true);
+  }catch(e){ if(SR) browserDictate(); else addErr('🎙 الميكروفون ممنوع — سمحلو من إعدادات المتصفح'); }
+}
+function browserDictate(){
+  if(srRec){ srRec.stop(); return; }
+  srRec=new SR(); srRec.lang=vsel.value; srRec.interimResults=true; srRec.continuous=true;
+  const base=inp.value?inp.value+' ':'';
+  srRec.onresult=(e)=>{ let t=''; for(let x=0;x<e.results.length;x++) t+=e.results[x][0].transcript; inp.value=base+t; grow(); };
+  srRec.onend=srRec.onerror=()=>{ srRec=null; mic.classList.remove('on'); };
+  mic.classList.add('on'); srRec.start();
+}
+mic.onclick=()=>{
+  if(busy) return;
+  if(rec){ rec.stop(); return; }
+  if(srRec){ srRec.stop(); return; }
+  if(canRecord) startRecording(); else browserDictate();
+};
+
+let speakOn=localStorage.getItem('speak')==='1', audioEl=null;
+const spk=$('spk'); const paintSpk=()=>{spk.textContent=speakOn?'🔊':'🔇';}; paintSpk();
+spk.onclick=()=>{ speakOn=!speakOn; localStorage.setItem('speak',speakOn?'1':'0'); paintSpk(); if(!speakOn) stopSpeaking(); };
+function stopSpeaking(){ try{speechSynthesis.cancel();}catch(_){} if(audioEl){audioEl.pause(); audioEl=null;} }
+function langOf(t){ if(/[\u0600-\u06FF]/.test(t)) return 'ar'; if(/[éèàçùâêîôû]|\b(le|la|les|est|pas|je|tu)\b/i.test(t)) return 'fr'; return 'en'; }
+async function speak(text){
+  if(!speakOn||!text) return;
+  const plain=text.replace(/```[\s\S]*?```/g,'').replace(/[*`#>_]/g,'').replace(/https?:\/\/\S+/g,'').slice(0,1500);
+  const lang=langOf(plain); stopSpeaking();
+  const voices=(window.speechSynthesis&&speechSynthesis.getVoices())||[];
+  const v=voices.find(x=>x.lang&&x.lang.toLowerCase().startsWith(lang));
+  // Arabic voices are missing on many phones; the server voice covers them.
+  if(v && lang!=='ar'){ const u=new SpeechSynthesisUtterance(plain); u.voice=v; u.lang=v.lang; speechSynthesis.speak(u); return; }
+  try{
+    const r=await fetch(api('tts'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:plain})});
+    if(!r.ok) throw new Error('tts');
+    audioEl=new Audio(URL.createObjectURL(await r.blob())); audioEl.play().catch(()=>{});
+  }catch(_){ if(v){ const u=new SpeechSynthesisUtterance(plain); u.voice=v; speechSynthesis.speak(u);} }
+}
+if(window.speechSynthesis) speechSynthesis.onvoiceschanged=()=>{};
+
+// ── Phone notifications for alerts ───────────────────────────
+function notifyPhone(title,body){
+  if(!('Notification' in window)||Notification.permission!=='granted'||!document.hidden) return;
+  navigator.serviceWorker&&navigator.serviceWorker.ready.then(r=>r.showNotification(title,{body:body.slice(0,180),icon:'icon.svg?t='+T,tag:'sahbi'})).catch(()=>{});
 }
 
 // ── Memory drawer ────────────────────────────────────────────
@@ -518,10 +592,16 @@ async function saveSettings(){
   $('sstate').textContent='✅ تسجّل';
 }
 ['s_watch','s_brief','s_wait','s_qs','s_qe','s_bm','s_be','s_budget','s_deep'].forEach(id=>$(id).addEventListener('change',saveSettings));
-$('bnow').onclick=async()=>{ $('sstate').textContent='⏳ يكتب في الحوصلة… (تجيك في تيليجرام وهوني)';
+$('bnow').onclick=async()=>{ $('sstate').textContent='⏳ يكتب في الحوصلة… (تظهر هوني في الشات)';
   const r=await post('brief/now',{kind:new Date().getHours()<15?'morning':'evening'}); const j=await r.json();
   $('sstate').textContent=j.ok?'✅ وصلت':'❌ '+(j.error||''); pollNew(); };
 $('wnow').onclick=async()=>{ $('sstate').textContent='⏳ يثبّت…'; await post('watch/now'); $('sstate').textContent='✅ ثبّت — كان فما حاجة جديدة تجيك'; pollNew(); };
+
+$('notif').onclick=async()=>{
+  if(!('Notification' in window)){ $('sstate').textContent='❌ المتصفح هذا ما يدعمش الإشعارات'; return; }
+  const p=await Notification.requestPermission(); $('notif').textContent=p==='granted'?'✅ شغّال':'❌ ممنوع';
+};
+if('Notification' in window && Notification.permission==='granted') setTimeout(()=>{ if($('notif')) $('notif').textContent='✅ شغّال'; },0);
 
 // ── Install hint ─────────────────────────────────────────────
 const standalone=matchMedia('(display-mode: standalone)').matches||navigator.standalone;

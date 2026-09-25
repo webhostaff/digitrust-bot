@@ -639,6 +639,158 @@ function liveSnapshot() {
   };
 }
 
+// ── Payments, live ───────────────────────────────────────────────────────────
+// Read-only calls to Binance with the shop's own keys — the same lookups the
+// admin panel's /trace uses. They cannot move money.
+
+const binance = (() => { try { return require('./binance'); } catch (_) { return null; } })();
+const fmtTime = (ms) => (ms ? new Date(Number(ms)).toISOString().slice(0, 16).replace('T', ' ') + ' UTC' : null);
+
+TOOLS.txid_check = {
+  description:
+    'Check a TxID / Binance Pay id / order id end to end: is it on Binance (live), for how much, ' +
+    'which network, confirmed or not — AND was it already used in the shop, by whom, credited or not, ' +
+    'what was bought with it. Use for any "check this txid" or "did X pay".',
+  input: { id: 'the TxID, Binance Pay transaction/order id, or a long part of it' },
+  run: async ({ id }) => {
+    const needle = String(id || '').trim();
+    if (needle.length < 6) return { error: 'id too short' };
+    const shop = (() => {
+      try {
+        const r = db.traceTxid(needle);
+        if (!r || !r.found) return { used_in_shop: false };
+        return {
+          used_in_shop: true, purpose: r.purpose, credited: r.credited,
+          customer: r.user ? { id: r.user.telegram_id, username: r.user.username } : null,
+          ledger: (r.ledger || []).slice(0, 3),
+          spent_after: (r.spentAfter || []).slice(0, 5).map((o) => ({ ...o, product_title: clean(o.product_title) })),
+          flags: r.flags,
+        };
+      } catch (e) { return { error: e.message }; }
+    })();
+    let chain = { checked: false, reason: 'Binance keys not configured' };
+    if (binance) {
+      const [dep, pay] = await Promise.all([
+        binance.findDepositRaw(needle).catch((e) => ({ ok: false, error: e.message })),
+        binance.findPayTransactionRaw(needle).catch((e) => ({ ok: false, error: e.message })),
+      ]);
+      chain = {
+        checked: !!(dep.ok || pay.ok),
+        error: !dep.ok && !pay.ok ? (dep.error || pay.error) : undefined,
+        onchain_deposits: (dep.matches || []).slice(0, 3).map((m) => ({
+          txid: m.txId, amount: m.amount, coin: m.coin, network: m.network,
+          status: m.status === 1 ? 'credited to Binance' : m.status === 0 ? 'pending' : `status ${m.status}`,
+          at: fmtTime(m.insertTime),
+        })),
+        binance_pay: (pay.matches || []).slice(0, 3).map((m) => ({
+          transaction_id: m.transactionId, order_id: m.orderId, amount: m.amount, currency: m.currency,
+          type: m.orderType, at: fmtTime(m.transactionTime),
+          from: m.payerInfo ? (m.payerInfo.name || m.payerInfo.binanceId || null) : null,
+        })),
+      };
+    }
+    const onBinance = chain.onchain_deposits?.length || chain.binance_pay?.length;
+    return {
+      verdict: !chain.checked ? 'could not check Binance'
+        : !onBinance ? 'NOT found on Binance'
+          : shop.used_in_shop ? 'on Binance AND already used in the shop'
+            : 'on Binance, NOT used in the shop yet',
+      binance: chain, shop,
+    };
+  },
+};
+
+TOOLS.recent_deposits = {
+  description: 'Live list of recent deposits received on Binance — "who sent 15.2 today?", "any TRC20 deposit?"',
+  input: { days: 'default 2, max 30', network: 'TRX | BSC | TON… optional', amount: 'exact amount, optional' },
+  run: async ({ days = 2, network = null, amount = null }) => {
+    if (!binance) return { error: 'Binance not available' };
+    const r = await binance.listRecentDeposits({
+      days: Math.min(30, Math.max(1, Number(days) || 2)), limit: 20,
+      network: network || null, amount: amount === null || amount === '' ? null : Number(amount),
+    }).catch((e) => ({ ok: false, error: e.message }));
+    if (!r.ok) return r;
+    return { total: r.total, matched: r.matched, deposits: r.rows.map((d) => ({
+      txid: d.txId, amount: Number(d.amount), coin: d.coin, network: d.network,
+      status: Number(d.status) === 1 ? 'credited' : 'pending', at: fmtTime(d.insertTime),
+    })) };
+  },
+};
+
+// ── ChatGPT Business bot ─────────────────────────────────────────────────────
+
+TOOLS.cgb_cycle_now = {
+  description: 'ChatGPT Business: which cycle a purchase made NOW lands in, start/end, days and price.',
+  input: {},
+  run: () => {
+    const c = require('./cgbCycles');
+    const b = c.calculateBestCycle();
+    if (!b) return null;
+    const f = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    return {
+      cycle: `${b.cycle.start_day} -> ${b.cycle.end_day}`, renews_at: b.cycle.start_time || '00:00',
+      starts: f(b.startDate || new Date()), ends: f(b.endDate), days: b.daysRemaining, cycle_days: b.cycleLength,
+      between_cycles: !!b.inGap, monthly_price: c.getMonthlyPrice(), price_now: c.pricePeriod(b, c.getMonthlyPrice()),
+      all_cycles: (b.all || []).map((e) => ({ cycle: `${e.cycle.start_day}->${e.cycle.end_day}`, days: e.daysRemaining,
+        not_started: !!e.inGap, renews_at: e.cycle.start_time || null })),
+    };
+  },
+};
+
+TOOLS.cgb_renewals = {
+  description:
+    'ChatGPT Business renewal round: seats ending recently/soon split into renewed & paid, said yes but unpaid, ' +
+    'no answer, declined — plus seats to activate now and later. Use for any renewal question.',
+  input: {},
+  run: () => {
+    const rows = raw.prepare(`
+      SELECT cs.id, cs.user_id, cs.email, cs.end_date, cs.renew_intent, cs.reminder_count, u.username,
+        (SELECT n.id FROM chatgpt_subscriptions n WHERE n.renewed_from = cs.id
+           AND COALESCE(n.status,'') IN ('active','pending') LIMIT 1) AS renewed_id
+      FROM chatgpt_subscriptions cs LEFT JOIN users u ON u.telegram_id = cs.user_id
+      WHERE COALESCE(cs.status,'') IN ('active','pending','expired')
+        AND date(cs.end_date) BETWEEN date('now','-12 days') AND date('now','+10 days')
+        AND NOT (cs.renewed_from IS NOT NULL AND date(cs.start_date) > date('now','-12 days'))
+      ORDER BY date(cs.end_date)`).all();
+    const who = (r) => (r.username ? '@' + r.username : String(r.user_id));
+    const pick = (f) => rows.filter(f).map((r) => ({ who: who(r), email: r.email, ends: r.end_date, reminded: r.reminder_count || 0 }));
+    const toAct = raw.prepare(`SELECT cs.email, cs.start_date, cs.end_date, u.username, cs.user_id FROM chatgpt_subscriptions cs
+      LEFT JOIN users u ON u.telegram_id = cs.user_id WHERE cs.status = 'pending' AND date(cs.start_date) <= date('now')`).all();
+    const later = raw.prepare(`SELECT cs.email, cs.start_date, cs.end_date, u.username, cs.user_id FROM chatgpt_subscriptions cs
+      LEFT JOIN users u ON u.telegram_id = cs.user_id WHERE COALESCE(cs.status,'') IN ('active','pending') AND date(cs.start_date) > date('now')`).all();
+    return {
+      renewed_paid: pick((r) => r.renewed_id), said_yes_unpaid: pick((r) => !r.renewed_id && r.renew_intent === 'yes'),
+      no_answer: pick((r) => !r.renewed_id && !r.renew_intent), declined: pick((r) => !r.renewed_id && r.renew_intent === 'no'),
+      activate_now: toAct.map((r) => ({ who: who(r), email: r.email, from: r.start_date, to: r.end_date })),
+      activate_later: later.map((r) => ({ who: who(r), email: r.email, from: r.start_date, to: r.end_date })),
+    };
+  },
+};
+
+TOOLS.cgb_find_seat = {
+  description: 'Find ChatGPT Business seats by email (or part of it) — who owns it, dates, status, paid.',
+  input: { email: 'email or part of it' },
+  run: ({ email }) => raw.prepare(`
+    SELECT cs.id, cs.user_id, u.username, cs.email, cs.status, cs.start_date, cs.end_date, cs.final_price,
+           cs.renew_intent, cs.renewed_from, cs.order_id, o.payment_method
+    FROM chatgpt_subscriptions cs LEFT JOIN users u ON u.telegram_id = cs.user_id
+    LEFT JOIN orders o ON o.id = cs.order_id
+    WHERE cs.email LIKE ? COLLATE NOCASE ORDER BY cs.id DESC LIMIT 10`).all(`%${String(email || '').trim()}%`),
+};
+
+TOOLS.order_lookup = {
+  description: 'One order by id: product, customer, amount, method, status, dates, TxID, delivery.',
+  input: { order_id: 'order number' },
+  run: ({ order_id }) => {
+    const o = raw.prepare(`SELECT o.*, p.title, u.username FROM orders o LEFT JOIN products p ON p.id = o.product_id
+      LEFT JOIN users u ON u.telegram_id = o.user_id WHERE o.id = ?`).get(Number(order_id));
+    if (!o) return { found: false };
+    const out = { ...o, title: clean(o.title) };
+    if (out.delivered_content) out.delivered_content = String(out.delivered_content).replace(/<[^>]+>/g, '').slice(0, 400);
+    return out;
+  },
+};
+
 /** Shape the model needs to know what it may call. */
 function toolSchemas() {
   return Object.entries(TOOLS).map(([name, t]) => ({
@@ -654,11 +806,12 @@ function toolSchemas() {
 }
 
 /** Run one tool by name. Unknown names are refused, never guessed at. */
-function runTool(name, input = {}) {
+async function runTool(name, input = {}) {
   const tool = TOOLS[name];
   if (!tool) return { error: `Unknown tool: ${name}` };
   try {
-    const out = tool.run(input || {});
+    // Some tools ask Binance live, so every tool may be awaited.
+    const out = await tool.run(input || {});
     logger.info(`[agent] ${name}(${JSON.stringify(input).slice(0, 80)})`);
     return out === undefined ? null : out;
   } catch (e) {

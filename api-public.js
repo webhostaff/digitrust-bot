@@ -29,6 +29,21 @@
  */
 
 const express = require('express');
+
+/**
+ * An item as the API client should receive it: the plain account/link.
+ *
+ * Delivered content is stored formatted for Telegram (`<code>…</code>` so the
+ * customer can tap to copy). A reseller's bot printing our JSON showed those
+ * tags literally around every link. The stored text stays as it is — the bot's
+ * own messages still need it — and only the API output is cleaned.
+ */
+function plainItem(s) {
+  return String(s == null ? '' : s)
+    .replace(/<\/?(code|pre|b|i|u|s|tg-spoiler)>/gi, '')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+    .trim();
+}
 const db      = require('./database/queries');
 const dbRaw   = require('./database/db');
 const logger  = require('./utils/logger');
@@ -391,7 +406,7 @@ router.post(['/purchase', '/order'], requireKey, async (req, res) => {
         unit_price: Number(Number(total / quantity).toFixed(6)),
         total,
         status: 'delivered',
-        items: String(result.content || '').split('\n\n').filter(Boolean),
+        items: String(result.content || '').split('\n\n').map(plainItem).filter(Boolean),
         balance: Number(Number(fresh?.balance || 0).toFixed(6)),
       },
     });
@@ -504,7 +519,7 @@ router.get('/order/:id', requireKey, (req, res) => {
         status: order.status,
         created_at: order.created_at,
         items: order.delivered_content
-          ? String(order.delivered_content).split('\n\n').filter(Boolean)
+          ? String(order.delivered_content).split('\n\n').map(plainItem).filter(Boolean)
           : null,
       },
     });

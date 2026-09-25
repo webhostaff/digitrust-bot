@@ -1157,3 +1157,28 @@ panel marks cycles that have not started yet.
 * `localNow` now removes the server's own timezone before applying the shop
   offset, so shop time is right whatever `TZ` the server has (it was shifted
   twice on non-UTC servers).
+
+# Part 30 — API items, renewals round, Sahbi v2
+
+* **API items without `<code>`**: `api-public.js` / `api-reseller.js` return items
+  through `plainItem()`, which strips the Telegram formatting tags. Stored
+  content and the bot's own messages are unchanged.
+* **Renewal reminders** (`chatgpt-bot.js sendRenewalReminders`): daily, at
+  `cgb_reminder_hour` (default 10:00 shop time), from `cgb_reminder_start_before`
+  days before the seat ends (default 1 → the 23rd for a seat ending the 24th)
+  until the day the next cycle opens (the 26th). Buttons: ✅ Yes, renew → payment
+  screen; ❌ No → never reminded again. Stops once a renewal is paid. A customer
+  who said yes but did not pay gets "💳 Complete payment". Columns
+  `reminder_last_date`, `reminder_count`.
+* **/renewals dashboard**: round overview (paid & revenue, yes-unpaid, no
+  answer, declined, activate now / later) with a list per section, pagination,
+  and a button per seat that opens its order card with the Activate button.
+  "Renewal paid" admin message restyled with where to activate and a link.
+* **Sahbi**: app-only (the watcher no longer writes in Telegram; phone
+  notifications from the app instead). New read-only tools: `txid_check` (live
+  Binance deposit + Binance Pay lookup combined with the shop's own trace, with a
+  verdict), `recent_deposits`, `cgb_cycle_now`, `cgb_renewals`, `cgb_find_seat`,
+  `order_lookup`. Tools may be async and run in parallel. Voice notes are
+  transcribed server-side (`/agent/transcribe`, gpt-4o-mini-transcribe →
+  whisper-1, Derja hint); replies can be read aloud (🔊, phone voice or
+  `/agent/tts`). Audio cost counts toward the daily budget. Conversational tone.

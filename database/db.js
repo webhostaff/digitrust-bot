@@ -1141,6 +1141,10 @@ try {
   // dedicated column is added rather than reusing one of them so the reminder
   // day stays configurable without the column name having to lie about it.
   addCol('reminder_sent', "INTEGER DEFAULT 0");
+  // Daily reminders from the day before the seat ends to the day the next
+  // cycle opens: the last day one was sent, and how many.
+  addCol('reminder_last_date', "TEXT DEFAULT NULL");
+  addCol('reminder_count',     "INTEGER DEFAULT 0");
 } catch (e) {
   console.error('[MIGRATION V4b] cgb renewal columns:', e.message);
 }

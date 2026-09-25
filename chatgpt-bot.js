@@ -706,72 +706,200 @@ bot.onText(/^\/(menu|renew|subscriptions?)$/i, async (msg) => {
 });
 
 /**
- * Who renewed — admin only, inside this bot.
+ * Renewals dashboard — admin only, inside this bot.
  *
- * Two lists, deliberately separate: renewals that were PAID, and customers who
- * said yes and have not paid. Merging them would turn intentions into revenue
- * on the same screen, and the second list is the one worth chasing.
+ * One screen that answers "where does this renewal round stand?": every seat
+ * ending in the window, sorted into paid / said yes but unpaid / no answer /
+ * declined, plus what has to be activated today and what later. Each section
+ * opens its own list, and a seat to activate opens its order card with the
+ * usual Activate button.
  */
+const RNW_WINDOW_BACK = 12;   // days: seats that ended recently
+const RNW_WINDOW_AHEAD = 10;  // days: seats ending soon
+const RNW_PAGE = 8;
+
+const rnwWho = (r) => (r.username ? `@${escapeHtml(r.username)}` : escapeHtml(r.first_name || String(r.user_id)));
+const rnwMoney = (n) => `$${Number(n || 0).toFixed(2)}`;
+
+function renewalBoard() {
+  const today = ymdLocal(cgbCycles.localNow(new Date()));
+  let seats = [];
+  try {
+    seats = db.prepare(`
+      SELECT cs.*, u.username, u.first_name
+      FROM chatgpt_subscriptions cs
+      LEFT JOIN users u ON cs.user_id = u.telegram_id
+      WHERE COALESCE(cs.status, '') IN ('active', 'pending', 'expired')
+        AND cs.end_date IS NOT NULL
+        AND date(cs.end_date) BETWEEN date(?, '-${RNW_WINDOW_BACK} days') AND date(?, '+${RNW_WINDOW_AHEAD} days')
+        -- a seat that IS a renewal is shown under the seat it continues
+        AND NOT (cs.renewed_from IS NOT NULL AND date(cs.start_date) > date(?, '-${RNW_WINDOW_BACK} days'))
+      ORDER BY date(cs.end_date) ASC, cs.id ASC`).all(today, today, today);
+  } catch (e) { logger.warn(`renewal board: ${e.message}`); }
+
+  const succ = db.prepare(`
+    SELECT n.*, o.total_price AS paid, o.payment_method
+    FROM chatgpt_subscriptions n LEFT JOIN orders o ON o.id = n.order_id
+    WHERE n.renewed_from = ? AND COALESCE(n.status,'') IN ('active','pending')
+    ORDER BY n.id DESC LIMIT 1`);
+
+  const out = { today, paid: [], unpaid: [], silent: [], declined: [] };
+  for (const s0 of seats) {
+    const n = succ.get(s0.id);
+    const row = { ...s0, next: n || null, cycleOpens: nextCycleStartYmd(String(s0.end_date).slice(0, 10)) };
+    if (n) out.paid.push(row);
+    else if (s0.renew_intent === 'no') out.declined.push(row);
+    else if (s0.renew_intent === 'yes') out.unpaid.push(row);
+    else out.silent.push(row);
+  }
+  out.activateNow = queries.getCgbDueNow();
+  out.scheduled = queries.getCgbScheduled();
+  out.revenue = out.paid.reduce((a, r) => a + Number(r.next.paid || r.next.final_price || 0), 0);
+  return out;
+}
+
+function nextState(n, today) {
+  if (!n) return '';
+  if (n.status === 'active') return '🟢 activated';
+  if (String(n.start_date) > today) return `🔵 activate on ${niceDate(n.start_date)}`;
+  return '🟠 <b>activate now</b>';
+}
+
+function renewalsHome(b) {
+  const total = b.paid.length + b.unpaid.length + b.silent.length + b.declined.length;
+  const pct = (n) => (total ? ` (${Math.round((n / total) * 100)}%)` : '');
+  const nextOpen = [...b.paid, ...b.unpaid, ...b.silent, ...b.declined]
+    .map((r) => r.cycleOpens).filter((d) => d >= b.today).sort()[0];
+
+  const txt =
+    `🔄 <b>RENEWALS</b>\n` +
+    `<i>Seats ending ${niceDate(addDaysYmd(b.today, -RNW_WINDOW_BACK))} → ${niceDate(addDaysYmd(b.today, RNW_WINDOW_AHEAD))}` +
+    `${nextOpen ? ` · next cycle opens ${niceDate(nextOpen)}` : ''}</i>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `📦 Seats in this round: <b>${total}</b>\n\n` +
+    `✅ Renewed & paid   <b>${b.paid.length}</b>${pct(b.paid.length)} · <b>${rnwMoney(b.revenue)}</b>\n` +
+    `⏳ Said yes, unpaid  <b>${b.unpaid.length}</b>\n` +
+    `🔔 No answer yet     <b>${b.silent.length}</b>\n` +
+    `🚫 Won't renew       <b>${b.declined.length}</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `⚡ <b>TO DO</b>\n` +
+    `🟠 Activate now: <b>${b.activateNow.length}</b>\n` +
+    `🔵 Activate later: <b>${b.scheduled.length}</b>` +
+    (b.scheduled[0] ? ` <i>(first on ${niceDate(b.scheduled[0].start_date)})</i>` : '') +
+    `\n━━━━━━━━━━━━━━━━━━━━\n` +
+    `<i>Customers are reminded daily from the day before their seat ends until ` +
+    `the new cycle opens. "No" stops the reminders for good.</i>`;
+
+  const kb = [
+    [{ text: `🟠 Activate now · ${b.activateNow.length}`, callback_data: 'rnw_l_act_0' },
+     { text: `🔵 Later · ${b.scheduled.length}`, callback_data: 'rnw_l_sch_0' }],
+    [{ text: `✅ Paid · ${b.paid.length}`, callback_data: 'rnw_l_paid_0' },
+     { text: `⏳ Unpaid · ${b.unpaid.length}`, callback_data: 'rnw_l_unp_0' }],
+    [{ text: `🔔 No answer · ${b.silent.length}`, callback_data: 'rnw_l_sil_0' },
+     { text: `🚫 Declined · ${b.declined.length}`, callback_data: 'rnw_l_dec_0' }],
+    [{ text: '🔄 Refresh', callback_data: 'rnw_home' }],
+  ];
+  return { txt, kb };
+}
+
+const RNW_TITLES = {
+  act: '🟠 ACTIVATE NOW', sch: '🔵 ACTIVATE LATER', paid: '✅ RENEWED & PAID',
+  unp: '⏳ SAID YES — NOT PAID', sil: '🔔 NO ANSWER YET', dec: "🚫 WON'T RENEW",
+};
+
+function renewalsList(b, cat, page) {
+  const src = { act: b.activateNow, sch: b.scheduled, paid: b.paid, unp: b.unpaid, sil: b.silent, dec: b.declined }[cat] || [];
+  const pages = Math.max(1, Math.ceil(src.length / RNW_PAGE));
+  page = Math.min(Math.max(0, page), pages - 1);
+  const slice = src.slice(page * RNW_PAGE, page * RNW_PAGE + RNW_PAGE);
+
+  const line = (r, i) => {
+    const n = page * RNW_PAGE + i + 1;
+    const head = `<b>${n}.</b> ${rnwWho(r)} · <code>${escapeHtml(r.email || '')}</code>`;
+    if (cat === 'act' || cat === 'sch') {
+      return `${head}\n    🗓 ${niceDate(r.start_date)} → ${niceDate(r.end_date)} · ${rnwMoney(r.final_price)}` +
+        (r.renewed_from ? ' · 🔄 renewal' : ' · 🆕 new');
+    }
+    if (cat === 'paid') {
+      const x = r.next;
+      return `${head}\n    💵 ${rnwMoney(x.paid || x.final_price)} · ${escapeHtml(String(x.payment_method || '—').replace('pay_', ''))}` +
+        `\n    🗓 ${niceDate(x.start_date)} → ${niceDate(x.end_date)} · ${nextState(x, b.today)}`;
+    }
+    const reminded = r.reminder_count ? ` · reminded ${r.reminder_count}×` : '';
+    return `${head}\n    📅 ends ${niceDate(r.end_date)}${reminded}` +
+      (cat === 'unp' ? ' · <i>chose renew, did not pay</i>' : '');
+  };
+
+  let txt = `${RNW_TITLES[cat]} — <b>${src.length}</b>\n━━━━━━━━━━━━━━━━━━━━\n`;
+  txt += slice.length ? slice.map(line).join('\n\n') : '<i>Nothing here.</i>';
+  if (cat === 'sch' && slice.length) txt += `\n\n<i>Paid ahead of their cycle. Activating early cuts days they paid for.</i>`;
+  if (cat === 'act' && slice.length) txt += `\n\n<i>Tap a seat to open its card with the Activate button.</i>`;
+  if (pages > 1) txt += `\n\n<i>Page ${page + 1}/${pages}</i>`;
+
+  const kb = [];
+  if (cat === 'act' || cat === 'sch') {
+    slice.forEach((r, i) => kb.push([{
+      text: `${cat === 'act' ? '🔔' : '🔵'} ${page * RNW_PAGE + i + 1}. ${String(r.email || '').slice(0, 30)}`,
+      callback_data: `rnw_card_${r.id}`,
+    }]));
+  }
+  const nav = [];
+  if (page > 0) nav.push({ text: '◀️', callback_data: `rnw_l_${cat}_${page - 1}` });
+  if (page < pages - 1) nav.push({ text: '▶️', callback_data: `rnw_l_${cat}_${page + 1}` });
+  if (nav.length) kb.push(nav);
+  kb.push([{ text: '🔙 Renewals', callback_data: 'rnw_home' }]);
+  return { txt, kb };
+}
+
+/** The standard order card for one seat, sent fresh so it can be activated. */
+async function sendSeatCard(chatId, subId) {
+  const sub = queries.getCgbSubById(subId);
+  if (!sub) return bot.sendMessage(chatId, '❌ Seat not found.');
+  const ord = sub.order_id ? db.prepare('SELECT * FROM orders WHERE id = ?').get(sub.order_id) : null;
+  const u = db.prepare('SELECT username, first_name FROM users WHERE telegram_id = ?').get(sub.user_id);
+  const who = u?.username ? '@' + u.username : (u?.first_name || `User ${sub.user_id}`);
+  const days = Math.max(1, Math.round((new Date(`${sub.end_date}T12:00:00`) - new Date(`${sub.start_date}T12:00:00`)) / 86400000));
+  const d = {
+    orderId: sub.order_id || sub.id, userId: sub.user_id, days,
+    name: escapeHtml(who), email: escapeHtml(sub.email || '—'),
+    startDate: sub.start_date, endDate: sub.end_date,
+    paid: Number(sub.final_price ?? ord?.total_price ?? 0).toFixed(2),
+    method: ord?.payment_method || '—', refLabel: 'Order', ref: String(sub.order_id || '—'),
+  };
+  const activated = sub.status === 'active';
+  const scheduled = !activated && String(sub.start_date) > ymdLocal(cgbCycles.localNow(new Date()));
+  return bot.sendMessage(chatId, orderCard(d, activated, scheduled), {
+    parse_mode: 'HTML',
+    reply_markup: activated
+      ? { inline_keyboard: [[{ text: '✅ Already activated', callback_data: 'noop' }]] }
+      : orderCardButtons(d),
+  });
+}
+
+async function handleRenewalsCallback(q) {
+  const chatId = q.message.chat.id;
+  const msgId = q.message.message_id;
+  const data = q.data;
+  if (data.startsWith('rnw_card_')) return sendSeatCard(chatId, parseInt(data.split('_').pop(), 10));
+  const b = renewalBoard();
+  let view;
+  if (data === 'rnw_home') view = renewalsHome(b);
+  else {
+    const [, , cat, page] = data.split('_');
+    view = renewalsList(b, cat, parseInt(page, 10) || 0);
+  }
+  await bot.editMessageText(view.txt, {
+    chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: view.kb }, disable_web_page_preview: true,
+  }).catch(() => {});
+}
+
 bot.onText(/^\/renewals?$/i, async (msg) => {
   if (String(msg.from.id) !== String(ADMIN_ID)) return; // silent for everyone else
-  const chatId = msg.chat.id;
-
-  const paid    = queries.getCgbRenewals(20);
-  const pending = queries.getCgbPendingRenewals();
-
-  const money = (n) => `$${Number(n || 0).toFixed(2)}`;
-  const who = (r) => r.username ? `@${escapeHtml(r.username)}` : escapeHtml(r.first_name || String(r.user_id));
-
-  let txt = `🔄 <b>Renewals</b>\n\n`;
-
-  // Paid early — listed first because they are the ones that need holding back,
-  // and the ones easiest to activate by mistake.
-  const scheduled = queries.getCgbScheduled();
-  const dueNow    = queries.getCgbDueNow();
-
-  if (dueNow.length) {
-    txt += `🟢 <b>Ready to activate now — ${dueNow.length}</b>\n` +
-      dueNow.slice(0, 10).map((r) =>
-        `• ${who(r)} — <code>${escapeHtml(r.email || '')}</code>\n` +
-        `  starts ${escapeHtml(r.start_date || '')} · until ${escapeHtml(r.end_date || '')}`
-      ).join('\n') + `\n\n`;
-  }
-
-  if (scheduled.length) {
-    txt += `🔵 <b>Paid early — do NOT activate yet (${scheduled.length})</b>\n` +
-      scheduled.slice(0, 10).map((r) =>
-        `• ${who(r)} — <code>${escapeHtml(r.email || '')}</code>\n` +
-        `  current seat ends ${escapeHtml(r.prev_end || r.start_date || '')} → ` +
-        `new period ${escapeHtml(r.start_date || '')} to ${escapeHtml(r.end_date || '')}`
-      ).join('\n') +
-      `\n<i>Activating these now would cut short days the customer already paid for.</i>\n\n`;
-  }
-
-  if (paid.length) {
-    const total = paid.reduce((a, r) => a + Number(r.paid || r.final_price || 0), 0);
-    txt += `✅ <b>Paid — last ${paid.length}</b> · ${money(total)} total\n\n`;
-    txt += paid.map((r) =>
-      `• ${who(r)} — <code>${escapeHtml(r.email || '')}</code>\n` +
-      `  ${money(r.paid || r.final_price)} · ${escapeHtml(r.payment_method || '—')} · ` +
-      `until ${escapeHtml(r.end_date || '')}` +
-      `${r.prev_end ? ` <i>(was ${escapeHtml(r.prev_end)})</i>` : ''}`
-    ).join('\n');
-  } else {
-    txt += `✅ <b>Paid renewals:</b> none yet.\n`;
-  }
-
-  if (pending.length) {
-    txt += `\n\n⏳ <b>Said yes, not paid — ${pending.length}</b>\n`;
-    txt += pending.slice(0, 15).map((r) => {
-      const d = daysLeft(r);
-      return `• ${who(r)} — <code>${escapeHtml(r.email || '')}</code>\n` +
-             `  ${d <= 2 ? '⏳' : '📅'} ends ${escapeHtml(r.end_date || '')} (${d}d)`;
-    }).join('\n');
-    if (pending.length > 15) txt += `\n<i>…and ${pending.length - 15} more</i>`;
-    txt += `\n\n<i>These are holds, not sales. Their seats are not secured.</i>`;
-  }
-
-  await bot.sendMessage(chatId, txt, { parse_mode: 'HTML' });
+  const view = renewalsHome(renewalBoard());
+  await bot.sendMessage(msg.chat.id, view.txt, {
+    parse_mode: 'HTML', reply_markup: { inline_keyboard: view.kb }, disable_web_page_preview: true,
+  });
 });
 
 /**
@@ -1010,6 +1138,13 @@ bot.on('callback_query', async (q) => {
 
   await bot.answerCallbackQuery(q.id).catch(() => {});
 
+  // ── Admin: renewals dashboard ──────────────────────────────────────────────
+  if (data.startsWith('rnw_')) {
+    if (String(userId) !== String(ADMIN_ID)) return;
+    await handleRenewalsCallback(q);
+    return;
+  }
+
   // ── Admin: Notify customer that subscription is activated ──────────────────
   if (data.startsWith('cgb_notify_')) {
     if (String(userId) !== String(ADMIN_ID)) return;
@@ -1161,9 +1296,9 @@ bot.on('callback_query', async (q) => {
       queries.markCgbReminded(subId);
       await notifyAdminRenewal(sub, 'no');
       await bot.sendMessage(chatId,
-        `👍 Noted — <code>${escapeHtml(sub.email)}</code> will not be renewed.\n\n` +
-        `It stays active until <b>${sub.end_date}</b>. You can change your mind ` +
-        `any time before then.`,
+        `👍 Noted — <code>${escapeHtml(sub.email)}</code> will not be renewed, ` +
+        `and we will not remind you again.\n\n` +
+        `It stays active until <b>${sub.end_date}</b>. Changed your mind? Tap below any time.`,
         { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
           [{ text: '🔄 Actually, renew it', callback_data: `cgb_renewyes_${subId}` }],
           [{ text: '🔙 Menu', callback_data: 'cgb_menu' }],
@@ -1902,35 +2037,52 @@ async function notifyAdminRenewalPaid(orderId, userId, sessionData) {
     const u = db.prepare('SELECT username, first_name FROM users WHERE telegram_id = ?').get(userId);
     const who = u?.username ? `@${escapeHtml(u.username)}` : escapeHtml(u?.first_name || String(userId));
     const months = sessionData.renewMonths || 1;
+    const today = ymdLocal(cgbCycles.localNow(new Date()));
+    const start = sessionData.startDate || '';
+    const when = start && start > today
+      ? `🔵 Activate on <b>${niceDate(start)}</b> — not before`
+      : `🟠 <b>Activate now</b>`;
+    const b = renewalBoard();
 
     await bot.sendMessage(ADMIN_ID,
-      `💰 <b>RENEWAL PAID</b>\n\n` +
+      `💰 <b>RENEWAL PAID</b>\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
       `👤 ${who} · <code>${userId}</code>\n` +
       `📧 <code>${escapeHtml(sessionData.email || '')}</code>\n` +
-      `📆 ${months} month${months === 1 ? '' : 's'}\n` +
       `💵 <b>$${Number(sessionData.finalPrice || 0).toFixed(2)}</b> · ` +
-      `${escapeHtml(String(sessionData.paymentMethod || '').replace('pay_', '') || 'paid')}\n` +
-      `📅 ${escapeHtml(sessionData.startDate || '')} → <b>${escapeHtml(sessionData.endDate || '')}</b>` +
-      (prev?.end_date ? `\n<i>Previously ended ${escapeHtml(prev.end_date)}</i>` : '') +
-      `\n🧾 Order #${orderId}`,
-      { parse_mode: 'HTML' });
+      `${escapeHtml(String(sessionData.paymentMethod || '').replace('pay_', '') || 'paid')} · ` +
+      `${months} month${months === 1 ? '' : 's'}\n` +
+      `🗓 ${niceDate(start)} → <b>${niceDate(sessionData.endDate || '')}</b>` +
+      (prev?.end_date ? ` <i>(was until ${niceDate(prev.end_date)})</i>` : '') + `\n` +
+      `🧾 Order #${orderId}\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `${when}\n\n` +
+      `📊 This round: ✅ ${b.paid.length} paid · ⏳ ${b.unpaid.length} unpaid · ` +
+      `🔔 ${b.silent.length} no answer · 🚫 ${b.declined.length} declined`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+        [{ text: '📊 Open renewals', callback_data: 'rnw_home' }],
+      ] } });
   } catch (e) {
     logger.warn(`notifyAdminRenewalPaid: ${e.message}`);
   }
 }
 
+/**
+ * A customer's answer to a reminder. "No" is worth knowing (one seat fewer to
+ * hold); "yes" is only an intention — the paid message above is the one that
+ * matters — so it is sent silently.
+ */
 async function notifyAdminRenewal(sub, intent) {
   if (!ADMIN_ID) return;
   try {
-    const reserved = queries.getCgbReserved().length;
+    const u = db.prepare('SELECT username, first_name FROM users WHERE telegram_id = ?').get(sub.user_id);
+    const who = u?.username ? `@${escapeHtml(u.username)}` : escapeHtml(u?.first_name || String(sub.user_id));
     await bot.sendMessage(ADMIN_ID,
-      `${intent === 'yes' ? '🔄' : '🚫'} <b>Renewal decision</b>\n\n` +
-      `📧 <code>${escapeHtml(sub.email || '')}</code>\n` +
-      `👤 <code>${sub.user_id}</code>\n` +
-      `📅 Ends: ${sub.end_date}\n` +
-      `Decision: <b>${intent === 'yes' ? 'WILL RENEW' : 'will NOT renew'}</b>\n\n` +
-      `📊 Seats reserved for next cycle: <b>${reserved}</b>`,
-      { parse_mode: 'HTML' });
+      `${intent === 'yes' ? '⏳ <b>Going to renew</b> — payment pending' : "🚫 <b>Won't renew</b>"}\n` +
+      `👤 ${who} · <code>${escapeHtml(sub.email || '')}</code>\n` +
+      `📅 Seat ends ${niceDate(sub.end_date)}`,
+      { parse_mode: 'HTML', disable_notification: intent === 'yes',
+        reply_markup: { inline_keyboard: [[{ text: '📊 Open renewals', callback_data: 'rnw_home' }]] } });
   } catch (e) {
     logger.warn(`notifyAdminRenewal: ${e.message}`);
   }
@@ -1945,56 +2097,135 @@ function reminderSettings() {
   };
   return {
     enabled: String(get('cgb_reminder_enabled', '1')) === '1',
-    days:    Math.max(0, parseInt(get('cgb_reminder_days', '2'), 10) || 2),
+    // First reminder this many days before the seat ends (1 → the 23rd for a
+    // seat ending on the 24th). Then one a day until the next cycle opens.
+    before:  Math.max(0, Math.min(7, parseInt(get('cgb_reminder_start_before', '1'), 10) || 1)),
+    // Shop-clock hour of the daily message — never in the middle of the night.
+    hour:    Math.max(0, Math.min(23, parseInt(get('cgb_reminder_hour', '10'), 10) || 10)),
   };
 }
 
+const p2d = (n) => String(n).padStart(2, '0');
+const ymdLocal = (d) => `${d.getFullYear()}-${p2d(d.getMonth() + 1)}-${p2d(d.getDate())}`;
+const addDaysYmd = (ymd, n) => { const d = new Date(`${ymd}T12:00:00`); d.setDate(d.getDate() + n); return ymdLocal(d); };
+const niceDate = (ymd) => {
+  const d = new Date(`${ymd}T12:00:00`);
+  return isNaN(d) ? ymd : d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+};
+
 /**
- * Message every customer whose seat expires within the configured window.
+ * The day the next cycle opens for a seat ending on `endYmd`.
  *
- * Each seat is flagged the moment its message is sent, so this is safe to run
- * on a timer and safe to run twice — a duplicate reminder reads as spam, and
- * the whole point is to feel like a service, not a nag.
+ * The seat's cycle is the one whose end day matches its end date (26 -> 24 for
+ * a seat ending on the 24th); the next cycle opens on that cycle's start day.
+ * With no matching cycle, the day after the end.
+ */
+function nextCycleStartYmd(endYmd) {
+  const end = new Date(`${endYmd}T12:00:00`);
+  const cycles = cgbCycles.getCycles();
+  const c = cycles.find((x) => Number(x.end_day) === end.getDate());
+  if (!c) return addDaysYmd(endYmd, 1);
+  for (let i = 1; i <= 31; i++) {
+    const d = new Date(end); d.setDate(d.getDate() + i);
+    const last = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+    if (d.getDate() === Math.min(Number(c.start_day), last)) return ymdLocal(d);
+  }
+  return addDaysYmd(endYmd, 1);
+}
+
+/** Has this seat already been renewed AND paid? */
+function hasPaidSuccessor(subId) {
+  try {
+    return !!db.prepare(`SELECT 1 FROM chatgpt_subscriptions WHERE renewed_from = ?
+      AND COALESCE(status,'') IN ('active','pending') LIMIT 1`).get(subId);
+  } catch (e) { return false; }
+}
+
+/**
+ * The daily renewal reminder.
+ *
+ * For a seat ending on the 24th of a 26 -> 24 cycle: the 23rd, the 24th, the
+ * 25th and the 26th — one message a day, at the configured hour. It stops:
+ *   - for good, the moment the customer answers "No";
+ *   - the moment a renewal is paid;
+ *   - after the day the next cycle opens.
+ * "Yes" goes straight to the payment screen. A customer who said yes but has
+ * not paid keeps getting a gentle "finish your payment" message instead.
  */
 async function sendRenewalReminders() {
-  const { enabled, days } = reminderSettings();
+  const { enabled, before, hour } = reminderSettings();
   if (!enabled) return 0;
 
-  let sent = 0;
-  let due = [];
+  const shopNow = cgbCycles.localNow(new Date());
+  if (shopNow.getHours() < hour) return 0;
+  const today = ymdLocal(shopNow);
+
+  let seats = [];
   try {
-    due = queries.getCgbDueReminders(days);
+    seats = db.prepare(`
+      SELECT cs.*, u.username, u.first_name
+      FROM chatgpt_subscriptions cs
+      LEFT JOIN users u ON cs.user_id = u.telegram_id
+      WHERE COALESCE(cs.status, 'pending') IN ('active', 'pending', 'expired')
+        AND COALESCE(cs.renew_intent, '') <> 'no'
+        AND cs.end_date IS NOT NULL
+        AND date(cs.end_date) BETWEEN date(?, '-35 days') AND date(?, '+7 days')
+        AND COALESCE(cs.reminder_last_date, '') <> ?
+      ORDER BY date(cs.end_date) ASC`).all(today, today, today);
   } catch (e) {
     logger.error(`renewal reminders query failed: ${e.message}`);
     return 0;
   }
 
-  for (const sub of due) {
-    const d = daysLeft(sub);
+  let sent = 0;
+  for (const sub of seats) {
+    const end = String(sub.end_date).slice(0, 10);
+    const first = addDaysYmd(end, -before);
+    const last = nextCycleStartYmd(end);
+    if (today < first || today > last) continue;
+    if (hasPaidSuccessor(sub.id)) continue;
+
+    const email = `<code>${escapeHtml(sub.email || '')}</code>`;
+    let head;
+    if (today < end) {
+      const d = Math.round((new Date(`${end}T12:00:00`) - new Date(`${today}T12:00:00`)) / 86400000);
+      head = `⏰ <b>Your ChatGPT Business seat ends ${d === 1 ? 'tomorrow' : `in ${d} days`}</b>`;
+    } else if (today === end) {
+      head = `⏰ <b>Your ChatGPT Business seat ends today</b>`;
+    } else if (today < last) {
+      head = `⌛ <b>Your ChatGPT Business seat has ended</b>`;
+    } else {
+      head = `🔔 <b>The new cycle starts today — last reminder</b>`;
+    }
+
+    const saidYes = sub.renew_intent === 'yes';
+    const body =
+      `${head}\n\n` +
+      `📧 ${email}\n` +
+      `📅 Ends: <b>${niceDate(end)}</b> · next cycle opens <b>${niceDate(last)}</b>\n\n` +
+      (saidYes
+        ? `You chose to renew, but the payment is not done yet. Finish it to keep the same email for the next cycle.`
+        : `Do you want to renew and keep the same email for the next cycle?`);
+
+    const kb = saidYes
+      ? [[{ text: '💳 Complete payment', callback_data: `cgb_renewyes_${sub.id}` }],
+         [{ text: '❌ No, cancel my renewal', callback_data: `cgb_renewno_${sub.id}` }]]
+      : [[{ text: '✅ Yes, renew', callback_data: `cgb_renewyes_${sub.id}` },
+          { text: '❌ No', callback_data: `cgb_renewno_${sub.id}` }]];
+
     try {
-      await bot.sendMessage(sub.user_id,
-        `⏰ <b>Your ChatGPT Business seat expires in ${d} day${d === 1 ? '' : 's'}</b>\n\n` +
-        `📧 <code>${escapeHtml(sub.email || '')}</code>\n` +
-        `🏢 Workspace: ${escapeHtml(workspaceName(sub))}\n` +
-        `📅 Ends: <b>${sub.end_date}</b>\n\n` +
-        `Renew now to keep the same email next cycle. Seats are limited, and a ` +
-        `seat is only held once the renewal is <b>paid for</b> — unpaid ones are ` +
-        `released to other customers.`,
-        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
-          [{ text: '🔄 Renew & pay', callback_data: `cgb_renewyes_${sub.id}` }],
-          [{ text: '❌ Will not renew', callback_data: `cgb_renewno_${sub.id}` }],
-          [{ text: '📋 Details',        callback_data: `cgb_details_${sub.id}` }],
-        ] } });
-      queries.markCgbReminded(sub.id);
+      await bot.sendMessage(sub.user_id, body, { parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
       sent++;
-      // Telegram throttles bulk sends; a short gap keeps the run under the limit.
       await new Promise((r) => setTimeout(r, 120));
     } catch (e) {
-      // A customer who blocked the bot must not stop the rest of the run, and
-      // the seat is flagged anyway so the loop cannot retry it forever.
+      // Blocked the bot, deleted the chat… still marked for today, so the
+      // hourly run does not retry every hour.
       logger.warn(`reminder to ${sub.user_id} failed: ${e.message}`);
-      queries.markCgbReminded(sub.id);
     }
+    try {
+      db.prepare(`UPDATE chatgpt_subscriptions SET reminder_last_date = ?, reminder_sent = 1,
+        reminder_count = COALESCE(reminder_count,0) + 1, updated_at = datetime('now') WHERE id = ?`).run(today, sub.id);
+    } catch (e) { logger.warn(`reminder mark ${sub.id}: ${e.message}`); }
   }
 
   if (sent) logger.info(`[CGB] ${sent} renewal reminder(s) sent`);
