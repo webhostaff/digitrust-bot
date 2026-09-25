@@ -381,7 +381,11 @@ any long random text to fix that permanently, then reinstall from the fresh link
 </body></html>`
     );
   }
-  res.type('html').send(PAGE.replace('__TOKEN__', ACCESS_TOKEN));
+  // split/join, not replace(): replace() with a string swaps only the FIRST
+  // occurrence. The page carries the token three times, and the one the chat
+  // uses was the third — so the page loaded fine and every message was then
+  // refused with "Invalid or missing token".
+  res.type('html').send(PAGE.split('__TOKEN__').join(ACCESS_TOKEN));
 });
 
 const PAGE = `<!DOCTYPE html>
@@ -546,7 +550,9 @@ It reads your live data — and cannot change anything.</div></div>
   <button id="close">Got it</button>
 </div></div>
 <script>
-const T='__TOKEN__', SID='s'+Date.now();
+// The token in the address bar is the one the server just accepted, so it is
+// preferred; the embedded copy covers a launch where the query was stripped.
+const T=(new URLSearchParams(location.search).get('t'))||'__TOKEN__', SID='s'+Date.now();
 
 // Registered so the page is installable; it caches nothing that matters.
 if('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?t='+T).catch(()=>{});

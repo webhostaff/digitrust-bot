@@ -1037,3 +1037,7 @@ Now, in `services/cgbCycles.js`:
   relative calls went to `/chat` at the site root.
 * `AGENT_MODEL` naming the other provider's model is ignored with a warning,
   and a provider 404 is reported as "model not found" rather than a bare 404.
+* The page's token was substituted with `String.replace`, which swaps only the
+  first occurrence. The chat's copy stayed as the literal `__TOKEN__`, so the
+  page opened but every message returned "Invalid or missing token". Fixed with
+  split/join; the page also prefers the token from its own address bar.
