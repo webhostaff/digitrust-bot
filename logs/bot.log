@@ -37,3 +37,23 @@
 2026-09-25T18:40:56.025Z [INFO] [agent] txid_check({"id":"456323181328080896"})
 2026-09-25T18:40:56.025Z [INFO] [agent] recent_deposits({})
 2026-09-25T18:42:54.660Z [INFO] [agent] txid_check({"id":"456323181328080896"})
+2026-09-25T22:30:41.118Z [INFO] [agent] find_product({"name":"ilove pdf"})
+2026-09-25T22:30:41.119Z [INFO] [agent] find_product({"name":"NOTION"})
+2026-09-25T22:30:41.120Z [INFO] [agent] propose_stock({"product_id":"10","split_by":"auto","__owner_text":"زيد هذول لـ ilove pdf\nuser)
+2026-09-25T22:30:41.120Z [INFO] [agent] propose_stock({"product_id":"11","split_by":"auto","__owner_text":"notion:\nEmail: a@x.com\nPa)
+2026-09-25T22:30:41.121Z [INFO] [agent] propose_stock({"product_id":"11","accounts":"z1@x.com pass AYMEN z2@x.com pass"})
+2026-09-25T22:30:41.121Z [INFO] [agent] propose_stock({"product_id":"999","accounts":"x"})
+2026-09-25T22:30:41.132Z [WARN] No updates/required channel configured — skipping channel publish
+2026-09-25T22:30:41.132Z [WARN] No updates/required group configured — skipping group publish
+2026-09-25T22:30:41.132Z [INFO] [BROADCAST] Channel: false, Group: false
+2026-09-25T22:30:41.132Z [INFO] [stockUpload] +3 → product 11 (Notion Plus [emoji:5368324170671202286])
+2026-09-25T22:31:30.682Z [INFO] [agent] find_product({"name":"ilove pdf"})
+2026-09-25T22:31:30.683Z [INFO] [agent] view_customer_media({"user_id":"111"})
+2026-09-25T22:31:30.684Z [INFO] [agent] propose_stock({"product_id":"10","split_by":"auto","__owner_text":"زيد هذول لـ ilove pdf\nnew1)
+2026-09-25T22:31:30.705Z [WARN] No updates/required channel configured — skipping channel publish
+2026-09-25T22:31:30.705Z [WARN] No updates/required group configured — skipping group publish
+2026-09-25T22:31:30.705Z [INFO] [BROADCAST] Channel: false, Group: false
+2026-09-25T22:31:30.705Z [INFO] [stockUpload] +2 → product 10 (iLovePDF Premium 1 Year)
+2026-09-25T22:41:08.715Z [INFO] [agent] propose_stock({"product_id":"11","split_by":"auto","__owner_text":"1. vickroylilleberg0172@out)
+2026-09-25T22:41:08.717Z [INFO] [agent] propose_stock({"product_id":"11","split_by":"auto","__owner_text":"1. vickroylilleberg0172@out)
+2026-09-25T22:41:08.718Z [INFO] [agent] propose_stock({"product_id":"11","split_by":"auto","__owner_text":"1. vickroylilleberg0172@out)

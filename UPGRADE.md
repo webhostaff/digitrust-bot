@@ -1182,3 +1182,36 @@ panel marks cycles that have not started yet.
   transcribed server-side (`/agent/transcribe`, gpt-4o-mini-transcribe →
   whisper-1, Derja hint); replies can be read aloud (🔊, phone voice or
   `/agent/tts`). Audio cost counts toward the daily budget. Conversational tone.
+
+# Part 31 — Sahbi adds stock, sees images, talks live
+
+* **Stock**: `find_product` (fuzzy names) and `propose_stock`. The owner pastes
+  accounts in any format; the model either passes them joined with AYMEN or has
+  the server split the owner's own message (`split_by`: auto / lines /
+  blank_lines / aymen / sep:…, header lines dropped, multi-line accounts kept
+  whole). Duplicates in the batch or already in stock are skipped. Nothing is
+  written until the owner taps ➕ on the preview card → `POST /agent/stock/approve`
+  → `services/stockUpload.js`, which does exactly what the panel's DONE does
+  (insert, counter, low-stock check, back-in-stock pings, channel post). Drafts
+  are single-use and expire after an hour. `app.set('storeBot')` added.
+* **Images**: the owner can attach photos (resized on the phone), paste
+  screenshots, or attach .txt/.csv lists. `view_customer_media` downloads a
+  customer's photos (shown to the model) and voice notes (transcribed).
+* **📞 Direct talk**: hands-free loop in the app — listens, detects silence,
+  transcribes, answers, speaks, listens again.
+* **Learning & personality**: lessons from corrections saved as "lesson" notes
+  and applied; a running "business" profile; own opinions. Fast tier thinks at
+  medium effort for actions and images.
+* **Support bot**: opening a chat's media puts 🔙 Back to chat / 📥 Inbox under the
+  LAST attachment instead of above all of them.
+
+# Part 32 — Stock formats Sahbi learns
+
+* The splitter drops list numbering ("1. ", "2) ", "- ", "•") at the start of an
+  account, and Arabic notes typed after the last account on the same line.
+* `propose_stock` returns `first_account_full`, `odd_accounts` (accounts whose
+  shape — @, :, |, links, lines — differs from the rest) and `remembered_format`
+  (the owner's saved format notes for that product). Previews show 320 chars.
+* Sahbi asks "where does one account start and end?" when the format is new or
+  something looks odd, then saves the answer as a "format" note per product and
+  stops asking.

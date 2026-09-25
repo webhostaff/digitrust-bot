@@ -860,20 +860,37 @@ async function replayMedia(staffChatId, targetUserId, page) {
     .filter((m) => m.media_type && m.file_id);
 
   if (!rows.length) {
-    await bot.sendMessage(staffChatId, 'ℹ️ No attachments on this page.');
+    await bot.sendMessage(staffChatId, 'ℹ️ No attachments on this page.', { reply_markup: { inline_keyboard: [
+      [{ text: '🔙 Back to chat', callback_data: `chat_p_${targetUserId}_${page}` }],
+    ] } });
     return;
   }
 
-  for (const m of rows) {
+  // The way back rides on the LAST attachment. Sent with the transcript above
+  // it, the buttons ended up off-screen above the photos, and getting back
+  // meant scrolling up past every one of them.
+  const nav = { inline_keyboard: [
+    [{ text: '🔙 Back to chat', callback_data: `chat_p_${targetUserId}_${page}` },
+     { text: '📥 Inbox', callback_data: 'inbox' }],
+  ] };
+
+  for (let i = 0; i < rows.length; i++) {
+    const m = rows[i];
     const cap = `${m.direction === 'in' ? '📩 Customer' : '📤 Support'} · ${formatFull(m.created_at)}` +
+                (rows.length > 1 ? ` · ${i + 1}/${rows.length}` : '') +
                 (m.content ? `\n${escapeHtml(m.content)}` : '');
+    const opts = { caption: cap, parse_mode: 'HTML' };
+    if (i === rows.length - 1) opts.reply_markup = nav;
     try {
-      if (m.media_type === 'photo')         await bot.sendPhoto(staffChatId, m.file_id,    { caption: cap, parse_mode: 'HTML' });
-      else if (m.media_type === 'video')    await bot.sendVideo(staffChatId, m.file_id,    { caption: cap, parse_mode: 'HTML' });
-      else if (m.media_type === 'voice')    await bot.sendVoice(staffChatId, m.file_id,    { caption: cap, parse_mode: 'HTML' });
-      else if (m.media_type === 'document') await bot.sendDocument(staffChatId, m.file_id, { caption: cap, parse_mode: 'HTML' });
+      if (m.media_type === 'photo')         await bot.sendPhoto(staffChatId, m.file_id,    opts);
+      else if (m.media_type === 'video')    await bot.sendVideo(staffChatId, m.file_id,    opts);
+      else if (m.media_type === 'voice')    await bot.sendVoice(staffChatId, m.file_id,    opts);
+      else if (m.media_type === 'document') await bot.sendDocument(staffChatId, m.file_id, opts);
+      else if (i === rows.length - 1) await bot.sendMessage(staffChatId, cap, opts);
     } catch (e) {
       logger.warn(`replayMedia failed: ${e.message}`);
+      // A failed last item must not take the way back with it.
+      if (i === rows.length - 1) await bot.sendMessage(staffChatId, '⬇️', { reply_markup: nav }).catch(() => {});
     }
   }
 }

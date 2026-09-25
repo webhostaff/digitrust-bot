@@ -118,6 +118,39 @@ header .sub{font-size:11.5px;color:var(--dim);white-space:nowrap;overflow:hidden
 .draft.done .acts{display:none}
 .draft .state{margin-top:10px;font-size:13.5px;font-weight:600}
 
+.thumbs{display:flex;gap:8px;padding:6px 12px 0;overflow-x:auto}
+.thumbs:empty{display:none}
+.thumb{position:relative;flex:none}
+.thumb img{width:64px;height:64px;object-fit:cover;border-radius:12px;border:1px solid var(--line)}
+.thumb .f{width:64px;height:64px;border-radius:12px;border:1px solid var(--line);background:var(--card);
+  display:grid;place-items:center;font-size:11px;color:var(--dim);text-align:center;padding:4px;overflow:hidden}
+.thumb button{position:absolute;top:-6px;right:-6px;width:22px;height:22px;border-radius:50%;border:none;
+  background:#ef4444;color:#fff;font-size:12px;line-height:22px;padding:0}
+.me .pics{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;margin-bottom:6px}
+.me .pics img{max-width:180px;max-height:180px;border-radius:12px;border:1px solid #ffffff33}
+#att{background:var(--card);border:1px solid var(--line);color:#c3cbd9}
+.stock{align-self:flex-start;max-width:94%;border-radius:17px;padding:13px;
+  background:linear-gradient(160deg,#10231a,#0d1a14);border:1px solid #1f5135}
+.stock .h{font-size:14px;color:#86efac;margin-bottom:8px;font-weight:600}
+.stock .n{font-size:13px;color:#cbd5e1;margin-bottom:8px}
+.stock .pv{background:#07120d;border:1px solid #1f3b2c;border-radius:11px;padding:9px;font:12.5px/1.5 ui-monospace,monospace;
+  white-space:pre-wrap;overflow-wrap:anywhere;max-height:160px;overflow:auto;color:#d1fae5}
+.stock .acts{display:flex;gap:8px;margin-top:11px}
+.stock .acts button{flex:1;border:none;border-radius:11px;padding:11px;font-size:15px;font-weight:600}
+.stock .yes{background:linear-gradient(135deg,#16a34a,#22c55e);color:#fff}
+.stock .no{background:transparent;border:1px solid var(--line)!important;color:var(--dim)}
+.stock.done .acts{display:none}
+.stock .state{margin-top:9px;font-size:13.5px;font-weight:600}
+#call{position:fixed;inset:0;z-index:12;display:none;flex-direction:column;align-items:center;justify-content:center;gap:22px;
+  background:radial-gradient(600px 400px at 50% 40%,#312e81,#0b0e14 70%);color:#fff;padding:30px;text-align:center}
+#call .ring{width:150px;height:150px;border-radius:50%;display:grid;place-items:center;font-size:56px;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));box-shadow:0 0 0 0 #818cf8aa;transition:transform .12s}
+#call .ring.listen{animation:ring 1.4s infinite}
+#call .ring.think{animation:pulse 1s infinite}
+@keyframes ring{0%{box-shadow:0 0 0 0 #818cf8aa}100%{box-shadow:0 0 0 40px #818cf800}}
+#call .st{font-size:17px;min-height:26px}
+#call .said{font-size:14px;color:#c7d2fe;max-width:340px;min-height:40px;opacity:.9}
+#call button{background:#ef4444;border:none;color:#fff;border-radius:999px;width:70px;height:70px;font-size:28px}
 .chips{display:flex;gap:7px;overflow-x:auto;padding:6px 12px 8px}
 .chips::-webkit-scrollbar{display:none}
 .chips button{white-space:nowrap;background:var(--card);border:1px solid var(--line);color:#c3cbd9;
@@ -177,6 +210,7 @@ header .sub{font-size:11.5px;color:var(--dim);white-space:nowrap;overflow:hidden
   <div class="orb" id="orb">🤝</div>
   <div class="who"><h1>صاحبي</h1><div class="sub" id="sub">…</div></div>
   <button class="hbtn" id="mode" title="Mode">Auto</button>
+  <button class="hbtn" id="callb" title="Talk directly">📞</button>
   <button class="hbtn" id="spk" title="Read replies aloud">🔇</button>
   <button class="hbtn" id="memb" title="Memory">🧠</button>
   <button class="hbtn" id="newc" title="New chat">＋</button>
@@ -191,11 +225,15 @@ header .sub{font-size:11.5px;color:var(--dim);white-space:nowrap;overflow:hidden
   <button>📦 شنوة قرب يوفى من المخزون؟</button>
   <button>📈 كيفاش المبيعات هالجمعة؟</button>
   <button>🤖 تجديدات ChatGPT</button>
+  <button>📦 نحب نزيد مخزون</button>
   <button>💡 عطيني أفكار باش نزيد نبيع</button>
   <button>🚨 فما حاجة مريبة؟</button>
   <button>🧠 شنوة تعرف عليّ؟</button>
 </div>
+<div class="thumbs" id="thumbs"></div>
 <div id="composer">
+  <button class="cbtn" id="att" title="Attach photo or file">📎</button>
+  <input type="file" id="file" accept="image/*,.txt,.csv,.json,text/plain" multiple style="display:none">
   <button class="cbtn" id="mic" title="Voice">🎙</button>
   <textarea id="i" rows="1" dir="auto" placeholder="اكتب ولا احكي 🎙…" enterkeyhint="send"></textarea>
   <div id="rec"><i></i><span id="rect">0:00</span><span style="flex:1;opacity:.8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">يسمع فيك… 🎙 باش تكمّل</span></div>
@@ -243,6 +281,8 @@ header .sub{font-size:11.5px;color:var(--dim);white-space:nowrap;overflow:hidden
     <button id="mclose" style="background:var(--card);border:1px solid var(--line)">سكّر</button>
   </div>
 </div></div>
+<div id="call"><div class="ring" id="ring">🤝</div><div class="st" id="cst">…</div><div class="said" id="csaid" dir="auto"></div>
+  <button id="cend" title="End">✕</button><div class="small" style="color:#a5b4fc">احكي عادي — كي تسكت يجاوبك، ومبعد يسمع فيك من جديد</div></div>
 <div id="how"><div><h3 style="margin:0 0 10px">📲 زيدو للشاشة الرئيسية</h3><ol id="steps"></ol><button id="close">فهمت</button></div></div>
 
 <script>
@@ -287,10 +327,14 @@ const toBottom=(force)=>{if(force||nearBottom()) log.scrollTop=log.scrollHeight;
 function clearTip(){const t=log.querySelector('.tip'); if(t) t.remove();}
 function timeOf(s){ if(!s) return ''; const d=new Date(s.replace(' ','T')+(s.includes('Z')?'':'Z')); return isNaN(d)?'':d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}); }
 
-function addMe(text,at){
+function addMe(text,at,pics){
   clearTip();
   const r=document.createElement('div'); r.className='row me';
-  const m=document.createElement('div'); m.className='msg'; m.dir='auto'; m.textContent=text;
+  const m=document.createElement('div'); m.className='msg'; m.dir='auto';
+  if(pics&&pics.length){ const w=document.createElement('div'); w.className='pics';
+    pics.forEach(u=>{ const im=document.createElement('img'); im.src=u; w.appendChild(im); }); m.appendChild(w); }
+  else if(pics===0){}
+  m.appendChild(document.createTextNode(text));
   r.appendChild(m);
   if(at){const t=document.createElement('div'); t.className='meta'; t.textContent=timeOf(at); r.appendChild(t);}
   log.appendChild(r); toBottom(true);
@@ -343,6 +387,26 @@ function showDraft(dr){
   log.appendChild(box); toBottom();
 }
 
+function showStock(dr){
+  const box=document.createElement('div'); box.className='stock';
+  box.innerHTML='<div class="h"></div><div class="n"></div><div class="pv" dir="ltr"></div>'+
+    '<div class="acts"><button class="yes"></button><button class="no">✕ لا</button></div><div class="state"></div>';
+  box.querySelector('.h').textContent='📦 '+dr.product;
+  box.querySelector('.n').textContent=`${dr.count} حساب جديد · المخزون ${dr.in_stock_now} ← ${dr.after}`+
+    (dr.skipped_duplicates?` · ${dr.skipped_duplicates} مكرّر تنحّى`:'')+(dr.supplier?` · 🏷 ${dr.supplier}`:'')+(dr.unit_cost!=null?` · 💰 $${dr.unit_cost}`:'');
+  box.querySelector('.pv').textContent=(dr.preview||[]).map((a,i)=>`${i+1}. ${a}`).join('\n')+(dr.last?`\n…\n${dr.count}. ${dr.last}`:'');
+  const yes=box.querySelector('.yes'); yes.textContent=`➕ زيد ${dr.count}`;
+  const st=box.querySelector('.state');
+  yes.onclick=async()=>{ yes.disabled=true; st.textContent='⏳ يزيد…';
+    try{ const r=await post('stock/approve',{draft_id:dr.stock_draft_id}); const j=await r.json();
+      if(j.ok){ box.classList.add('done'); st.style.color='#86efac';
+        st.textContent=`✅ تزادو ${j.added} — المخزون توا ${j.now}`+(j.published?' · تنشر في القناة':'')+(j.subscribersNotified?` · ${j.subscribersNotified} يستناو تعلمو`:''); loadBrief(); }
+      else { yes.disabled=false; st.style.color='#fca5a5'; st.textContent='❌ '+(j.error||'فشل'); }
+    }catch(e){ yes.disabled=false; st.style.color='#fca5a5'; st.textContent='❌ '+e.message; } };
+  box.querySelector('.no').onclick=()=>{ box.classList.add('done'); st.style.color='var(--dim)'; st.textContent='تفسخ — ما تزاد شي'; };
+  log.appendChild(box); toBottom();
+}
+
 // ── Brief & header ───────────────────────────────────────────
 function setMode(m){mode=m; localStorage.setItem('mode',m);
   $('mode').innerHTML=m==='fast'?'⚡ <b>سريع</b>':m==='deep'?'🧠 <b>عميق</b>':'✨ Auto';}
@@ -382,7 +446,7 @@ async function loadHistory(){
 }
 function renderItem(it){
       lastId=Math.max(lastId,it.id||0);
-      if(it.role==='user') addMe(it.content,it.created_at);
+      if(it.role==='user') addMe((it.meta&&it.meta.images?'📷×'+it.meta.images+'  ':'')+it.content,it.created_at);
       else if(it.role==='alert') addAlert(it.content,it.created_at);
       else if(it.role==='assistant') addBot(it.content,it.meta,it.created_at);
       else if(it.role==='divider') addNote('divider','— محادثة جديدة —');
@@ -406,9 +470,16 @@ async function pollNew(){
 // ── Sending (streamed) ───────────────────────────────────────
 function setBusy(b){busy=b; orb.classList.toggle('busy',b); sendB.classList.toggle('stop',b); sendB.textContent=b?'■':'➤';}
 
+let pending=[], lastReply=''; // {kind:'img',url} | {kind:'txt',name,text}
 async function send(text){
-  text=String(text||'').trim(); if(!text||busy) return;
-  addMe(text,new Date().toISOString());
+  text=String(text||'').trim();
+  const pics=pending.filter(p=>p.kind==='img').map(p=>p.url);
+  const files=pending.filter(p=>p.kind==='txt');
+  if((!text&&!pics.length&&!files.length)||busy) return;
+  // Text files go inside the message: a pasted list of accounts is just text.
+  for(const f of files) text+=(text?'\n\n':'')+`[${f.name}]\n`+f.text;
+  addMe(files.length?text.slice(0,600)+(text.length>600?'…':''):text,new Date().toISOString(),pics);
+  pending=[]; renderThumbs();
   inp.value=''; grow(); setBusy(true);
 
   const r=document.createElement('div'); r.className='row bot';
@@ -421,7 +492,7 @@ async function send(text){
   ctrl=new AbortController();
   try{
     const res=await fetch(api('chat/stream'),{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({message:text,mode}),signal:ctrl.signal});
+      body:JSON.stringify({message:text,mode,images:pics}),signal:ctrl.signal});
     if(!res.ok){ let e='HTTP '+res.status; try{e=(await res.json()).error||e;}catch(_){} throw new Error(e); }
     const rd=res.body.getReader(), dec=new TextDecoder(); let buf='';
     while(true){
@@ -435,6 +506,7 @@ async function send(text){
         else if(ev.type==='status'){ st.querySelector('span').textContent=ev.text+'…'; }
         else if(ev.type==='delta'){ full+=ev.text; if(!raf) raf=requestAnimationFrame(paint); }
         else if(ev.type==='draft'){ showDraft(ev.draft); }
+        else if(ev.type==='stock_draft'){ showStock(ev.draft); }
         else if(ev.type==='done'){ meta=ev; }
         else if(ev.type==='error'){ failed=true; addErr(ev.error); }
       }
@@ -446,12 +518,38 @@ async function send(text){
   if(raf) cancelAnimationFrame(raf);
   st.remove();
   if(!full && failed){ r.remove(); }
-  else { m.innerHTML=md(full||'…'); r.appendChild(metaLine(full,meta,new Date().toISOString())); if(!failed) speak(full); }
+  else { m.innerHTML=md(full||'…'); r.appendChild(metaLine(full,meta,new Date().toISOString())); if(!failed && !inCall) speak(full); }
   ctrl=null; setBusy(false); toBottom(); loadBrief();
+  lastReply=failed?'':full;
   try{ const j=await (await fetch(api('history?limit=5'))).json(); for(const it of j.items||[]) lastId=Math.max(lastId,it.id||0);}catch(_){}
 }
 
 sendB.onclick=()=>{ if(busy){ ctrl&&ctrl.abort(); return; } send(inp.value); };
+
+// ── Attachments ──────────────────────────────────────────────
+$('att').onclick=()=>$('file').click();
+$('file').onchange=async(e)=>{
+  for(const f of [...e.target.files].slice(0,6)){
+    if(f.type.startsWith('image/')) pending.push({kind:'img',url:await shrink(f)});
+    else if(f.size<2e6) pending.push({kind:'txt',name:f.name,text:await f.text()});
+  }
+  e.target.value=''; renderThumbs();
+};
+// Photos are resized on the phone (max 1600px, JPEG): enough to read a
+// screenshot, a fraction of the upload and of the tokens.
+function shrink(file){ return new Promise((res)=>{ const img=new Image(); const u=URL.createObjectURL(file);
+  img.onload=()=>{ const k=Math.min(1,1600/Math.max(img.width,img.height)); const c=document.createElement('canvas');
+    c.width=Math.round(img.width*k); c.height=Math.round(img.height*k); c.getContext('2d').drawImage(img,0,0,c.width,c.height);
+    URL.revokeObjectURL(u); res(c.toDataURL('image/jpeg',0.82)); };
+  img.onerror=()=>{ const r=new FileReader(); r.onload=()=>res(r.result); r.readAsDataURL(file); };
+  img.src=u; }); }
+function renderThumbs(){ const t=$('thumbs'); t.innerHTML='';
+  pending.forEach((p,i)=>{ const d=document.createElement('div'); d.className='thumb';
+    d.innerHTML=p.kind==='img'?'<img>':'<div class="f"></div>'; if(p.kind==='img') d.querySelector('img').src=p.url; else d.querySelector('.f').textContent='📄 '+p.name;
+    const x=document.createElement('button'); x.textContent='✕'; x.onclick=()=>{pending.splice(i,1); renderThumbs();}; d.appendChild(x); t.appendChild(d); }); }
+// Paste a screenshot straight into the box.
+inp.addEventListener('paste',async(e)=>{ const it=[...(e.clipboardData&&e.clipboardData.items||[])].filter(x=>x.type.startsWith('image/'));
+  for(const x of it){ pending.push({kind:'img',url:await shrink(x.getAsFile())}); } if(it.length){ e.preventDefault(); renderThumbs(); } });
 document.querySelectorAll('#chips button').forEach(b=>b.onclick=()=>send(b.textContent));
 
 // Grows with the text up to ~45% of the screen, then scrolls inside.
@@ -542,6 +640,75 @@ async function speak(text){
   }catch(_){ if(v){ const u=new SpeechSynthesisUtterance(plain); u.voice=v; speechSynthesis.speak(u);} }
 }
 if(window.speechSynthesis) speechSynthesis.onvoiceschanged=()=>{};
+
+// ── 📞 Direct talk ───────────────────────────────────────────
+// Hands-free: it listens, notices when you stop talking, answers out loud,
+// then listens again — until you press ✕.
+let inCall=false, callStream=null, callRec=null, callCtx=null;
+const ring=$('ring'), cst=$('cst'), csaid=$('csaid');
+$('callb').onclick=()=>startCall();
+$('cend').onclick=()=>endCall();
+async function startCall(){
+  if(!canRecord){ addErr('📞 المتصفح هذا ما يدعمش التسجيل'); return; }
+  try{ callStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true}}); }
+  catch(e){ addErr('🎙 سمح للميكروفون باش نحكيو'); return; }
+  inCall=true; $('call').style.display='flex'; csaid.textContent='';
+  callCtx=new (window.AudioContext||window.webkitAudioContext)();
+  listenOnce();
+}
+function endCall(){
+  inCall=false; $('call').style.display='none'; stopSpeaking();
+  try{ callRec&&callRec.state!=='inactive'&&callRec.stop(); }catch(_){}
+  if(callStream) callStream.getTracks().forEach(t=>t.stop()); callStream=null;
+  try{ callCtx&&callCtx.close(); }catch(_){} callCtx=null;
+}
+function listenOnce(){
+  if(!inCall) return;
+  ring.className='ring listen'; cst.textContent='🎧 نسمع فيك…';
+  const src=callCtx.createMediaStreamSource(callStream), an=callCtx.createAnalyser(); an.fftSize=1024; src.connect(an);
+  const buf=new Uint8Array(an.fftSize);
+  const type=['audio/webm;codecs=opus','audio/webm','audio/mp4'].find(t=>MediaRecorder.isTypeSupported(t))||'';
+  callRec=new MediaRecorder(callStream,type?{mimeType:type}:undefined); const parts=[];
+  callRec.ondataavailable=e=>{ if(e.data.size) parts.push(e.data); };
+  let spoke=false, quietSince=0; const t0=Date.now();
+  const tick=()=>{
+    if(!inCall||callRec.state==='inactive') return;
+    an.getByteTimeDomainData(buf); let sum=0; for(const v of buf){ const x=(v-128)/128; sum+=x*x; }
+    const rms=Math.sqrt(sum/buf.length); ring.style.transform=`scale(${1+Math.min(.25,rms*3)})`;
+    if(rms>0.035){ spoke=true; quietSince=0; } else if(spoke){ quietSince=quietSince||Date.now(); }
+    const long=Date.now()-t0;
+    if((spoke&&quietSince&&Date.now()-quietSince>1100)||long>45000||(!spoke&&long>12000)){ callRec.stop(); return; }
+    requestAnimationFrame(tick);
+  };
+  callRec.onstop=async()=>{
+    ring.style.transform=''; src.disconnect();
+    if(!inCall) return;
+    if(!spoke){ listenOnce(); return; }
+    ring.className='ring think'; cst.textContent='🤔 نخمم…';
+    const blob=new Blob(parts,{type:callRec.mimeType||'audio/webm'});
+    try{
+      const r=await fetch(api('transcribe?sec='+Math.round((Date.now()-t0)/1000)),{method:'POST',headers:{'Content-Type':blob.type},body:blob});
+      const j=await r.json();
+      if(!j.text){ cst.textContent='ما سمعتكش مليح، عاود'; setTimeout(listenOnce,900); return; }
+      csaid.textContent='🗣 '+j.text;
+      await send(j.text);
+      if(!inCall) return;
+      cst.textContent='🔊 …'; ring.className='ring';
+      await speakAndWait(lastReply);
+    }catch(e){ cst.textContent='❌ '+e.message; await new Promise(r=>setTimeout(r,1500)); }
+    listenOnce();
+  };
+  callRec.start(); requestAnimationFrame(tick);
+}
+function speakAndWait(text){
+  return new Promise(async(done)=>{
+    if(!text){ done(); return; }
+    const was=speakOn; speakOn=true; await speak(text); speakOn=was;
+    const wait=()=>{ const talking=(audioEl&&!audioEl.paused&&!audioEl.ended)||(window.speechSynthesis&&speechSynthesis.speaking);
+      if(!inCall||!talking) done(); else setTimeout(wait,250); };
+    setTimeout(wait,600);
+  });
+}
 
 // ── Phone notifications for alerts ───────────────────────────
 function notifyPhone(title,body){

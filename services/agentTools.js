@@ -791,6 +791,222 @@ TOOLS.order_lookup = {
   },
 };
 
+// ── Stock: proposed by Sahbi, added only when the owner taps "Add" ──────────
+//
+// The same pattern as propose_reply. The model never writes stock: it turns
+// whatever the owner pasted into a clean list of accounts and a draft, and the
+// app shows the draft with a button. Only that button — the owner's tap —
+// calls stockUpload. A customer message cannot trigger it.
+
+const STOCK_DRAFTS = new Map(); // id → { productId, accounts, supplier, unitCost, at }
+const STOCK_TTL = 60 * 60 * 1000;
+
+const norm = (t) => clean(t).toLowerCase().replace(/[^a-z0-9\u0600-\u06ff]+/g, '');
+
+function findProducts(q) {
+  const want = norm(q);
+  if (!want) return [];
+  const all = raw.prepare(`SELECT id, title, price, stock_quantity, delivery_type, unlimited_stock,
+      is_chatgpt_business, COALESCE(is_active,1) AS is_active FROM products`).all();
+  return all.map((p) => {
+    const t = norm(p.title);
+    const score = t === want ? 100 : t.startsWith(want) ? 80 : t.includes(want) ? 60
+      : want.split(/\s+/).every((w) => t.includes(w)) ? 40 : 0;
+    return { ...p, title: clean(p.title), score };
+  }).filter((p) => p.score > 0).sort((a, b) => b.score - a.score || b.is_active - a.is_active).slice(0, 8);
+}
+
+TOOLS.find_product = {
+  description: 'Find products by (part of) their name, tolerant of spacing/case: "ilovepdf", "I LOVE PDF", "notion".',
+  input: { name: 'product name or part of it' },
+  run: ({ name }) => findProducts(name).map((p) => ({
+    id: p.id, title: p.title, price: p.price, in_stock: raw.prepare(
+      `SELECT COUNT(*) AS n FROM product_items WHERE product_id = ? AND status = 'available'`).get(p.id).n,
+    active: !!p.is_active,
+    kind: p.is_chatgpt_business ? 'chatgpt_business' : p.unlimited_stock ? 'unlimited' : p.delivery_type === 'manual' ? 'manual' : 'stock',
+  })),
+};
+
+/** Split pasted text into accounts. `mode` is decided by the model, or 'auto'. */
+function splitAccounts(text, mode = 'auto', dropPattern = '') {
+  let t = String(text || '').replace(/\r/g, '');
+  let parts;
+  const m = String(mode || 'auto').toLowerCase();
+  if (m === 'aymen' || (m === 'auto' && /AYMEN/.test(t))) parts = t.split('AYMEN');
+  else if (m === 'blank_lines' || (m === 'auto' && /\n\s*\n/.test(t) && t.split(/\n\s*\n/).some((b) => b.trim().includes('\n')))) parts = t.split(/\n\s*\n+/);
+  else if (m.startsWith('sep:')) parts = t.split(mode.slice(4));
+  else parts = t.split('\n');
+  let drop = null;
+  try { drop = dropPattern ? new RegExp(dropPattern, 'i') : null; } catch (_) {}
+  // In auto mode a line with none of the marks of an account (@ : | / digits)
+  // is the owner's own words ("add these to Notion") and is left out.
+  const looksLikeAccount = (x) => /[@:|\/\\]|\d{3,}|https?:/.test(x);
+  // Inside a multi-line account, leading lines with no account marks are the
+  // owner's words ("notion:", "add these") glued to the first block.
+  const isHeader = (l) => !looksLikeAccount(l) || /^[^@|\/\\\d]{1,40}:\s*$/.test(l.trim());
+  const trimLead = (x) => {
+    const lines = x.split('\n');
+    while (lines.length > 1 && isHeader(lines[0])) lines.shift();
+    return lines.join('\n').trim();
+  };
+  return parts.map((x) => x.trim()).filter(Boolean)
+    .map((x) => (m === 'auto' || m === 'blank_lines' ? trimLead(x) : x))
+    // "1. ", "2) ", "- ", "• " in front of an account is the list, not the account.
+    .map((x) => x.replace(/^\s*(?:\d{1,4}\s*[.)\-:]\s+|[-•*▪➤►]\s+)/, ''))
+    // The owner's own words typed after the last account on the same line:
+    // Arabic text after a gap, in stock that is otherwise Latin.
+    .map((x) => (/[\u0600-\u06FF]/.test(x) && !/^[^\n]*[\u0600-\u06FF]/.test(x.split(/\s{2,}|\s(?=\S*[\u0600-\u06FF])/)[0])
+      ? x.replace(/\s+\S*[\u0600-\u06FF][\s\S]*$/, '').trim() : x))
+    .map((x) => x.split('\n').filter((l) => !(drop && drop.test(l))).join('\n').trim())
+    .filter(Boolean)
+    .filter((x) => m !== 'auto' || (looksLikeAccount(x) && !(x.indexOf('\n') < 0 && isHeader(x))));
+}
+
+TOOLS.propose_stock = {
+  description:
+    'Prepare accounts to ADD TO STOCK of one product. It does not add anything: the owner sees a preview ' +
+    'card and taps Add. Either pass the accounts yourself, joined with the word AYMEN between each, or ' +
+    'let the server split the owner\'s own pasted message with split_by (best for long lists — no need to ' +
+    'repeat them). Always find_product first to get the id. Duplicates already in stock are skipped.',
+  input: {
+    product_id: 'product id (from find_product)',
+    accounts: 'optional: the accounts joined with AYMEN between each one',
+    split_by: 'optional, when accounts is empty: auto | lines | blank_lines | aymen | sep:<text> — applied to the owner\'s latest message',
+    drop_lines_matching: 'optional regex of lines to leave out (e.g. headers)',
+    supplier: 'optional supplier name', unit_cost: 'optional cost per account in $',
+  },
+  run: ({ product_id, accounts, split_by, drop_lines_matching, supplier, unit_cost, __owner_text }) => {
+    const p = raw.prepare('SELECT * FROM products WHERE id = ?').get(Number(product_id));
+    if (!p) return { error: 'product not found — use find_product' };
+    if (p.is_chatgpt_business || p.unlimited_stock || p.delivery_type === 'manual') {
+      return { error: `"${clean(p.title)}" does not use stock items (${p.is_chatgpt_business ? 'ChatGPT Business' : p.unlimited_stock ? 'unlimited' : 'manual delivery'})` };
+    }
+    let list = accounts && String(accounts).trim()
+      ? String(accounts).split('AYMEN').map((x) => x.trim()).filter(Boolean)
+      : splitAccounts(__owner_text || '', split_by || 'auto', drop_lines_matching);
+    if (!list.length) return { error: 'no accounts found in the message — ask the owner to paste them' };
+
+    const seen = new Set();
+    const inBatch = [];
+    list = list.filter((a) => { const k = a.toLowerCase(); if (seen.has(k)) { inBatch.push(a); return false; } seen.add(k); return true; });
+    const exists = raw.prepare('SELECT 1 FROM product_items WHERE product_id = ? AND raw_content = ? LIMIT 1');
+    const already = list.filter((a) => exists.get(p.id, a));
+    list = list.filter((a) => !already.includes(a));
+    if (!list.length) return { error: 'every account is already in stock', duplicates: already.length };
+
+    // Do the accounts all look alike? One that does not is usually a split in
+    // the wrong place, or a note that slipped in — worth a question first.
+    const shape = (a) => [
+      (a.match(/@/g) || []).length, (a.match(/:/g) || []).length, (a.match(/\|/g) || []).length,
+      (a.match(/https?:/g) || []).length, a.split('\n').length,
+    ].join('/');
+    const counts = {};
+    list.forEach((a) => { const k = shape(a); counts[k] = (counts[k] || 0) + 1; });
+    const common = Object.entries(counts).sort((x, y) => y[1] - x[1])[0][0];
+    const odd = list.map((a, i) => ({ i: i + 1, a })).filter((x) => shape(x.a) !== common || /[\u0600-\u06FF]/.test(x.a));
+
+    let remembered = [];
+    try {
+      const words = clean(p.title).split(/\s+/).filter((w) => w.length > 2).slice(0, 2);
+      remembered = words.flatMap((w) => mem.searchMemory(w, 5))
+        .filter((n) => /format|stock|مخزون|حساب|account/i.test(n.text + n.category)).map((n) => n.text);
+      remembered = [...new Set(remembered)].slice(0, 3);
+    } catch (_) {}
+
+    const id = `stk_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+    const cost = unit_cost !== undefined && unit_cost !== '' && Number.isFinite(Number(unit_cost)) ? Number(unit_cost) : null;
+    STOCK_DRAFTS.set(id, { productId: p.id, accounts: list, supplier: supplier || null, unitCost: cost, at: Date.now() });
+    for (const [k, v] of STOCK_DRAFTS) if (Date.now() - v.at > STOCK_TTL) STOCK_DRAFTS.delete(k);
+    const inStock = raw.prepare(`SELECT COUNT(*) AS n FROM product_items WHERE product_id = ? AND status='available'`).get(p.id).n;
+    return {
+      stock_draft_id: id, product_id: p.id, product: clean(p.title), count: list.length,
+      in_stock_now: inStock, after: inStock + list.length,
+      preview: list.slice(0, 3).map((a) => a.slice(0, 320)), last: list.length > 3 ? list[list.length - 1].slice(0, 320) : null,
+      skipped_duplicates: already.length + inBatch.length, supplier: supplier || null, unit_cost: cost,
+      first_account_full: list[0].slice(0, 400),
+      odd_accounts: odd.slice(0, 5).map((x) => ({ n: x.i, text: x.a.slice(0, 200) })),
+      remembered_format: remembered,
+      note: odd.length
+        ? `${odd.length} account(s) do not look like the others — check them with the owner before they tap Add.`
+        : 'All accounts look alike. Waiting for the owner to tap Add in the app.',
+    };
+  },
+};
+
+function takeStockDraft(id) {
+  const d = STOCK_DRAFTS.get(id);
+  if (!d || Date.now() - d.at > STOCK_TTL) return null;
+  STOCK_DRAFTS.delete(id);
+  return d;
+}
+
+// ── Customer media: see the photos, hear the voice notes ─────────────────────
+
+let SUPPORT_BOT = null;
+const supportBot = () => {
+  if (SUPPORT_BOT) return SUPPORT_BOT;
+  try { const b = require('../support-bot'); if (b && b.getFileLink) SUPPORT_BOT = b; } catch (_) {}
+  return SUPPORT_BOT;
+};
+
+TOOLS.view_customer_media = {
+  description:
+    'Look at the photos (screenshots, payment proofs, error screens) and listen to the voice notes a customer ' +
+    'sent in support. Returns the images for you to see and voice notes as text. Default: their latest ones.',
+  input: { user_id: 'customer telegram id', count: 'how many recent items, default 3, max 6' },
+  run: async ({ user_id, count = 3 }) => {
+    const bot = supportBot();
+    if (!bot) return { error: 'support bot not available' };
+    const n = Math.min(6, Math.max(1, Number(count) || 3));
+    const rows = raw.prepare(`SELECT id, direction, media_type, file_id, content, created_at FROM support_messages
+      WHERE user_id = ? AND file_id IS NOT NULL AND media_type IN ('photo','document','voice')
+      ORDER BY id DESC LIMIT ?`).all(Number(user_id), n).reverse();
+    if (!rows.length) return { found: 0, note: 'no photos or voice notes from this customer' };
+    const out = { found: rows.length, items: [], __images: [] };
+    for (const r of rows) {
+      try {
+        const link = await bot.getFileLink(r.file_id);
+        const res = await fetch(link);
+        const buf = Buffer.from(await res.arrayBuffer());
+        const type = String(res.headers.get('content-type') || '');
+        const meta = { from: r.direction === 'in' ? 'customer' : 'support', at: r.created_at, caption: r.content || null };
+        if (r.media_type === 'voice') {
+          const t = await transcribeBuffer(buf, 'audio/ogg');
+          out.items.push({ ...meta, kind: 'voice', text: t || '(could not transcribe)' });
+        } else if (r.media_type === 'photo' || /^image\//.test(type) || /\.(jpe?g|png|webp)$/i.test(link)) {
+          if (buf.length > 6 * 1024 * 1024) { out.items.push({ ...meta, kind: 'image', note: 'too large' }); continue; }
+          const mime = /png/i.test(link) ? 'image/png' : /webp/i.test(link) ? 'image/webp' : 'image/jpeg';
+          out.__images.push({ label: `${meta.from} · ${meta.at}${meta.caption ? ' · ' + meta.caption : ''}`, url: `data:${mime};base64,${buf.toString('base64')}` });
+          out.items.push({ ...meta, kind: 'image', shown: out.__images.length });
+        } else {
+          out.items.push({ ...meta, kind: 'file', note: 'not an image — cannot view' });
+        }
+      } catch (e) {
+        out.items.push({ at: r.created_at, error: e.message });
+      }
+    }
+    return out;
+  },
+};
+
+async function transcribeBuffer(buf, type) {
+  if (!process.env.OPENAI_API_KEY) return '';
+  for (const model of ['gpt-4o-mini-transcribe', 'whisper-1']) {
+    try {
+      const form = new FormData();
+      form.append('file', new Blob([buf], { type }), 'voice.ogg');
+      form.append('model', model);
+      form.append('prompt', 'Tunisian Arabic, French, English. Customer of a digital accounts shop.');
+      const r = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+        method: 'POST', headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }, body: form });
+      if (r.status === 404) continue;
+      const j = await r.json();
+      return String(j.text || '').trim();
+    } catch (_) {}
+  }
+  return '';
+}
+
 /** Shape the model needs to know what it may call. */
 function toolSchemas() {
   return Object.entries(TOOLS).map(([name, t]) => ({
@@ -899,4 +1115,4 @@ async function sendApprovedReply(draftId, bot) {
   }
 }
 
-module.exports = { TOOLS, toolSchemas, runTool, sendApprovedReply, liveSnapshot };
+module.exports = { TOOLS, toolSchemas, runTool, sendApprovedReply, liveSnapshot, takeStockDraft, splitAccounts };

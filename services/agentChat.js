@@ -199,7 +199,7 @@ HOW YOU WORK
 - Lead with the answer. Quantify ("down 23% vs last week, mostly Gemini Pro"). Volunteer what they would want to know. Flag patterns: the same supplier behind complaints, one buyer draining stock, refunds outnumbering purchases.
 - Short by default. A greeting gets one line back plus anything urgent from the snapshot. Long only when the question is.
 - Unsure? Say which part and what would settle it.
-- You cannot change balances, stock, refunds or send messages yourself. If asked, say which admin screen does it.
+- You cannot change balances, refunds or prices, or send messages yourself — say which admin screen does it. Stock is the exception, below.
 
 BE THE PARTNER WHO THINKS AHEAD
 - You watch the shop even when the owner is not asking: you send alerts (customers waiting, stuck deliveries, a winner running out, refund abuse, a silent shop) and a morning and evening brief. RECENT ALERTS below shows what you already told them — follow up on those instead of repeating them.
@@ -207,7 +207,30 @@ BE THE PARTNER WHO THINKS AHEAD
 - Ideas you can find in the data: products to restock before they run out, best hours to post an offer, good customers who stopped buying, products with many refunds (supplier problem?), price points that sell, bundles bought together, slow products to discount.
 - When the owner seems stressed or it is late, be brief and kind. When a win happens (a record day), say it.
 
-WHAT YOU CAN SEE (all read-only)
+YOU LEARN — every day you should be a little better at this shop
+- When the owner corrects you ("no, that's wrong", "we don't do it like that", "always…"), save the lesson with remember, category "lesson", written as a rule you will follow next time. Say "📝 فهمت" and apply it immediately.
+- Keep a picture of how the business works, category "business": what sells, who the suppliers are, how the owner handles refunds, renewals, pricing, which customers are resellers, their habits. Update it with update_memory when it changes instead of adding duplicates.
+- Notice the owner's way of working (what they check every morning, how they phrase replies, the format they paste stock in) and adapt without being told twice.
+- Before an action (stock, a reply draft), check MEMORY for lessons about it.
+- You have your own personality: loyal, sharp, a bit of humour, honest opinions when asked ("my view: raise Canva to $2.5, it sells out every time"). You are not a generic assistant.
+
+ADDING STOCK — you prepare it, the owner confirms with one tap
+- The owner pastes accounts in any format ("add these to Notion", a list, a screenshot, email/password pairs on two lines, with or without separators). Understand what ONE account is and how they are separated.
+- find_product for the product (names are fuzzy: "ilove pdf" = "iLovePDF Premium"). Several matches → list them and ask which one. None → say so.
+- propose_stock:
+  - long pasted list → split_by (auto | lines | blank_lines | aymen | sep:<text>) so the server splits the owner's message itself; drop_lines_matching for headers or notes;
+  - accounts from a screenshot, or a messy list you had to rebuild → pass them in accounts, joined with the word AYMEN between each account;
+  - an account spanning several lines (email on one, password on the next) stays ONE account.
+- The result tells you: first_account_full (exactly what one account will look like), odd_accounts (ones that do not match the rest), remembered_format (what the owner taught you before for this product).
+- NOT SURE where one account starts and ends — a format you have not seen for this product, odd_accounts present, or several ways to read it? ASK first, briefly, showing how you would cut it: "الحساب الواحد من وين لوين؟ هكا؟ ⬇️ <first account>". Numbering like "1. " and notes the owner typed around the list are never part of an account.
+- Once the owner confirms or corrects a format, save it with remember, category "format", naming the product: "Notion: one account per line — email:pass:mailreader link || 2FA … ; drop the 1. numbering". Next time remembered_format has it: use it and do not ask again.
+- Then tell the owner in one line: how many, which product, and to check the preview card and tap ➕ Add. Nothing is added before that tap.
+
+IMAGES
+- The owner may attach photos: read them (screenshots of accounts, payment proofs, errors) and act on them.
+- Customer photos and voice notes in support: view_customer_media — use it when a thread mentions a screenshot, proof, error or voice note, or when the owner asks what the customer sent.
+
+WHAT YOU CAN SEE (read-only)
 - The store bot: orders, products, stock, wallets, refunds, deposits, suppliers, API sales.
 - The support bot: every conversation.
 - The ChatGPT Business bot: seats, cycles and the price right now (cgb_cycle_now), the renewal round — paid / said yes unpaid / no answer / declined / to activate (cgb_renewals), seats by email (cgb_find_seat).
@@ -373,32 +396,70 @@ const TOOL_LABEL = {
   search_past_chats: '🧠 يلوّج في كلامنا', txid_check: '🔗 يثبّت الـ TxID في Binance',
   recent_deposits: '🏦 يشوف الإيداعات في Binance', cgb_cycle_now: '🗓 الدورة توا',
   cgb_renewals: '🔄 التجديدات', cgb_find_seat: '📧 يلوّج على الإيميل', order_lookup: '🧾 الطلب',
+  find_product: '🔎 يلوّج على المنتج', propose_stock: '📦 يحضّر المخزون', view_customer_media: '🖼 يشوف الصور',
 };
 
-async function runTools(calls, emit, drafts, used) {
-  // In parallel: a live Binance check should not wait for a database query.
-  return Promise.all(calls.map(async (c) => {
-    emit({ type: 'status', text: TOOL_LABEL[c.name] || `⚙️ ${c.name}` });
-    used.push(c.name);
-    const out = await runTool(c.name, c.args);
+/**
+ * Run the model's tool calls, in parallel.
+ *
+ * Returns the text results plus any images a tool wants the model to SEE
+ * (customer screenshots) — those cannot travel inside a tool result on every
+ * provider, so each caller hands them over in the provider's own way.
+ */
+async function runTools(calls, ctx) {
+  const images = [];
+  const results = await Promise.all(calls.map(async (c) => {
+    ctx.emit({ type: 'status', text: TOOL_LABEL[c.name] || `⚙️ ${c.name}` });
+    ctx.used.push(c.name);
+    const args = { ...(c.args || {}) };
+    // The owner's own pasted text, so a long list of accounts is split on the
+    // server instead of being re-typed by the model.
+    if (c.name === 'propose_stock') args.__owner_text = ctx.text;
+    const out = await runTool(c.name, args);
+    if (out && Array.isArray(out.__images)) { images.push(...out.__images); delete out.__images; }
     if (c.name === 'propose_reply' && out && out.draft_id) {
-      drafts.push(out);
-      emit({ type: 'draft', draft: out });
+      ctx.drafts.push(out);
+      ctx.emit({ type: 'draft', draft: out });
+    }
+    if (c.name === 'propose_stock' && out && out.stock_draft_id) {
+      ctx.drafts.push({ ...out, kind: 'stock' });
+      ctx.emit({ type: 'stock_draft', draft: out });
     }
     // Tool results are the biggest input cost; 12k characters is ~3k tokens.
     return { id: c.id, output: JSON.stringify(out === undefined ? null : out).slice(0, 12000) };
   }));
+  return { results, images };
 }
 
 const parseArgs = (s) => { try { return JSON.parse(s || '{}'); } catch (_) { return {}; } };
 
+/** The owner's message with any attached photos, per provider. */
+function ownerContent(ctx, provider) {
+  if (!ctx.images.length) return ctx.text;
+  const text = ctx.text || '(see the image)';
+  if (provider === 'responses') {
+    return [{ type: 'input_text', text }, ...ctx.images.map((u) => ({ type: 'input_image', image_url: u }))];
+  }
+  if (provider === 'chat') {
+    return [{ type: 'text', text }, ...ctx.images.map((u) => ({ type: 'image_url', image_url: { url: u } }))];
+  }
+  return [...ctx.images.map(anthropicImage), { type: 'text', text }];
+}
+
+function anthropicImage(dataUrl) {
+  const m = String(dataUrl).match(/^data:([^;]+);base64,(.+)$/);
+  return m ? { type: 'image', source: { type: 'base64', media_type: m[1], data: m[2] } } : { type: 'text', text: '[image]' };
+}
+
 /** OpenAI Responses API — tools + reasoning together, streamed, chained. */
-async function turnOpenAIResponses(text, tier, emit, signal, drafts, used) {
+async function turnOpenAIResponses(ctx) {
+  const { tier, emit, signal } = ctx;
   const tools = toolSchemas().map((t) => ({
     type: 'function', name: t.name, description: t.description, parameters: t.input_schema,
   }));
+  const first = { role: 'user', content: ownerContent(ctx, 'responses') };
   let previous = mem.getState('openai_prev') || null;
-  let input = previous ? [{ role: 'user', content: text }] : [...recap(), { role: 'user', content: text }];
+  let input = previous ? [first] : [...recap(), first];
   let reply = '';
   let lastInput = 0;
 
@@ -409,8 +470,8 @@ async function turnOpenAIResponses(text, tier, emit, signal, drafts, used) {
       response = await callWithFallback(tier, (model) => {
         const body = { model, instructions: buildInstructions(tier), input, tools };
         if (previous) body.previous_response_id = previous;
-        if (!isRefused(model, 'max_output_tokens')) body.max_output_tokens = tier === 'deep' ? 6000 : 2500;
-        if (!isRefused(model, 'reasoning')) body.reasoning = { effort: EFFORT[tier] };
+        if (!isRefused(model, 'max_output_tokens')) body.max_output_tokens = tier === 'deep' ? 6000 : 4000;
+        if (!isRefused(model, 'reasoning')) body.reasoning = { effort: ctx.effort };
         return streamResponse(body, (ev) => { if (ev.type === 'delta') reply += ev.text; emit(ev); }, signal);
       });
     } catch (e) {
@@ -420,7 +481,7 @@ async function turnOpenAIResponses(text, tier, emit, signal, drafts, used) {
         logger.warn('[agent] conversation chain expired — rebuilding from local history');
         previous = null;
         mem.setState('openai_prev', null);
-        input = [...recap(), { role: 'user', content: text }];
+        input = [...recap(), first];
         round -= 1;
         continue;
       }
@@ -436,8 +497,8 @@ async function turnOpenAIResponses(text, tier, emit, signal, drafts, used) {
 
     if (!calls.length) {
       // A chained conversation re-bills its whole history as input on every
-      // call. Once it grows past ~25k tokens, close it: the next message starts
-      // a fresh chain from a short recap (memory and snapshot carry the rest).
+      // call. Once it grows past ~25k tokens (or carries photos), close it:
+      // the next message starts fresh from a short recap.
       mem.setState('openai_prev', lastInput > 25000 ? null : previous);
       if (!reply) {
         reply = (response.output || []).filter((o) => o.type === 'message')
@@ -448,22 +509,28 @@ async function turnOpenAIResponses(text, tier, emit, signal, drafts, used) {
       return reply;
     }
     if (reply && !reply.endsWith('\n')) { reply += '\n\n'; emit({ type: 'delta', text: '\n\n' }); }
-    input = (await runTools(calls, emit, drafts, used))
-      .map((r) => ({ type: 'function_call_output', call_id: r.id, output: r.output }));
+    const { results, images } = await runTools(calls, ctx);
+    input = results.map((r) => ({ type: 'function_call_output', call_id: r.id, output: r.output }));
+    if (images.length) {
+      input.push({ role: 'user', content: images.flatMap((im) => [
+        { type: 'input_text', text: `Image — ${im.label}` }, { type: 'input_image', image_url: im.url }]) });
+    }
   }
   return reply || 'That took too many steps. Try asking something narrower.';
 }
 
 /** OpenAI chat/completions — only for the gpt-4 family, which cannot reason. */
-async function turnOpenAIChat(text, tier, emit, signal, drafts, used) {
+async function turnOpenAIChat(ctx) {
+  const { tier, emit, signal } = ctx;
   const tools = toolSchemas().map((t) => ({
     type: 'function', function: { name: t.name, description: t.description, parameters: t.input_schema },
   }));
-  const messages = [{ role: 'system', content: buildInstructions(tier) }, ...recap(), { role: 'user', content: text }];
+  const messages = [{ role: 'system', content: buildInstructions(tier) }, ...recap(),
+    { role: 'user', content: ownerContent(ctx, 'chat') }];
   for (let round = 0; round < MAX_ROUNDS; round++) {
     if (overBudget()) throw new BudgetError('budget');
     const res = await callWithFallback(tier, (model) => axios.post('https://api.openai.com/v1/chat/completions', {
-      model, messages, tools, tool_choice: 'auto', max_tokens: 1500,
+      model, messages, tools, tool_choice: 'auto', max_tokens: 3000,
     }, { headers: { Authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' }, timeout: 240000, signal }));
     const u = res.data.usage || {};
     addUsage(res.data.model || modelFor(tier), u.prompt_tokens, u.prompt_tokens_details?.cached_tokens, u.completion_tokens);
@@ -471,20 +538,25 @@ async function turnOpenAIChat(text, tier, emit, signal, drafts, used) {
     messages.push(msg);
     const calls = (msg.tool_calls || []).map((c) => ({ id: c.id, name: c.function.name, args: parseArgs(c.function.arguments) }));
     if (!calls.length) { emit({ type: 'delta', text: msg.content || '' }); return msg.content || ''; }
-    for (const r of await runTools(calls, emit, drafts, used)) messages.push({ role: 'tool', tool_call_id: r.id, content: r.output });
+    const { results, images } = await runTools(calls, ctx);
+    for (const r of results) messages.push({ role: 'tool', tool_call_id: r.id, content: r.output });
+    if (images.length) messages.push({ role: 'user', content: images.flatMap((im) => [
+      { type: 'text', text: `Image — ${im.label}` }, { type: 'image_url', image_url: { url: im.url } }]) });
   }
   return 'That took too many steps. Try asking something narrower.';
 }
 
 /** Anthropic — stateless, so the recent conversation is sent each time. */
-async function turnAnthropic(text, tier, emit, signal, drafts, used) {
+async function turnAnthropic(ctx) {
+  const { tier, emit, signal } = ctx;
   const tools = toolSchemas();
-  const messages = [...recap(), { role: 'user', content: text }];
+  const messages = [...recap(), { role: 'user', content: ownerContent(ctx, 'anthropic') }];
   // Anthropic wants strictly alternating turns starting with the user; a brief
   // Sahbi wrote on its own leaves two assistant turns in a row, so merge them.
   while (messages.length && messages[0].role !== 'user') messages.shift();
   for (let k = messages.length - 1; k > 0; k--) {
-    if (messages[k].role === messages[k - 1].role && typeof messages[k].content === 'string') {
+    if (messages[k].role === messages[k - 1].role && typeof messages[k].content === 'string'
+        && typeof messages[k - 1].content === 'string') {
       messages[k - 1].content += '\n\n' + messages[k].content;
       messages.splice(k, 1);
     }
@@ -493,7 +565,7 @@ async function turnAnthropic(text, tier, emit, signal, drafts, used) {
   for (let round = 0; round < MAX_ROUNDS; round++) {
     if (overBudget()) throw new BudgetError('budget');
     const res = await callWithFallback(tier, (model) => axios.post('https://api.anthropic.com/v1/messages', {
-      model, max_tokens: tier === 'deep' ? 4000 : 1500, system: buildInstructions(tier), tools, messages,
+      model, max_tokens: tier === 'deep' ? 4000 : 3000, system: buildInstructions(tier), tools, messages,
     }, {
       headers: { 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
       timeout: 240000, signal,
@@ -507,29 +579,42 @@ async function turnAnthropic(text, tier, emit, signal, drafts, used) {
     const said = content.filter((c) => c.type === 'text').map((c) => c.text).join('\n');
     if (said) emit({ type: 'delta', text: said + (calls.length ? '\n\n' : '') });
     if (!calls.length) return said;
-    messages.push({ role: 'user', content: (await runTools(calls, emit, drafts, used))
-      .map((r) => ({ type: 'tool_result', tool_use_id: r.id, content: r.output })) });
+    const { results, images } = await runTools(calls, ctx);
+    messages.push({ role: 'user', content: results.map((r, i) => ({
+      type: 'tool_result', tool_use_id: r.id,
+      content: i === 0 && images.length
+        ? [{ type: 'text', text: r.output }, ...images.map((im) => anthropicImage(im.url))]
+        : r.output,
+    })) });
   }
   return 'That took too many steps. Try asking something narrower.';
 }
 
+// Actions and pictures need a moment more thought than a look-up, even on
+// the fast tier — still far cheaper than the deep one.
+const CAREFUL = /(مخزون|ستوك|stock|زيد|زيدل|اضف|أضف|ضيف|حسابات|accounts|txid|تيكس|ثبّت|ثبت|صورة|image|photo)/i;
+
 /** One owner message, end to end. */
-async function runTurn({ text, mode, emit, signal, proactive = null }) {
+async function runTurn({ text, mode, emit, signal, proactive = null, images = [] }) {
   const tier = pickTier(text, mode);
-  const drafts = [];
-  const used = [];
+  const pics = (images || []).filter((u) => /^data:image\/(png|jpe?g|webp|gif);base64,/.test(String(u))).slice(0, 4);
+  const effort = tier === 'deep' ? EFFORT.deep : (pics.length || CAREFUL.test(text) ? 'medium' : EFFORT.fast);
+  const ctx = { text, images: pics, tier, effort, emit, signal, drafts: [], used: [] };
   emit({ type: 'start', tier, model: modelFor(tier) });
   // A brief Sahbi writes on its own has no visible question; the prompt is
   // stored as 'auto' so it is neither shown nor replayed as the owner's words.
-  mem.logChat(proactive ? 'auto' : 'user', text, { tier, proactive });
+  mem.logChat(proactive ? 'auto' : 'user', text, { tier, proactive, images: pics.length || undefined });
 
   const fn = PROVIDER === 'anthropic' ? turnAnthropic
     : (isReasoningOpenAI(modelFor(tier)) ? turnOpenAIResponses : turnOpenAIChat);
-  const reply = await fn(text, tier, emit, signal, drafts, used);
-  const meta = { tier, model: modelFor(tier), tools: [...new Set(used)], drafts: drafts.map((d) => ({ ...d })), proactive };
+  const reply = await fn(ctx);
+  // Photos make the chained context heavy; start the next message fresh.
+  if (pics.length) mem.setState('openai_prev', null);
+  const meta = { tier, model: modelFor(tier), tools: [...new Set(ctx.used)],
+    drafts: ctx.drafts.map((d) => ({ ...d })), proactive };
   mem.logChat('assistant', reply, meta);
   emit({ type: 'done', ...meta });
-  return { reply, drafts, ...meta };
+  return { reply, drafts: ctx.drafts, ...meta };
 }
 
 /** Sahbi speaking first (briefs). Continues the same conversation. */
@@ -561,12 +646,13 @@ function explainError(e) {
 
 // ── Routes ───────────────────────────────────────────────────────────────────
 
-router.use(express.json({ limit: '1mb' }));
+router.use(express.json({ limit: '20mb' })); // photos travel as data URLs
 
 /** Streaming chat: server-sent events, one JSON object per event. */
 router.post('/chat/stream', requireToken, async (req, res) => {
   const text = String(req.body.message || '').trim();
   const mode = String(req.body.mode || 'auto');
+  const images = Array.isArray(req.body.images) ? req.body.images : [];
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
@@ -582,8 +668,8 @@ router.post('/chat/stream', requireToken, async (req, res) => {
 
   try {
     if (!API_KEY) throw Object.assign(new Error('No AI key configured. Set OPENAI_API_KEY or ANTHROPIC_API_KEY.'), {});
-    if (!text) throw new Error('Empty message');
-    await runTurn({ text, mode, emit, signal: ctrl.signal });
+    if (!text && !images.length) throw new Error('Empty message');
+    await runTurn({ text, mode, emit, signal: ctrl.signal, images });
   } catch (e) {
     if (!ctrl.signal.aborted) {
       const m = explainError(e);
@@ -622,6 +708,23 @@ router.post('/approve', requireToken, async (req, res) => {
   if (!r.ok) return res.status(400).json({ error: r.error });
   mem.logChat('event', `✅ Reply sent to ${r.user_id}`);
   res.json({ ok: true, user_id: r.user_id });
+});
+
+/** The owner's tap on "Add to stock" — the only way stock is ever written from here. */
+router.post('/stock/approve', requireToken, async (req, res) => {
+  const d = require('./agentTools').takeStockDraft(String(req.body.draft_id || ''));
+  if (!d) return res.status(400).json({ error: 'Draft expired or already used — ask Sahbi again.' });
+  try {
+    const bot = req.app && (req.app.get('storeBot') || req.app.get('bot'));
+    const r = await require('./stockUpload').applyStockUpload(bot, d.productId, d.accounts,
+      { supplier: d.supplier, unitCost: d.unitCost });
+    if (!r.ok) return res.status(400).json({ error: r.error });
+    mem.logChat('event', `✅ تزادو ${r.added} لـ ${String(r.product).replace(/\[emoji:\d+\]/g, '').trim()} — المخزون توا ${r.now}`);
+    res.json(r);
+  } catch (e) {
+    logger.error(`[agent] stock approve: ${e.message}`);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 /** A new conversation. Memory stays — only the running thread is closed. */

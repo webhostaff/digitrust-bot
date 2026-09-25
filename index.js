@@ -1998,6 +1998,7 @@ app.use('/api/v1', resellerApi); // legacy reseller API (separate balances)
 // Public customer API: self-service keys, wallet-funded, same pricing and the
 // same atomic purchase path as the bot itself.
 app.set('bot', bot);   // manual-delivery notifications need a bot instance
+app.set('storeBot', bot); // stays the store bot even after 'bot' is swapped for the support bot
 app.use('/api/v2', require('./api-public'));
 
 // Owner's assistant. Read-only tools, guarded by a token only the owner has.
