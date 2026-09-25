@@ -1,0 +1,9115 @@
+'use strict';
+
+const db      = require('../database/queries');
+const session = require('./session');
+const { States } = require('./session');
+const config  = require('../config');
+const {
+  adminMainKb, adminProductsKb, adminProductEditFieldsKb, adminBulkPriceKb, adminStockManageKb,
+  adminUsersKb, adminUserActionsKb, adminTicketsKb, adminTicketActionsKb,
+  adminOrdersKb, adminSettingsKb, requiresEmailKb, notifTargetKb,
+  announcementTargetKb, adminConfirmKb, adminBackKb, confirmZeroStockKb,
+  backToProductEditKb, adminProfitsKb, adminRefundConfirmKb, deleteStockItemKb,
+  adminSortProductsKb,
+  adminSortItemKb,
+  adminPreordersMainKb, adminPreorderProductsKb, adminPreorderSetupKb,
+  adminPreordersListKb, adminPreorderDetailKb,
+  adminUserOrdersKb, adminUserOrderDetailKb,
+  adminResetWalletConfirmKb,
+  adminPreorderConfirmDeliverKb,
+  adminEmojiLibraryKb,
+  // Shared button helpers, aliased so they cannot collide with local names.
+  iconBtn: kbIconBtn, iconIdFrom: kbIconIdFrom, stripEmojiCodes: kbStripEmojiCodes,
+} = require('../utils/keyboard');
+const items = require('../database/items');
+const binance = require('../services/binance');
+const subPricing = require('../utils/subscriptionPricing');
+const cgbCycles = require('../services/cgbCycles');
+const notices   = require('../services/notices');
+const { formatPrice, formatPriceExact, escapeHtml, expandPremiumEmojis, scaleTiersProportionally, productEmojiId, calcOrderPrice } = require('../utils/format');
+const {
+  publishToChannel, publishToGroup, broadcastToUsers, autoPublish, autoPublishWithPhoto,
+  buildNewProductText, buildStockUpdateText,
+  buildLowStockText, buildOutOfStockText, buildPriceDropText,
+  updatesChannelId, updatesGroupId,
+} = require('../services/notifications');
+const { notifyBackInStockSubscribers } = require('./buy');
+const { evaluateStock } = require('../services/stockAlerts');
+const logger = require('../utils/logger');
+
+// Pending notification context per admin user
+const pendingNotifs = new Map();
+
+// ── Product ordering ──────────────────────────────────────────────────────────
+
+/**
+ * Which product each admin is currently "holding" on the ordering screen.
+ * Deliberately in memory rather than the session store: the ordering screen is
+ * pure navigation state, and parking it in the FSM session would collide with
+ * whatever text-input flow the admin was in.
+ */
+const sortHeld = new Map(); // userId -> productId
+
+/**
+ * Which customer list the admin is arranging: null = "📦 Other Products",
+ * a number = that category. Ordering is always scoped, because the customer
+ * never sees one flat list — categories are separate screens.
+ */
+const sortScope = new Map(); // userId -> categoryId | null
+
+const SORT_PAGE_SIZE = 8; // must match utils/keyboard.js
+
+/** Products of one customer-visible list, in the order shown there. */
+function scopeProducts(userId) {
+  return db.getProductsForSorting(sortScope.get(userId) ?? null);
+}
+
+/** Human name of the list being arranged. */
+function scopeLabel(userId) {
+  const catId = sortScope.get(userId) ?? null;
+  if (catId == null) return '📦 Other Products';
+  const c = db.getCategoryById(catId);
+  const emoji = kbStripEmojiCodes(String(c?.emoji || '')).trim();
+  const name  = kbStripEmojiCodes(String(c?.name  || 'Category')).trim();
+  return `${emoji || '🗂'} ${name}`;
+}
+
+/**
+ * Give every product a unique display_order (1,2,3,… over the whole table).
+ *
+ * Ties are the reason this exists: `ORDER BY display_order, id` silently breaks
+ * a tie by id, so two products sharing a number make the list reshuffle itself
+ * the moment anything is written. Uniqueness makes every position an honest slot
+ * and lets a scoped move reuse exact slots without collisions.
+ */
+function normaliseGlobalOrder() {
+  db.getAllProductsForSorting().forEach((p, idx) => {
+    if (p.display_order !== idx + 1) db.setDisplayOrder(p.id, idx + 1);
+  });
+}
+
+/**
+ * Move a product to `targetIdx` (0-based) WITHIN its own list.
+ *
+ * Only the slots already occupied by this list are reshuffled, so arranging
+ * "Other Products" cannot disturb a category's internal order, or vice versa.
+ *
+ * @returns {number} the index it landed on, or -1 if it is no longer in the list
+ */
+function moveProductTo(userId, productId, targetIdx) {
+  normaliseGlobalOrder();
+
+  const list = scopeProducts(userId);
+  const from = list.findIndex((p) => p.id === productId);
+  if (from === -1) return -1;
+
+  const to = Math.max(0, Math.min(targetIdx, list.length - 1));
+  const slots = list.map((p) => p.display_order).sort((a, b) => a - b);
+
+  const [moved] = list.splice(from, 1);
+  list.splice(to, 0, moved);
+  list.forEach((p, idx) => db.setDisplayOrder(p.id, slots[idx]));
+  return to;
+}
+
+// ── Security guard ────────────────────────────────────────────────────────────
+
+/**
+ * Returns true if userId is in config.adminIds.
+ * Used by EVERY admin function.
+ */
+function isAdmin(userId) {
+  return config.adminIds.includes(userId);
+}
+
+/**
+ * Rejects non-admin callback queries with a visible alert.
+ */
+async function rejectNonAdmin(bot, queryId) {
+  await bot.answerCallbackQuery(queryId, {
+    text: '❌ You are not authorized to use this section.',
+    show_alert: true,
+  }).catch(() => {});
+}
+
+// ── Panel ─────────────────────────────────────────────────────────────────────
+
+async function showAdminPanel(bot, chatId, messageId = null) {
+  const text = '🔧 <b>Admin Panel</b>\n\nWelcome, Admin.';
+  if (messageId) {
+    await bot.editMessageText(text, {
+      chat_id: chatId, message_id: messageId,
+      parse_mode: 'HTML', reply_markup: adminMainKb(),
+    });
+  } else {
+    await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: adminMainKb() });
+  }
+}
+
+// ── startAddProduct ───────────────────────────────────────────────────────────
+
+async function startAddProduct(bot, chatId, userId, messageId) {
+  session.set(userId, States.ADMIN_ADD_TITLE, {});
+  await bot.editMessageText(
+    '➕ <b>Add Product</b>\n\nStep 1/7\n\n📝 Enter product title:',
+    { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: adminBackKb() }
+  );
+}
+
+// ── Text message handler ──────────────────────────────────────────────────────
+
+// Convert any premium custom emojis in the message into [emoji:ID]🎁 markers
+// so they survive storage and re-rendering.
+function convertCustomEmojisToMarkers(msg) {
+  const text = msg.text || msg.caption || '';
+  const entities = msg.entities || msg.caption_entities || [];
+  if (!text) return text;
+
+  const customEmojis = entities
+    .filter(e => e.type === 'custom_emoji' && e.custom_emoji_id);
+
+  if (!customEmojis.length) return text;
+
+  // Telegram offsets are in UTF-16 code units. We need to convert to UTF-16 array.
+  // Build the text as an array of UTF-16 units, then replace from end to start.
+  const sorted = [...customEmojis].sort((a, b) => b.offset - a.offset);
+  let result = text;
+  for (const e of sorted) {
+    // Slice using UTF-16 indexing (default string operations in JS use UTF-16)
+    const before = result.substring(0, e.offset);
+    const original = result.substring(e.offset, e.offset + e.length);
+    const after = result.substring(e.offset + e.length);
+    result = before + `[emoji:${e.custom_emoji_id}]${original}` + after;
+  }
+  logger.info(`[EMOJI CONVERT] Found ${customEmojis.length} premium emojis, result: ${result.slice(0, 100)}`);
+  return result;
+}
+
+
+/**
+ * Buttons for the stock-confirmation screen.
+ *
+ * Recently used supplier names are offered as taps. Suppliers repeat constantly
+ * and are typed from memory, so retyping invites "Ahmed", "ahmed" and "Ahmad"
+ * to become three different suppliers in the reports.
+ */
+function stockConfirmRows(userId, productId, count) {
+  const sess = session.get(userId);
+  const current = sess?.data?.supplier || null;
+  const rows = [];
+
+  if (!current) {
+    for (const name of (items.recentSuppliers() || []).slice(0, 4)) {
+      rows.push([{ text: `🏷 ${String(name).slice(0, 30)}`, callback_data: `admin_stock_sup_${Buffer.from(String(name)).toString('base64url').slice(0, 50)}` }]);
+    }
+    rows.push([{ text: '✏️ Type supplier name', callback_data: 'admin_stock_supplier' }]);
+  } else {
+    rows.push([{ text: `🏷 Supplier: ${String(current).slice(0, 24)} — change`, callback_data: 'admin_stock_supplier' }]);
+  }
+
+  const cost = sess?.data?.unitCost;
+  rows.push([{
+    text: cost != null ? `💰 Cost: $${Number(cost).toFixed(2)}/unit — change` : '💰 Set cost per unit',
+    callback_data: 'admin_stock_cost',
+  }]);
+  rows.push([{ text: `✅ Add ${count} item(s)${current ? '' : ' without supplier'}`, callback_data: 'admin_stock_confirm_yes' }]);
+  rows.push([{ text: '❌ Cancel', callback_data: `admin_edit_p_${productId}` }]);
+  return rows;
+}
+
+async function handleAdminText(bot, msg) {
+  if (!isAdmin(msg.from.id)) return; // silent drop — already guarded in index.js
+
+  const userId = msg.from.id;
+  const chatId = msg.chat.id;
+
+  // ── AUTO-CONVERT premium emojis to [emoji:ID] markers ──────────
+  // Product titles used to be excluded here, on the reasoning that "buttons can
+  // display the actual emoji char anyway". That discarded the custom_emoji_id,
+  // so a premium logo typed into a title was reduced to its plain placeholder
+  // and the product page fell back to the old premium_emoji_id field — which is
+  // why a published title showed a DIFFERENT logo than the one that was typed.
+  //
+  // Titles are now converted like every other field. convertCustomEmojisToMarkers
+  // keeps the placeholder right after the marker ("[emoji:123]✨ Gemini"), so:
+  //   • utils/keyboard.js strips the marker and still has ✨ for the label
+  //   • the button also gets the real logo via icon_custom_emoji_id (Bot API 9.4)
+  //   • utils/format.js renders the true premium emoji on the product page
+  const sessCheck = session.get(userId);
+  const isProductTitle =
+    sessCheck.state === States.ADMIN_ADD_TITLE ||
+    (sessCheck.state === States.ADMIN_EDIT_VALUE && sessCheck.data && sessCheck.data.editField === 'title');
+  const text = convertCustomEmojisToMarkers(msg).trim();
+
+  // A title carrying its own emoji makes the separate premium_emoji_id field
+  // redundant — and while it is still set, products.js prepends it as a
+  // hardcoded prefix, which is the stale "random logo". Clear it.
+  if (isProductTitle && /\[emoji:\d+\]/.test(text) &&
+      sessCheck.state === States.ADMIN_EDIT_VALUE && sessCheck.data.editProductId) {
+    try {
+      db.updateProduct(sessCheck.data.editProductId, 'premium_emoji_id', null);
+    } catch (e) {
+      logger.warn(`[EMOJI] could not clear premium_emoji_id: ${e.message}`);
+    }
+  }
+
+  const sess   = session.get(userId);
+  const s      = sess.state;
+  const d      = sess.data;
+
+  // ═══════════════════════════════════════════════════════════════════
+  // V2 TEXT STATES
+  // ═══════════════════════════════════════════════════════════════════
+
+  // ── Per-product low-stock threshold ──────────────────────────────
+  // ── Set a negotiated price for one customer ──────────────────────
+  if (s === States.ADMIN_CUST_PRICE) {
+    // The product was chosen by tapping, so the price is expected first.
+    // An optional "x20" token sets the quantity this price starts from.
+    const parts = String(text).trim().split(/\s+/);
+    const price = parseFloat(String(parts[0] || '').replace(',', '.'));
+    let qtyLimit = 0;   // 0 = no limit
+    const rest = [];
+    for (const tok of parts.slice(1)) {
+      const m = /^q(\d+)$/i.exec(tok);
+      if (m && qtyLimit === 0) qtyLimit = Math.max(0, parseInt(m[1], 10));
+      else rest.push(tok);
+    }
+    const note  = rest.join(' ') || null;
+    const targetId  = d.cpUserId;
+    const productId = d.cpProductId;
+
+    if (!Number.isFinite(price) || price < 0) {
+      await bot.sendMessage(chatId,
+        '❌ Send just the price, e.g. <code>3.50</code>', { parse_mode: 'HTML' });
+      return;
+    }
+    const product = db.getProduct(productId);
+    if (!product) {
+      session.clear(userId);
+      await bot.sendMessage(chatId, '❌ That product no longer exists.');
+      return;
+    }
+
+    session.clear(userId);
+    db.setCustomerPrice({ userId: targetId, productId, price, note, adminId: userId, qtyLimit });
+    logger.info(`Admin ${userId} set special price ${price} for user ${targetId} on product ${productId}`);
+
+    const diff = Number(product.price) - price;
+    await bot.sendMessage(
+      chatId,
+      `✅ <b>Special Price Set</b>\n\n` +
+      `👤 Customer: <code>${targetId}</code>\n` +
+      `📦 ${escapeHtml(String(product.title || ''))}\n` +
+      `💵 Public: ${formatPriceExact(product.price)}\n` +
+      `💲 This customer pays: <b>${formatPriceExact(price)}</b>` +
+      (qtyLimit > 0
+        ? ` <i>(for the first ${qtyLimit} units)</i>\n` +
+          `📊 After ${qtyLimit} units the normal price applies again.\n`
+        : ` <i>(no limit)</i>\n`) +
+      (diff > 0 ? `📉 Discount: ${formatPriceExact(diff)} per unit\n`
+                : diff < 0 ? `📈 Markup: ${formatPriceExact(-diff)} per unit\n` : '') +
+      // Prices are displayed to customers rounded to cents, so anything finer
+      // than that shows one figure and charges another. Say so plainly.
+      (Math.abs(price - Number(price.toFixed(2))) > 1e-9
+        ? `\n⚠️ <b>Sub-cent price.</b> The customer will see ` +
+          `<b>${formatPrice(price)}</b> but be charged <b>${formatPriceExact(price)}</b>. ` +
+          `Use 2 decimals to keep them identical.\n`
+        : '') +
+      (note ? `📝 <i>${escapeHtml(note)}</i>\n` : '') +
+      `\n<i>Applies immediately, on every screen and at checkout. Bulk tiers no ` +
+      `longer apply to this customer for this product.</i>`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '💲 Special Prices', callback_data: `admin_cprices_${targetId}` }]] } }
+    );
+    return;
+  }
+
+  // ── Reverse a fraudulent deposit ─────────────────────────────────
+  if (s === States.ADMIN_DEP_REVERSE) {
+    const parts    = String(text).trim().split(/\s+/);
+    const targetId = parseInt(parts[0], 10);
+    const amount   = parseFloat(String(parts[1] || '').replace(',', '.'));
+    const reason   = parts.slice(2).join(' ') || 'Fraudulent deposit';
+
+    if (!Number.isFinite(targetId) || !Number.isFinite(amount) || amount <= 0) {
+      await bot.sendMessage(chatId, '❌ Format: <code>USER_ID AMOUNT [reason]</code>', { parse_mode: 'HTML' });
+      return;
+    }
+    const target = db.getUser(targetId);
+    if (!target) {
+      session.clear(userId);
+      await bot.sendMessage(chatId, '❌ User not found.');
+      return;
+    }
+
+    session.clear(userId);
+    const res = db.reverseDeposit({ userId: targetId, amount, reason, adminId: userId });
+    logger.warn(`Admin ${userId} REVERSED ${amount} from user ${targetId}: ${reason}`);
+
+    await bot.sendMessage(
+      chatId,
+      `↩️ <b>Deposit Reversed</b>\n\n` +
+      `👤 <code>${targetId}</code>\n` +
+      `💵 Removed: <b>${formatPrice(amount)}</b>\n` +
+      `💰 Balance: ${formatPrice(res.before)} → <b>${formatPrice(res.after)}</b>\n` +
+      `📝 <i>${escapeHtml(reason)}</i>` +
+      (res.after < 0 ? `\n\n⚠️ <b>Balance is negative — the money had already been spent.</b>` : ''),
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: '🚫 Ban this user', callback_data: `admin_toggle_ban_${targetId}` }],
+          [{ text: '🛡 Deposit Review', callback_data: 'admin_deposits' }],
+        ] } }
+    );
+    return;
+  }
+
+  if (s === States.ADMIN_LOW_STOCK) {
+    const n = parseInt(text, 10);
+    if (isNaN(n) || n < 0) {
+      await bot.sendMessage(chatId, '❌ Enter a non-negative number (0 = use the global default).');
+      return;
+    }
+    const productId = d.lowStockProductId;
+    require('../database/db').prepare('UPDATE products SET low_stock_threshold = ? WHERE id = ?')
+      .run(n, productId);
+    // Re-arm the alert latches so the new threshold is evaluated cleanly.
+    db.resetStockAlertFlags(productId);
+    session.clear(userId);
+
+    const product = db.getProduct(productId);
+    const globalDefault = db.getSetting('low_stock_threshold_default', '5');
+    await bot.sendMessage(
+      chatId,
+      `✅ <b>Low-stock threshold updated</b>\n\n` +
+      `📦 ${escapeHtml(product?.title || '')}\n` +
+      `🔔 Alert when stock reaches: <b>${n > 0 ? n : `${globalDefault} (global default)`}</b>\n` +
+      `📊 Current stock: <b>${product?.stock_quantity || 0}</b>`,
+      { parse_mode: 'HTML', reply_markup: backToProductEditKb(productId) }
+    );
+    return;
+  }
+
+  // ── Content for a manual-delivery task ───────────────────────────
+  if (s === States.ADMIN_MD_CONTENT) {
+    const taskId = d.mdTaskId;
+    const content = (text || '').trim();
+    if (!content) {
+      await bot.sendMessage(chatId, '❌ Content cannot be empty.');
+      return;
+    }
+    session.clear(userId);
+    const manualDelivery = require('./manualDelivery');
+    const res = await manualDelivery.completeManualDelivery(bot, taskId, content);
+    await bot.sendMessage(
+      chatId,
+      res.ok
+        ? `✅ <b>Task #${taskId} delivered.</b>` +
+          (res.notified ? '' : '\n⚠️ The customer could not be messaged — the content is saved on the task.')
+        : `⚠️ Could not deliver: <b>${res.reason}</b>`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '📦 Manual Delivery', callback_data: 'admin_md_list_pending_0' }]] } }
+    );
+    return;
+  }
+
+  // ── Create a reseller (this handler was missing entirely: the state was
+  //    registered in index.js but nothing consumed it, so "Add New Reseller"
+  //    silently did nothing) ───────────────────────────────────────
+  if (s === 'ADMIN_RESELLER_NEW_NAME') {
+    session.clear(userId);
+    const name = (text || '').trim();
+    if (name.length < 2 || name.length > 60) {
+      await bot.sendMessage(chatId, '❌ Name must be between 2 and 60 characters.');
+      return;
+    }
+    const apiKey = 'rk_' + require('crypto').randomBytes(24).toString('hex');
+    try {
+      db.createReseller(name, apiKey);
+      await bot.sendMessage(
+        chatId,
+        `✅ <b>Reseller created</b>\n\n` +
+        `🏪 <b>Name:</b> ${escapeHtml(name)}\n` +
+        `🔑 <b>API key</b> (tap to copy):\n<code>${apiKey}</code>\n\n` +
+        `⚠️ <i>Share this key only with the reseller. Add balance before they can order.</i>`,
+        { parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '🏪 Resellers', callback_data: 'admin_resellers' }]] } }
+      );
+      logger.info(`Admin ${userId} created reseller "${name}"`);
+    } catch (e) {
+      await bot.sendMessage(chatId, `❌ Could not create reseller: ${e.message}`);
+    }
+    return;
+  }
+
+  // ── Adjust reseller balance (same missing-handler problem) ───────
+  if (s === 'ADMIN_RESELLER_BALANCE') {
+    const { resellerId } = d;
+    const amount = parseFloat(String(text).replace('$', '').replace(',', '.'));
+    if (isNaN(amount) || amount === 0) {
+      await bot.sendMessage(chatId, '❌ Enter a non-zero amount, e.g. <code>10</code> or <code>-5</code>.', { parse_mode: 'HTML' });
+      return;
+    }
+    const r = db.getResellerById(resellerId);
+    if (!r) {
+      session.clear(userId);
+      await bot.sendMessage(chatId, '❌ Reseller not found.');
+      return;
+    }
+    if (amount < 0 && Math.abs(amount) > Number(r.balance) + 1e-9) {
+      await bot.sendMessage(chatId,
+        `❌ Cannot subtract ${formatPrice(Math.abs(amount))} — balance is only ${formatPrice(r.balance)}.`,
+        { parse_mode: 'HTML' });
+      return;
+    }
+    db.addResellerBalance(resellerId, amount);
+    session.clear(userId);
+    const updated = db.getResellerById(resellerId);
+    await bot.sendMessage(
+      chatId,
+      `✅ <b>Balance updated</b>\n\n` +
+      `🏪 ${escapeHtml(updated.name)}\n` +
+      `${amount > 0 ? '➕' : '➖'} ${formatPrice(Math.abs(amount))}\n` +
+      `💰 New balance: <b>${formatPrice(updated.balance)}</b>`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🏪 Back to reseller', callback_data: `admin_reseller_${resellerId}` }]] } }
+    );
+    return;
+  }
+
+  // ── Product wizard ───────────────────────────────────────────────
+  if (s === States.ADMIN_ADD_TITLE) {
+    session.set(userId, States.ADMIN_ADD_DESCRIPTION, { title: text });
+    await bot.sendMessage(chatId, 'Step 2/7\n\n📋 Enter product description:', { reply_markup: adminBackKb() });
+    return;
+  }
+  if (s === States.ADMIN_ADD_DESCRIPTION) {
+    session.update(userId, { description: text });
+    session.set(userId, States.ADMIN_ADD_PRICE, session.get(userId).data);
+    await bot.sendMessage(chatId, 'Step 3/7\n\n💵 Enter price (e.g. 14.09):', { reply_markup: adminBackKb() });
+    return;
+  }
+  if (s === States.ADMIN_ADD_PRICE) {
+    const price = parseFloat(String(text).replace('$', '').replace(',', '.'));
+    if (isNaN(price) || price <= 0) {
+      await bot.sendMessage(chatId, '❌ Enter a valid price, e.g. <code>14.09</code>', { parse_mode: 'HTML' });
+      return;
+    }
+    session.update(userId, { price });
+    session.set(userId, States.ADMIN_ADD_WARRANTY, session.get(userId).data);
+    await bot.sendMessage(chatId, 'Step 4/7\n\n🛡 Enter warranty info:', { reply_markup: adminBackKb() });
+    return;
+  }
+  if (s === States.ADMIN_ADD_WARRANTY) {
+    session.update(userId, { warranty: text });
+    session.set(userId, States.ADMIN_ADD_REQ_EMAIL, session.get(userId).data);
+    await bot.sendMessage(
+      chatId,
+      'Step 5/7\n\n📧 <b>Does this product require customer email?</b>',
+      { parse_mode: 'HTML', reply_markup: requiresEmailKb() }
+    );
+    return;
+  }
+  if (s === States.ADMIN_ADD_INSTRUCTION) {
+    const instruction = text.toLowerCase() === 'skip' ? null : text;
+    session.update(userId, { instruction });
+    session.set(userId, States.ADMIN_ADD_IMAGE, session.get(userId).data);
+    await bot.sendMessage(
+      chatId,
+      'Step 7/8\n\n🖼 Send a product image or type <code>skip</code>:',
+      { parse_mode: 'HTML', reply_markup: adminBackKb() }
+    );
+    return;
+  }
+  if (s === States.ADMIN_ADD_IMAGE) {
+    if (text.toLowerCase() !== 'skip') {
+      await bot.sendMessage(chatId, '❌ Send a photo or type <code>skip</code>.', { parse_mode: 'HTML' });
+      return;
+    }
+    session.update(userId, { imageFileId: null });
+    await askForInitialStock(bot, chatId, userId);
+    return;
+  }
+  // ── Create new category ─────────────────────────────────
+  if (s === 'ADMIN_CAT_NEW_NAME') {
+    session.clear(userId);
+    const input = (text || '').trim();
+    if (!input) {
+      await bot.sendMessage(chatId, '❌ Empty name. Try again.');
+      return;
+    }
+    // Simple split: first "word" (or emoji sequence before space) becomes emoji
+    let emoji = '', name = input;
+    const firstSpace = input.indexOf(' ');
+    if (firstSpace > 0 && firstSpace <= 10) {
+      const possibleEmoji = input.slice(0, firstSpace);
+      // If it's not pure ASCII letters/digits, treat as emoji
+      if (!/^[a-zA-Z0-9_-]+$/.test(possibleEmoji)) {
+        emoji = possibleEmoji;
+        name = input.slice(firstSpace + 1).trim();
+      }
+    }
+    if (!name) name = input;
+    try {
+      db.createCategory(name, emoji, 999);
+      await bot.sendMessage(chatId,
+        `✅ <b>Category Created</b>\n\n${emoji} ${escapeHtml(name)}`,
+        { parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [
+            [{ text: '🗂 View Categories', callback_data: 'admin_categories' }],
+            [{ text: '➕ Add Another', callback_data: 'admin_cat_new' }],
+          ] } }
+      );
+      logger.info(`Admin ${userId} created category: ${emoji} ${name}`);
+    } catch (e) {
+      await bot.sendMessage(chatId, `❌ Error: ${e.message}`);
+      logger.error(`Category create failed: ${e.message}`);
+    }
+    return;
+  }
+
+  // ── Rename category ─────────────────────────────────────
+  if (s === 'ADMIN_CAT_RENAME') {
+    const { catId } = session.get(userId)?.data || {};
+    session.clear(userId);
+    if (!catId) return;
+    const input = (text || '').trim();
+    if (!input) { await bot.sendMessage(chatId, '❌ Empty name'); return; }
+    let emoji = '', name = input;
+    const firstSpace = input.indexOf(' ');
+    if (firstSpace > 0 && firstSpace <= 10) {
+      const possibleEmoji = input.slice(0, firstSpace);
+      if (!/^[a-zA-Z0-9_-]+$/.test(possibleEmoji)) {
+        emoji = possibleEmoji;
+        name = input.slice(firstSpace + 1).trim();
+      }
+    }
+    if (!name) name = input;
+    try {
+      const cat = db.getCategoryById(catId);
+      db.updateCategoryRow(catId, name, emoji, cat?.display_order || 999);
+      await bot.sendMessage(chatId,
+        `✅ <b>Renamed</b>\n\n${emoji} ${escapeHtml(name)}`,
+        { parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [
+            [{ text: '🗂 View Categories', callback_data: 'admin_categories' }],
+          ] } }
+      );
+    } catch (e) {
+      await bot.sendMessage(chatId, `❌ Error: ${e.message}`);
+    }
+    return;
+  }
+
+  // ── ChatGPT Business: Set monthly price ──
+  if (s === 'ADMIN_CGB_PRICE') {
+    session.clear(userId);
+    const price = parseFloat(String(text).replace('$', '').replace(',', '.'));
+    if (isNaN(price) || price <= 0) { await bot.sendMessage(chatId, '❌ Invalid price'); return; }
+    const dbRaw = require('../database/db');
+    dbRaw.prepare(`
+      INSERT INTO settings (key, value) VALUES ('chatgpt_monthly_price', ?)
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value
+    `).run(String(price));
+    await bot.sendMessage(chatId,
+      `✅ <b>Monthly price updated to $${price.toFixed(2)}</b>`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: '🤖 Back to ChatGPT Panel', callback_data: 'admin_cgb_panel' }]
+        ] } }
+    );
+    return;
+  }
+
+  // ── ChatGPT Business: Add cycle ──
+  if (s === 'ADMIN_CGB_ADDCYCLE') {
+    session.clear(userId);
+    const m = text.match(/^(\d{1,2})\s*-\s*(\d{1,2})$/);
+    if (!m) { await bot.sendMessage(chatId, '❌ Invalid format. Use <code>START-END</code> e.g. <code>26-25</code>', { parse_mode: 'HTML' }); return; }
+    const startDay = parseInt(m[1], 10);
+    const endDay = parseInt(m[2], 10);
+    if (startDay < 1 || startDay > 31 || endDay < 1 || endDay > 31) {
+      await bot.sendMessage(chatId, '❌ Days must be between 1 and 31'); return;
+    }
+    db.addBillingCycle(startDay, endDay);
+    await bot.sendMessage(chatId,
+      `✅ <b>Cycle added: Day ${startDay} → Day ${endDay}</b>`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: '📅 Back to Cycles', callback_data: 'admin_cgb_cycles' }],
+          [{ text: '🤖 Back to Panel', callback_data: 'admin_cgb_panel' }]
+        ] } }
+    );
+    return;
+  }
+
+  if (s === States.ADMIN_ADD_STOCK) {
+    if (text.toLowerCase() === 'skip') {
+      await finalizeProduct(bot, chatId, userId, []);
+    } else {
+      const lines = text.split('\n').filter((l) => l.trim());
+      await finalizeProduct(bot, chatId, userId, lines);
+    }
+    return;
+  }
+
+  // ── Edit product field ────────────────────────────────────────────
+  if (s === States.ADMIN_EDIT_VALUE) {
+    const { editProductId, editField } = d;
+    let value = text;
+
+    if (editField === 'price') {
+      value = parseFloat(String(text).replace('$', '').replace(',', '.'));
+      if (isNaN(value)) { await bot.sendMessage(chatId, '❌ Invalid price.'); return; }
+    } else if (['requires_email', 'is_active'].includes(editField)) {
+      value = text === '1' ? 1 : 0;
+    } else if (editField === 'stock_quantity') {
+      value = parseInt(text, 10);
+      if (isNaN(value) || value < 0) { await bot.sendMessage(chatId, '❌ Enter a valid non-negative number.'); return; }
+    } else if (editField === 'sales_count') {
+      value = parseInt(text, 10);
+      if (isNaN(value) || value < 0) { await bot.sendMessage(chatId, '❌ Enter a valid non-negative number.'); return; }
+    } else if (editField === 'bulk_min_qty') {
+      value = parseInt(text, 10);
+      if (isNaN(value) || value < 0) { await bot.sendMessage(chatId, '❌ Enter a valid non-negative integer. Use <code>0</code> to disable bulk discount.', { parse_mode: 'HTML' }); return; }
+    } else if (editField === 'bulk_discount') {
+      value = parseFloat(String(text).replace('%', '').replace(',', '.'));
+      if (isNaN(value) || value < 0 || value > 100) { await bot.sendMessage(chatId, '❌ Enter a percentage between <b>0</b> and <b>100</b>. Use <code>0</code> to disable.', { parse_mode: 'HTML' }); return; }
+    } else if (editField === 'wholesale_price') {
+      value = parseFloat(String(text).replace('$', '').replace(',', '.'));
+      if (isNaN(value) || value < 0) { await bot.sendMessage(chatId, '❌ Enter a valid price (use <code>0</code> to disable)', { parse_mode: 'HTML' }); return; }
+    } else if (['bulk_tier1_qty', 'bulk_tier2_qty', 'bulk_tier3_qty'].includes(editField)) {
+      value = parseInt(text, 10);
+      if (isNaN(value) || value < 0) { await bot.sendMessage(chatId, '❌ Enter a valid non-negative integer. Use <code>0</code> to disable this tier.', { parse_mode: 'HTML' }); return; }
+    } else if (['bulk_tier1_price', 'bulk_tier2_price', 'bulk_tier3_price'].includes(editField)) {
+      value = parseFloat(String(text).replace('$', '').replace(',', '.'));
+      if (isNaN(value) || value < 0) { await bot.sendMessage(chatId, '❌ Enter a valid non-negative price. Use <code>0</code> to disable.', { parse_mode: 'HTML' }); return; }
+    }
+
+    // Price drop detection → send notification
+    let priceDropNotif = false;
+    let priceDropOldValue = null;
+    // Auto-scale bulk pricing tiers by the same % change as the base price
+    // (e.g. base price drops 17% → every set tier price drops 17% too),
+    // so the admin doesn't have to manually re-enter every tier.
+    let tierScaleChanges = [];
+    if (editField === 'price') {
+      const oldProduct = db.getProduct(editProductId);
+      const oldPrice   = oldProduct ? oldProduct.price : null;
+      if (oldPrice !== null && value < oldPrice) {
+        priceDropNotif = true;
+        priceDropOldValue = oldPrice;
+      }
+      if (oldProduct) {
+        tierScaleChanges = scaleTiersProportionally(oldProduct, oldPrice, value);
+      }
+    }
+
+    // Allow clearing instruction or premium_emoji_id with 'clear' keyword
+    if ((editField === 'instruction' || editField === 'premium_emoji_id') &&
+        String(value).toLowerCase().trim() === 'clear') {
+      value = null;
+    }
+    db.updateProduct(editProductId, editField, value);
+
+    // Apply the scaled tier prices (after the base price is saved)
+    for (const change of tierScaleChanges) {
+      db.updateProduct(editProductId, `bulk_tier${change.tier}_price`, change.newPrice);
+    }
+
+    session.clear(userId);
+
+    // Send price drop notification to channel/group
+    if (priceDropNotif) {
+      try {
+        const updatedProduct = db.getProduct(editProductId);
+        const botInfo = await bot.getMe().catch(() => ({ username: '' }));
+        const dropText = buildPriceDropText(updatedProduct, botInfo.username, priceDropOldValue);
+        const kbPd = { inline_keyboard: [[{ text: '🛒 Buy now', url: `https://t.me/${botInfo.username}?start=p_${editProductId}` }]] };
+        await autoPublishWithPhoto(bot, updatedProduct, dropText, kbPd);
+        logger.info(`Price drop broadcast sent for product ${editProductId}`);
+      } catch (e) {
+        logger.warn(`Price drop notification failed: ${e.message}`);
+      }
+    }
+
+    // Show success with back button to edit fields
+    const { adminProductEditFieldsKb } = require('../utils/keyboard');
+    let tierScaleNote = '';
+    if (tierScaleChanges.length) {
+      const lines = tierScaleChanges
+        .map((c) => `  • Tier ${c.tier}: $${c.oldPrice.toFixed(2)} → $${c.newPrice.toFixed(2)}`)
+        .join('\n');
+      tierScaleNote = `\n\n📊 <b>Bulk tiers auto-adjusted</b> (same % change as the base price):\n${lines}`;
+    }
+    await bot.sendMessage(
+      chatId,
+      `✅ <b>${editField}</b> updated successfully!${priceDropNotif ? '\n\n📢 Price drop notification sent to channel.' : ''}${tierScaleNote}`,
+      { parse_mode: 'HTML', reply_markup: adminProductEditFieldsKb(editProductId) }
+    );
+    return;
+  }
+
+  // ── Bulk Pricing — combined "qty price" tier entry ──────────────────
+  if (s === States.ADMIN_BULK_TIER_VALUE) {
+    const { bulkProductId, bulkTierNum } = d;
+    const product = db.getProduct(bulkProductId);
+    if (!product) {
+      session.clear(userId);
+      await bot.sendMessage(chatId, '❌ Product not found.');
+      return;
+    }
+
+    const m = text.trim().match(/^(\d+)\s+([\d.]+)$/);
+    if (!m) {
+      await bot.sendMessage(chatId,
+        '❌ Invalid format. Send the quantity and price separated by a space.\n\n' +
+        '<b>Example:</b> <code>20 0.80</code>',
+        { parse_mode: 'HTML' });
+      return;
+    }
+    const qty   = parseInt(m[1], 10);
+    const price = parseFloat(m[2]);
+
+    if (qty < 1) {
+      await bot.sendMessage(chatId, '❌ Quantity must be at least 1.');
+      return;
+    }
+    if (isNaN(price) || price <= 0) {
+      await bot.sendMessage(chatId, '❌ Enter a valid price greater than 0.');
+      return;
+    }
+    if (price >= Number(product.price)) {
+      await bot.sendMessage(chatId,
+        `❌ Tier price must be <b>lower</b> than the base price (${formatPrice(product.price)}). ` +
+        `Bulk pricing is meant to be a discount.`,
+        { parse_mode: 'HTML' });
+      return;
+    }
+
+    // Sanity check against the other two tiers: tiers must make sense as
+    // increasing quantity → decreasing price, so an admin can't accidentally
+    // set Tier 2 cheaper-qty-but-pricier than Tier 1, etc.
+    const otherTiers = [1, 2, 3]
+      .filter((n) => n !== bulkTierNum)
+      .map((n) => ({ n, qty: product[`bulk_tier${n}_qty`] || 0, price: product[`bulk_tier${n}_price`] || 0 }))
+      .filter((t) => t.qty > 0 && t.price > 0);
+
+    for (const other of otherTiers) {
+      if (qty > other.qty && price >= other.price) {
+        await bot.sendMessage(chatId,
+          `❌ A higher quantity tier must have a price lower than ${formatPrice(other.price)} ` +
+          `(currently set on Tier ${other.n} at ${other.qty}+ pcs).`,
+          { parse_mode: 'HTML' });
+        return;
+      }
+      if (qty < other.qty && price <= other.price) {
+        await bot.sendMessage(chatId,
+          `❌ A lower quantity tier must have a price higher than ${formatPrice(other.price)} ` +
+          `(currently set on Tier ${other.n} at ${other.qty}+ pcs).`,
+          { parse_mode: 'HTML' });
+        return;
+      }
+    }
+
+    db.updateProduct(bulkProductId, `bulk_tier${bulkTierNum}_qty`, qty);
+    db.updateProduct(bulkProductId, `bulk_tier${bulkTierNum}_price`, price);
+    session.clear(userId);
+
+    const fresh = db.getProduct(bulkProductId);
+    await bot.sendMessage(
+      chatId,
+      `✅ <b>Tier ${bulkTierNum} saved:</b> ${qty}+ pcs → ${formatPrice(price)} each`,
+      { parse_mode: 'HTML', reply_markup: adminBulkPriceKb(fresh) }
+    );
+    return;
+  }
+
+  // ── Large Stock Upload — multi-message batch accumulator ───────────
+  if (s === States.ADMIN_STOCK_BATCH) {
+    const productId = d.stockProductId;
+    const product   = db.getProduct(productId);
+    if (!product) { session.clear(userId); await bot.sendMessage(chatId, '❌ Product not found.'); return; }
+
+    const cmd = text.trim().toUpperCase();
+
+    // Supplier for this whole upload. Accepted at any point — the name is
+    // usually remembered halfway through pasting, and forcing it up front would
+    // mean cancelling and starting the paste again.
+    if (cmd.startsWith('SUPPLIER')) {
+      const name = text.trim().slice('SUPPLIER'.length).trim();
+      if (!name) {
+        await bot.sendMessage(chatId, '❌ Send it as <code>SUPPLIER Ahmed Store</code>.', { parse_mode: 'HTML' });
+        return;
+      }
+      session.update(userId, { supplier: name.slice(0, 60) });
+      await bot.sendMessage(chatId,
+        `🏷 Supplier for this upload: <b>${escapeHtml(name.slice(0, 60))}</b>\n\n` +
+        `<i>Every item in this batch will carry it. Keep pasting, then send DONE.</i>`,
+        { parse_mode: 'HTML' });
+      return;
+    }
+
+    // Cost per unit for this upload. Accepted at any point, like SUPPLIER —
+    // the number is often looked up mid-paste.
+    if (cmd.startsWith('COST')) {
+      const raw = text.trim().slice('COST'.length).trim().replace(/[$,\s]/g, '');
+      const v = parseFloat(raw);
+      if (!Number.isFinite(v) || v < 0) {
+        await bot.sendMessage(chatId, '❌ Send it as <code>COST 0.25</code>.', { parse_mode: 'HTML' });
+        return;
+      }
+      session.update(userId, { unitCost: v });
+      await bot.sendMessage(chatId,
+        `💰 Cost for this upload: <b>${formatPrice(v)}</b> per unit\n\n` +
+        `<i>Keep pasting, then send DONE.</i>`,
+        { parse_mode: 'HTML' });
+      return;
+    }
+
+    // Cancel
+    if (cmd === 'CANCEL') {
+      session.clear(userId);
+      await bot.sendMessage(chatId,
+        `❌ <b>Upload cancelled.</b> No items were added.`,
+        { parse_mode: 'HTML', reply_markup: adminStockManageKb(productId) });
+      return;
+    }
+
+    // Done — save everything accumulated
+    if (cmd === 'DONE') {
+      const allItems = d.batchItems || [];
+      if (!allItems.length) {
+        session.clear(userId);
+        await bot.sendMessage(chatId,
+          `⚠️ No items were received. Upload cancelled.`,
+          { parse_mode: 'HTML', reply_markup: adminStockManageKb(productId) });
+        return;
+      }
+
+      const prevStock = product.stock_quantity || 0;
+      const count     = items.insertItems(productId, allItems, d.supplier || null, d.unitCost ?? null);
+      db.adjustStockQuantity(productId, count);
+      session.clear(userId);
+
+      await bot.sendMessage(chatId,
+        `✅ <b>Large Stock Upload Complete!</b>\n\n` +
+        `📦 Product: <b>${escapeHtml(product.title)}</b>\n` +
+        `📨 Batches received: <b>${d.batchCount}</b>\n` +
+        `➕ Items added: <b>${count}</b>\n` +
+        (d.supplier
+          ? `🏷 Supplier: <b>${escapeHtml(d.supplier)}</b>\n`
+          : `🏷 <i>No supplier recorded — you will not know who to chase if these fail.</i>\n`) +
+        (d.unitCost != null
+          ? `💰 Cost: <b>${formatPrice(d.unitCost)}</b>/unit · spent <b>${formatPrice(d.unitCost * count)}</b>\n`
+          : `💰 <i>No cost recorded — this batch's profit cannot be calculated.</i>\n`) +
+        `📊 Previous stock: ${prevStock}\n` +
+        `📊 New stock: <b>${prevStock + count}</b>`,
+        { parse_mode: 'HTML', reply_markup: adminStockManageKb(productId) });
+
+      await evaluateStock(bot, productId);
+
+      // Notify back-in-stock subscribers if stock was zero
+      if (prevStock === 0 && count > 0) {
+        const notified = await notifyBackInStockSubscribers(bot, productId);
+        if (notified > 0) {
+          await bot.sendMessage(chatId,
+            `🔔 Notified <b>${notified}</b> waiting user(s) that stock is available again.`,
+            { parse_mode: 'HTML' });
+        }
+      }
+
+      // Auto-publish stock update to channel + group (same as regular stock add)
+      const notifEnabled = db.getSetting('stock_notifications_enabled', '1');
+      if (notifEnabled === '1' && count > 0) {
+        try {
+          const fresh = db.getProduct(productId);
+          const botInfo = await bot.getMe().catch(() => ({ username: '' }));
+          const kb = { inline_keyboard: [[{ text: '🛒 Buy now', url: `https://t.me/${botInfo.username}?start=p_${fresh.id}` }]] };
+          await autoPublishWithPhoto(bot, fresh, buildStockUpdateText(fresh, count), kb);
+        } catch (e) {
+          logger.warn(`Batch stock notif error: ${e.message}`);
+        }
+      }
+      return;
+    }
+
+    // Regular batch message — parse and accumulate
+    const { valid } = items.validateLines(text);
+    if (!valid.length) {
+      await bot.sendMessage(chatId,
+        `⚠️ No valid items found in this message. Send another batch or type <code>DONE</code> to finish (${(d.batchItems || []).length} items accumulated so far).`,
+        { parse_mode: 'HTML' });
+      return;
+    }
+
+    const accumulated = [...(d.batchItems || []), ...valid];
+    session.update(userId, { batchItems: accumulated, batchCount: (d.batchCount || 0) + 1 });
+
+    await bot.sendMessage(chatId,
+      `✅ <b>Batch ${(d.batchCount || 0) + 1} received</b> — <b>${valid.length}</b> items added\n` +
+      `📊 Total accumulated: <b>${accumulated.length}</b> items\n\n` +
+      `Send another batch, or type <code>DONE</code> to save all ${accumulated.length} items.\n` +
+      `Type <code>CANCEL</code> to discard everything.`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  // ── Stock item bulk add (product_items) ─────────────────────────
+  if (s === States.ADMIN_STOCK_DATA) {
+    const productId = d.stockProductId;
+    const product   = db.getProduct(productId);
+    const prevStock = product?.stock_quantity || 0;
+
+    const { valid } = items.validateLines(text);
+
+    if (!valid.length) {
+      await bot.sendMessage(chatId, '❌ No valid items found. Please check your format and try again.');
+      return;
+    }
+
+    // Show CONFIRMATION instead of adding immediately
+    // Save items in session for confirmation step
+    session.set(userId, States.ADMIN_STOCK_CONFIRM, {
+      stockProductId: productId,
+      stockItems: valid,
+      prevStock: prevStock,
+    });
+
+    // Preview first 3 items
+    const preview = valid.slice(0, 3).map((v, i) => `${i + 1}. <code>${escapeHtml((v.raw || '').slice(0, 50))}</code>`).join('\n');
+    const more = valid.length > 3 ? `\n... and ${valid.length - 3} more` : '';
+
+    await bot.sendMessage(
+      chatId,
+      `⚠️ <b>Confirm Stock Addition</b>\n\n` +
+      `📦 <b>Product:</b> ${escapeHtml(product.title)}\n` +
+      `➕ <b>Items to add:</b> <b>${valid.length}</b>\n` +
+      `📊 <b>Current stock:</b> ${prevStock}\n` +
+      `📊 <b>New stock will be:</b> <b>${prevStock + valid.length}</b>\n\n` +
+      `📋 <b>Preview:</b>\n${preview}${more}\n\n` +
+      `🏷 <b>Supplier:</b> <i>not set</i>\n\n` +
+      `Are you sure you want to add these ${valid.length} item(s)?`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: stockConfirmRows(userId, productId, valid.length) } }
+    );
+    return;
+  }
+
+  // ── Supplier name for the batch being added ──────────────────────
+  if (s === States.ADMIN_STOCK_SUPPLIER) {
+    const name = String(text || '').trim();
+    if (!name) { await bot.sendMessage(chatId, '❌ Send a name, or tap Skip.'); return; }
+    if (name.length > 60) { await bot.sendMessage(chatId, '❌ Too long — keep it under 60 characters.'); return; }
+
+    // Back to the confirmation screen, now carrying the supplier.
+    session.set(userId, States.ADMIN_STOCK_CONFIRM, { ...d, supplier: name });
+    const product2 = db.getProduct(d.stockProductId);
+    await bot.sendMessage(chatId,
+      `🏷 Supplier set to <b>${escapeHtml(name)}</b>\n\n` +
+      `📦 ${escapeHtml(kbStripEmojiCodes(String(product2?.title || '')).trim())}\n` +
+      `➕ <b>${(d.stockItems || []).length}</b> item(s) ready to add.`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: stockConfirmRows(userId, d.stockProductId, (d.stockItems || []).length) } });
+    return;
+  }
+
+  // Continued — placeholder to keep regular flow disabled
+  if (false) {
+    const productId = d.stockProductId;
+    const product   = db.getProduct(productId);
+    const wasZero   = (product?.stock_quantity || 0) === 0;
+    const prevStock = product?.stock_quantity || 0;
+    const { valid } = { valid: [] };
+    logger.info(`Admin ${userId} adding ${valid.length} stock items to product ${productId}`);
+    const count   = items.insertItems(productId, valid);
+    const newQty  = db.adjustStockQuantity(productId, count).after;
+    session.clear(userId);
+
+    await bot.sendMessage(
+      chatId,
+      `✅ <b>Stock Items Added Successfully!</b>\n\n` +
+      `📦 <b>Product:</b> ${product.title}\n` +
+      `➕ <b>Items added:</b> ${count}\n` +
+      `📊 <b>Previous stock:</b> ${prevStock}\n` +
+      `📊 <b>New stock:</b> ${newQty}`,
+      { parse_mode: 'HTML', reply_markup: backToProductEditKb(productId) }
+    );
+
+    if (wasZero && newQty > 0) {
+      const notified = await notifyBackInStockSubscribers(bot, productId);
+      if (notified > 0) {
+        await bot.sendMessage(chatId, `🔔 Notified <b>${notified}</b> waiting user(s) that stock is available again.`, { parse_mode: 'HTML' });
+      }
+    }
+
+    // ── Pre-Order: ASK admin first before auto-delivering ──────────
+    try {
+      const pending = db.getReservedPreordersByProduct(productId);
+      if (pending.length > 0) {
+        const productLatest = db.getProduct(productId);
+        await bot.sendMessage(
+          chatId,
+          `🔜 <b>Pre-Order Notice</b>\n\n` +
+          `📦 Product: ${escapeHtml(productLatest.title)}\n` +
+          `👥 Pending Pre-Orders: <b>${pending.length}</b>\n\n` +
+          `Do you want to deliver these pre-orders now?\n\n` +
+          `<i>⚠️ If you added wrong items by mistake, choose "No" to skip and fix the stock first.</i>`,
+          { parse_mode: 'HTML', reply_markup: adminPreorderConfirmDeliverKb(productId, pending.length) }
+        );
+      }
+    } catch (e) {
+      logger.warn(`Pre-order notice error: ${e.message}`);
+    }
+
+    const notifEnabled = db.getSetting('stock_notifications_enabled', '1');
+    if (notifEnabled === '1') {
+      const fresh = db.getProduct(productId);
+      const botUserSu = await bot.getMe().catch(() => ({ username: '' }));
+      const kbSu = { inline_keyboard: [[{ text: '🛒 Buy now', url: `https://t.me/${botUserSu.username}?start=p_${fresh.id}` }]] };
+      await autoPublishWithPhoto(bot, fresh, buildStockUpdateText(fresh, count), kbSu);
+    }
+    return;
+  }
+
+  // ── Add to stock_quantity (numeric) ──────────────────────────────
+  if (s === States.ADMIN_STOCK_ADD_QTY) {
+    const n = parseInt(text, 10);
+    if (isNaN(n) || n < 1) {
+      await bot.sendMessage(chatId, '❌ Enter a positive number.');
+      return;
+    }
+    const productId = d.stockProductId;
+    const wasZero   = (db.getProduct(productId)?.stock_quantity || 0) === 0;
+    const result    = db.adjustStockQuantity(productId, n);
+    const product   = db.getProduct(productId);
+    session.clear(userId);
+
+    await bot.sendMessage(
+      chatId,
+      `✅ <b>Quantity Updated!</b>\n\n📦 ${product.title}\n` +
+      `➕ Added: ${n}\n📊 New stock: <b>${result.after}</b>`,
+      { parse_mode: 'HTML', reply_markup: adminBackKb() }
+    );
+
+    await evaluateStock(bot, productId);
+
+    // Fire back-in-stock notifications if was 0 before
+    if (wasZero && result.after > 0) {
+      const notified = await notifyBackInStockSubscribers(bot, productId);
+      if (notified > 0) {
+        await bot.sendMessage(chatId, `🔔 Notified <b>${notified}</b> waiting user(s).`, { parse_mode: 'HTML' });
+      }
+    }
+
+    // Auto-publish stock update to channel + group
+    const notifEnabled = db.getSetting('stock_notifications_enabled', '1');
+    if (notifEnabled === '1') {
+      const botUserSu2 = await bot.getMe().catch(() => ({ username: '' }));
+      const kbSu2 = { inline_keyboard: [[{ text: '🛒 Buy now', url: `https://t.me/${botUserSu2.username}?start=p_${product.id}` }]] };
+      await autoPublishWithPhoto(bot, product, buildStockUpdateText(product, n), kbSu2);
+    }
+    return;
+  }
+
+  // ── Remove from stock_quantity ───────────────────────────────────
+  if (s === States.ADMIN_STOCK_REMOVE_QTY) {
+    const n = parseInt(text, 10);
+    if (isNaN(n) || n < 1) {
+      await bot.sendMessage(chatId, '❌ Enter a positive number.');
+      return;
+    }
+    const productId = d.stockProductId;
+    const before    = db.getProduct(productId)?.stock_quantity || 0;
+    const result    = db.adjustStockQuantity(productId, -n);
+    session.clear(userId);
+    await bot.sendMessage(
+      chatId,
+      `✅ <b>Stock Updated Successfully!</b>\n\n` +
+      `📦 ${db.getProduct(productId)?.title}\n` +
+      `➖ Removed: ${n}\n` +
+      `📊 Previous stock: ${before}\n` +
+      `📊 New stock: <b>${result.after}</b>`,
+      { parse_mode: 'HTML', reply_markup: backToProductEditKb(productId) }
+    );
+    await evaluateStock(bot, productId);
+    return;
+  }
+
+  // ── Set stock_quantity manually ───────────────────────────────────
+  if (s === States.ADMIN_STOCK_SET_QTY) {
+    const n = parseInt(text, 10);
+    if (isNaN(n) || n < 0) {
+      await bot.sendMessage(chatId, '❌ Enter a valid non-negative number.');
+      return;
+    }
+    const productId = d.stockProductId;
+    const wasZero   = (db.getProduct(productId)?.stock_quantity || 0) === 0;
+    const newQty    = db.setStockQuantity(productId, n);
+    const product   = db.getProduct(productId);
+    session.clear(userId);
+
+    await bot.sendMessage(
+      chatId,
+      `✅ <b>Stock Set!</b>\n\n📦 ${product.title}\n📊 Stock quantity: <b>${newQty}</b>`,
+      { parse_mode: 'HTML', reply_markup: backToProductEditKb(productId) }
+    );
+
+    await evaluateStock(bot, productId);
+
+    if (wasZero && newQty > 0) {
+      const notified = await notifyBackInStockSubscribers(bot, productId);
+      if (notified > 0) {
+        await bot.sendMessage(chatId, `🔔 Notified <b>${notified}</b> waiting user(s).`, { parse_mode: 'HTML' });
+      }
+    }
+
+    // Announce it, exactly as adding stock items does.
+    //
+    // This path was the only way to stock a manual-delivery product, and it was
+    // the one path that never posted — so every restock of a manually delivered
+    // product was silent while item-based ones were announced. The channel is
+    // where customers learn something is back; a restock nobody hears about is
+    // a restock that does not sell.
+    if (newQty > 0 && db.getSetting('stock_notifications_enabled', '1') === '1') {
+      try {
+        const fresh = db.getProduct(productId);
+        const me = await bot.getMe().catch(() => ({ username: '' }));
+        const kb = { inline_keyboard: [[{
+          text: '🛒 Buy now',
+          url: `https://t.me/${me.username}?start=p_${fresh.id}`,
+        }]] };
+        const published = await autoPublishWithPhoto(
+          bot, fresh, buildStockUpdateText(fresh, newQty), kb
+        );
+        await bot.sendMessage(chatId,
+          published
+            ? '📢 Posted to your channel and group.'
+            : '⚠️ Could not post — check /admin → Settings → 🩺 Broadcast Check.');
+      } catch (e) {
+        logger.warn(`stock set qty publish: ${e.message}`);
+      }
+    }
+    return;
+  }
+
+  // ── Set sales_count ───────────────────────────────────────────────
+  if (s === States.ADMIN_SALES_COUNT_SET) {
+    const n = parseInt(text, 10);
+    if (isNaN(n) || n < 0) {
+      await bot.sendMessage(chatId, '❌ Enter a valid non-negative number.');
+      return;
+    }
+    db.setSalesCount(d.editProductId, n);
+    session.clear(userId);
+    await bot.sendMessage(
+      chatId,
+      `✅ Sales count updated to <b>${n}</b>.`,
+      { parse_mode: 'HTML', reply_markup: adminBackKb() }
+    );
+    return;
+  }
+
+  // ── Broadcast ─────────────────────────────────────────────────────
+  if (s === States.ADMIN_BROADCAST_MSG) {
+    session.set(userId, States.ADMIN_BROADCAST_CONFIRM, { broadcastText: msg.html || text });
+    const allUsers = db.getAllUsers();
+    await bot.sendMessage(
+      chatId,
+      `📣 <b>Broadcast Preview</b>\n\nWill send to <b>${allUsers.length}</b> users:\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n${text}\n━━━━━━━━━━━━━━━━━━━━\n\nConfirm?`,
+      { parse_mode: 'HTML', reply_markup: adminConfirmKb('admin_confirm_broadcast', 'admin_broadcast') }
+    );
+    return;
+  }
+
+  // ── Support reply ─────────────────────────────────────────────────
+  if (s === States.ADMIN_REPLY_TICKET) {
+    const { replyTicketId } = d;
+    const ticket = db.getTicket(replyTicketId);
+    db.replyTicket(replyTicketId, text);
+    session.clear(userId);
+
+    let notified = false;
+    if (ticket) {
+      try {
+        await bot.sendMessage(
+          ticket.user_id,
+          `💬 <b>Support Reply</b>\n\nRegarding ticket #${replyTicketId}:\n\n${text}`,
+          { parse_mode: 'HTML' }
+        );
+        notified = true;
+      } catch { /* user may have blocked */ }
+    }
+    await bot.sendMessage(
+      chatId,
+      `✅ Reply sent!${notified ? '' : '\n⚠️ Could not notify user (may have blocked bot).'}`,
+      { reply_markup: adminBackKb() }
+    );
+    return;
+  }
+
+  // ── Settings value ────────────────────────────────────────────────
+  if (s === States.ADMIN_SETTING_VALUE) {
+    db.setSetting(d.settingKey, text);
+    session.clear(userId);
+    await bot.sendMessage(chatId, `✅ Setting <b>${d.settingKey}</b> → <code>${text}</code>`, {
+      parse_mode: 'HTML', reply_markup: adminBackKb(),
+    });
+    return;
+  }
+
+  // ── Announcement ──────────────────────────────────────────────────
+  if (s === States.ADMIN_ANN_MSG) {
+    session.set(userId, States.ADMIN_ANN_BUTTON_ASK, { annText: text });
+    await bot.sendMessage(
+      chatId,
+      `📢 <b>Preview:</b>\n\n${text}\n\nWould you like to add a button?`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: '🛒 Add Buy Product Button', callback_data: 'ann_btn_product' }],
+          [{ text: '⏭ Skip (no button)', callback_data: 'ann_btn_skip' }],
+        ] } }
+    );
+    return;
+  }
+
+  // Admin types button text for product button: "TEXT|PRODUCT_ID"
+  if (s === States.ADMIN_ANN_BUTTON_TEXT) {
+    const parts = text.split('|').map(p => p.trim());
+    if (parts.length < 2) {
+      await bot.sendMessage(chatId, '❌ Format: <code>Button Text|PRODUCT_ID</code>\n\nExample: <code>🛒 Buy Now|5</code>', { parse_mode: 'HTML' });
+      return;
+    }
+    const [btnText, prodIdStr] = parts;
+    const prodId = parseInt(prodIdStr, 10);
+    if (!btnText || !prodId) {
+      await bot.sendMessage(chatId, '❌ Invalid format.');
+      return;
+    }
+    const product = db.getProduct(prodId);
+    if (!product) {
+      await bot.sendMessage(chatId, '❌ Product not found.');
+      return;
+    }
+    const sessData = session.get(userId).data;
+    session.set(userId, States.ADMIN_ANN_TARGET, {
+      annText: sessData.annText,
+      annButton: { text: btnText, product_id: prodId },
+    });
+    await bot.sendMessage(chatId,
+      `✅ Button set: <b>${escapeHtml(btnText)}</b> → ${escapeHtml(product.title)}\n\nWhere to send?`,
+      { parse_mode: 'HTML', reply_markup: announcementTargetKb() }
+    );
+    return;
+  }
+
+  // ── Manual balance: step 1 — collect target user ID or @username ──
+  if (s === States.ADMIN_BALANCE_USER_ID) {
+    const input = text.trim();
+    let target = null;
+
+    if (input.startsWith('@')) {
+      // Lookup by username
+      target = db.getUserByUsername(input.slice(1));
+    } else {
+      const targetId = parseInt(input, 10);
+      if (!isNaN(targetId) && targetId > 0) {
+        target = db.getUser(targetId);
+      }
+    }
+
+    if (!target) {
+      await bot.sendMessage(
+        chatId,
+        `❌ User <code>${input}</code> not found.\n\nEnter a valid Telegram ID or <code>@username</code>.\nThe user must have started the bot at least once.`,
+        { parse_mode: 'HTML', reply_markup: adminBackKb() }
+      );
+      return;
+    }
+
+    const targetId = target.telegram_id;
+    const op = d.balanceOp === 'remove' ? 'remove' : 'add';
+    const nextState = op === 'remove'
+      ? States.ADMIN_BALANCE_AMOUNT_REMOVE
+      : States.ADMIN_BALANCE_AMOUNT_ADD;
+    session.set(userId, nextState, {
+      balanceOp: op, balanceTargetId: targetId,
+      // Carried from the payment trace, so an amount that was already read off
+      // Binance is not retyped — retyping is where a $12.83 becomes $12.38.
+      prefillAmount: d.prefillAmount || null,
+      prefillNote: d.prefillNote || null,
+    });
+
+    const name = target.username ? `@${target.username}` : (target.first_name || `User ${targetId}`);
+    const prompt = op === 'remove'
+      ? '➖ <b>Remove User Balance</b>\n\n'
+      : '➕ <b>Add User Balance</b>\n\n';
+
+    const rows = [];
+    if (d.prefillAmount) {
+      rows.push([{ text: `✅ ${op === 'remove' ? 'Remove' : 'Add'} ${formatPrice(d.prefillAmount)}`,
+                   callback_data: `admin_balgo_${targetId}_${Math.round(Number(d.prefillAmount) * 100)}` }]);
+    }
+    rows.push([{ text: '🔙 Back', callback_data: 'admin_panel' }]);
+
+    await bot.sendMessage(
+      chatId,
+      prompt +
+      `👤 Target: <b>${name}</b> (<code>${targetId}</code>)\n` +
+      `💰 Current balance: <b>${formatPrice(target.balance || 0)}</b>\n\n` +
+      (d.prefillAmount
+        ? `💵 From the trace: <b>${formatPrice(d.prefillAmount)}</b>\n` +
+          (d.prefillNote ? `<i>${escapeHtml(String(d.prefillNote))}</i>\n` : '') +
+          `\nTap below to confirm, or send a different amount:`
+        : `Send the <b>amount</b> to ${op}:`),
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }
+    );
+    return;
+  }
+
+  // ── Manual balance: step 2 — apply amount ────────────────────────
+  if (s === States.ADMIN_BALANCE_AMOUNT_ADD || s === States.ADMIN_BALANCE_AMOUNT_REMOVE) {
+    const op       = s === States.ADMIN_BALANCE_AMOUNT_REMOVE ? 'remove' : 'add';
+    const targetId = d.balanceTargetId;
+    const amount   = parseFloat((text || '').replace('$', '').replace(',', '.'));
+
+    if (isNaN(amount) || amount <= 0) {
+      await bot.sendMessage(chatId, '❌ Enter a valid positive amount. Example: <code>10.00</code>', { parse_mode: 'HTML' });
+      return;
+    }
+
+    const target = db.getUser(targetId);
+    if (!target) {
+      await bot.sendMessage(chatId, '❌ Target user no longer exists.', { reply_markup: adminBackKb() });
+      session.clear(userId);
+      return;
+    }
+
+    const currentBalance = Number(target.balance || 0);
+    if (op === 'remove' && amount > currentBalance + 1e-9) {
+      await bot.sendMessage(
+        chatId,
+        `❌ Cannot remove <b>${formatPrice(amount)}</b> — user only has <b>${formatPrice(currentBalance)}</b>.`,
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    const delta = op === 'remove' ? -amount : amount;
+    db.updateBalance(targetId, delta);
+    db.addTransaction({
+      userId:      targetId,
+      type:        op === 'remove' ? 'admin_debit' : 'admin_credit',
+      amount:      delta,
+      description: op === 'remove'
+        ? `Admin balance removal (by admin ${userId})`
+        : `Admin balance credit (by admin ${userId})`,
+      refId:       null,
+      orderId:     null,
+    });
+
+    const updated = db.getUser(targetId);
+    const newBalance = Number(updated?.balance || 0);
+    const name = target.username ? `@${target.username}` : (target.first_name || `User ${targetId}`);
+
+    session.clear(userId);
+
+    // Confirm to admin
+    await bot.sendMessage(
+      chatId,
+      `✅ <b>Balance ${op === 'remove' ? 'Removed' : 'Added'}!</b>\n\n` +
+      `👤 ${name} (<code>${targetId}</code>)\n` +
+      `${op === 'remove' ? '➖' : '➕'} ${formatPrice(amount)}\n` +
+      `💰 New balance: <b>${formatPrice(newBalance)}</b>`,
+      { parse_mode: 'HTML', reply_markup: adminBackKb() }
+    );
+
+    // Notify the user
+    try {
+      if (op === 'remove') {
+        await bot.sendMessage(
+          targetId,
+          `⚠️ <b>Your wallet was adjusted by admin.</b>\n\n` +
+          `Amount: <b>-${formatPrice(amount)}</b>\n` +
+          `New Balance: <b>${formatPrice(newBalance)}</b>\n\n` +
+          `Contact support if you have questions.`,
+          { parse_mode: 'HTML' }
+        );
+      } else {
+        await bot.sendMessage(
+          targetId,
+          `✅ <b>Your wallet has been credited by admin.</b>\n\n` +
+          `Amount: <b>${formatPrice(amount)}</b>\n` +
+          `New Balance: <b>${formatPrice(newBalance)}</b>`,
+          { parse_mode: 'HTML' }
+        );
+      }
+    } catch (e) {
+      logger.warn(`Could not notify user ${targetId} about balance change: ${e.message}`);
+    }
+    return;
+  }
+
+  // ── User Search (text input) ──────────────────────────────────────
+  if (s === States.ADMIN_USER_SEARCH) {
+    const query = String(text).trim().replace(/^@/, '');
+    if (!query) {
+      await bot.sendMessage(chatId, '❌ Enter a search term.');
+      return;
+    }
+    const results = db.searchUsers(query);
+    session.clear(userId);
+
+    if (!results.length) {
+      await bot.sendMessage(
+        chatId,
+        `🔍 No users found matching "<b>${escapeHtml(query)}</b>".`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Users', callback_data: 'admin_users' }]] } }
+      );
+      return;
+    }
+
+    const rows = results.slice(0, 15).map((u) => {
+      const name = u.username || u.first_name || `User ${u.telegram_id}`;
+      const banned = u.is_banned ? '🚫 ' : '';
+      return [{ text: `${banned}${name} — $${Number(u.balance).toFixed(2)}`, callback_data: `admin_user_${u.telegram_id}` }];
+    });
+    rows.push([{ text: '🔍 New Search', callback_data: 'admin_user_search' }]);
+    rows.push([{ text: '🔙 All Users', callback_data: 'admin_users' }]);
+
+    await bot.sendMessage(
+      chatId,
+      `🔍 <b>Found ${results.length} user(s)</b> matching "<b>${escapeHtml(query)}</b>"`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }
+    );
+    return;
+  }
+
+  // ── Edit Broadcast Interval ──────────────────────────────────────
+  if (s === States.ADMIN_VIP_INTERVAL) {
+    const minutes = parseInt(text.replace(/[^\d]/g, ''), 10);
+    if (isNaN(minutes) || minutes < 5 || minutes > 1440) {
+      await bot.sendMessage(chatId, '❌ Please enter a valid number between 5 and 1440 minutes.');
+      return;
+    }
+    db.setSetting('vip_broadcast_interval_min', String(minutes));
+    session.clear(userId);
+    if (typeof global._scheduleVipBroadcast === 'function') {
+      global._scheduleVipBroadcast();
+    }
+    await bot.sendMessage(chatId,
+      `✅ <b>Interval Updated</b>\n\nVIP broadcast will now run every <b>${minutes} minute(s)</b>.`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 VIP Panel', callback_data: 'admin_vip_toggle' }]] } }
+    );
+    return;
+  }
+
+  // ── Admin Custom Refund Amount ───────────────────────────────────
+  if (s === States.ADMIN_REFUND_AMOUNT) {
+    const amount = parseFloat(text.replace(',', '.'));
+    if (isNaN(amount) || amount <= 0) {
+      await bot.sendMessage(chatId, '❌ Please enter a valid amount.');
+      return;
+    }
+    const r = db.getRefundRequestById(d.refundId);
+    if (!r) { await bot.sendMessage(chatId, '❌ Refund not found.'); session.clear(userId); return; }
+    if (amount > Number(r.total_price)) {
+      await bot.sendMessage(chatId, `❌ Amount cannot exceed order total (${formatPrice(r.total_price)}).`);
+      return;
+    }
+    session.clear(userId);
+    const sent = await bot.sendMessage(chatId, '⏳ Processing...');
+    await processRefundApproval(bot, chatId, sent.message_id, r, amount);
+    return;
+  }
+
+  // ── Edit VIP Limit ────────────────────────────────────────────────
+  if (s === States.ADMIN_VIP_LIMIT) {
+    const num = parseInt(text.replace(/[,. ]/g, ''), 10);
+    if (isNaN(num) || num < 1 || num > 10000000) {
+      await bot.sendMessage(chatId, '❌ Please enter a valid number (1 to 10,000,000).');
+      return;
+    }
+    db.setSetting('vip_limit', String(num));
+    session.clear(userId);
+    await bot.sendMessage(chatId,
+      `✅ <b>VIP Limit Updated</b>\n\nNew limit: <b>${num.toLocaleString()}</b>`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 VIP Panel', callback_data: 'admin_vip_toggle' }]] } }
+    );
+    return;
+  }
+
+  // ── Clear VIP Image ───────────────────────────────────────────────
+  if (s === States.ADMIN_VIP_IMAGE) {
+    if (text.toLowerCase().trim() === 'clear') {
+      db.setSetting('vip_image_file_id', '');
+      session.clear(userId);
+      await bot.sendMessage(chatId, '✅ VIP image cleared.', {
+        reply_markup: { inline_keyboard: [[{ text: '🔙 VIP Panel', callback_data: 'admin_vip_toggle' }]] }
+      });
+    } else {
+      await bot.sendMessage(chatId, 'ℹ️ Send a photo or type <code>clear</code> to remove.', { parse_mode: 'HTML' });
+    }
+    return;
+  }
+
+  // ── Edit Maintenance Message ──────────────────────────────────────
+  if (s === States.ADMIN_MAINTENANCE_MSG) {
+    if (text.length > 500) {
+      await bot.sendMessage(chatId, '❌ Message too long (max 500 chars).');
+      return;
+    }
+    db.setSetting('maintenance_message', text);
+    session.clear(userId);
+    await bot.sendMessage(chatId,
+      `✅ <b>Maintenance message updated.</b>\n\n` +
+      `Customers will now see:\n<i>${escapeHtml(text)}</i>`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Maintenance Panel', callback_data: 'admin_maintenance' }]] } }
+    );
+    return;
+  }
+
+  // ── Add Emoji to Library ──────────────────────────────────────────
+  if (s === States.ADMIN_EMOJI_ADD) {
+    const parts = text.split('|').map(p => p.trim());
+    if (parts.length < 2 || parts.length > 3) {
+      await bot.sendMessage(chatId, '❌ Invalid format. Use: <code>name|EMOJI_ID|fallback</code>', { parse_mode: 'HTML' });
+      return;
+    }
+    const [name, emojiId, fallback = '🎁'] = parts;
+    if (!name || !emojiId || !/^\d+$/.test(emojiId)) {
+      await bot.sendMessage(chatId, '❌ Name and numeric EMOJI_ID are required.');
+      return;
+    }
+    if (name.length > 50) {
+      await bot.sendMessage(chatId, '❌ Name too long (max 50 chars).');
+      return;
+    }
+
+    const result = db.addEmoji(name.toLowerCase().replace(/\s+/g, '_'), emojiId, fallback);
+    // The plain-emoji -> premium map is cached for a minute; drop it so the new
+    // entry takes effect on the very next message instead of up to 60s later.
+    try { require('../utils/format').clearEmojiCache(); } catch (_) {}
+    session.clear(userId);
+
+    if (!result) {
+      await bot.sendMessage(chatId, '❌ Name already used. Try a different one.');
+      return;
+    }
+
+    await bot.sendMessage(
+      chatId,
+      `✅ <b>Emoji added!</b>\n\n` +
+      `<b>Name:</b> ${escapeHtml(name)}\n` +
+      `Preview: <tg-emoji emoji-id="${emojiId}">${fallback}</tg-emoji>\n\n` +
+      `Use this anywhere:\n` +
+      `<code>[emoji:${emojiId}]${fallback}</code>`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Library', callback_data: 'admin_emojis' }]] } }
+    );
+    return;
+  }
+
+  // ── Send Pre-Order content manually ───────────────────────────────
+  if (s === States.ADMIN_PRE_SEND_CONTENT) {
+    const { sendPreId } = d;
+    logger.info(`[PREORDER SEND] Admin ${userId} sending content for preorder #${sendPreId}`);
+    const pr = db.getPreorderById(sendPreId);
+    if (!pr) {
+      await bot.sendMessage(chatId, `❌ Pre-order #${sendPreId} not found in DB.`);
+      session.clear(userId);
+      return;
+    }
+    if (pr.status !== 'reserved') {
+      await bot.sendMessage(chatId, `❌ Pre-order #${sendPreId} already ${pr.status}.`);
+      session.clear(userId);
+      return;
+    }
+    const product = db.getProduct(pr.product_id);
+    const contentToSend = (text || '').trim();
+    if (!contentToSend) {
+      await bot.sendMessage(chatId, '❌ Content cannot be empty.');
+      return;
+    }
+
+    logger.info(`[PREORDER SEND] Sending content to user ${pr.user_id}, length=${contentToSend.length}`);
+
+    // Format date
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const dateStr =
+      pad(now.getDate()) + '/' + pad(now.getMonth() + 1) + '/' + now.getFullYear() +
+      ' ' + pad(now.getHours()) + ':' + pad(now.getMinutes());
+
+    const instr = (product && product.instruction)
+      ? `\n━━━━━━━━━━━━━━━━━━━━\n📌 <b>Instructions:</b>\n${escapeHtml(product.instruction)}\n` : '';
+
+    // Build message — keep customer content as code block (safer with HTML)
+    const userMsg =
+      `🎉 <b>Your Pre-Order is Ready!</b>\n\n` +
+      `📦 <b>Order:</b> ${escapeHtml(product?.title || '')}\n` +
+      `🔢 <b>Quantity:</b> ${pr.quantity}\n` +
+      (pr.email ? `📧 ${escapeHtml(pr.email)}\n` : '') +
+      `💵 ${formatPrice(pr.total_paid)}\n` +
+      `📅 Delivered: ${dateStr}\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `🎁 <b>Your Product(s):</b>\n\n` +
+      `<code>${escapeHtml(contentToSend)}</code>\n` +
+      `━━━━━━━━━━━━━━━━━━━━${instr}\n` +
+      `✨ Thank you for your patience!`;
+
+    let sentOk = false;
+    try {
+      await bot.sendMessage(pr.user_id, userMsg, { parse_mode: 'HTML' });
+      sentOk = true;
+      logger.info(`[PREORDER SEND] ✅ Sent successfully to ${pr.user_id}`);
+    } catch (err) {
+      logger.error(`[PREORDER SEND ERROR] ${err.message} | trying without HTML...`);
+      try {
+        const plainMsg = userMsg.replace(/<\/?[^>]+>/g, '');
+        await bot.sendMessage(pr.user_id, plainMsg);
+        sentOk = true;
+        logger.info(`[PREORDER SEND] ✅ Sent in plain mode`);
+      } catch (err2) {
+        logger.error(`[PREORDER SEND FATAL] ${err2.message}`);
+      }
+    }
+
+    if (sentOk) {
+      db.markPreorderDelivered(sendPreId, contentToSend);
+      session.clear(userId);
+      await bot.sendMessage(
+        chatId,
+        `✅ <b>Pre-Order #${sendPreId} Sent!</b>\n\nDelivered to <code>${pr.user_id}</code>.`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Pre-Orders', callback_data: 'admin_preorders_list' }]] } }
+      );
+    } else {
+      session.clear(userId);
+      await bot.sendMessage(
+        chatId,
+        `⚠️ <b>Failed to send to user.</b>\n\nThe user (<code>${pr.user_id}</code>) may have blocked the bot or never started it.\n\nPre-order NOT marked as delivered. Try again or refund.`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Pre-Orders', callback_data: 'admin_preorders_list' }]] } }
+      );
+    }
+    return;
+  }
+
+  // ── Set Pre-Order Max Quantity ────────────────────────────────────
+  if (s === States.ADMIN_PRE_SET_MAX) {
+    const max = parseInt(text, 10);
+    if (isNaN(max) || max < 0) {
+      await bot.sendMessage(chatId, '❌ Enter a valid non-negative number.');
+      return;
+    }
+    const { preProductId } = d;
+    db.updateProduct(preProductId, 'preorder_max', max);
+    session.clear(userId);
+    const product = db.getProduct(preProductId);
+    await bot.sendMessage(
+      chatId,
+      `✅ Max set to <b>${max}</b>.\n\n` +
+      `⚙️ <b>Pre-Order: ${product.title}</b>\n` +
+      `Status: ${product.preorder_enabled ? '✅ ENABLED' : '⚪ Disabled'}\n` +
+      `Max: <b>${product.preorder_max}</b> | Reserved: <b>${product.preorder_count}</b>`,
+      { parse_mode: 'HTML', reply_markup: adminPreorderSetupKb(preProductId, !!product.preorder_enabled) }
+    );
+    return;
+  }
+
+  // ── Manual cycle end ──────────────────────────────────────────────
+  if (s === States.ADMIN_CGB_CYCLE_END) {
+    const raw = String(text || '').trim();
+    if (/^(off|none|clear|-)$/i.test(raw)) {
+      db.setSetting('cgb_manual_cycle_end', '');
+      session.clear(userId);
+      await bot.sendMessage(chatId, '✅ Override removed — day-of-month cycles are back in charge.',
+        { reply_markup: { inline_keyboard: [[{ text: '🕒 Cycle end', callback_data: 'admin_cgb_manual' }]] } });
+      return;
+    }
+
+    const when = new Date(raw.replace(' ', 'T'));
+    if (isNaN(when.getTime())) {
+      await bot.sendMessage(chatId, '❌ Could not read that. Use <code>YYYY-MM-DD HH:MM</code>, e.g. <code>2026-09-30 20:00</code>.',
+        { parse_mode: 'HTML' });
+      return;
+    }
+    if (when <= new Date()) {
+      // Accepting a past time would sell zero-day subscriptions for real money.
+      await bot.sendMessage(chatId, '❌ That moment has already passed. Pick a future date and time.');
+      return;
+    }
+
+    db.setSetting('cgb_manual_cycle_end', raw);
+    session.clear(userId);
+    const days = Math.max(1, Math.ceil((when - new Date()) / 86400000));
+    const monthly = cgbCycles.getMonthlyPrice();
+    await bot.sendMessage(chatId,
+      `✅ <b>Cycle now ends ${escapeHtml(raw)}</b>\n\n` +
+      `⏳ New customers get <b>${days}</b> day(s)\n` +
+      `💰 They pay <b>${formatPrice((days / 30) * monthly)}</b>\n\n` +
+      `<i>After that moment the day-of-month cycles take over again automatically.</i>`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🕒 Cycle end', callback_data: 'admin_cgb_manual' }]] } });
+    return;
+  }
+
+  // ── Cost per unit for the pending batch ───────────────────────────
+  if (s === States.ADMIN_STOCK_COST) {
+    const v = parseFloat(String(text || '').replace(/[$,\s]/g, ''));
+    if (!Number.isFinite(v) || v < 0) {
+      await bot.sendMessage(chatId, '❌ Send a number, e.g. <code>0.25</code>.', { parse_mode: 'HTML' });
+      return;
+    }
+    session.set(userId, States.ADMIN_STOCK_CONFIRM, { ...d, unitCost: v });
+    const n = (d.stockItems || []).length;
+    await bot.sendMessage(chatId,
+      `💰 Cost set to <b>${formatPrice(v)}</b> per unit.\n` +
+      `Total for ${n} item(s): <b>${formatPrice(v * n)}</b>`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: stockConfirmRows(userId, d.stockProductId, n) } });
+    return;
+  }
+
+  // ── Supplier lookup by account content ────────────────────────────
+  if (s === States.ADMIN_SUPPLIER_LOOKUP) {
+    session.clear(userId);
+    const frag = String(text || '').trim();
+    if (frag.length < 3) {
+      await bot.sendMessage(chatId, '❌ Send at least 3 characters.');
+      return;
+    }
+
+    const found = items.findItemsByContent(frag);
+    if (!found.length) {
+      await bot.sendMessage(chatId,
+        `🏷 <b>${escapeHtml(frag.slice(0, 40))}</b>\n\n` +
+        `❌ Not found in stock or in any delivered order.\n\n` +
+        `<i>Either it was never added through the bot, or the text does not match ` +
+        `exactly — try a shorter fragment, like just the email.</i>`,
+        { parse_mode: 'HTML' });
+      return;
+    }
+
+    const parts = found.slice(0, 8).map((it) => {
+      const who = it.supplier
+        ? `🏷 <b>${escapeHtml(it.supplier)}</b>`
+        : `🏷 <i>no supplier recorded</i>`;
+      const sold = it.status === 'sold'
+        ? `🔴 Sold${it.sold_to_user_id ? ` to <code>${it.sold_to_user_id}</code>` : ''}` +
+          `${it.order_ref ? ` · order #${it.order_ref}` : ''}${it.sold_at ? ` · ${escapeHtml(String(it.sold_at).slice(0, 16))}` : ''}`
+        : `🟢 Still in stock`;
+      return `${who}\n` +
+             `📦 ${escapeHtml(kbStripEmojiCodes(String(it.product_title || '')).trim().slice(0, 34))}\n` +
+             `${sold}\n` +
+             `📅 Added ${escapeHtml(String(it.created_at || '—').slice(0, 16))}\n` +
+             `<code>${escapeHtml(String(it.raw_content || '').slice(0, 60))}</code>`;
+    });
+
+    await bot.sendMessage(chatId,
+      `🏷 <b>Supplier lookup</b>\n\n${parts.join('\n\n➖➖➖\n\n')}` +
+      (found.length > 8 ? `\n\n<i>…and ${found.length - 8} more matches</i>` : ''),
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+        [{ text: '🔎 Look up another', callback_data: 'admin_supplier_lookup' }],
+        [{ text: '🏷 All suppliers', callback_data: 'admin_suppliers' }],
+      ] } });
+    return;
+  }
+
+  // ── Announcement text ─────────────────────────────────────────────
+  if (s === States.ADMIN_NOTICE_TEXT) {
+    const b = sess.data.noticeBot;
+    const body = String(text || '').trim();
+    session.clear(userId);
+
+    if (body === '-' || !body) {
+      await bot.sendMessage(chatId, '❌ Cancelled.');
+      return;
+    }
+    if (body.length > 900) {
+      await bot.sendMessage(chatId, '❌ Too long — keep it under 900 characters so it does not push the menu off screen.');
+      return;
+    }
+
+    // Writing keeps whatever expiry was already set, so editing the wording of
+    // a timed notice does not silently make it permanent.
+    const prev = notices.peek(b);
+    notices.set(b, body, prev?.expires_at || null);
+
+    await bot.sendMessage(chatId,
+      `✅ <b>Announcement saved and switched on.</b>\n\n` +
+      `<b>Customers will see:</b>\n\n${notices.banner(b)}`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '📢 Announcements', callback_data: `admin_notice_${b}` }]] } })
+      .catch(async (e) => {
+        // Bad HTML in the text would otherwise fail silently and leave the admin
+        // thinking it saved wrong, when it saved fine and only the preview broke.
+        await bot.sendMessage(chatId,
+          `✅ Saved, but the preview could not be rendered — check your HTML tags.\n\n${e.message}`);
+      });
+    return;
+  }
+
+  // ── TxID tracer: one id, the whole story ──────────────────────────
+  if (s === States.ADMIN_TXID_SEARCH) {
+    session.clear(userId);
+    logger.info(`[TXID] admin ${userId} tracing "${String(text).slice(0, 24)}" via panel`);
+    await runTxidTrace(bot, chatId, text);
+    return;
+  }
+
+  // ── Revoke one VIP by id ──────────────────────────────────────────
+  if (s === States.ADMIN_VIP_REVOKE) {
+    session.clear(userId);
+    const target = parseInt(String(text || '').replace(/[^0-9]/g, ''), 10);
+    if (!Number.isFinite(target)) {
+      await bot.sendMessage(chatId, '❌ Send a numeric user id.');
+      return;
+    }
+    const wasVip = db.isVIP(target);
+    const n = db.revokeVIP(target);
+    await bot.sendMessage(chatId,
+      wasVip && n
+        ? `✅ VIP removed from <code>${target}</code>.\n\n` +
+          `<i>They keep whatever discount their spend rank earns them.</i>`
+        : `ℹ️ <code>${target}</code> was not a VIP member.`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '👑 VIP members', callback_data: 'admin_vip_review' }]] } });
+    return;
+  }
+
+  // ── Time-limited product: end date + full price ───────────────────
+  if (s === States.ADMIN_SUB_EXPIRY) {
+    const productId = sess.data.productId;
+    const parts = String(text || '').trim().split(/\s+/);
+    const date = parts[0];
+    const total = parseFloat(String(parts[1] || '').replace(/[$,\s]/g, ''));
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(total) || total <= 0) {
+      await bot.sendMessage(chatId, '❌ Send it as <code>YYYY-MM-DD PRICE</code>, e.g. <code>2026-09-19 10</code>.', { parse_mode: 'HTML' });
+      return;
+    }
+
+    const left = subPricing.daysLeft(date);
+    if (!left || left <= 0) {
+      await bot.sendMessage(chatId, '❌ That date has already passed. Pick a future date.');
+      return;
+    }
+
+    // A date decades away is a typo, not an intention. Accepting it produced
+    // "— 20721 days — $13321.54": the price is per-day multiplied by the days
+    // left, so one wrong year turns a $10 product into a five-figure one that
+    // no customer can buy and the shop cannot explain.
+    if (left > 730) {
+      await bot.sendMessage(chatId,
+        `❌ That date is <b>${left}</b> days away (${date}).\n\n` +
+        `Time-limited pricing is for accounts that expire within about two ` +
+        `years. Check the year — <code>2083</code> instead of <code>2026</code> ` +
+        `is the usual slip.`,
+        { parse_mode: 'HTML' });
+      return;
+    }
+
+    const p = db.getProductRaw ? db.getProductRaw(productId) : db.getProduct(productId);
+    if (!p) { await bot.sendMessage(chatId, '❌ Product not found.'); return; }
+
+    // The base title is captured now, before any countdown suffix is added, so
+    // turning this off later can restore exactly what the admin wrote.
+    const baseTitle = p.sub_base_title || String(p.title || '')
+      .replace(/\s*[—-]\s*\d+\s*days?\s*left\s*$/i, '');
+    const perDay = Number((total / left).toFixed(4));
+
+    db.updateProductField(productId, 'sub_base_title', baseTitle);
+    db.updateProductField(productId, 'sub_end_date', date);
+    db.updateProductField(productId, 'sub_price_per_day', perDay);
+    session.clear(userId);
+
+    const live = db.getProduct(productId);
+    const tomorrow = Math.max(Number(p.sub_min_price) || 0, Math.ceil(perDay * (left - 1) * 100) / 100);
+
+    await bot.sendMessage(chatId,
+      `✅ <b>Time-limited pricing on</b>\n\n` +
+      `📅 Ends <b>${date}</b> · ⏳ <b>${left}</b> day(s) left\n` +
+      `💵 <b>${formatPrice(perDay)}</b> per day\n\n` +
+      `<b>Today:</b> ${escapeHtml(kbStripEmojiCodes(String(live?.title || '')).trim())} — <b>${formatPrice(live?.price || 0)}</b>\n` +
+      `<b>Tomorrow:</b> ${escapeHtml(baseTitle)} — ${left - 1} day(s) left — <b>${formatPrice(tomorrow)}</b>\n\n` +
+      `<i>Updates itself daily. No action needed from you.</i>`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '⏳ Settings', callback_data: `admin_subexp_${productId}` }]] } });
+    return;
+  }
+
+  if (s === States.ADMIN_SUB_MINDAYS) {
+    const productId = sess.data.productId;
+    const v = parseInt(String(text || '').replace(/[^0-9]/g, ''), 10);
+    if (!Number.isFinite(v) || v < 0 || v > 365) {
+      await bot.sendMessage(chatId, '❌ Send a whole number of days, e.g. 3 — or 0 to sell to the last day.');
+      return;
+    }
+    db.updateProductField(productId, 'sub_min_days', v);
+    session.clear(userId);
+    const live = db.getProduct(productId);
+    await bot.sendMessage(chatId,
+      v > 0
+        ? `✅ Goes OUT OF STOCK once fewer than <b>${v}</b> day(s) remain.\n\n` +
+          `Right now: <b>${live?.sub_days_left ?? 0}</b> day(s) — ` +
+          `${(live?.stock_quantity || 0) > 0 ? '🟢 still selling' : '🔴 out of stock'}`
+        : `✅ Will keep selling down to the last day.`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '⏳ Settings', callback_data: `admin_subexp_${productId}` }]] } });
+    return;
+  }
+
+  if (s === States.ADMIN_SUB_MIN) {
+    const productId = sess.data.productId;
+    const v = parseFloat(String(text || '').replace(/[$,\s]/g, ''));
+    if (!Number.isFinite(v) || v < 0) {
+      await bot.sendMessage(chatId, '❌ Send a number, e.g. 2 — or 0 for no floor.');
+      return;
+    }
+    db.updateProductField(productId, 'sub_min_price', v);
+    session.clear(userId);
+    const live = db.getProduct(productId);
+    await bot.sendMessage(chatId,
+      v > 0
+        ? `✅ Never drops below <b>${formatPrice(v)}</b>.\n\nRight now: <b>${formatPrice(live?.price || 0)}</b>`
+        : `✅ Floor removed — the price follows the days only.`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '⏳ Settings', callback_data: `admin_subexp_${productId}` }]] } });
+    return;
+  }
+
+  // ── Spend ranks: edit one field / add a tier ──────────────────────
+  if (s === States.ADMIN_RANK_EDIT) {
+    const { rankId, field } = sess.data || {};
+    const raw = String(text || '').trim();
+
+    if (field === 'legacy_vip') {
+      const pct = parseFloat(raw.replace('%', ''));
+      if (!isFinite(pct) || pct < 0 || pct > 100) {
+        await bot.sendMessage(chatId, '❌ Send a number between 0 and 100.');
+        return;
+      }
+      db.setSetting('legacy_vip_discount_pct', String(pct));
+      session.clear(userId);
+      await bot.sendMessage(chatId, `✅ Old VIP members now keep <b>${pct}%</b> for life.`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🏆 Ranks', callback_data: 'admin_ranks' }]] } });
+      return;
+    }
+
+    let value = raw;
+    if (field === 'min_spend' || field === 'discount_pct') {
+      // Tolerant of "$600" and "5%" — the admin is typing into a chat box, not
+      // a validated form, and rejecting those would just be pedantic.
+      value = parseFloat(raw.replace(/[$%,\s]/g, ''));
+      if (!isFinite(value) || value < 0) {
+        await bot.sendMessage(chatId, '❌ Send a number, for example 600 or 5.');
+        return;
+      }
+      if (field === 'discount_pct' && value > 100) {
+        await bot.sendMessage(chatId, '❌ A discount above 100% would pay the customer to buy.');
+        return;
+      }
+    } else if (!value) {
+      await bot.sendMessage(chatId, '❌ That cannot be empty.');
+      return;
+    }
+
+    try {
+      db.updateRankTier(rankId, field, value);
+    } catch (e) {
+      await bot.sendMessage(chatId, `❌ ${escapeHtml(e.message)}`);
+      return;
+    }
+    session.clear(userId);
+    const t = db.getRankTier(rankId);
+    await bot.sendMessage(chatId,
+      `✅ Updated.\n\n${t.emoji || '🏅'} <b>${escapeHtml(t.name)}</b> — $${Number(t.min_spend).toFixed(0)}+ → <b>${Number(t.discount_pct)}%</b>`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🏆 Ranks', callback_data: 'admin_ranks' }]] } });
+    return;
+  }
+
+  if (s === States.ADMIN_RANK_ADD) {
+    const parts = String(text || '').split('|').map((x) => x.trim());
+    if (parts.length < 4) {
+      await bot.sendMessage(chatId, '❌ Use: <code>NAME | EMOJI | MIN_SPEND | DISCOUNT%</code>', { parse_mode: 'HTML' });
+      return;
+    }
+    const [name, emoji] = parts;
+    const minSpend = parseFloat(String(parts[2]).replace(/[$,\s]/g, ''));
+    const pct      = parseFloat(String(parts[3]).replace(/[%\s]/g, ''));
+    if (!name || !isFinite(minSpend) || !isFinite(pct) || pct < 0 || pct > 100 || minSpend < 0) {
+      await bot.sendMessage(chatId, '❌ Check the numbers. Example: <code>ELITE | 👑 | 3000 | 20</code>', { parse_mode: 'HTML' });
+      return;
+    }
+    db.addRankTier(name, emoji || '🏅', minSpend, pct);
+    session.clear(userId);
+    await bot.sendMessage(chatId, `✅ Tier <b>${escapeHtml(name)}</b> added.`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🏆 Ranks', callback_data: 'admin_ranks' }]] } });
+    return;
+  }
+
+  // ── Legacy: typed position number ─────────────────────────────────
+  // Nothing puts an admin into this state any more — positions are tapped, not
+  // typed. A stale session left over from before the change is answered here
+  // rather than falling through into the next matcher and being read as, say,
+  // a broadcast message.
+  if (s === States.ADMIN_SET_ORDER) {
+    session.clear(userId);
+    await bot.sendMessage(
+      chatId,
+      '↕️ Product ordering moved to tap-to-place.\n\n' +
+      'Open ↕️ <b>Sort Products</b>, choose a list, tap a product, then tap the position you want it in.',
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '↕️ Open Product Order', callback_data: 'admin_sort_products' }]] } }
+    );
+    return;
+  }
+
+  // ── Refund flow ───────────────────────────────────────────────────
+  // ── Search Order by ID (admin orders panel) ─────────────────────────────────
+  if (s === 'ADMIN_SEARCH_ORDER') {
+    const orderId = parseInt(text.trim(), 10);
+    session.clear(userId);
+    if (isNaN(orderId) || orderId <= 0) {
+      await bot.sendMessage(chatId, '❌ Invalid order number. Please enter a number like <code>1672</code>.', { parse_mode: 'HTML' });
+      return;
+    }
+    const order = db.getOrder(orderId);
+    if (!order) {
+      await bot.sendMessage(chatId,
+        `❌ <b>Order #${orderId} not found.</b>\n\nPlease check the number and try again.`,
+        { parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '🔍 Search Again', callback_data: 'admin_orders_search' }, { text: '📋 All Orders', callback_data: 'admin_orders' }]] } }
+      );
+      return;
+    }
+    const statusEmoji = { pending: '⏳', delivered: '✅', cancelled: '❌', paid: '💰' };
+    const payMap = { binance: '🟡 Binance Pay', wallet: '💰 Wallet', usdt: '💎 USDT', cryptobot: '🤖 CryptoBot', bep20: '💎 USDT BEP20', trc20: '💎 USDT TRC20' };
+    const uname = order.username ? '@' + order.username : (order.first_name || `User ${order.user_id}`);
+    let txt =
+      `🔍 <b>Order #${orderId}</b>\n\n` +
+      `${statusEmoji[order.status] || '❓'} <b>Status:</b> ${(order.status || '').toUpperCase()}\n` +
+      `👤 <b>Customer:</b> ${escapeHtml(uname)} (<code>${order.user_id}</code>)\n` +
+      `📦 <b>Product:</b> ${escapeHtml(order.product_title || 'N/A')}\n` +
+      `🔢 <b>Qty:</b> ${order.quantity || 1}\n` +
+      `💵 <b>Total:</b> $${Number(order.total_price || 0).toFixed(2)}\n` +
+      `💳 <b>Payment:</b> ${payMap[order.payment_method] || order.payment_method || 'N/A'}\n` +
+      `📅 <b>Created:</b> ${(order.created_at || '').slice(0, 16)}\n`;
+    if (order.paid_at) txt += `✅ <b>Paid at:</b> ${(order.paid_at || '').slice(0, 16)}\n`;
+    if (order.email) txt += `📧 <b>Email:</b> <code>${escapeHtml(order.email)}</code>\n`;
+    if (order.delivered_content) {
+      const preview = order.delivered_content.slice(0, 200);
+      txt += `\n📦 <b>Delivered Content:</b>\n<code>${escapeHtml(preview)}${order.delivered_content.length > 200 ? '...' : ''}</code>`;
+    }
+    await bot.sendMessage(chatId, txt, {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: '🔍 Search Again', callback_data: 'admin_orders_search' }, { text: '📋 All Orders', callback_data: 'admin_orders' }],
+      ]},
+    });
+    return;
+  }
+
+  if (s === States.ADMIN_REFUND_ORDER_ID) {
+    const orderId = parseInt(text, 10);
+    if (isNaN(orderId)) {
+      await bot.sendMessage(chatId, '❌ Enter a valid Order ID (number only).');
+      return;
+    }
+    const order = db.getOrder(orderId);
+    if (!order) {
+      await bot.sendMessage(chatId, `❌ Order #${orderId} not found.`, { reply_markup: adminBackKb() });
+      session.clear(userId);
+      return;
+    }
+    if (order.status !== 'delivered') {
+      await bot.sendMessage(chatId, `❌ Order #${orderId} is not delivered (status: ${order.status}).`, { reply_markup: adminBackKb() });
+      session.clear(userId);
+      return;
+    }
+    const existing = db.getRefundByOrderId(orderId);
+    if (existing) {
+      await bot.sendMessage(chatId, `❌ Order #${orderId} was already refunded ($${existing.refund_amount.toFixed(2)}).`, { reply_markup: adminBackKb() });
+      session.clear(userId);
+      return;
+    }
+    session.set(userId, States.ADMIN_REFUND_END_DATE, { refundOrderId: orderId, order });
+    await bot.sendMessage(
+      chatId,
+      `📋 <b>Order #${orderId} Found</b>\n\n` +
+      `👤 User: <code>${order.user_id}</code>\n` +
+      `📦 Product: ${order.product_title}\n` +
+      `💵 Price: ${formatPrice(order.total_price)}\n` +
+      `📅 Purchased: ${(order.created_at || '').slice(0, 16)}\n\n` +
+      `📅 <b>Step 2:</b> Enter the subscription end date:\n` +
+      `Format: <code>YYYY-MM-DD</code> (e.g. 2025-06-15)`,
+      { parse_mode: 'HTML', reply_markup: adminBackKb() }
+    );
+    return;
+  }
+
+  if (s === States.ADMIN_REFUND_END_DATE) {
+    const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+    if (!dateRegex.test(text.trim())) {
+      await bot.sendMessage(chatId, '❌ Invalid format. Use <code>YYYY-MM-DD</code> (e.g. 2025-06-15)', { parse_mode: 'HTML' });
+      return;
+    }
+    const endDate = new Date(text.trim());
+    if (isNaN(endDate.getTime())) {
+      await bot.sendMessage(chatId, '❌ Invalid date. Try again.');
+      return;
+    }
+    session.update(userId, { refundEndDate: text.trim() });
+    session.set(userId, States.ADMIN_REFUND_WARRANTY, session.get(userId).data);
+    await bot.sendMessage(
+      chatId,
+      `✅ End date set: <b>${text.trim()}</b>\n\n` +
+      `🛡 <b>Step 3:</b> Enter the <b>total warranty days</b>:\n` +
+      `Example: <code>30</code>`,
+      { parse_mode: 'HTML', reply_markup: adminBackKb() }
+    );
+    return;
+  }
+
+  if (s === States.ADMIN_REFUND_WARRANTY) {
+    const warrantyDays = parseInt(text, 10);
+    if (isNaN(warrantyDays) || warrantyDays < 1) {
+      await bot.sendMessage(chatId, '❌ Enter a valid number of days (e.g. 30).');
+      return;
+    }
+    const { refundOrderId, order, refundEndDate } = d;
+    const today   = new Date(); today.setHours(0, 0, 0, 0);
+    const endDate = new Date(refundEndDate); endDate.setHours(0, 0, 0, 0);
+    const msPerDay      = 24 * 60 * 60 * 1000;
+    const daysRemaining = Math.max(0, Math.round((endDate - today) / msPerDay));
+    const refundAmount  = parseFloat(((daysRemaining / warrantyDays) * order.total_price).toFixed(2));
+    session.update(userId, { warrantyDays, daysRemaining, refundAmount });
+    await bot.sendMessage(
+      chatId,
+      `💸 <b>Refund Calculation</b>\n\n` +
+      `📦 Order #${refundOrderId}\n` +
+      `🛒 ${order.product_title}\n` +
+      `💵 Original: ${formatPrice(order.total_price)}\n` +
+      `🛡 Warranty Days: ${warrantyDays}\n` +
+      `📅 End Date: ${refundEndDate}\n` +
+      `⏳ Days Remaining: <b>${daysRemaining}</b>\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `💰 Refund: <b>${formatPrice(refundAmount)}</b>\n` +
+      `Formula: (${daysRemaining} ÷ ${warrantyDays}) × ${formatPrice(order.total_price)}\n\n` +
+      `Confirm to credit user's wallet?`,
+      { parse_mode: 'HTML', reply_markup: adminRefundConfirmKb(refundOrderId) }
+    );
+    return;
+  }
+}
+
+// ── Photo handler ─────────────────────────────────────────────────────────────
+
+async function handleAdminPhoto(bot, msg) {
+  if (!isAdmin(msg.from.id)) return;
+
+  const userId = msg.from.id;
+  const chatId = msg.chat.id;
+  const sess   = session.get(userId);
+
+  if (sess.state === States.ADMIN_ADD_IMAGE) {
+    const fileId = msg.photo[msg.photo.length - 1].file_id;
+    session.update(userId, { imageFileId: fileId });
+    await askForInitialStock(bot, chatId, userId);
+  } else if (sess.state === States.ADMIN_VIP_IMAGE) {
+    const fileId = msg.photo[msg.photo.length - 1].file_id;
+    db.setSetting('vip_image_file_id', fileId);
+    session.clear(userId);
+    await bot.sendMessage(chatId, '✅ VIP image saved.', {
+      reply_markup: { inline_keyboard: [[{ text: '🔙 VIP Panel', callback_data: 'admin_vip_toggle' }]] }
+    });
+    return;
+  } else if (sess.state === States.ADMIN_EDIT_VALUE && sess.data.editField === 'image_file_id') {
+    const fileId = msg.photo[msg.photo.length - 1].file_id;
+    db.updateProduct(sess.data.editProductId, 'image_file_id', fileId);
+    session.clear(userId);
+    await bot.sendMessage(chatId, '✅ Image updated!', { reply_markup: adminBackKb() });
+  }
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+async function askForInitialStock(bot, chatId, userId) {
+  session.set(userId, States.ADMIN_ADD_STOCK, session.get(userId).data);
+  await bot.sendMessage(
+    chatId,
+    '📦 <b>Add initial stock</b> (one item per line):\n\n' +
+    '<code>email1@example.com:password1\nemail2@example.com:password2</code>\n\n' +
+    'Or type <code>skip</code>.',
+    { parse_mode: 'HTML', reply_markup: adminBackKb() }
+  );
+}
+
+async function finalizeProduct(bot, chatId, userId, stockLines) {
+  const d = session.get(userId).data;
+
+  let stockAdded = 0;
+  const productId = db.insertProduct({
+    title:         d.title,
+    description:   d.description,
+    warranty:      d.warranty,
+    price:         d.price,
+    requiresEmail: d.requiresEmail ?? 1,
+    imageFileId:   d.imageFileId || null,
+    stockQuantity: 0,
+    salesCount:    0,
+  });
+
+  // Save instruction if provided
+  if (d.instruction) {
+    db.updateProduct(productId, 'instruction', d.instruction);
+  }
+
+  if (stockLines.length > 0) {
+    const { valid } = items.validateLines(stockLines.join('#'));
+    if (valid.length > 0) {
+      stockAdded = items.insertItems(productId, valid);
+      db.setStockQuantity(productId, stockAdded);
+    }
+  }
+
+  session.clear(userId);
+
+  await bot.sendMessage(
+    chatId,
+    `✅ <b>Product Created!</b>\n\n🆔 ID: ${productId}\n📦 ${d.title}\n💵 ${formatPrice(d.price)}\n` +
+    `📧 Email required: ${d.requiresEmail ? 'Yes' : 'No'}\n📦 Stock: ${stockAdded} items`,
+    { parse_mode: 'HTML', reply_markup: adminBackKb() }
+  );
+
+  const notifEnabled = db.getSetting('product_notifications_enabled', '1');
+  if (notifEnabled === '1' && stockAdded > 0) {
+    const fresh = db.getProduct(productId);
+    const botUserNp = await bot.getMe().catch(() => ({ username: '' }));
+    const kbNp = { inline_keyboard: [[{ text: '🛒 Buy now', url: `https://t.me/${botUserNp.username}?start=p_${fresh.id}` }]] };
+    await autoPublishWithPhoto(bot, fresh, buildNewProductText(fresh), kbNp);
+  }
+}
+
+// ── Callback handler ──────────────────────────────────────────────────────────
+
+
+/**
+ * Build and send the payment trace report.
+ *
+ * Shared by the /txid command and the admin panel button so the two can never
+ * drift apart — the report is the feature, the two entry points are just doors.
+ */
+async function runTxidTrace(bot, chatId, rawText) {
+    const needle = String(rawText || '').trim();
+    if (needle.length < 4) {
+      await bot.sendMessage(chatId, '❌ Send at least 4 characters of the id.');
+      return;
+    }
+
+    const money = (n) => `$${Number(n || 0).toFixed(2)}`;
+
+    // An amount is a valid thing to trace, not only a hash. On TON it is the
+    // ONLY thing that identifies a deposit, so refusing it would leave the one
+    // network that needs this tool unable to use it.
+    if (/^\d+\.\d{2,8}$/.test(needle)) {
+      const want = Number(needle);
+      let found = null;
+      try {
+        const recent = await binance.listRecentDeposits({ days: 30, limit: 50, amount: want });
+        found = recent.ok ? recent.rows : [];
+      } catch (e) { found = []; }
+
+      const intent = (() => {
+        try { return db.findIntentForDeposit('TON', want) || db.findIntentForDeposit('BEP20', want); }
+        catch (e) { return null; }
+      })();
+
+      await bot.sendMessage(chatId,
+        `🔎 <b>Amount ${want}</b>\n\n` +
+        (found.length
+          ? `✅ <b>Found on Binance</b>\n` + found.slice(0, 5).map((d) => {
+              const when = new Date(Number(d.insertTime)).toISOString().slice(0, 16).replace('T', ' ');
+              return `• ${escapeHtml(String(d.amount))} ${escapeHtml(d.coin || '')} · ` +
+                     `${escapeHtml(d.network || '?')} · ${when}`;
+            }).join('\n')
+          : `❌ No Binance deposit of exactly this amount in the last 30 days.`) +
+        (intent
+          ? `\n\n🎯 <b>Reserved for user <code>${intent.user_id}</code></b> — status ${escapeHtml(intent.status)}`
+          : `\n\n<i>No open reservation matches this amount.</i>`),
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+          ...(found.length ? [[{ text: `➕ Add ${money(found[0].amount)} to a customer`,
+                                 callback_data: `admin_addbal_${Math.round(Number(found[0].amount) * 100)}` }]] : []),
+          [{ text: '🔎 Trace another', callback_data: 'admin_txid_search' }],
+        ] } });
+      return;
+    }
+
+    const r = db.traceTxid(needle);
+    const short = (v) => {
+      const x = String(v || '');
+      // Hashes are 64 characters; printing them whole buries the answer.
+      return x.length > 22 ? `${x.slice(0, 10)}…${x.slice(-8)}` : x;
+    };
+
+    if (!r || !r.found) {
+      // The local tables only know about deposits the bot itself picked up.
+      // "Not in my database" and "never arrived" are different answers, and
+      // only Binance can tell them apart — so ask it before saying no.
+      let chainLine = '';
+      // Remembered so the "add balance" button can carry the exact figure that
+      // was just read off Binance.
+      let chainAmount = 0;
+      let chainScanned = 0;
+      try {
+        const chain = await binance.findDepositRaw(needle);
+        chainScanned = Number(chain.scanned) || 0;
+        if (!chain.ok) {
+          chainLine = `\n\n⚠️ <i>Could not check Binance: ${escapeHtml(chain.error || 'unknown error')}</i>`;
+        } else if (chain.matches.length) {
+          const d = chain.matches[0];
+          chainAmount = Number(d.amount) || 0;
+          const state = d.status === 1 ? '✅ Completed on Binance'
+                      : d.status === 0 ? '⏳ Still pending on Binance'
+                      : d.status === 6 ? '🔒 Credited but withdrawal-locked'
+                      : `Status code ${d.status}`;
+          const isUsdt = String(d.coin || '').toUpperCase() === 'USDT';
+          chainLine =
+            `\n\n🟡 <b>FOUND ON BINANCE — but never credited here</b>\n` +
+            // Only USDT is shown with a dollar sign. Printing "$1.79" for 1.79
+            // TRX would invite crediting a dollar amount that was never sent.
+            `💵 <b>${isUsdt ? '$' : ''}${Number(d.amount).toFixed(isUsdt ? 2 : 6)}</b> ${escapeHtml(d.coin || '')}\n` +
+            (isUsdt ? '' : `⚠️ <b>This is ${escapeHtml(d.coin || 'another coin')}, not USDT.</b> Convert it before crediting.\n`) +
+            `🌐 ${escapeHtml(d.network || '?')}\n` +
+            `📥 To: <code>${escapeHtml(String(d.address || '—'))}</code>\n` +
+            `📅 ${new Date(d.insertTime).toISOString().slice(0, 16).replace('T', ' ')}\n` +
+            `📊 ${state}\n\n` +
+            `<i>The money is in your Binance account. It was not added to any ` +
+            `wallet — most often because it went to a different address than the ` +
+            `one the bot watches, arrived in a coin the bot does not accept, or ` +
+            `came without a matching deposit request. ` +
+            `Add it manually with ➕ Add User Balance once you know the customer.</i>`;
+        } else {
+          // Not an on-chain deposit — try Binance Pay. Money "sent on Binance"
+          // is often an internal transfer, which never touches deposit history
+          // at all, so stopping here would report a false "never arrived".
+          let payLine = '';
+          try {
+            const pay = await binance.findPayTransactionRaw(needle);
+            if (pay.ok && pay.matches.length) {
+              const t = pay.matches[0];
+              chainAmount = Number(t.amount) || 0;
+              payLine =
+                `\n\n🟡 <b>FOUND ON BINANCE PAY — but never credited here</b>\n` +
+                `💵 <b>$${Number(t.amount).toFixed(2)}</b> ${escapeHtml(t.currency || '')}\n` +
+                `🔁 Type: ${escapeHtml(String(t.orderType || 'PAY'))} (internal transfer, off-chain)\n` +
+                `🆔 <code>${escapeHtml(String(t.transactionId || t.orderId || '—'))}</code>\n` +
+                `📅 ${new Date(t.transactionTime).toISOString().slice(0, 16).replace('T', ' ')}\n\n` +
+                `<i>The money is in your Binance account. Credit it with ` +
+                `➕ Add User Balance once you know the customer.</i>`;
+            } else if (!pay.ok) {
+              payLine = `\n⚠️ <i>Binance Pay check: ${escapeHtml(pay.error || 'failed')}</i>`;
+            }
+          } catch (e) {
+            logger.warn(`[TXID] Binance Pay lookup failed: ${e.message}`);
+          }
+
+          // The count is the useful part: "searched 0 deposits" means the API
+          // call returned nothing at all — a key or permission problem — while
+          // "searched 214" means the money genuinely is not there.
+          // A TON hash can never match: TON gives a transfer two different
+          // hashes, one shown by the sending wallet and another recorded by the
+          // receiver. Saying "the money never reached your account" about a TON
+          // id is therefore usually wrong — and it is the one answer that stops
+          // the search. Recent TON deposits are listed instead, so the amount
+          // can be matched by eye in seconds.
+          const looksTon = /^[A-Za-z0-9+/_-]{43,48}={0,2}$/.test(needle);
+          if (looksTon) {
+            let tonList = '';
+            try {
+              const recent = await binance.listRecentDeposits({ days: 7, limit: 8, network: 'TON' });
+              if (recent.ok && recent.rows.length) {
+                tonList = `\n\n📥 <b>Recent TON deposits</b> — find yours by AMOUNT:\n` +
+                  recent.rows.map((d) => {
+                    const when = new Date(Number(d.insertTime)).toISOString().slice(0, 16).replace('T', ' ');
+                    return `• <b>${escapeHtml(String(d.amount))}</b> ${escapeHtml(d.coin || '')} · ${when}`;
+                  }).join('\n');
+              }
+            } catch (e) { /* listing is a convenience, not the answer */ }
+
+            chainLine =
+              `\n\n🔷 <b>This looks like a TON hash, and it did not match.</b>\n\n` +
+              // Not "cannot" — Binance records the wallet's own hash for some
+              // TON deposits and a different one for others, so a failed match
+              // means this particular transfer is one of the latter, not that
+              // TON lookups never work.
+              `<i>TON transfers can carry two different hashes: the one the ` +
+              `sending wallet shows, and the one Binance records. They sometimes ` +
+              `match and sometimes do not — when they do not, no amount of ` +
+              `waiting will help.</i>\n\n` +
+              `✅ <b>Search by amount instead:</b> <code>/deposits 7 TON</code>` +
+              tonList +
+              `\n\n<i>Deposits made through the bot are matched automatically by ` +
+              `their reserved amount — this only affects manual lookups.</i>`;
+          } else chainLine = payLine ||
+            `\n\n🔍 <i>Searched <b>${chainScanned}</b> Binance deposit(s) and Binance Pay ` +
+            `(last 180 days) — nothing matched.</i>` +
+            (chainScanned === 0
+              ? `\n\n⚠️ <b>Binance returned no deposits at all.</b> Check the API key ` +
+                `has <i>Enable Reading</i> permission and that its IP allow-list ` +
+                `includes this server.`
+              : '');
+        }
+      } catch (e) {
+        logger.warn(`[TXID] Binance lookup failed: ${e.message}`);
+        chainLine = `\n\n⚠️ <i>Binance check failed: ${escapeHtml(e.message)}</i>`;
+      }
+
+      await bot.sendMessage(chatId,
+        `🔎 <b>${escapeHtml(short(needle))}</b>\n\n` +
+        `❌ <b>Not in the bot's records.</b>\n` +
+        `Never credited, never queued, never held for review.` +
+        chainLine +
+        // Offered because a customer with proof should not wait for the cause
+        // to be found. Crediting them and investigating afterwards is the right
+        // order — the money is theirs either way.
+        `\n\n💡 <i>If the customer has shown you proof of the transfer, credit ` +
+        `them now with ➕ Add User Balance and investigate after. Run ` +
+        `<code>/deposits</code> to see what Binance actually has.</i>`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+          [{ text: `➕ Add ${chainAmount ? money(chainAmount) : 'User Balance'} to a customer`,
+             callback_data: chainAmount ? `admin_addbal_${Math.round(chainAmount * 100)}` : 'admin_add_balance' }],
+          [{ text: '🔎 Trace another', callback_data: 'admin_txid_search' }],
+        ] } });
+      return;
+    }
+
+    const L = [`🔎 <b>Payment trace</b>\n<code>${escapeHtml(short(needle))}</code>`];
+
+    if (r.user) {
+      L.push(
+        `\n👤 <b>Customer</b>\n` +
+        `${r.user.username ? '@' + escapeHtml(r.user.username) : escapeHtml(r.user.first_name || '—')} · ` +
+        `<code>${r.user.telegram_id}</code>\n` +
+        `💰 Balance now: <b>${money(r.user.balance)}</b>` +
+        (r.user.is_vip ? ' · 👑 VIP' : '') +
+        `\n🛒 Rank spend: ${money(r.user.rank_spend)}`
+      );
+    }
+
+    // ── Did it arrive and get credited?
+    if (r.credited.length) {
+      for (const c of r.credited) {
+        // The heading states what the money DID, not merely that the id is on
+        // record — those are different answers and support needs the first one.
+        const head = r.purpose === 'wallet_topup'
+          ? `✅ <b>DEPOSIT — added to wallet balance</b>`
+          : r.purpose === 'direct_order'
+            ? `🛒 <b>PAID FOR AN ORDER DIRECTLY — never entered the wallet</b>`
+            : `📗 <b>Payment on record</b>`;
+
+        L.push(
+          `\n${head}\n` +
+          `💵 Amount: <b>${money(c.amount)}</b>\n` +
+          `🌐 ${escapeHtml(c.network || '?')} ${escapeHtml(c.asset || '')}\n` +
+          `📅 ${escapeHtml(c.created_at || '—')}`
+        );
+
+        if (r.purpose === 'direct_order' && r.paidOrder) {
+          L.push(
+            `📦 Order <b>#${r.paidOrder.id}</b> — ` +
+            `${escapeHtml(kbStripEmojiCodes(String(r.paidOrder.product_title || '')).trim().slice(0, 30))}\n` +
+            `💵 ${money(r.paidOrder.total_price)} · <b>${escapeHtml(r.paidOrder.status || '')}</b>`
+          );
+        } else if (r.purpose === 'recorded_only') {
+          L.push(`⚠️ <i>No matching wallet credit or order — check manually.</i>`);
+        }
+      }
+    } else if (r.review.length) {
+      for (const v of r.review) {
+        L.push(
+          `\n⏸ <b>HELD FOR REVIEW — not credited</b>\n` +
+          `💵 ${money(v.amount)} · ${escapeHtml(v.network || '?')}\n` +
+          `❓ Reason: ${escapeHtml(v.reason || '—')}\n` +
+          `📊 Status: <b>${escapeHtml(v.status || 'pending')}</b>` +
+          (v.admin_note ? `\n📝 ${escapeHtml(v.admin_note)}` : '')
+        );
+      }
+    } else if (r.pending.length) {
+      for (const p of r.pending) {
+        L.push(
+          `\n⏳ <b>SEEN but NOT credited</b>\n` +
+          `💵 ${money(p.amount)} · ${escapeHtml(p.network || '?')}\n` +
+          `🔁 Checked ${p.attempts} time(s), first seen ${escapeHtml(p.first_seen || '—')}`
+        );
+      }
+    }
+
+    if (r.intents.length) {
+      for (const i of r.intents) {
+        L.push(`\n🎯 <b>Matched a deposit request</b>\nExpected <b>${money(i.unique_amount)}</b> · status ${escapeHtml(i.status)}`);
+      }
+    }
+
+    // ── Was it used to pay for an order directly?
+    if (r.orders.length) {
+      L.push(`\n🛍 <b>Paid for ${r.orders.length} order(s) directly</b>`);
+      for (const o of r.orders.slice(0, 6)) {
+        L.push(`• #${o.id} — ${escapeHtml(kbStripEmojiCodes(String(o.product_title || '')).trim().slice(0, 28))} · ${money(o.total_price)} · <b>${escapeHtml(o.status)}</b>`);
+      }
+    }
+
+    if (r.nowInv.length || r.cbInv.length) {
+      for (const i of r.nowInv) {
+        L.push(`\n🧾 <b>NOWPayments invoice</b>\n${money(i.amount)} · ${escapeHtml(i.payment_status || '?')} · ${i.credited ? '✅ credited' : '❌ not credited'} · ${escapeHtml(i.purpose || '')}`);
+      }
+      for (const i of r.cbInv) {
+        L.push(`\n🤖 <b>CryptoBot invoice</b>\n${money(i.amount)} · ${i.credited ? '✅ credited' : '❌ not credited'} · ${escapeHtml(i.purpose || '')}${i.paid_at ? ` · paid ${escapeHtml(i.paid_at)}` : ''}`);
+      }
+    }
+
+    if (r.reversals.length) {
+      for (const v of r.reversals) {
+        L.push(`\n↩️ <b>REVERSED by admin</b>\n−${money(v.amount)} · ${escapeHtml(v.reason || '—')}\nBalance ${money(v.balance_before)} → ${money(v.balance_after)}`);
+      }
+    }
+
+    if (r.ledger.length) {
+      L.push(`\n📒 <b>Ledger</b>`);
+      for (const t of r.ledger.slice(0, 5)) {
+        L.push(`• ${Number(t.amount) >= 0 ? '+' : ''}${money(t.amount)} · ${escapeHtml(t.type)} · ${escapeHtml(String(t.created_at || '').slice(0, 16))}`);
+      }
+    }
+
+    // ── What happened to the money afterwards?
+    // Only a top-up has an "afterwards" — a direct order payment funded its one
+    // order and nothing else, and the sentence below would contradict the
+    // heading by talking about money still sitting in a wallet it never entered.
+    if (r.purpose === 'wallet_topup') {
+      if (r.spentAfter.length) {
+        const spent = r.spentAfter.reduce((a, o) => a + Number(o.total_price || 0), 0);
+        L.push(`\n💸 <b>Spent after this deposit: ${money(spent)}</b> across ${r.spentAfter.length} order(s)`);
+        for (const o of r.spentAfter.slice(0, 8)) {
+          L.push(`• #${o.id} — ${escapeHtml(kbStripEmojiCodes(String(o.product_title || '')).trim().slice(0, 26))} · ${money(o.total_price)} · ${escapeHtml(o.payment_method || '')}`);
+        }
+        if (r.spentAfter.length > 8) L.push(`<i>…and ${r.spentAfter.length - 8} more</i>`);
+      } else {
+        L.push(`\n💤 <b>Nothing bought since this deposit.</b> The money is still in the wallet.`);
+      }
+    }
+
+    // ── The dispute settler ──
+    // Shown whenever a customer says "I deposited it and never used it": the
+    // ledger either side of the payment answers it without anyone's memory.
+    if (r.around && r.around.length) {
+      L.push(`\n🧾 <b>Account activity around this payment</b>`);
+      for (const t of r.around.slice(0, 12)) {
+        const amt = Number(t.amount);
+        const sign = amt >= 0 ? '➕' : '➖';
+        const mark = (r.ledger || []).some((x) => x.id === t.id) ? ' ⬅️ <b>this one</b>' : '';
+        L.push(
+          `${sign} ${money(Math.abs(amt))} · ${escapeHtml(t.type)}` +
+          `${t.order_id ? ` · order #${t.order_id}` : ''}` +
+          ` · ${escapeHtml(String(t.created_at || '').slice(5, 16))}${mark}`
+        );
+      }
+      const ups = r.around.filter((t) => Number(t.amount) > 0).reduce((a, t) => a + Number(t.amount), 0);
+      const dns = r.around.filter((t) => Number(t.amount) < 0).reduce((a, t) => a + Math.abs(Number(t.amount)), 0);
+      L.push(`\n📊 In this window: <b>+${money(ups)}</b> in, <b>−${money(dns)}</b> out`);
+    }
+
+    if (r.flags && r.flags.length) {
+      const names = {
+        debit_without_order: '⚠️ A debit with NO order attached — money left the account with nothing to show for it. Worth investigating.',
+        no_ledger_entry:     '⚠️ Payment recorded but NO ledger entry — it was never booked as a deposit or a purchase.',
+        amount_mismatch:     '⚠️ Paid amount does not match the order total.',
+      };
+      L.push(`\n🚩 <b>Needs attention</b>\n` + r.flags.map((f) => names[f] || f).join('\n'));
+    }
+
+    const kb = { inline_keyboard: [] };
+    if (r.user) kb.inline_keyboard.push([{ text: '👤 Open customer', callback_data: `admin_txid_user_${r.user.telegram_id}` }]);
+    kb.inline_keyboard.push([{ text: '🔎 Trace another', callback_data: 'admin_txid_search' }]);
+    kb.inline_keyboard.push([{ text: '🔙 Admin Panel', callback_data: 'admin_panel' }]);
+
+    // Telegram caps a message at 4096 characters; a busy wallet can exceed it.
+    const full = L.join('\n');
+    const parts = full.match(/[\s\S]{1,3500}/g) || [full];
+    for (let i = 0; i < parts.length; i++) {
+      await bot.sendMessage(chatId, parts[i], {
+        parse_mode: 'HTML',
+        reply_markup: i === parts.length - 1 ? kb : undefined,
+      }).catch(async () => {
+        await bot.sendMessage(chatId, parts[i].replace(/<[^>]+>/g, ''));
+      });
+    }
+    return;
+  
+}
+
+async function handleAdminCallback(bot, query) {
+  // ── Security: hard gate on every admin callback ───────────────────
+  if (!isAdmin(query.from.id)) {
+    await rejectNonAdmin(bot, query.id);
+    return;
+  }
+
+  const data   = query.data || '';
+  const userId = query.from.id;
+  const chatId = query.message.chat.id;
+  const msgId  = query.message.message_id;
+  const answer = (text = '') => bot.answerCallbackQuery(query.id, { text }).catch(() => {});
+
+  await answer();
+
+  /**
+   * Draw the ordering screen for the list the admin picked.
+   *
+   * The status line carries all the feedback, because answerCallbackQuery has
+   * already fired once above — a second call is rejected by Telegram, so toast
+   * popups never actually reach the admin on this screen.
+   *
+   * @param {number} page
+   * @param {string} note  optional one-line result of the last action
+   */
+  async function renderSortScreen(page = 0, note = '') {
+    const products = scopeProducts(userId);
+    const label    = scopeLabel(userId);
+
+    if (!products.length) {
+      sortHeld.delete(userId);
+      await bot.editMessageText(
+        `↕️ <b>${escapeHtml(label)}</b>\n\n📭 This list has no products on sale.`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '🔙 Choose another list', callback_data: 'admin_sort_products' }]] } }
+      ).catch(() => {});
+      return;
+    }
+
+    const heldId = sortHeld.get(userId) || null;
+    const held   = heldId ? products.find((p) => p.id === heldId) : null;
+    if (heldId && !held) sortHeld.delete(userId);
+
+    const totalPages = Math.max(1, Math.ceil(products.length / SORT_PAGE_SIZE));
+    const pg = Math.max(0, Math.min(page, totalPages - 1));
+
+    let text =
+      `↕️ <b>Arranging: ${escapeHtml(label)}</b>\n\n` +
+      `📦 <b>${products.length}</b> product${products.length === 1 ? '' : 's'} on sale` +
+      (totalPages > 1 ? `   •   📄 Page <b>${pg + 1}</b>/<b>${totalPages}</b>` : '') + `\n`;
+
+    if (held) {
+      const pos = products.findIndex((p) => p.id === held.id) + 1;
+      text +=
+        `\n✋ <b>Holding:</b> ${escapeHtml(kbStripEmojiCodes(String(held.title || '')).trim())}\n` +
+        `📍 Currently <b>#${pos}</b>\n\n` +
+        `<i>Tap any row to drop it on that number, or use the arrows above. ` +
+        `Paging keeps it in your hand.</i>`;
+    } else {
+      const out = products.filter((p) => Number(p.stock_quantity || 0) <= 0).length;
+      text += `\n<i>Tap a product to pick it up, then tap the position you want it in.</i>`;
+      if (out) {
+        // Said plainly, because otherwise moving a sold-out product to #1 looks
+        // like the ordering screen is broken when the shop does not change.
+        text += `\n\n⚠️ <i>${out} of these are sold out. Customers always see ` +
+                `in-stock products first, whatever order you set here — this list ` +
+                `decides the order WITHIN each group.</i>`;
+      }
+    }
+
+    if (note) text += `\n\n${note}`;
+
+    await bot.editMessageText(text, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: adminSortProductsKb(products, pg, heldId),
+    }).catch(() => {});
+  }
+
+  /** List picker: which customer-facing screen is being arranged. */
+  async function renderSortPicker() {
+    const categories = db.getAllCategories();
+    const other = db.getProductsForSorting(null);
+    const rows = [];
+
+    if (other.length) {
+      rows.push([{ text: `📦 Other Products (${other.length})`, callback_data: 'admin_sortscope_other' }]);
+    }
+    for (const c of categories) {
+      const n = db.getProductsForSorting(c.id).length;
+      if (!n) continue; // an empty category has nothing to arrange
+      const emoji = kbStripEmojiCodes(String(c.emoji || '')).trim() || '🗂';
+      const name  = kbStripEmojiCodes(String(c.name  || 'Category')).trim();
+      rows.push([{ text: `${emoji} ${name} (${n})`, callback_data: `admin_sortscope_${c.id}` }]);
+    }
+
+    if (!rows.length) {
+      await bot.editMessageText('📦 No products on sale to arrange.', {
+        chat_id: chatId, message_id: msgId, reply_markup: adminBackKb(),
+      }).catch(() => {});
+      return;
+    }
+
+    rows.push([{ text: '🔙 Back', callback_data: 'admin_panel' }]);
+    await bot.editMessageText(
+      `↕️ <b>Product Order</b>\n\n` +
+      `Each of these is a screen in your shop. Pick the one you want to arrange.\n\n` +
+      `<i>Only products currently on sale are listed — deleted and hidden ones ` +
+      `are left out, since customers never see them.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: rows } }
+    ).catch(() => {});
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // V2 CALLBACKS — refund eligibility, delivery mode, stock alerts,
+  // notification centre and manual-delivery management.
+  // Placed first so they are matched before the older generic patterns.
+  // ═══════════════════════════════════════════════════════════════════
+
+  // ═══════════════════════════════════════════════════════════════════
+  // V3 — DEPOSIT SECURITY: manual review queue + reversals
+  // ═══════════════════════════════════════════════════════════════════
+
+  if (data === 'admin_deposits' || /^admin_dep_list_[a-z]+_\d+$/.test(data)) {
+    let status = 'pending', page = 0;
+    if (data !== 'admin_deposits') {
+      const parts = data.split('_');
+      page   = parseInt(parts.pop(), 10) || 0;
+      status = parts.slice(3).join('_');
+    }
+    const TABS = { pending: '🕐 Pending', approved: '✅ Approved', rejected: '❌ Rejected' };
+    const safe = Object.prototype.hasOwnProperty.call(TABS, status) ? status : 'pending';
+
+    const PER   = 8;
+    const total = db.countDepositReviews(safe);
+    const pages = Math.max(1, Math.ceil(total / PER));
+    const pg    = Math.max(0, Math.min(page, pages - 1));
+    const rows  = db.listDepositReviews(safe, PER, pg * PER);
+
+    const txt =
+      `🛡 <b>Deposit Review</b>\n\n` +
+      `Deposits that could not be matched to a reservation are held here. ` +
+      `They are <b>never</b> credited automatically.\n\n` +
+      `🕐 Pending: <b>${db.countDepositReviews('pending')}</b>   ` +
+      `✅ Approved: <b>${db.countDepositReviews('approved')}</b>   ` +
+      `❌ Rejected: <b>${db.countDepositReviews('rejected')}</b>\n\n` +
+      `<b>Showing:</b> ${TABS[safe]} — ${total} item(s)` +
+      (rows.length ? '' : '\n\n<i>Nothing here.</i>');
+
+    const kb = [Object.keys(TABS).map((k) => ({
+      text: (k === safe ? '✓ ' : '') + TABS[k], callback_data: `admin_dep_list_${k}_0`,
+    }))];
+    for (const r of rows) {
+      kb.push([{
+        text: `#${r.id} · ${Number(r.amount).toFixed(2)} ${r.network || ''} · ${r.user_id}`,
+        callback_data: `admin_dep_view_${r.id}`,
+      }]);
+    }
+    if (pages > 1) {
+      const nav = [];
+      if (pg > 0)         nav.push({ text: '◀️ Prev', callback_data: `admin_dep_list_${safe}_${pg - 1}` });
+      nav.push({ text: `${pg + 1}/${pages}`, callback_data: 'noop' });
+      if (pg < pages - 1) nav.push({ text: 'Next ▶️', callback_data: `admin_dep_list_${safe}_${pg + 1}` });
+      kb.push(nav);
+    }
+    kb.push([{ text: '↩️ Reverse a deposit', callback_data: 'admin_dep_reverse' }]);
+    kb.push([{ text: '🔙 Back', callback_data: 'admin_panel' }]);
+
+    try {
+      await bot.editMessageText(txt, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+    } catch (e) {
+      await bot.sendMessage(chatId, txt, { parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+    }
+    return;
+  }
+
+  if (/^admin_dep_view_\d+$/.test(data)) {
+    const id = parseInt(data.split('_').pop(), 10);
+    const r  = db.getDepositReview(id);
+    if (!r) { await answer('❌ Not found'); return; }
+
+    const u   = db.getUser(r.user_id);
+    const who = u?.username ? `@${u.username}` : (u?.first_name || `User ${r.user_id}`);
+    const when = r.insert_time
+      ? new Date(Number(r.insert_time)).toISOString().replace('T', ' ').slice(0, 16)
+      : 'unknown';
+    const ageMin = r.insert_time ? Math.round((Date.now() - Number(r.insert_time)) / 60000) : null;
+
+    const REASONS = {
+      no_matching_reservation: 'No reservation matched this amount',
+      predates_reservation:    'Transfer is older than the reservation',
+    };
+
+    const txt =
+      `🛡 <b>Deposit Review #${r.id}</b>\n\n` +
+      `<b>Status:</b> ${String(r.status).toUpperCase()}\n` +
+      `⚠️ <b>Reason:</b> ${REASONS[r.reason] || r.reason || 'n/a'}\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `💵 <b>Amount:</b> ${Number(r.amount).toFixed(6)} USDT\n` +
+      `🌐 <b>Network:</b> ${r.network || 'n/a'}\n` +
+      `🔗 <b>TxID:</b>\n<code>${escapeHtml(r.txid)}</code>\n` +
+      `📅 <b>On chain:</b> ${when} UTC` +
+      (ageMin !== null ? ` (${ageMin} min ago)` : '') + `\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `👤 <b>Claimed by:</b> ${escapeHtml(who)}\n` +
+      `🆔 <code>${r.user_id}</code>\n` +
+      (u ? `💰 <b>Balance:</b> ${formatPrice(u.balance || 0)}\n` : '') +
+      `📝 <b>Submitted:</b> ${String(r.created_at || '').slice(0, 16)}\n` +
+      (r.admin_note ? `\n📌 <i>${escapeHtml(r.admin_note)}</i>\n` : '') +
+      `\n<i>Approve only if you are sure this transfer really belongs to this user.</i>`;
+
+    const kb = [];
+    if (r.status === 'pending') {
+      kb.push([{ text: '✅ Approve & credit', callback_data: `admin_dep_ok_${r.id}` }]);
+      kb.push([{ text: '❌ Reject',           callback_data: `admin_dep_no_${r.id}` }]);
+    }
+    kb.push([{ text: '🔙 Back', callback_data: 'admin_deposits' }]);
+
+    try {
+      await bot.editMessageText(txt, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+    } catch (e) {
+      await bot.sendMessage(chatId, txt, { parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+    }
+    return;
+  }
+
+  if (/^admin_dep_ok_\d+$/.test(data)) {
+    const id = parseInt(data.split('_').pop(), 10);
+    const r  = db.getDepositReview(id);
+    if (!r || r.status !== 'pending') { await answer('❌ Already handled'); return; }
+
+    // saveUsedTxid throws on a duplicate — that is the replay guard.
+    try {
+      db.saveUsedTxid({
+        txid: r.txid, userId: r.user_id, amount: r.amount,
+        network: r.network, asset: 'USDT', address: r.address || null,
+      });
+    } catch (e) {
+      db.resolveDepositReview(id, 'rejected', 'TxID already credited', userId);
+      await answer('❌ This TxID was already credited');
+      return await handleAdminCallback(bot, { ...query, data: `admin_dep_view_${id}` });
+    }
+
+    db.updateBalance(r.user_id, Number(r.amount));
+    db.addTransaction({
+      userId: r.user_id, type: 'deposit', amount: Number(r.amount),
+      description: `USDT ${r.network} top-up (manually approved)`,
+      refId: r.txid, orderId: null,
+    });
+    db.resolveDepositReview(id, 'approved', `Approved by admin ${userId}`, userId);
+    logger.info(`Admin ${userId} APPROVED deposit review #${id} — ${r.amount} to user ${r.user_id}`);
+
+    try {
+      const fresh = db.getUser(r.user_id);
+      await bot.sendMessage(r.user_id,
+        `✅ <b>Deposit Credited</b>\n\n` +
+        `💵 <b>${Number(r.amount).toFixed(6)} USDT</b> has been added to your wallet after review.\n` +
+        `💰 <b>New balance:</b> ${formatPrice(fresh?.balance || 0)}`,
+        { parse_mode: 'HTML' });
+    } catch (e) { /* user may have blocked the bot */ }
+
+    await answer('✅ Credited');
+    return await handleAdminCallback(bot, { ...query, data: `admin_dep_view_${id}` });
+  }
+
+  if (/^admin_dep_no_\d+$/.test(data)) {
+    const id = parseInt(data.split('_').pop(), 10);
+    db.resolveDepositReview(id, 'rejected', `Rejected by admin ${userId}`, userId);
+    logger.info(`Admin ${userId} REJECTED deposit review #${id}`);
+    await answer('❌ Rejected');
+    return await handleAdminCallback(bot, { ...query, data: `admin_dep_view_${id}` });
+  }
+
+  if (data === 'admin_dep_reverse') {
+    session.set(userId, States.ADMIN_DEP_REVERSE, {});
+    await bot.editMessageText(
+      `↩️ <b>Reverse a Deposit</b>\n\n` +
+      `Send: <code>USER_ID AMOUNT [reason]</code>\n\n` +
+      `Example:\n<code>354712964 1117.7303 stolen TxID</code>\n\n` +
+      `The amount is removed from the wallet and written to the audit log. ` +
+      `The balance may go negative — if the money was already spent, the debt ` +
+      `stays visible instead of disappearing.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Cancel', callback_data: 'admin_deposits' }]] } }
+    ).catch(() => {});
+    return;
+  }
+
+  // ── Toggle refund eligibility for a product ───────────────────────
+  if (/^admin_toggle_refund_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product   = db.getProduct(productId);
+    if (!product) { await answer('❌ Product not found'); return; }
+    const newVal = Number(product.refund_enabled) === 1 ? 0 : 1;
+    db.updateProduct(productId, 'refund_enabled', newVal);
+    logger.info(`Admin ${userId} set refund_enabled=${newVal} on product #${productId}`);
+
+    await bot.editMessageText(
+      `🔄 <b>Refund Eligibility</b>\n\n` +
+      `📦 ${escapeHtml(product.title || '')}\n\n` +
+      `Status: ${newVal ? '✅ <b>ELIGIBLE</b> — customers can request a refund'
+                        : '🚫 <b>NOT ELIGIBLE</b> — refund requests are blocked'}\n\n` +
+      `<i>Blocked products are hidden from the customer's refund list, and the ` +
+      `server rejects any request for them even if the button is forged.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: newVal ? '🚫 Disable refunds' : '✅ Enable refunds', callback_data: `admin_toggle_refund_${productId}` }],
+          [{ text: '🔙 Back to product', callback_data: `admin_edit_p_${productId}` }],
+        ] } }
+    ).catch(() => {});
+    return;
+  }
+
+  // ── Toggle automatic / manual delivery ────────────────────────────
+  if (/^admin_toggle_delivery_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product   = db.getProduct(productId);
+    if (!product) { await answer('❌ Product not found'); return; }
+    const isManual = product.delivery_type === 'manual';
+    const newVal   = isManual ? 'auto' : 'manual';
+    require('../database/db').prepare('UPDATE products SET delivery_type = ? WHERE id = ?')
+      .run(newVal, productId);
+    logger.info(`Admin ${userId} set delivery_type=${newVal} on product #${productId}`);
+
+    await bot.editMessageText(
+      `🚚 <b>Delivery Method</b>\n\n` +
+      `📦 ${escapeHtml(product.title || '')}\n\n` +
+      (newVal === 'manual'
+        ? `Mode: 🖐 <b>MANUAL</b>\n\n` +
+          `After a successful payment the stock is NOT handed out automatically. ` +
+          `A task is opened under 📦 Manual Delivery and you deliver it yourself. ` +
+          `The customer is told their order is queued.`
+        : `Mode: ⚡ <b>AUTOMATIC</b>\n\n` +
+          `Stock items are delivered instantly the moment payment succeeds.`),
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: newVal === 'manual' ? '⚡ Switch to automatic' : '🖐 Switch to manual',
+             callback_data: `admin_toggle_delivery_${productId}` }],
+          [{ text: '🔙 Back to product', callback_data: `admin_edit_p_${productId}` }],
+        ] } }
+    ).catch(() => {});
+    return;
+  }
+
+  // ── Per-product low-stock threshold ───────────────────────────────
+  if (/^admin_lowstock_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product   = db.getProduct(productId);
+    if (!product) { await answer('❌ Product not found'); return; }
+    const globalDefault = db.getSetting('low_stock_threshold_default', '5');
+    session.set(userId, States.ADMIN_LOW_STOCK, { lowStockProductId: productId });
+
+    await bot.editMessageText(
+      `🔔 <b>Low-Stock Alert Threshold</b>\n\n` +
+      `📦 ${escapeHtml(product.title || '')}\n` +
+      `📊 Current stock: <b>${product.stock_quantity || 0}</b>\n\n` +
+      `Current threshold: <b>${Number(product.low_stock_threshold) > 0
+        ? product.low_stock_threshold
+        : `${globalDefault} (global default)`}</b>\n\n` +
+      `Send the number of units at which you want to be warned.\n` +
+      `Send <code>0</code> to fall back to the global default.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Cancel', callback_data: `admin_edit_p_${productId}` }]] } }
+    ).catch(() => {});
+    return;
+  }
+
+  // ── Notification centre ───────────────────────────────────────────
+  if (data === 'admin_notifications' || /^admin_notif_(all|unread)_\d+$/.test(data)) {
+    let mode = 'unread';
+    let page = 0;
+    if (/^admin_notif_(all|unread)_\d+$/.test(data)) {
+      const parts = data.split('_');
+      page = parseInt(parts.pop(), 10) || 0;
+      mode = parts[2];
+    }
+
+    const PER = 8;
+    const unreadOnly = mode === 'unread';
+    const total  = unreadOnly ? db.countUnreadNotifications() : db.countAdminNotifications();
+    const totalPages = Math.max(1, Math.ceil(total / PER));
+    const safePage   = Math.max(0, Math.min(page, totalPages - 1));
+    const rows = db.getAdminNotifications(PER, safePage * PER, unreadOnly);
+
+    const unreadCount = db.countUnreadNotifications();
+    const icons = { manual_delivery: '📦', stock_out: '🔴', stock_low: '🟠',
+                    refund_request: '🔄', support_message: '💬' };
+
+    let txt =
+      `🔔 <b>Notifications</b>\n\n` +
+      `🔴 Unread: <b>${unreadCount}</b>   📋 Total: <b>${db.countAdminNotifications()}</b>\n` +
+      `<b>Showing:</b> ${unreadOnly ? '🔴 Unread only' : '📋 All'} — ${total} item(s)\n`;
+
+    if (!rows.length) txt += `\n<i>Nothing here.</i>`;
+
+    const kb = [[
+      { text: (unreadOnly ? '✓ ' : '') + '🔴 Unread', callback_data: 'admin_notif_unread_0' },
+      { text: (!unreadOnly ? '✓ ' : '') + '📋 All',   callback_data: 'admin_notif_all_0' },
+    ]];
+
+    for (const n of rows) {
+      const dot = n.is_read ? '' : '🆕 ';
+      const when = String(n.created_at || '').slice(5, 16).replace('-', '/');
+      kb.push([{
+        text: `${dot}${icons[n.type] || '🔔'} ${String(n.title).slice(0, 42)} · ${when}`,
+        callback_data: `admin_notif_view_${n.id}`,
+      }]);
+    }
+
+    if (totalPages > 1) {
+      const nav = [];
+      if (safePage > 0)              nav.push({ text: '◀️ Prev', callback_data: `admin_notif_${mode}_${safePage - 1}` });
+      nav.push({ text: `${safePage + 1}/${totalPages}`, callback_data: 'noop' });
+      if (safePage < totalPages - 1) nav.push({ text: 'Next ▶️', callback_data: `admin_notif_${mode}_${safePage + 1}` });
+      kb.push(nav);
+    }
+
+    if (unreadCount > 0) kb.push([{ text: '✅ Mark all as read', callback_data: 'admin_notif_readall' }]);
+    kb.push([{ text: '🔙 Back', callback_data: 'admin_panel' }]);
+
+    try {
+      await bot.editMessageText(txt, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+    } catch (e) {
+      await bot.sendMessage(chatId, txt, { parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+    }
+    return;
+  }
+
+  if (/^admin_notif_view_\d+$/.test(data)) {
+    const id = parseInt(data.split('_').pop(), 10);
+    const n  = db.getAdminNotification(id);
+    if (!n) { await answer('❌ Not found'); return; }
+
+    // Opening a notification is what marks it read.
+    db.markNotificationRead(id);
+
+    const icons = { manual_delivery: '📦', stock_out: '🔴', stock_low: '🟠',
+                    refund_request: '🔄', support_message: '💬' };
+
+    // Deep link back to whatever the notification is about.
+    const jump = [];
+    if (n.ref_type === 'manual_delivery') jump.push([{ text: '📦 Open task',    callback_data: `admin_md_view_${n.ref_id}` }]);
+    if (n.ref_type === 'refund_request')  jump.push([{ text: '🔄 Open request', callback_data: `admin_refund_view_${n.ref_id}` }]);
+    if (n.ref_type === 'product')         jump.push([{ text: '📦 Manage stock', callback_data: `admin_stock_select_p_${n.ref_id}` }]);
+
+    const txt =
+      `${icons[n.type] || '🔔'} <b>${escapeHtml(n.title)}</b>\n` +
+      `🕒 ${String(n.created_at || '').slice(0, 16)}\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `${n.body || '<i>(no details)</i>'}`;
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [...jump, [{ text: '🔙 Notifications', callback_data: 'admin_notifications' }]] },
+    }).catch(async () => {
+      await bot.sendMessage(chatId, txt, { parse_mode: 'HTML' });
+    });
+    return;
+  }
+
+  if (data === 'admin_notif_readall') {
+    const n = db.markAllNotificationsRead();
+    await answer(`✅ ${n} marked as read`);
+    return await handleAdminCallback(bot, { ...query, data: 'admin_notifications' });
+  }
+
+  // ── Manual delivery management (mirrors the Support Bot panel) ─────
+  if (/^admin_md_list_[a-z]+_\d+$/.test(data)) {
+    const parts  = data.split('_');
+    const page   = parseInt(parts.pop(), 10) || 0;
+    const status = parts.slice(3).join('_');
+    const TABS = { pending: '🕐 Waiting', processing: '⚙️ In progress',
+                   delivered: '✅ Delivered', cancelled: '❌ Cancelled', all: '📋 All' };
+    const safeStatus = Object.prototype.hasOwnProperty.call(TABS, status) ? status : 'pending';
+
+    const counts = db.getManualDeliveryCounts();
+    let rows = db.getAllManualDeliveries();
+    if (safeStatus !== 'all') rows = rows.filter((r) => r.status === safeStatus);
+
+    const PER = 8;
+    const totalPages = Math.max(1, Math.ceil(rows.length / PER));
+    const safePage   = Math.max(0, Math.min(page, totalPages - 1));
+    const slice = rows.slice(safePage * PER, (safePage + 1) * PER);
+
+    const txt =
+      `📦 <b>Manual Delivery Requests</b>\n\n` +
+      `🕐 Waiting: <b>${counts.pending}</b>   ⚙️ In progress: <b>${counts.processing}</b>\n` +
+      `✅ Delivered: <b>${counts.delivered}</b>   ❌ Cancelled: <b>${counts.cancelled}</b>\n` +
+      (counts.unseen ? `\n🆕 <b>${counts.unseen}</b> new request(s)\n` : '') +
+      `\n<b>Showing:</b> ${TABS[safeStatus]} — ${rows.length} result(s)`;
+
+    const kb = [];
+    const chip = (k) => ({ text: (k === safeStatus ? '✓ ' : '') + TABS[k], callback_data: `admin_md_list_${k}_0` });
+    kb.push(['pending', 'processing'].map(chip));
+    kb.push(['delivered', 'cancelled'].map(chip));
+    kb.push([chip('all')]);
+
+    for (const r of slice) {
+      const isNew = (!r.seen_at && r.status === 'pending') ? '🆕 ' : '';
+      const who = r.username ? `@${r.username}` : (r.first_name || `User ${r.user_id}`);
+      const title = String(r.product_title || '').replace(/\[emoji:\d+\]/g, '').trim().slice(0, 16);
+      kb.push([{ text: `${isNew}#${r.id} · ${who.slice(0, 12)} · ${title} ×${r.quantity}`,
+                 callback_data: `admin_md_view_${r.id}` }]);
+    }
+
+    if (totalPages > 1) {
+      const nav = [];
+      if (safePage > 0)              nav.push({ text: '◀️ Prev', callback_data: `admin_md_list_${safeStatus}_${safePage - 1}` });
+      nav.push({ text: `${safePage + 1}/${totalPages}`, callback_data: 'noop' });
+      if (safePage < totalPages - 1) nav.push({ text: 'Next ▶️', callback_data: `admin_md_list_${safeStatus}_${safePage + 1}` });
+      kb.push(nav);
+    }
+    kb.push([{ text: '🔙 Back', callback_data: 'admin_panel' }]);
+
+    try {
+      await bot.editMessageText(txt, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+    } catch (e) {
+      await bot.sendMessage(chatId, txt, { parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+    }
+    return;
+  }
+
+  if (/^admin_md_view_\d+$/.test(data)) {
+    const id = parseInt(data.split('_').pop(), 10);
+    const t  = db.getManualDelivery(id);
+    if (!t) { await answer('❌ Not found'); return; }
+    db.markManualSeen(id);
+
+    const manualDelivery = require('./manualDelivery');
+    const who  = t.username ? `@${t.username}` : (t.first_name || `User ${t.user_id}`);
+    const user = db.getUser(t.user_id);
+
+    const txt =
+      `📦 <b>Manual Delivery #${t.id}</b>\n\n` +
+      `<b>Status:</b> ${manualDelivery.STATUS_LABEL[t.status] || t.status}\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `🆔 <b>Order:</b> #${t.order_id}\n` +
+      `🛒 <b>Product:</b> ${manualDelivery.cleanTitle(t.product_title)}\n` +
+      `🔢 <b>Quantity:</b> ${t.quantity}\n` +
+      (t.email ? `📧 <b>Email:</b> <code>${escapeHtml(t.email)}</code>\n` : '') +
+      `💵 <b>Paid:</b> ${formatPrice(t.total_paid)}\n` +
+      `💳 <b>Method:</b> ${escapeHtml(t.payment_method || 'n/a')}\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `👤 <b>Customer:</b> ${escapeHtml(who)}\n` +
+      `🆔 <code>${t.user_id}</code>\n` +
+      (user ? `💰 <b>Wallet:</b> ${formatPrice(user.balance || 0)}\n` : '') +
+      `📅 <b>Created:</b> ${String(t.created_at || '').slice(0, 16)}\n` +
+      (t.delivered_at ? `✅ <b>Delivered:</b> ${String(t.delivered_at).slice(0, 16)}\n` : '') +
+      (t.admin_note ? `\n📝 <i>${escapeHtml(t.admin_note)}</i>\n` : '') +
+      (t.delivered_content
+        ? `\n🎁 <b>Content sent:</b>\n<code>${escapeHtml(String(t.delivered_content).slice(0, 500))}</code>\n`
+        : '');
+
+    const kb = [];
+    if (t.status === 'pending' || t.status === 'processing') {
+      if (t.status === 'pending') kb.push([{ text: '⚙️ Mark as in progress', callback_data: `admin_md_proc_${t.id}` }]);
+      kb.push([{ text: '✅ Deliver now (send content)', callback_data: `admin_md_deliver_${t.id}` }]);
+      kb.push([{ text: '☑️ Mark delivered (no content)', callback_data: `admin_md_done_${t.id}` }]);
+      kb.push([{ text: '❌ Cancel & refund', callback_data: `admin_md_cancel_${t.id}` }]);
+    }
+    kb.push([{ text: '🔙 Back to list', callback_data: `admin_md_list_${t.status}_0` }]);
+
+    try {
+      await bot.editMessageText(txt, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+    } catch (e) {
+      await bot.sendMessage(chatId, txt, { parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+    }
+    return;
+  }
+
+  if (/^admin_md_proc_\d+$/.test(data)) {
+    const id = parseInt(data.split('_').pop(), 10);
+    db.setManualDeliveryStatus(id, 'processing', 'Marked in progress');
+    await answer('⚙️ In progress');
+    return await handleAdminCallback(bot, { ...query, data: `admin_md_view_${id}` });
+  }
+
+  if (/^admin_md_deliver_\d+$/.test(data)) {
+    const id = parseInt(data.split('_').pop(), 10);
+    const t  = db.getManualDelivery(id);
+    if (!t) { await answer('❌ Not found'); return; }
+    session.set(userId, States.ADMIN_MD_CONTENT, { mdTaskId: id });
+    await bot.editMessageText(
+      `✍️ <b>Deliver Task #${id}</b>\n\n` +
+      `👤 <code>${t.user_id}</code>\n` +
+      `📦 ${escapeHtml(String(t.product_title || ''))} ×${t.quantity}\n` +
+      (t.email ? `📧 <code>${escapeHtml(t.email)}</code>\n` : '') +
+      `\nSend the content to deliver to the customer.\n` +
+      `<i>Your next message is forwarded to them and the task is closed.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Cancel', callback_data: `admin_md_view_${id}` }]] } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_md_done_\d+$/.test(data)) {
+    const id = parseInt(data.split('_').pop(), 10);
+    const manualDelivery = require('./manualDelivery');
+    const res = await manualDelivery.completeManualDelivery(bot, id, null);
+    await answer(res.ok ? '✅ Delivered' : `⚠️ ${res.reason}`);
+    return await handleAdminCallback(bot, { ...query, data: `admin_md_view_${id}` });
+  }
+
+  if (/^admin_md_cancel_\d+$/.test(data)) {
+    const id = parseInt(data.split('_').pop(), 10);
+    const manualDelivery = require('./manualDelivery');
+    const res = await manualDelivery.cancelManualDelivery(bot, id, 'Cancelled by admin');
+    await answer(res.ok ? '❌ Cancelled & refunded' : `⚠️ ${res.reason}`);
+    return await handleAdminCallback(bot, { ...query, data: `admin_md_view_${id}` });
+  }
+
+  // ── Requires-email step ───────────────────────────────────────────
+  if (data === 'req_email_yes' || data === 'req_email_no') {
+    session.update(userId, { requiresEmail: data === 'req_email_yes' ? 1 : 0 });
+    session.set(userId, States.ADMIN_ADD_INSTRUCTION, session.get(userId).data);
+    await bot.editMessageText(
+      'Step 6/8\n\n📋 <b>Enter the Instruction for this product</b>\n' +
+      '(Shown to the customer after purchase. Type <code>skip</code> to leave empty.)',
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminBackKb() }
+    );
+    return;
+  }
+
+  // ── Product lists ─────────────────────────────────────────────────
+  if (data === 'admin_edit_product') {
+    const products = db.getAllActiveProducts();
+    await bot.editMessageText('✏️ <b>Select product to edit:</b>', {
+      chat_id: chatId, message_id: msgId,
+      parse_mode: 'HTML', reply_markup: adminProductsKb(products, 'edit'),
+    });
+    return;
+  }
+  if (data === 'admin_delete_product') {
+    const products = db.getAllActiveProducts();
+    await bot.editMessageText('🗑 <b>Select product to delete:</b>', {
+      chat_id: chatId, message_id: msgId,
+      parse_mode: 'HTML', reply_markup: adminProductsKb(products, 'delete'),
+    });
+    return;
+  }
+
+  // ── Edit product — select ─────────────────────────────────────────
+  if (/^admin_edit_p_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product   = db.getProduct(productId);
+    const stockQty  = product?.stock_quantity || 0;
+    const statusLine = stockQty === 0 ? '❌ <b>OUT OF STOCK</b>' : '✅ <b>IN STOCK</b>';
+    // Both systems, or neither — the screens used to disagree because this one
+    // only knew about the old percentage rule.
+    const tierBits = [1, 2, 3]
+      .map((n) => ({ q: product?.[`bulk_tier${n}_qty`] || 0, p: product?.[`bulk_tier${n}_price`] || 0 }))
+      .filter((t) => t.q > 0 && t.p > 0)
+      .map((t) => `${t.q}+ → $${Number(t.p).toFixed(2)}`);
+    if (product?.bulk_min_qty > 0 && product?.bulk_discount > 0) {
+      tierBits.push(`${product.bulk_min_qty}+ → ${product.bulk_discount}% off`);
+    }
+    const bulkInfo  = tierBits.length
+      ? `🎁 <b>Bulk:</b> ${tierBits.join(' · ')}\n`
+      : `🎁 <b>Bulk:</b> Disabled\n`;
+    const refundInfo   = Number(product?.refund_enabled) === 1
+      ? '🔄 <b>Refunds:</b> ✅ Allowed\n'
+      : '🔄 <b>Refunds:</b> 🚫 Blocked\n';
+    const deliveryInfo = product?.delivery_type === 'manual'
+      ? '🚚 <b>Delivery:</b> 🖐 Manual\n'
+      : '🚚 <b>Delivery:</b> ⚡ Automatic\n';
+    const lowInfo = `🔔 <b>Low-stock alert at:</b> ${
+      Number(product?.low_stock_threshold) > 0
+        ? product.low_stock_threshold
+        : db.getSetting('low_stock_threshold_default', '5') + ' (default)'}\n`;
+    await bot.editMessageText(
+      `✏️ <b>Edit Product:</b> ${product?.title}\n` +
+      `🆔 <b>Product ID:</b> <code>${productId}</code>\n\n` +
+      `📦 <b>Stock qty:</b> ${stockQty}   📈 <b>Sales:</b> ${product?.sales_count || 0}\n` +
+      bulkInfo + refundInfo + deliveryInfo + lowInfo +
+      `${statusLine}\n\n` +
+      `Select a field to edit or manage stock:`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminProductEditFieldsKb(productId) }
+    );
+    return;
+  }
+
+  // ── Edit product — field selected ─────────────────────────────────
+  if (/^admin_edit_field_\d+_/.test(data)) {
+    const parts     = data.split('_');
+    const field     = parts.slice(4).join('_');
+    const productId = parseInt(parts[3], 10);
+
+    const prompts = {
+      title:          'Enter new title:',
+      description:    'Enter new description:',
+      price:          'Enter new price (e.g. 14.09):',
+      cost_price:     'Enter the cost price (what YOU paid per unit, e.g. 5.50).\nThis is used to calculate net profit.',
+      premium_emoji_id: '💎 Enter the Premium Emoji ID.\n\n' +
+        '🔍 How to get one:\n' +
+        '1. Open @emojiidbot or @stickerinfoBot in Telegram\n' +
+        '2. Send a premium emoji\n' +
+        '3. Copy the numeric ID (e.g. 5368324170671202286)\n\n' +
+        'Type <code>clear</code> to remove the premium emoji.',
+      warranty:       'Enter new warranty:',
+      instruction:    'Enter new instruction (shown to customer after purchase).\nType <code>clear</code> to remove it.',
+      requires_email: 'Type <code>1</code> for Yes, <code>0</code> for No:',
+      is_active:      'Type <code>1</code> to activate, <code>0</code> to deactivate:',
+      stock_quantity: 'Enter new stock quantity (e.g. 50):',
+      sales_count:    'Enter new sales count (e.g. 100):',
+                  image_file_id:  'Send new product image:',
+    };
+
+    // Fetch current value of the field
+    const currentProduct = db.getProduct(productId);
+    let currentRaw = '';
+    let displayLabel = '(empty)';
+    if (currentProduct) {
+      const raw = currentProduct[field];
+      if (raw === null || raw === undefined || raw === '') {
+        currentRaw = '';
+        displayLabel = '(empty)';
+      } else if (field === 'requires_email' || field === 'is_active') {
+        currentRaw = String(raw);
+        displayLabel = raw ? 'Yes (1)' : 'No (0)';
+      } else if (field === 'image_file_id') {
+        currentRaw = '';
+        displayLabel = raw ? '(image already set)' : '(no image)';
+      } else {
+        currentRaw = String(raw);
+        displayLabel = currentRaw;
+      }
+    }
+
+    // Set up the edit state
+    const keepKb = {
+      inline_keyboard: [
+        [{ text: '🎨 Choose Emoji from Library', callback_data: 'admin_emoji_picker' }],
+        [{ text: '✋ Keep Current (no change)', callback_data: `admin_edit_p_${productId}` }],
+        [{ text: '🔙 Back', callback_data: 'admin_panel' }],
+      ],
+    };
+
+    if (field === 'sales_count') {
+      session.set(userId, States.ADMIN_SALES_COUNT_SET, { editProductId: productId });
+    } else {
+      session.set(userId, States.ADMIN_EDIT_VALUE, { editProductId: productId, editField: field });
+    }
+
+    // Send the prompt message
+    await bot.editMessageText(
+      `✏️ <b>Editing: ${field}</b>\n\n` + (prompts[field] || 'Enter new value:'),
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: keepKb }
+    );
+
+    // Send the current value as a SEPARATE tap-to-copy message
+    // This way admin can long-press to copy/edit it
+    if (currentRaw && currentRaw.length > 0) {
+      // Split into chunks if too long (Telegram max ~4000)
+      const CHUNK = 3500;
+      if (currentRaw.length <= CHUNK) {
+        await bot.sendMessage(
+          chatId,
+          `📋 <b>Current value</b> (tap text below to copy):\n\n<code>${escapeHtml(currentRaw)}</code>`,
+          { parse_mode: 'HTML' }
+        );
+      } else {
+        await bot.sendMessage(
+          chatId,
+          `📋 <b>Current value</b> (long — split into parts, tap each to copy):`,
+          { parse_mode: 'HTML' }
+        );
+        for (let i = 0; i < currentRaw.length; i += CHUNK) {
+          const part = currentRaw.slice(i, i + CHUNK);
+          await bot.sendMessage(
+            chatId,
+            `<code>${escapeHtml(part)}</code>`,
+            { parse_mode: 'HTML' }
+          );
+        }
+      }
+    } else {
+      await bot.sendMessage(
+        chatId,
+        `📋 <b>Current value:</b> <i>${displayLabel}</i>`,
+        { parse_mode: 'HTML' }
+      );
+    }
+    return;
+  }
+
+  // ── Bulk Pricing (by quantity) — overview screen ───────────────────
+  if (/^admin_bulkprice_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product   = db.getProduct(productId);
+    if (!product) { await answer('❌ Product not found.'); return; }
+
+    const tierLines = [1, 2, 3].map((n) => {
+      const qty   = product[`bulk_tier${n}_qty`];
+      const price = product[`bulk_tier${n}_price`];
+      if (qty > 0 && price > 0) {
+        return `  • Tier ${n}: <b>${qty}+ pcs</b> → <b>$${Number(price).toFixed(2)}</b> each`;
+      }
+      return `  • Tier ${n}: <i>not set</i>`;
+    }).join('\n');
+
+    // The older percentage rule lives on the same product and is applied at
+    // checkout too. Showing only the tiers meant this screen and the product
+    // screen disagreed about the product's own pricing, with no way to tell
+    // which one the customer actually pays.
+    const legacyMin = Number(product.bulk_min_qty) || 0;
+    const legacyPct = Number(product.bulk_discount) || 0;
+    let legacyBlock = '';
+    if (legacyMin > 0 && legacyPct > 0) {
+      const legacyUnit = Number(product.price) * (1 - legacyPct / 100);
+      legacyBlock =
+        `\n⚠️ <b>Old percentage rule is also active</b>\n` +
+        `${legacyMin}+ pcs → ${legacyPct}% off = <b>$${legacyUnit.toFixed(4)}</b> each\n` +
+        `<i>Customers get whichever rule is cheapest for them.</i>\n`;
+    }
+
+    // A worked example beats a description: the ladder is what the admin is
+    // actually trying to see, and it is computed by the same code checkout uses.
+    const sample = [1, 5, 10, 25, 50, 100]
+      .map((q) => {
+        const r = calcOrderPrice(product, q);
+        return `${String(q).padStart(3)} pcs → $${r.unitPrice.toFixed(4)} each`;
+      }).join('\n');
+
+    await bot.editMessageText(
+      `📊 <b>Bulk Pricing — ${escapeHtml(product.title || '')}</b>\n\n` +
+      `Base price (1 pc): <b>${formatPrice(product.price)}</b>\n\n` +
+      `${tierLines}\n` +
+      legacyBlock +
+      `\n💵 <b>What customers actually pay</b>\n<code>${sample}</code>\n\n` +
+      `Tap a tier below to set or change it. Each tier needs a <b>minimum quantity</b> and a <b>price per piece</b> — once the customer reaches that quantity, every piece in the order is charged at that tier's price.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: (() => {
+          const kb = adminBulkPriceKb(product);
+          if (legacyMin > 0 && legacyPct > 0) {
+            kb.inline_keyboard.splice(kb.inline_keyboard.length - 1, 0,
+              [{ text: `🗑 Remove old rule (${legacyMin}+ → ${legacyPct}%)`, callback_data: `admin_bulklegacy_clear_${product.id}` }]);
+          }
+          return kb;
+        })() }
+    );
+    return;
+  }
+
+  // ── Remove the old percentage rule ────────────────────────────────
+  if (/^admin_bulklegacy_clear_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    db.updateProductField(productId, 'bulk_min_qty', 0);
+    db.updateProductField(productId, 'bulk_discount', 0);
+    logger.info(`[BULK] legacy percentage rule cleared on product ${productId} by ${userId}`);
+    return handleAdminCallback(bot, { ...query, data: `admin_bulkprice_${productId}` });
+  }
+
+  // ── The AI assistant: open it, or explain what is missing ─────────
+  if (data === 'admin_assistant') {
+    const agentChat = require('../services/agentChat');
+    const cfg = agentChat.agentConfig ? agentChat.agentConfig() : {};
+
+    // Both requirements are checked and reported together. Telling someone to
+    // fix one thing, then meeting a second wall, is two trips for no reason.
+    const problems = [];
+    if (!cfg.base)     problems.push('🌐 <b>No public domain.</b>\nRailway → Settings → Networking → <b>Generate Domain</b>, then redeploy.');
+    if (!cfg.hasKey)   problems.push('🔑 <b>No AI key.</b>\nAdd <code>OPENAI_API_KEY</code> in Railway → Variables, then redeploy.');
+    if (!cfg.fixedTok) problems.push('🔗 <b>Link changes on every deploy.</b>\nAdd <code>AGENT_TOKEN</code> with any long random text so it stays the same.');
+
+    if (!cfg.base || !cfg.hasKey) {
+      await bot.editMessageText(
+        `🤖 <b>AI Assistant</b>\n\n` +
+        `Ask about sales, stock, customers and support in plain language, and ` +
+        `draft replies you approve before they send.\n\n` +
+        `<b>Needs setting up first:</b>\n\n${problems.join('\n\n')}`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'admin_panel' }]] } }
+      ).catch(() => {});
+      return;
+    }
+
+    await bot.editMessageText(
+      `🤖 <b>AI Assistant</b>\n\n` +
+      `🧠 Model: <b>${escapeHtml(cfg.model)}</b>\n` +
+      `🔒 Read-only — it cannot change balances, stock or send anything ` +
+      `without your approval.\n\n` +
+      `📱 <b>To install it as an app:</b>\n` +
+      `1. Tap <b>Open Assistant</b> below\n` +
+      `2. A blue bar appears at the top — tap <b>How</b>\n` +
+      `3. Follow the two steps for your phone\n\n` +
+      (problems.length ? `⚠️ ${problems.join('\n\n')}\n\n` : '') +
+      `⚠️ <i>Anyone with this link can read your shop data. Do not forward it.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', disable_web_page_preview: true,
+        reply_markup: { inline_keyboard: [
+          [{ text: '🤖 Open Assistant', url: cfg.url }],
+          [{ text: '🔙 Back', callback_data: 'admin_panel' }],
+        ] } }
+    ).catch(() => {});
+    return;
+  }
+
+  // ── Everything sold through the API ───────────────────────────────
+  if (data === 'admin_apisales' || /^admin_apisales_\d+$/.test(data)) {
+    const days = /^admin_apisales_\d+$/.test(data) ? parseInt(data.split('_').pop(), 10) : 30;
+    const a = db.apiSales(days);
+    const who = (b) => b.username ? `@${escapeHtml(b.username)}` : escapeHtml(b.first_name || String(b.user_id));
+
+    let txt =
+      `🔌 <b>API sales</b> — last ${days} day(s)\n\n` +
+      `📦 Units: <b>${a.units}</b>\n` +
+      `🧾 Orders: <b>${a.orders}</b>\n` +
+      `💵 Revenue: <b>${formatPrice(a.revenue)}</b>\n`;
+
+    if (!a.orders) {
+      txt += `\n<i>Nothing bought through the API in this window.</i>\n\n` +
+             `<i>Note: orders placed before this tracking was added are counted ` +
+             `as bot purchases, because the source was not recorded then.</i>`;
+    } else {
+      txt += `\n<b>Who bought</b>\n` +
+        a.buyers.slice(0, 10).map((b) =>
+          `• ${who(b)} · <code>${b.user_id}</code>\n` +
+          `   <b>${b.units}</b> unit(s) · ${b.orders} order(s) · ${formatPrice(b.spent)}`
+        ).join('\n');
+      if (a.buyers.length > 10) txt += `\n<i>…and ${a.buyers.length - 10} more</i>`;
+
+      txt += `\n\n<b>What they bought</b>\n` +
+        a.products.slice(0, 8).map((p) =>
+          `• ${escapeHtml(kbStripEmojiCodes(String(p.title || '')).trim().slice(0, 30))} — ` +
+          `<b>${p.units}</b> · ${formatPrice(p.revenue)}`
+        ).join('\n');
+    }
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: `${days === 1 ? '✅ ' : ''}24h`,  callback_data: 'admin_apisales_1' },
+         { text: `${days === 7 ? '✅ ' : ''}7d`,   callback_data: 'admin_apisales_7' },
+         { text: `${days === 30 ? '✅ ' : ''}30d`, callback_data: 'admin_apisales_30' }],
+        [{ text: '🧾 Recent API orders', callback_data: `admin_apiorders_${days}` }],
+        [{ text: '🔙 Back', callback_data: 'admin_panel' }],
+      ] },
+    }).catch(() => {});
+    return;
+  }
+
+  if (/^admin_apiorders_\d+$/.test(data)) {
+    const days = parseInt(data.split('_').pop(), 10);
+    const a = db.apiSales(days);
+    const who = (r) => r.username ? `@${escapeHtml(r.username)}` : escapeHtml(r.first_name || String(r.user_id));
+
+    await bot.editMessageText(
+      `🧾 <b>Recent API orders</b> — last ${days} day(s)\n\n` +
+      (a.recent.length
+        ? a.recent.map((r) =>
+            `<b>#${r.id}</b> · ${who(r)}\n` +
+            `   ${escapeHtml(kbStripEmojiCodes(String(r.product_title || '')).trim().slice(0, 26))} ` +
+            `×${r.quantity} · ${formatPrice(r.total_price)} · ` +
+            `${escapeHtml(String(r.created_at || '').slice(0, 16))}`
+          ).join('\n')
+        : '<i>None.</i>'),
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: `admin_apisales_${days}` }]] } }
+    ).catch(() => {});
+    return;
+  }
+
+  // ── Batch by batch: where did THIS upload go? ─────────────────────
+  if (/^admin_batches_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const batches = db.stockBatches(productId, 12);
+    const p = db.getProduct(productId);
+
+    if (!batches.length) {
+      await bot.editMessageText(
+        `📦 <b>No stock batches recorded</b> for this product.\n\n` +
+        `<i>Either nothing was ever added as items, or it sells by counter only.</i>`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: `admin_edit_p_${productId}` }]] } }
+      ).catch(() => {});
+      return;
+    }
+
+    const rows = batches.map((b, i) => [{
+      text: `${b.added_at.slice(0, 10)} · ${b.total} pcs → ${b.sold} sold, ${b.available} left`,
+      callback_data: `admin_batch_${productId}_${i}`,
+    }]);
+    rows.push([{ text: '🔙 Back', callback_data: `admin_edit_p_${productId}` }]);
+
+    await bot.editMessageText(
+      `📦 <b>Stock batches</b>\n${escapeHtml(kbStripEmojiCodes(String(p?.title || '')).trim())}\n\n` +
+      `<i>Each row is one upload. Tap it to see where those exact units went.</i>\n\n` +
+      batches.map((b, i) =>
+        `<b>${i === 0 ? '🆕 ' : ''}${b.added_at.slice(0, 16)}</b> — added <b>${b.total}</b> pcs\n` +
+        `   🔴 sold <b>${b.sold}</b> · 🟢 <b>${b.available}</b> left` +
+        (b.supplier ? ` · 🏷 ${escapeHtml(b.supplier)}` : '') +
+        (b.profit_so_far != null
+          ? `\n   💵 ${formatPrice(b.revenue)} in · ${formatPrice(b.spent)} spent · ` +
+            `<b>${b.net_vs_spend >= 0 ? '+' : ''}${formatPrice(b.net_vs_spend)}</b>`
+          : `\n   💰 <i>no cost recorded</i>`)
+      ).join('\n\n'),
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_batch_\d+_\d+$/.test(data)) {
+    const parts = data.split('_');
+    const productId = parseInt(parts[2], 10);
+    const idx = parseInt(parts[3], 10);
+    const batches = db.stockBatches(productId, 12);
+    const b = batches[idx];
+    if (!b) { await answer('❌ Batch not found'); return; }
+
+    const who = (x) => x.username ? `@${escapeHtml(x.username)}` : escapeHtml(x.first_name || String(x.user_id));
+
+    const soldPct = b.total ? Math.round((b.sold / b.total) * 100) : 0;
+
+    await bot.editMessageText(
+      `📦 <b>Batch of ${b.total}</b>\n` +
+      `📅 Added ${escapeHtml(b.added_at.slice(0, 16))}\n` +
+      (b.supplier ? `🏷 Supplier: <b>${escapeHtml(b.supplier)}</b>\n` : '') +
+      `\n🔴 Sold: <b>${b.sold}</b> of ${b.total} (${soldPct}%)\n` +
+      `🟢 Still available: <b>${b.available}</b>\n` +
+      `👥 Went to <b>${b.distinct_buyers}</b> different buyer(s)\n` +
+      (b.unit_cost != null
+        ? `\n💰 <b>Money</b>\n` +
+          `   Cost: ${formatPrice(b.unit_cost)}/unit · spent <b>${formatPrice(b.spent)}</b>\n` +
+          `   Earned so far: <b>${formatPrice(b.revenue)}</b>\n` +
+          `   Profit on sold units: <b>${b.profit_so_far >= 0 ? '+' : ''}${formatPrice(b.profit_so_far)}</b>\n` +
+          // Both figures are shown because they answer different questions:
+          // one is how the sold units performed, the other whether the batch
+          // has paid for itself yet.
+          `   ${b.net_vs_spend >= 0 ? '🟢' : '🔴'} Against full spend: ` +
+          `<b>${b.net_vs_spend >= 0 ? '+' : ''}${formatPrice(b.net_vs_spend)}</b>` +
+          (b.available > 0 && b.net_vs_spend < 0
+            ? `\n   <i>${b.available} unsold unit(s) worth ${formatPrice(b.unit_cost * b.available)} still to recover.</i>`
+            : '') + `\n`
+        : `\n💰 <i>No cost recorded for this batch, so profit cannot be worked out. ` +
+          `Set it on the next upload with the COST command.</i>\n`) +
+      `\n<b>Where it went</b>\n` +
+      (b.buyers.length
+        ? b.buyers.map((x) =>
+            `• ${who(x)} · <code>${x.user_id}</code> — <b>${x.units}</b> pcs` +
+            // The share matters more than the count: it is what tells you
+            // whether a batch was spread across the shop or taken by one buyer.
+            ` (${b.sold ? Math.round((x.units / b.sold) * 100) : 0}%)`
+          ).join('\n')
+        : '<i>None sold from this batch yet.</i>'),
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Batches', callback_data: `admin_batches_${productId}` }]] } }
+    ).catch(() => {});
+    return;
+  }
+
+  // ── Does the stock add up? ────────────────────────────────────────
+  if (/^admin_reconcile_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const r = db.stockReconcile(productId);
+    if (!r) { await answer('❌ Product not found'); return; }
+
+    const isManual = db.getProduct(productId)?.delivery_type === 'manual';
+
+    let txt =
+      `🧮 <b>Stock reconciliation</b>\n` +
+      `${escapeHtml(kbStripEmojiCodes(String(r.product.title || '')).trim())}\n\n` +
+      `<b>Items added ever:</b> ${r.items.added}\n` +
+      `   🟢 still available: <b>${r.items.available}</b>\n` +
+      `   🔴 sold: <b>${r.items.sold}</b>\n` +
+      (r.items.other ? `   ❓ other status: ${r.items.other}\n` : '') +
+      `\n<b>Orders:</b> ${r.orders.count} · <b>${r.orders.units}</b> unit(s) · ` +
+      `${formatPrice(r.orders.revenue)}\n` +
+      `<b>Stock counter says:</b> ${r.counter}\n`;
+
+    const problems = [];
+
+    // The decisive check: units that left with no sale behind them.
+    if (r.gaps.orphan_items > 0) {
+      problems.push(
+        `🚨 <b>${r.gaps.orphan_items} item(s) marked sold with no valid order.</b>\n` +
+        `<i>Units left the shop without a sale standing behind them. This is the ` +
+        `one number that should never be above zero.</i>`
+      );
+    }
+
+    if (r.gaps.orders_vs_items !== 0 && !isManual) {
+      problems.push(
+        r.gaps.orders_vs_items > 0
+          ? `⚠️ <b>${r.gaps.orders_vs_items} more unit(s) ordered than items consumed.</b>\n` +
+            `<i>Usually orders placed while stock was set by hand, or recovered items.</i>`
+          : `⚠️ <b>${Math.abs(r.gaps.orders_vs_items)} more item(s) consumed than ordered.</b>\n` +
+            `<i>Items were taken without an order — check admin actions and refunds.</i>`
+      );
+    }
+
+    if (r.gaps.counter_vs_items !== 0 && !isManual) {
+      problems.push(
+        `ℹ️ <b>Counter is ${r.gaps.counter_vs_items > 0 ? 'ahead of' : 'behind'} the item rows by ` +
+        `${Math.abs(r.gaps.counter_vs_items)}.</b>\n` +
+        `<i>The counter was set by hand at some point. The item rows are the ` +
+        `reliable record.</i>`
+      );
+    }
+
+    if (isManual) {
+      problems.push(
+        `ℹ️ <i>This product delivers manually, so it sells by counter without ` +
+        `consuming items. Only the orders column is meaningful here.</i>`
+      );
+    }
+
+    txt += `\n` + (problems.length
+      ? problems.join('\n\n')
+      : `✅ <b>Everything adds up.</b>\n<i>Every unit that left the shop has an ` +
+        `order behind it. Nothing went missing.</i>`);
+
+    if (r.items.first_added) {
+      txt += `\n\n📅 <i>First stock added ${escapeHtml(String(r.items.first_added).slice(0, 16))}, ` +
+             `last ${escapeHtml(String(r.items.last_added || '').slice(0, 16))}.</i>`;
+    }
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: '🔍 Who bought it', callback_data: `admin_stockaudit_${productId}_30` }],
+        [{ text: '🔙 Back', callback_data: `admin_edit_p_${productId}` }],
+      ] },
+    }).catch(() => {});
+    return;
+  }
+
+  // ── Where did the stock go? ───────────────────────────────────────
+  if (/^admin_stockaudit_\d+(_\d+)?$/.test(data)) {
+    const parts = data.split('_');
+    const productId = parseInt(parts[2], 10);
+    const days = parts[3] ? parseInt(parts[3], 10) : 7;
+
+    const p = db.getProduct(productId);
+    if (!p) { await answer('❌ Product not found'); return; }
+    const a = db.stockAudit(productId, days);
+
+    const who = (b) => b.username ? `@${escapeHtml(b.username)}` : escapeHtml(b.first_name || String(b.user_id));
+
+    let txt =
+      `🔍 <b>Stock audit</b>\n${escapeHtml(kbStripEmojiCodes(String(p.title || '')).trim())}\n\n` +
+      `📦 In stock now: <b>${p.stock_quantity || 0}</b>\n` +
+      `📉 Sold in ${days} day(s): <b>${a.units}</b> unit(s) across ${a.orders} order(s)\n` +
+      `💵 Revenue: <b>${formatPrice(a.revenue)}</b>\n`;
+
+    if (!a.orders) {
+      txt += `\n<i>No sales in this window. If stock fell anyway, it was changed by ` +
+             `hand or recovered — check the admin actions, not the orders.</i>`;
+    } else {
+      txt += `\n<b>Who took it</b>\n` +
+        a.buyers.slice(0, 10).map((b) =>
+          `${b.via_api ? '🔌' : '👤'} ${who(b)} · <code>${b.user_id}</code>\n` +
+          `   <b>${b.units}</b> unit(s) · ${b.orders} order(s) · ${formatPrice(b.spent)}` +
+          (b.api_units ? `\n   🔌 ${b.api_units} of those via API` : '')
+        ).join('\n');
+      if (a.buyers.length > 10) txt += `\n<i>…and ${a.buyers.length - 10} more buyers</i>`;
+
+      const apiUnits = a.buyers.reduce((x, b) => x + (b.api_units || 0), 0);
+      if (apiUnits) {
+        txt += `\n\n🔌 <b>${apiUnits}</b> of those unit(s) went to customers holding an API key.`;
+      }
+
+      const top = a.buyers[0];
+      if (top && a.units > 0 && top.units / a.units >= 0.5) {
+        // Worth stating outright: one buyer taking most of a product is the
+        // usual explanation for stock vanishing "for no reason".
+        txt += `\n\n⚠️ <b>${who(top)} alone took ${Math.round((top.units / a.units) * 100)}%</b> ` +
+               `of everything sold here.`;
+      }
+    }
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: `${days === 1 ? '✅ ' : ''}24h`, callback_data: `admin_stockaudit_${productId}_1` },
+         { text: `${days === 7 ? '✅ ' : ''}7d`,  callback_data: `admin_stockaudit_${productId}_7` },
+         { text: `${days === 30 ? '✅ ' : ''}30d`, callback_data: `admin_stockaudit_${productId}_30` }],
+        [{ text: '🔙 Back', callback_data: `admin_edit_p_${productId}` }],
+      ] },
+    }).catch(() => {});
+    return;
+  }
+
+  // ── Time-limited product: price falls as the end date approaches ───
+  if (/^admin_subexp_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const p = db.getProductRaw ? db.getProductRaw(productId) : db.getProduct(productId);
+    if (!p) { await answer('❌ Product not found'); return; }
+
+    const live = db.getProduct(productId);
+    const rows = [[{ text: p.sub_end_date ? '📅 Change end date' : '📅 Set end date', callback_data: `admin_subset_${productId}` }]];
+    if (p.sub_end_date) {
+      rows.push([{ text: '💵 Price floor', callback_data: `admin_submin_${productId}` }]);
+      rows.push([{ text: `⛔ Stop selling below (${p.sub_min_days ?? 3} days)`, callback_data: `admin_submindays_${productId}` }]);
+      rows.push([{ text: '🗑 Turn off (fixed price again)', callback_data: `admin_subclear_${productId}` }]);
+    }
+    // Unlimited stock is offered only where it makes sense: a ChatGPT Business
+    // seat is issued on demand from a workspace, so there is no item to run out
+    // of. On an ordinary product it would just be a way to oversell.
+    if (Number(p.is_chatgpt_business) === 1 || Number(p.unlimited_stock) === 1) {
+      rows.push([{
+        text: Number(p.unlimited_stock) === 1 ? '♾ Unlimited stock: ON' : '♾ Unlimited stock: off',
+        callback_data: `admin_unlimited_${productId}`,
+      }]);
+    }
+    rows.push([{ text: '🔙 Back', callback_data: `admin_edit_p_${productId}` }]);
+
+    await bot.editMessageText(
+      `⏳ <b>Time-limited pricing</b>\n${escapeHtml(kbStripEmojiCodes(String(p.sub_base_title || p.title || '')).trim())}\n\n` +
+      (p.sub_end_date
+        ? `📅 Ends: <b>${escapeHtml(p.sub_end_date)}</b>\n` +
+          `⏳ Days left: <b>${live?.sub_days_left ?? 0}</b>\n` +
+          `💵 Per day: <b>${formatPrice(p.sub_price_per_day)}</b>\n` +
+          (Number(p.sub_min_price) > 0 ? `🛑 Never below: <b>${formatPrice(p.sub_min_price)}</b>\n` : '') +
+          `\n<b>Customers see right now</b>\n` +
+          `${escapeHtml(kbStripEmojiCodes(String(live?.title || '')).trim())}\n` +
+          `💰 <b>${formatPrice(live?.price || 0)}</b>\n\n` +
+          `<i>Tomorrow: ${formatPrice(Math.max(Number(p.sub_min_price) || 0, Math.ceil(Number(p.sub_price_per_day) * Math.max(0, (live?.sub_days_left || 0) - 1) * 100) / 100))}</i>`
+        : `<i>Not set — this product has a fixed price.</i>\n\n` +
+          `Set an end date and the price drops by itself every day, with the ` +
+          `title showing how many days are left. Use it for accounts that die ` +
+          `on a known date.`),
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_subset_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    session.set(userId, States.ADMIN_SUB_EXPIRY, { productId });
+    await bot.sendMessage(chatId,
+      `⏳ <b>End date and full price</b>\n\n` +
+      `Send them together:\n<code>YYYY-MM-DD PRICE</code>\n\n` +
+      `Example: <code>2026-09-19 10</code>\n` +
+      `<i>= the account dies on the 19th, and is worth $10 for the whole ` +
+      `remaining period as of today. The per-day rate is worked out from that, ` +
+      `so tomorrow it is one day cheaper.</i>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  // ── Stock that never runs out ─────────────────────────────────────
+  if (/^admin_unlimited_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const p = db.getProductRaw ? db.getProductRaw(productId) : db.getProduct(productId);
+    if (!p) { await answer('❌ Product not found'); return; }
+
+    const turningOn = Number(p.unlimited_stock) !== 1;
+
+    // Guarded here as well as in the keyboard: a stale button from an older
+    // message must not be able to switch this on for a normal product.
+    if (turningOn && Number(p.is_chatgpt_business) !== 1) {
+      await answer('❌ Only available on the ChatGPT Business product');
+      return;
+    }
+
+    // Unlimited stock and automatic delivery contradict each other: automatic
+    // delivery hands out a stored item and there is no endless supply of those.
+    // Refusing here is better than letting the first customer pay and then find
+    // nothing to deliver.
+    if (turningOn && p.delivery_type !== 'manual') {
+      await bot.editMessageText(
+        `♾ <b>Unlimited stock needs manual delivery</b>\n\n` +
+        `This product delivers automatically from stored items, and there is no ` +
+        `endless supply of those — the first order past the last item would take ` +
+        `the money and have nothing to hand over.\n\n` +
+        `Switch delivery to <b>Manual</b> first, then turn this on. You will get a ` +
+        `notification for each order and send the account yourself.`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+          [{ text: '🚚 Change delivery mode', callback_data: `admin_toggle_delivery_${productId}` }],
+          [{ text: '🔙 Back', callback_data: `admin_subexp_${productId}` }],
+        ] } }
+      ).catch(() => {});
+      return;
+    }
+
+    db.updateProductField(productId, 'unlimited_stock', turningOn ? 1 : 0);
+    logger.info(`[PRODUCT ${productId}] unlimited stock ${turningOn ? 'ON' : 'OFF'} by ${userId}`);
+    return handleAdminCallback(bot, { ...query, data: `admin_subexp_${productId}` });
+  }
+
+  if (/^admin_submindays_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    session.set(userId, States.ADMIN_SUB_MINDAYS, { productId });
+    await bot.sendMessage(chatId,
+      `⛔ <b>Stop selling below</b>\n\nHow many days must remain for this to stay on sale?\n\n` +
+      `Example: <code>3</code> — once fewer than 3 days are left it goes OUT OF STOCK ` +
+      `on its own.\n\n<i>Send <code>0</code> to keep selling to the last day.</i>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (/^admin_submin_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    session.set(userId, States.ADMIN_SUB_MIN, { productId });
+    await bot.sendMessage(chatId,
+      `🛑 <b>Price floor</b>\n\nSend the lowest price this product may ever drop to.\n\n` +
+      `<i>On the last day a per-day price can fall below what the sale is worth ` +
+      `handling. Send <code>0</code> for no floor.</i>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (/^admin_subclear_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const p = db.getProductRaw ? db.getProductRaw(productId) : null;
+    // Put the title back the way it was, or it keeps the "— 3 days left" suffix
+    // for good on a product that no longer counts down.
+    if (p && p.sub_base_title) db.updateProductField(productId, 'title', p.sub_base_title);
+    db.updateProductField(productId, 'sub_end_date', null);
+    db.updateProductField(productId, 'sub_price_per_day', 0);
+    db.updateProductField(productId, 'sub_base_title', null);
+    return handleAdminCallback(bot, { ...query, data: `admin_edit_p_${productId}` });
+  }
+
+  // ── Bulk Pricing — edit one tier (combined qty + price prompt) ─────
+  if (/^admin_bulkprice_edit_\d+_[123]$/.test(data)) {
+    const parts     = data.split('_');
+    const productId = parseInt(parts[3], 10);
+    const tierNum   = parseInt(parts[4], 10);
+    const product   = db.getProduct(productId);
+    if (!product) { await answer('❌ Product not found.'); return; }
+
+    const curQty   = product[`bulk_tier${tierNum}_qty`]   || 0;
+    const curPrice = product[`bulk_tier${tierNum}_price`] || 0;
+    const curLine  = (curQty > 0 && curPrice > 0)
+      ? `\n📋 <b>Current:</b> ${curQty}+ pcs → $${Number(curPrice).toFixed(2)} each`
+      : '';
+
+    session.set(userId, States.ADMIN_BULK_TIER_VALUE, { bulkProductId: productId, bulkTierNum: tierNum });
+
+    await bot.editMessageText(
+      `📊 <b>Tier ${tierNum} — ${escapeHtml(product.title || '')}</b>\n\n` +
+      `Send the <b>minimum quantity</b> and the <b>price per piece</b> for this tier, separated by a space.\n\n` +
+      `<b>Example:</b> <code>20 0.80</code>\n` +
+      `(means: starting at 20 pcs, each piece costs $0.80)` +
+      curLine,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: `admin_bulkprice_${productId}` }]] } }
+    );
+    return;
+  }
+
+  // ── Bulk Pricing — clear one tier ───────────────────────────────────
+  if (/^admin_bulkprice_clear_\d+_[123]$/.test(data)) {
+    const parts     = data.split('_');
+    const productId = parseInt(parts[3], 10);
+    const tierNum   = parseInt(parts[4], 10);
+    const product   = db.getProduct(productId);
+    if (!product) { await answer('❌ Product not found.'); return; }
+
+    db.updateProduct(productId, `bulk_tier${tierNum}_qty`, 0);
+    db.updateProduct(productId, `bulk_tier${tierNum}_price`, 0);
+
+    await answer(`✅ Tier ${tierNum} cleared.`);
+    const fresh = db.getProduct(productId);
+    await bot.editMessageText(
+      `📊 <b>Bulk Pricing — ${escapeHtml(fresh.title || '')}</b>\n\n` +
+      `Tier ${tierNum} has been cleared.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminBulkPriceKb(fresh) }
+    );
+    return;
+  }
+
+  // ── Delete product ────────────────────────────────────────────────
+  if (/^admin_delete_p_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product   = db.getProduct(productId);
+    await bot.editMessageText(
+      `⚠️ <b>Delete:</b> ${product?.title}?\n\nThis cannot be undone.`,
+      {
+        chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: adminConfirmKb(`admin_confirm_delete_${productId}`, 'admin_delete_product'),
+      }
+    );
+    return;
+  }
+  if (/^admin_confirm_delete_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    db.softDeleteProduct(productId);
+    await bot.editMessageText('✅ Product deleted.', {
+      chat_id: chatId, message_id: msgId, reply_markup: adminBackKb(),
+    });
+    return;
+  }
+
+  // ── Stock management ──────────────────────────────────────────────
+  if (data === 'admin_stock') {
+    const products = db.getAllActiveProducts();
+    await bot.editMessageText('📦 <b>Stock Management</b>\n\nSelect product:', {
+      chat_id: chatId, message_id: msgId,
+      parse_mode: 'HTML', reply_markup: adminProductsKb(products, 'stock_select'),
+    });
+    return;
+  }
+  if (/^admin_stock_select_p_\d+$/.test(data)) {
+    const productId  = parseInt(data.split('_').pop(), 10);
+    const product    = db.getProduct(productId);
+    const itemStats  = items.getItemStats(productId);
+    const stockQty   = product?.stock_quantity || 0;
+    const statusLine = stockQty === 0
+      ? '❌ <b>OUT OF STOCK</b>'
+      : '✅ <b>IN STOCK</b>';
+
+    await bot.editMessageText(
+      `📦 <b>${product.title}</b>\n\n` +
+      `💵 Price: <b>${formatPrice(product.price)}</b>\n` +
+      `${statusLine}\n` +
+      `📊 Stock quantity: <b>${stockQty}</b>\n` +
+      `📋 Available items: <b>${itemStats.available}</b>\n` +
+      `📈 Sales count: <b>${product.sales_count || 0}</b>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminStockManageKb(productId) }
+    );
+    return;
+  }
+
+  // ── Add stock items (product_items) ──────────────────────────────
+  if (/^admin_stock_add_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product   = db.getProduct(productId);
+    session.set(userId, States.ADMIN_STOCK_DATA, { stockProductId: productId });
+
+    const instructions =
+      `📦 <b>Add Stock Items — ${product.title}</b>\n\n` +
+      `Separate items using <b>AYMEN</b>:\n` +
+      `<code>item1AYMENitem2AYMENitem3</code>\n\n` +
+      `Each item can be anything (key, account, code, url, etc.).\n` +
+      `Example:\n` +
+      `<code>user1@mail.com:pass1AYMENuser2@mail.com:pass2</code>\n` +
+      `<code>KEY-AAAA-1111AYMENKEY-BBBB-2222</code>`;
+
+    await bot.editMessageText(instructions, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: backToProductEditKb(productId),
+    });
+    return;
+  }
+
+  // ── Large Stock Upload — multi-message batch mode ─────────────────
+  // Allows uploading thousands of items across multiple messages,
+  // bypassing Telegram's 4096-character per-message limit.
+  // Admin sends batches one by one; types DONE when finished.
+  if (/^admin_stock_batch_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product   = db.getProduct(productId);
+    if (!product) { await answer('❌ Product not found.'); return; }
+
+    session.set(userId, States.ADMIN_STOCK_BATCH, {
+      stockProductId: productId,
+      batchItems: [],      // accumulated items across messages
+      batchCount: 0,       // number of messages received so far
+    });
+
+    await bot.editMessageText(
+      `📤 <b>Large Stock Upload — ${escapeHtml(product.title)}</b>\n\n` +
+      `Send your items in <b>multiple messages</b> — each message can contain as many items as you want (up to Telegram's limit of 4096 chars).\n\n` +
+      `Separate items within each message using <b>AYMEN</b>:\n` +
+      `<code>item1AYMENitem2AYMENitem3</code>\n\n` +
+      `🏷 To tag this batch with a supplier, send:\n` +
+      `<code>SUPPLIER Ahmed Store</code>\n\n` +
+      `💰 To record what you paid per unit, send:\n` +
+      `<code>COST 0.25</code>\n` +
+      `<i>Used to work out this batch's profit later.</i>\n\n` +
+      `When you've sent all batches, type <code>DONE</code> to save everything.\n` +
+      `To cancel, type <code>CANCEL</code>.\n\n` +
+      `📊 <b>Current stock:</b> ${product.stock_quantity}`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: `admin_stock_select_p_${productId}` }]] } }
+    );
+    return;
+  }
+
+  // ── Remove from stock_quantity ───────────────────────────────────
+  if (/^admin_stock_removeqty_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product   = db.getProduct(productId);
+    session.set(userId, States.ADMIN_STOCK_REMOVE_QTY, { stockProductId: productId });
+    await bot.editMessageText(
+      `➖ <b>Remove Quantity</b>\n\n` +
+      `Product: <b>${product.title}</b>\n` +
+      `Current quantity: <b>${product.stock_quantity || 0}</b>\n\n` +
+      `Enter quantity to remove (e.g. 20):\n` +
+      `<i>Example: current=100, remove=20 → new=80</i>\n` +
+      `<i>Stock will never go below 0.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: backToProductEditKb(productId) }
+    );
+    return;
+  }
+
+  // ── Set stock_quantity manually ───────────────────────────────────
+  if (/^admin_stock_setqty_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product   = db.getProduct(productId);
+    session.set(userId, States.ADMIN_STOCK_SET_QTY, { stockProductId: productId });
+    const isManual = product.delivery_type === 'manual';
+    await bot.editMessageText(
+      `✏️ <b>Set Stock Manually</b>\n\n` +
+      `Product: <b>${escapeHtml(kbStripEmojiCodes(String(product.title || '')).trim())}</b>\n` +
+      `Current quantity: <b>${product.stock_quantity || 0}</b>\n` +
+      `🚚 Delivery: <b>${isManual ? 'Manual' : 'Automatic'}</b>\n\n` +
+      `Enter the <b>exact</b> new stock quantity (replaces current value):\n` +
+      `<i>Example: current=5, set=100 → new=100</i>\n\n` +
+      (isManual
+        // Said explicitly because it is not obvious, and the alternative is the
+        // shop owner pasting 80 dummy lines to make a counter go up.
+        ? `✅ <i>This product delivers manually, so the number is all that is ` +
+          `needed — no account details. Each sale takes one off the counter and ` +
+          `opens a delivery task for you.</i>`
+        : `⚠️ <i>This product delivers automatically, so the number alone is not ` +
+          `enough — it must be backed by real stock items, or a customer will pay ` +
+          `and receive nothing. Use ➕ Add Stock Items instead, or switch delivery ` +
+          `to Manual.</i>`),
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: backToProductEditKb(productId) }
+    );
+    return;
+  }
+
+  // ── Set stock to 0 (with confirmation) ───────────────────────────
+  if (/^admin_stock_zero_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product   = db.getProduct(productId);
+    await bot.editMessageText(
+      `🔄 <b>Set Stock to 0</b>\n\n` +
+      `Product: <b>${product.title}</b>\n` +
+      `Current stock: <b>${product.stock_quantity || 0}</b>\n\n` +
+      `⚠️ Are you sure you want to set this product stock to 0?`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: confirmZeroStockKb(productId) }
+    );
+    return;
+  }
+  if (/^admin_stock_zero_confirm_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product   = db.getProduct(productId);
+    items.clearUnsoldItems(productId);
+    db.clearUnsoldStock(productId);
+    db.setStockQuantity(productId, 0);
+    await bot.editMessageText(
+      `✅ <b>Stock set to 0.</b>\n\n<b>${product.title}</b> is now ❌ <b>OUT OF STOCK</b>.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: backToProductEditKb(productId) }
+    );
+    await evaluateStock(bot, productId);
+    return;
+  }
+
+  // ── View stock count ──────────────────────────────────────────────
+  if (/^admin_stock_view_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product   = db.getProduct(productId);
+    const itemStats = items.getItemStats(productId);
+    const stockQty  = product?.stock_quantity || 0;
+    const statusLine = stockQty === 0 ? '❌ <b>OUT OF STOCK</b>' : '✅ <b>IN STOCK</b>';
+
+    let viewText =
+      `📦 <b>${product.title}</b>\n\n` +
+      `${statusLine}\n` +
+      `📊 Stock quantity: <b>${stockQty}</b>\n` +
+      `📋 Available items: <b>${itemStats.available}</b>\n` +
+      `🛒 Sold items: <b>${itemStats.sold}</b>\n` +
+      `📈 Sales count: <b>${product.sales_count || 0}</b>`;
+
+    const sample = items.getItemsPage(productId).slice(0, 5);
+    if (sample.length > 0) {
+      const sampleLines = sample.map((it, idx) => {
+        return `${idx + 1}. <code>${(it.raw_content || '').slice(0, 50)}</code>`;
+      }).join('\n');
+      viewText += `\n\n<b>Sample available items:</b>\n${sampleLines}`;
+      if (itemStats.available > 5) viewText += `\n<i>…and ${itemStats.available - 5} more</i>`;
+    } else {
+      viewText += '\n\n<i>No items in inventory yet.</i>';
+    }
+
+    await bot.editMessageText(viewText, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: backToProductEditKb(productId),
+    });
+    return;
+  }
+
+  // ── Show ALL stock items in detail (admin only) ──────────────────
+  if (/^admin_stock_full_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product   = db.getProduct(productId);
+    const all       = items.getAllAvailable(productId);
+
+    // Also get legacy stock items
+    const legacyStock = db.getStockItems(productId);
+
+    if (!all.length && !legacyStock.length) {
+      await bot.editMessageText(
+        `📋 <b>${product.title}</b> — Full Stock\n\n<i>No available items in inventory.</i>`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: backToProductEditKb(productId) }
+      );
+      return;
+    }
+
+    // Build numbered list of all available items (product_items)
+    const lines = all.map((it, idx) => `${idx + 1}. <code>${escapeHtml(it.raw_content || '')}</code>`);
+    // Add legacy stock items with their IDs for deletion
+    const legacyLines = legacyStock.map((it, idx) => `L${idx + 1}. [#${it.id}] <code>${escapeHtml(it.content || '')}</code>`);
+    const allLines = [...lines, ...legacyLines];
+
+    const header =
+      `📋 <b>${product.title}</b> — Full Stock\n` +
+      `📦 <b>Total available:</b> ${all.length + legacyStock.length}\n` +
+      `━━━━━━━━━━━━━━━━━━\n\n`;
+
+    const MAX = 3800;
+    let buf = header;
+    const chunks = [];
+    for (const line of allLines) {
+      if ((buf + line + '\n').length > MAX) { chunks.push(buf); buf = ''; }
+      buf += line + '\n';
+    }
+    if (buf) chunks.push(buf);
+
+    // First chunk: edit current message
+    await bot.editMessageText(chunks[0], {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: chunks.length === 1 ? backToProductEditKb(productId) : undefined,
+    }).catch(() => {});
+
+    // Remaining chunks: send as new messages
+    for (let i = 1; i < chunks.length; i++) {
+      const isLast = i === chunks.length - 1;
+      await bot.sendMessage(chatId, chunks[i], {
+        parse_mode: 'HTML',
+        reply_markup: isLast ? backToProductEditKb(productId) : undefined,
+      });
+    }
+
+    // Send delete buttons for ALL items — both product_items and legacy stock
+    // Combine into one list with type marker
+    const deletables = [
+      ...all.map((it) => ({ id: it.id, content: it.raw_content, type: 'item' })),
+      ...legacyStock.map((it) => ({ id: it.id, content: it.content, type: 'stock' })),
+    ];
+
+    if (deletables.length > 0) {
+      // Build keyboard with delete buttons (max 20 at a time)
+      const { mk } = require('../utils/keyboard') || {};
+      const buildKb = (rows) => ({ inline_keyboard: rows });
+      const rows = deletables.slice(0, 20).map((it) => {
+        const preview = String(it.content || '').slice(0, 30);
+        const prefix  = it.type === 'item' ? 'i' : 's';
+        return [{ text: `🗑 #${it.id}: ${preview}`, callback_data: `admin_del_stock_item_${prefix}_${it.id}` }];
+      });
+      rows.push([{ text: '🔙 Back to Product', callback_data: `admin_edit_p_${productId}` }]);
+      await bot.sendMessage(
+        chatId,
+        `🗑 <b>Delete a specific account/code:</b>\nTap any item below to remove it from stock.`,
+        { parse_mode: 'HTML', reply_markup: buildKb(rows) }
+      );
+    }
+    return;
+  }
+
+  if (/^admin_stock_clear_\d+$/.test(data)) {
+    const productId    = parseInt(data.split('_').pop(), 10);
+    const product      = db.getProduct(productId);
+    const itemsCleared = items.clearUnsoldItems(productId);
+    db.clearUnsoldStock(productId);
+    db.setStockQuantity(productId, 0);
+    await bot.editMessageText(
+      `✅ <b>All unsold stock cleared.</b>\n\n` +
+      `📦 ${product.title}\n` +
+      `🗑 Cleared: ${itemsCleared} items\n` +
+      `📊 Stock quantity reset to 0.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: backToProductEditKb(productId) }
+    );
+    await evaluateStock(bot, productId);
+    return;
+  }
+
+  // ── Users ─────────────────────────────────────────────────────────
+  if (data === 'admin_users') {
+    const users = db.getAllUsers();
+    await bot.editMessageText(`👥 <b>Users</b> (${users.length} total)`, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminUsersKb(users),
+    });
+    return;
+  }
+  // ═══════════════════════════════════════════════════════════════════
+  // CUSTOMER WALLETS — what the shop is holding on their behalf
+  // ═══════════════════════════════════════════════════════════════════
+
+  if (data === 'admin_treasury' || data === 'admin_treasury_top') {
+    const t = db.getWalletTreasury();
+
+    if (data === 'admin_treasury_top') {
+      const top = db.getTopWallets(15);
+      let txt = `🏆 <b>Largest Wallets</b>\n\n`;
+      if (!top.length) {
+        txt += '<i>No customer holds a balance.</i>';
+      } else {
+        top.forEach((u, i) => {
+          const who = u.username ? `@${u.username}` : (u.first_name || `User ${u.telegram_id}`);
+          const share = t.total > 0 ? ((u.balance / t.total) * 100).toFixed(1) : '0.0';
+          txt += `${String(i + 1).padStart(2)}. <b>${formatPrice(u.balance)}</b> · ${escapeHtml(who)}\n` +
+                 `     <code>${u.telegram_id}</code> — ${share}% of the total\n`;
+        });
+      }
+      try {
+        await bot.editMessageText(txt, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'admin_treasury' }]] } });
+      } catch (e) {
+        await bot.sendMessage(chatId, txt, { parse_mode: 'HTML' });
+      }
+      return;
+    }
+
+    const avg = t.usersFunded > 0 ? t.total / t.usersFunded : 0;
+    const TYPE_LABEL = {
+      deposit: '💵 Deposits', purchase: '🛒 Purchases', refund: '🔄 Refunds',
+      referral: '🎁 Referral', cashback: '💸 Cashback', reversal: '↩️ Reversals',
+      admin_add: '➕ Admin credit', admin_deduct: '➖ Admin debit',
+    };
+    const flows = t.byType.slice(0, 8).map((r) => {
+      const label = TYPE_LABEL[r.type] || `• ${r.type}`;
+      const sign = r.sum >= 0 ? '+' : '−';
+      return `   ${label}: ${sign}${formatPrice(Math.abs(r.sum))} <i>(${r.n})</i>`;
+    }).join('\n');
+
+    const txt =
+      `🏦 <b>Customer Wallets</b>\n\n` +
+      `<b>Held on their behalf right now</b>\n` +
+      `💰 <b>${formatPrice(t.total)}</b>\n\n` +
+      `👥 Customers with a balance: <b>${t.usersFunded}</b> of ${t.usersTotal}\n` +
+      `📊 Average balance: <b>${formatPrice(avg)}</b>\n` +
+      `🔝 Largest single wallet: <b>${formatPrice(t.largest)}</b>\n` +
+      (t.usersNegative > 0
+        ? `\n⚠️ <b>${t.usersNegative}</b> wallet(s) in debt: <b>${formatPrice(t.negativeTotal)}</b>\n` +
+          `<i>Negative balances come from reversed deposits that were already spent.</i>\n`
+        : '') +
+      (t.resellerCount > 0
+        ? `\n🏪 Reseller balances: <b>${formatPrice(t.resellerTotal)}</b> (${t.resellerCount} active)\n`
+        : '') +
+      `\n━━━━━━━━━━━━━━━━━━━━\n` +
+      `<b>Lifetime wallet flow</b>\n` +
+      `⬆️ Credited in: <b>${formatPrice(t.credited)}</b>\n` +
+      `⬇️ Spent out: <b>${formatPrice(t.spent)}</b>\n` +
+      (flows ? `\n<b>By type</b>\n${flows}\n` : '') +
+      `\n━━━━━━━━━━━━━━━━━━━━\n` +
+      `<i>This is money you already received but customers have not spent yet. ` +
+      `They can still buy with it or request it back, so treat it as a liability ` +
+      `rather than profit.</i>`;
+
+    try {
+      await bot.editMessageText(txt, {
+        chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: '🏆 Largest wallets', callback_data: 'admin_treasury_top' }],
+          [{ text: '🔄 Refresh', callback_data: 'admin_treasury' }],
+          [{ text: '🔙 Back', callback_data: 'admin_panel' }],
+        ] },
+      });
+    } catch (e) {
+      await bot.sendMessage(chatId, txt, { parse_mode: 'HTML' });
+    }
+    return;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // FRAUD RESPONSE — cancel every open order of one user
+  // ═══════════════════════════════════════════════════════════════════
+
+  // ═══════════════════════════════════════════════════════════════════
+  // PER-CUSTOMER PRICING
+  // ═══════════════════════════════════════════════════════════════════
+
+  if (/^admin_cprices_\d+$/.test(data)) {
+    const targetId = parseInt(data.split('_').pop(), 10);
+    const user = db.getUser(targetId);
+    if (!user) { await answer('❌ User not found'); return; }
+    const list = db.listCustomerPrices(targetId);
+    const name = user.username ? `@${user.username}` : (user.first_name || `User ${targetId}`);
+
+    let txt =
+      `💲 <b>Special Prices</b>\n\n` +
+      `👤 ${escapeHtml(name)} — <code>${targetId}</code>\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n`;
+    if (!list.length) {
+      txt += `\n<i>No special prices. This customer pays the public price.</i>`;
+    } else {
+      for (const cp of list) {
+        const t = String(cp.title || '').replace(/\[emoji:\d+\]/g, '').trim().slice(0, 30);
+        txt += `\n📦 ${escapeHtml(t)}\n` +
+               `   ${cp.min_qty > 1 ? `<b>${cp.min_qty}+</b> units` : 'any qty'}: ` +
+               `${formatPriceExact(cp.public_price)} → <b>${formatPriceExact(cp.price)}</b>` +
+               (cp.note ? `  <i>(${escapeHtml(cp.note)})</i>` : '') + `\n`;
+      }
+      txt += `\n<i>An allowance covers the first N units the customer buys. Beyond it, the normal price applies automatically — including within the same order.</i>`;
+    }
+
+    const kb = [[{ text: '➕ Set a special price', callback_data: `admin_cprice_add_${targetId}` }]];
+    for (const cp of list.slice(0, 8)) {
+      const t = String(cp.title || '').replace(/\[emoji:\d+\]/g, '').trim().slice(0, 18);
+      const q = cp.min_qty > 1 ? ` ${cp.min_qty}+` : '';
+      kb.push([{
+        text: `🗑 ${t}${q} — ${formatPriceExact(cp.price)}`,
+        callback_data: `admin_cprice_del_${targetId}_${cp.product_id}_${cp.min_qty}`,
+      }]);
+    }
+    kb.push([{ text: '🔙 Back to user', callback_data: `admin_user_${targetId}` }]);
+
+    try {
+      await bot.editMessageText(txt, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+    } catch (e) {
+      await bot.sendMessage(chatId, txt, { parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+    }
+    return;
+  }
+
+  // Pick the product from a list rather than typing an id.
+  // The ordering screen shows POSITION numbers (#11 = eleventh in the list),
+  // which are not product ids — asking for a typed id invited setting the
+  // price on the wrong product. Tapping removes the ambiguity entirely.
+  if (/^admin_cprice_add_\d+(_\d+)?$/.test(data)) {
+    const parts = data.split('_');
+    const page = parts.length === 5 ? parseInt(parts.pop(), 10) : 0;
+    const targetId = parseInt(parts.pop(), 10);
+
+    const all = db.getAllProductsBrief();
+    const PER = 8;
+    const pages = Math.max(1, Math.ceil(all.length / PER));
+    const pg = Math.max(0, Math.min(page, pages - 1));
+    const slice = all.slice(pg * PER, (pg + 1) * PER);
+
+    const kb = slice.map((pr) => {
+      const t = String(pr.title || '').replace(/\[emoji:\d+\]/g, '').trim().slice(0, 28);
+      return [{
+        text: `${pr.is_active ? '🟢' : '🔴'} ${t} · ${formatPrice(pr.price)}`,
+        callback_data: `admin_cprice_pick_${targetId}_${pr.id}`,
+      }];
+    });
+
+    if (pages > 1) {
+      const nav = [];
+      if (pg > 0)         nav.push({ text: '◀️ Prev', callback_data: `admin_cprice_add_${targetId}_${pg - 1}` });
+      nav.push({ text: `${pg + 1}/${pages}`, callback_data: 'noop' });
+      if (pg < pages - 1) nav.push({ text: 'Next ▶️', callback_data: `admin_cprice_add_${targetId}_${pg + 1}` });
+      kb.push(nav);
+    }
+    kb.push([{ text: '🔙 Cancel', callback_data: `admin_cprices_${targetId}` }]);
+
+    await bot.editMessageText(
+      `💲 <b>Set a Special Price</b>\n\n` +
+      `👤 Customer: <code>${targetId}</code>\n` +
+      `📄 Page ${pg + 1} of ${pages}\n\n` +
+      `<b>Pick the product:</b>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } }
+    ).catch(() => {});
+    return;
+  }
+
+  // Product chosen — now only the price is needed.
+  if (/^admin_cprice_pick_\d+_\d+$/.test(data)) {
+    const parts = data.split('_');
+    const productId = parseInt(parts.pop(), 10);
+    const targetId  = parseInt(parts.pop(), 10);
+    const product = db.getProduct(productId);
+    if (!product) { await answer('❌ Product not found'); return; }
+
+    const existing = db.listCustomerPrices(targetId).find((x) => x.product_id === productId);
+    session.set(userId, States.ADMIN_CUST_PRICE, { cpUserId: targetId, cpProductId: productId });
+
+    await bot.editMessageText(
+      `💲 <b>Set a Special Price</b>\n\n` +
+      `👤 Customer: <code>${targetId}</code>\n` +
+      `📦 ${escapeHtml(String(product.title || ''))}\n` +
+      `🆔 Product ID: <code>${product.id}</code>\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `💵 Public price: <b>${formatPriceExact(product.price)}</b>\n` +
+      (existing ? `💲 Current special: <b>${formatPriceExact(existing.price)}</b>\n` : '') +
+      (() => {
+        const al = db.getCustomerAllowance(targetId, productId);
+        if (!al) return '';
+        return al.unlimited
+          ? `♾ Current allowance: no limit\n`
+          : `📊 Used <b>${al.used}</b> of ${al.limit} units — <b>${al.remaining}</b> left\n`;
+      })() +
+      `\n<b>Send the price for this customer.</b>\n` +
+      `<code>3.50</code> — this price, no limit\n` +
+      `<code>3.50 q20</code> — this price for <b>20 units total</b>, then back to normal\n` +
+      `<code>3.50 q20 wholesale</code> — with a note\n\n` +
+      `<i>With a limit, the allowance covers the first 20 units the customer ` +
+      `buys — across any number of orders. Anything beyond that is charged the ` +
+      `normal price automatically.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Cancel', callback_data: `admin_cprices_${targetId}` }]] } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_cprice_del_\d+_\d+(_\d+)?$/.test(data)) {
+    const parts = data.split('_');
+    // Trailing min_qty is optional so older buttons keep working.
+    const minQty    = parts.length === 6 ? parseInt(parts.pop(), 10) : null;
+    const productId = parseInt(parts.pop(), 10);
+    const targetId  = parseInt(parts.pop(), 10);
+    db.removeCustomerPrice(targetId, productId, minQty);
+    logger.info(`Admin ${userId} removed special price: user ${targetId}, product ${productId}`);
+    await answer('🗑 Removed');
+    return await handleAdminCallback(bot, { ...query, data: `admin_cprices_${targetId}` });
+  }
+
+  if (/^admin_purge_\d+$/.test(data)) {
+    const targetId = parseInt(data.split('_').pop(), 10);
+    const user = db.getUser(targetId);
+    if (!user) { await answer('❌ User not found'); return; }
+    const pv = db.previewPurge(targetId);
+    const name = user.username ? `@${user.username}` : (user.first_name || `User ${targetId}`);
+
+    await bot.editMessageText(
+      `🧹 <b>Erase Order Data</b>\n\n` +
+      `👤 ${escapeHtml(name)} — <code>${targetId}</code>\n` +
+      `📦 Orders on record: <b>${pv.total}</b>\n` +
+      `🔑 Of those, still showing product keys: <b>${pv.withContent}</b>\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `<b>🧽 Wipe delivered content</b>\n` +
+      `Removes the keys/accounts from their "My Orders" so they can no longer ` +
+      `read what was delivered. The order rows stay, so your sales and stock ` +
+      `figures remain correct. <b>This is what you normally want.</b>\n\n` +
+      `<b>🗑 Delete everything</b>\n` +
+      `Removes the order rows entirely — no trace at all. Your revenue and ` +
+      `sales statistics will change, because those purchases disappear from ` +
+      `the record. Irreversible.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: '🧽 Wipe delivered content', callback_data: `admin_purge_go_${targetId}_0` }],
+          [{ text: '🗑 Delete everything (irreversible)', callback_data: `admin_purge_go_${targetId}_1` }],
+          [{ text: '🔙 Back to user', callback_data: `admin_user_${targetId}` }],
+        ] } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_purge_go_\d+_[01]$/.test(data)) {
+    const parts = data.split('_');
+    const hard  = parts.pop() === '1';
+    const targetId = parseInt(parts.pop(), 10);
+
+    const r = db.purgeUserOrderData(targetId, { hardDelete: hard });
+    logger.warn(`Admin ${userId} PURGED order data for user ${targetId} (hardDelete=${hard}): ${JSON.stringify(r)}`);
+
+    await bot.editMessageText(
+      `✅ <b>Order Data Erased</b>\n\n` +
+      `👤 <code>${targetId}</code>\n` +
+      `🔑 Delivered content wiped: <b>${r.contentWiped}</b> order(s)\n` +
+      `📦 Manual task content wiped: <b>${r.manualWiped}</b>\n` +
+      (hard
+        ? `🗑 Order rows deleted: <b>${r.ordersDeleted}</b>\n\n` +
+          `⚠️ <i>Sales and revenue statistics have changed — those purchases no longer exist.</i>`
+        : `📊 Order rows kept: <b>${r.kept}</b>\n\n` +
+          `<i>Your statistics are untouched. The customer can see the orders exist but not what was inside.</i>`),
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back to user', callback_data: `admin_user_${targetId}` }]] } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_fraud_\d+$/.test(data)) {
+    const targetId = parseInt(data.split('_').pop(), 10);
+    const user = db.getUser(targetId);
+    if (!user) { await answer('❌ User not found'); return; }
+
+    const pv = db.previewCancelAllUserOrders(targetId);
+    const name = user.username ? `@${user.username}` : (user.first_name || `User ${targetId}`);
+
+    const txt =
+      `🚨 <b>Fraud Response</b>\n\n` +
+      `👤 ${escapeHtml(name)}\n` +
+      `🆔 <code>${targetId}</code>\n` +
+      `💰 Balance: <b>${formatPrice(user.balance || 0)}</b>\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `<b>Will be cancelled:</b>\n` +
+      `⏳ Pending orders: <b>${pv.pending}</b>\n` +
+      `🕐 Paid, awaiting delivery: <b>${pv.awaiting}</b> (${formatPrice(pv.paidValue)})\n` +
+      `🔄 Pending refund requests: <b>${pv.pendingRefunds}</b>\n\n` +
+      `<b>Will NOT be touched:</b>\n` +
+      `✅ Already delivered: <b>${pv.delivered}</b> — the goods are gone, history stays intact\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `Stock is returned to inventory and the sold/sales counters are corrected. ` +
+      `Outstanding refund requests are rejected so stolen credit cannot be cashed out.\n\n` +
+      `Choose whether the money goes back to their wallet:`;
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: '🚨 Cancel all — NO refund', callback_data: `admin_fraud_go_${targetId}_0` }],
+        [{ text: '↩️ Cancel all + refund wallet', callback_data: `admin_fraud_go_${targetId}_1` }],
+        [{ text: '🔙 Back to user', callback_data: `admin_user_${targetId}` }],
+      ] },
+    }).catch(() => {});
+    return;
+  }
+
+  if (/^admin_fraud_go_\d+_[01]$/.test(data)) {
+    const parts    = data.split('_');
+    const refund   = parts.pop() === '1';
+    const targetId = parseInt(parts.pop(), 10);
+    const user     = db.getUser(targetId);
+    if (!user) { await answer('❌ User not found'); return; }
+
+    const r = db.cancelAllUserOrders(targetId, { refund });
+    logger.warn(
+      `Admin ${userId} FRAUD-CANCELLED all orders for user ${targetId} ` +
+      `(refund=${refund}): ${JSON.stringify(r)}`
+    );
+
+    const name = user.username ? `@${user.username}` : (user.first_name || `User ${targetId}`);
+    const fresh = db.getUser(targetId);
+
+    const txt =
+      `✅ <b>Fraud Response Applied</b>\n\n` +
+      `👤 ${escapeHtml(name)} — <code>${targetId}</code>\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `❌ Pending orders cancelled: <b>${r.cancelledPending}</b>\n` +
+      `❌ Paid orders cancelled: <b>${r.cancelledPaid}</b>\n` +
+      `📦 Manual delivery tasks closed: <b>${r.manualCancelled}</b>\n` +
+      `📊 Stock returned: <b>${r.stockRestored}</b> unit(s)\n` +
+      `🔄 Refund requests rejected: <b>${r.refundRequestsRejected}</b>\n` +
+      `🎫 Reservations released: <b>${r.reservationsReleased}</b>\n` +
+      (refund
+        ? `↩️ Refunded to wallet: <b>${formatPrice(r.refunded)}</b>\n`
+        : `🚫 <b>No refund issued.</b>\n`) +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `✅ Left untouched (delivered): <b>${r.delivered}</b>\n` +
+      `💰 Balance now: <b>${formatPrice(fresh?.balance || 0)}</b>\n\n` +
+      (r.delivered > 0
+        ? `⚠️ <i>${r.delivered} order(s) were already delivered. Those products cannot be recalled — ` +
+          `review them manually if they were bought with stolen credit.</i>\n\n`
+        : '') +
+      `<i>Next: ban the account, and reverse the fraudulent deposit if you have not yet.</i>`;
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: user.is_banned ? '✅ Unban' : '🚫 Ban this user', callback_data: `admin_toggle_ban_${targetId}` }],
+        [{ text: '🧹 Erase their order data', callback_data: `admin_purge_${targetId}` }],
+        [{ text: '↩️ Reverse a deposit', callback_data: 'admin_dep_reverse' }],
+        [{ text: '🔙 Back to user', callback_data: `admin_user_${targetId}` }],
+      ] },
+    }).catch(() => {});
+    return;
+  }
+
+  if (/^admin_user_\d+$/.test(data)) {
+    const targetId = parseInt(data.split('_').pop(), 10);
+    const user     = db.getUser(targetId);
+    const orders   = db.getUserOrders(targetId);
+    if (!user) { await answer('❌ Not found.'); return; }
+    const name = user.username || user.first_name || `User ${targetId}`;
+    await bot.editMessageText(
+      `👤 <b>${name}</b>\n\n🆔 <code>${targetId}</code>\n💰 ${formatPrice(user.balance)}\n` +
+      `📦 Orders: ${orders.length}\n📅 Joined: ${(user.created_at || '').slice(0, 10)}\n` +
+      `⚡ Status: ${user.is_banned ? '🚫 BANNED' : '✅ Active'}`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminUserActionsKb(targetId, !!user.is_banned) }
+    );
+    return;
+  }
+  if (/^admin_toggle_ban_\d+$/.test(data)) {
+    const targetId = parseInt(data.split('_').pop(), 10);
+    const user     = db.getUser(targetId);
+    db.banUser(targetId, !user?.is_banned);
+    const updated  = db.getUser(targetId);
+    await answer(updated.is_banned ? 'User banned 🚫' : 'User unbanned ✅');
+    const name = updated.username || updated.first_name || `User ${targetId}`;
+    await bot.editMessageText(
+      `👤 <b>${name}</b>\n\n💰 ${formatPrice(updated.balance)}\n⚡ ${updated.is_banned ? '🚫 BANNED' : '✅ Active'}`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminUserActionsKb(targetId, !!updated.is_banned) }
+    );
+    return;
+  }
+
+  // ── Reset User Wallet to $0 ───────────────────────────────────────
+  if (/^admin_user_resetwallet_\d+$/.test(data)) {
+    const targetId = parseInt(data.split('_').pop(), 10);
+    const user = db.getUser(targetId);
+    if (!user) { await answer('❌ Not found'); return; }
+    const name = user.username || user.first_name || `User ${targetId}`;
+    await bot.editMessageText(
+      `🔄 <b>Reset Wallet</b>\n\n` +
+      `👤 User: <b>${escapeHtml(name)}</b> (<code>${targetId}</code>)\n` +
+      `💰 Current Balance: <b>${formatPrice(user.balance)}</b>\n\n` +
+      `⚠️ This will set their wallet balance to <b>$0.00</b>.\n` +
+      `This action cannot be undone.\n\n` +
+      `Are you sure?`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: adminResetWalletConfirmKb(targetId) }
+    );
+    return;
+  }
+
+  if (/^admin_user_resetwallet_confirm_\d+$/.test(data)) {
+    const targetId = parseInt(data.split('_').pop(), 10);
+    const user = db.getUser(targetId);
+    if (!user) { await answer('❌ Not found'); return; }
+    const previousBalance = user.balance;
+
+    // Reset by adding -previousBalance (since updateBalance adds the amount)
+    db.updateBalance(targetId, -previousBalance);
+    db.addTransaction({
+      userId:      targetId,
+      type:        'admin_reset',
+      amount:      -previousBalance,
+      description: `Wallet reset to $0 by admin`,
+      refId:       null,
+      orderId:     null,
+    });
+
+    await answer('✅ Wallet reset to $0');
+
+    // Notify user
+    try {
+      await bot.sendMessage(
+        targetId,
+        `⚠️ <b>Your wallet has been reset by admin.</b>\n\n` +
+        `Previous balance: <b>${formatPrice(previousBalance)}</b>\n` +
+        `New balance: <b>$0.00</b>\n\n` +
+        `Contact support if you have questions.`,
+        { parse_mode: 'HTML' }
+      );
+    } catch (e) {
+      logger.warn(`Could not notify ${targetId} about wallet reset: ${e.message}`);
+    }
+
+    const name = user.username || user.first_name || `User ${targetId}`;
+    await bot.editMessageText(
+      `✅ <b>Wallet Reset Complete</b>\n\n` +
+      `👤 User: <b>${escapeHtml(name)}</b>\n` +
+      `💰 Previous: <b>${formatPrice(previousBalance)}</b>\n` +
+      `💰 New: <b>$0.00</b>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back to User', callback_data: `admin_user_${targetId}` }]] } }
+    );
+    return;
+  }
+
+  // ── What this batch cost ──────────────────────────────────────────
+  if (data === 'admin_stock_cost') {
+    const sess = session.get(userId);
+    if (sess.state !== States.ADMIN_STOCK_CONFIRM) { await answer('❌ Session expired.'); return; }
+    session.set(userId, States.ADMIN_STOCK_COST, sess.data);
+    await bot.sendMessage(chatId,
+      `💰 <b>Cost per unit</b>\n\nWhat did you pay for ONE unit of this batch?\n\n` +
+      `Example: <code>0.25</code>\n\n` +
+      `<i>Stored on these units only, so a later price change from your supplier ` +
+      `never rewrites this batch's profit.</i>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  // ── Supplier for the batch being added ────────────────────────────
+  if (data === 'admin_stock_supplier') {
+    const sess = session.get(userId);
+    if (sess.state !== States.ADMIN_STOCK_CONFIRM) { await answer('❌ Session expired.'); return; }
+    session.set(userId, States.ADMIN_STOCK_SUPPLIER, sess.data);
+    await bot.sendMessage(chatId,
+      `🏷 <b>Supplier</b>\n\nSend the supplier's name for this batch.\n\n` +
+      `<i>Stored on every item in it, so when an account stops working you can ` +
+      `see who it came from.</i>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (/^admin_stock_sup_/.test(data)) {
+    const sess = session.get(userId);
+    if (sess.state !== States.ADMIN_STOCK_CONFIRM) { await answer('❌ Session expired.'); return; }
+    let name = '';
+    try { name = Buffer.from(data.replace('admin_stock_sup_', ''), 'base64url').toString('utf8'); } catch (_) {}
+    if (!name) { await answer('❌ Could not read that name'); return; }
+    session.update(userId, { supplier: name });
+    await bot.editMessageReplyMarkup(
+      { inline_keyboard: stockConfirmRows(userId, sess.data.stockProductId, (sess.data.stockItems || []).length) },
+      { chat_id: chatId, message_id: msgId }
+    ).catch(() => {});
+    return;
+  }
+
+  // ── Confirm stock addition ────────────────────────────────────────
+  if (data === 'admin_stock_confirm_yes') {
+    const sess = session.get(userId);
+    if (sess.state !== States.ADMIN_STOCK_CONFIRM) {
+      await answer('❌ Session expired. Please try again.');
+      return;
+    }
+    const { stockProductId, stockItems, prevStock, supplier } = sess.data;
+    const product = db.getProduct(stockProductId);
+    if (!product) { await answer('❌ Product not found'); return; }
+
+    const wasZero = prevStock === 0;
+    logger.info(`Admin ${userId} CONFIRMED adding ${stockItems.length} stock items to product ${stockProductId}`);
+
+    const count = items.insertItems(stockProductId, stockItems, supplier || null, sess.data.unitCost ?? null);
+    const newQty = db.adjustStockQuantity(stockProductId, count).after;
+    session.clear(userId);
+
+    await bot.editMessageText(
+      `✅ <b>Stock Items Added Successfully!</b>\n\n` +
+      `📦 <b>Product:</b> ${escapeHtml(product.title)}\n` +
+      `➕ <b>Items added:</b> ${count}\n` +
+      `📊 <b>Previous stock:</b> ${prevStock}\n` +
+      `📊 <b>New stock:</b> ${newQty}`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: backToProductEditKb(stockProductId) }
+    );
+
+    await evaluateStock(bot, stockProductId);
+
+    // ── BROADCAST to channel & group ───────────────────────────────
+    try {
+      const fresh = db.getProduct(stockProductId);
+      const botUserSC = await bot.getMe().catch(() => ({ username: '' }));
+      const kbSC = { inline_keyboard: [[{ text: '🛒 Buy now', url: `https://t.me/${botUserSC.username}?start=p_${fresh.id}` }]] };
+      const stockText = buildStockUpdateText(fresh, count);
+      await autoPublishWithPhoto(bot, fresh, stockText, kbSC);
+      logger.info(`Stock broadcast sent for product ${fresh.id}`);
+    } catch (e) {
+      logger.warn(`Stock broadcast failed: ${e.message}`);
+    }
+
+    // Notify out-of-stock subscribers
+    if (wasZero && newQty > 0) {
+      const notified = await notifyBackInStockSubscribers(bot, stockProductId);
+      if (notified > 0) {
+        await bot.sendMessage(chatId,
+          `🔔 Notified <b>${notified}</b> waiting user(s) that stock is available again.`,
+          { parse_mode: 'HTML' });
+      }
+    }
+
+    // Pre-Order check
+    try {
+      const pending = db.getReservedPreordersByProduct(stockProductId);
+      if (pending.length > 0) {
+        await bot.sendMessage(
+          chatId,
+          `🔜 <b>Pre-Order Notice</b>\n\n` +
+          `📦 Product: ${escapeHtml(product.title)}\n` +
+          `👥 Pending Pre-Orders: <b>${pending.length}</b>\n\n` +
+          `Do you want to deliver these pre-orders now?\n\n` +
+          `<i>⚠️ If you added wrong items by mistake, choose "No" to skip.</i>`,
+          { parse_mode: 'HTML',
+            reply_markup: adminPreorderConfirmDeliverKb(stockProductId, pending.length) }
+        );
+      }
+    } catch (e) {
+      logger.warn(`Pre-order notice error: ${e.message}`);
+    }
+    return;
+  }
+
+  // ── View User's Top-Up History ────────────────────────────────────
+  if (/^admin_user_topups_\d+$/.test(data)) {
+    const targetId = parseInt(data.split('_').pop(), 10);
+    const user = db.getUser(targetId);
+    if (!user) { await answer('❌ Not found'); return; }
+    const name = user.username || user.first_name || `User ${targetId}`;
+
+    // Get all transactions for this user
+    const allTx = db.getUserTransactions(targetId);
+
+    // Filter for top-ups: deposits, admin_credit, refunds
+    const topups = allTx.filter(t => ['deposit', 'admin_credit', 'refund', 'referral', 'referral_cashback'].includes(t.type));
+
+    if (!topups.length) {
+      await bot.editMessageText(
+        `💳 <b>${escapeHtml(name)}'s Top-Up History</b>\n\n` +
+        `No top-ups or credits found for this user.`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '🔙 Back to User', callback_data: `admin_user_${targetId}` }]] } }
+      );
+      return;
+    }
+
+    // Calculate totals by type
+    let totalDeposits = 0;
+    let totalAdminCredits = 0;
+    let totalRefunds = 0;
+    let totalReferrals = 0;
+    topups.forEach(t => {
+      const a = Number(t.amount) || 0;
+      if (t.type === 'deposit') totalDeposits += a;
+      else if (t.type === 'admin_credit') totalAdminCredits += a;
+      else if (t.type === 'refund') totalRefunds += a;
+      else if (t.type === 'referral' || t.type === 'referral_cashback') totalReferrals += a;
+    });
+
+    const typeEmoji = {
+      deposit: '💰',
+      admin_credit: '👨‍💼',
+      refund: '↩️',
+      referral: '👥',
+      referral_cashback: '🎁',
+    };
+    const typeLabel = {
+      deposit: 'User Top-Up',
+      admin_credit: 'Admin Add',
+      refund: 'Refund',
+      referral: 'Referral Bonus',
+      referral_cashback: 'Cashback',
+    };
+
+    // Format list (latest first, max 20)
+    const lines = topups.slice(0, 20).map((t, i) => {
+      const emoji = typeEmoji[t.type] || '💵';
+      const label = typeLabel[t.type] || t.type;
+      const date = (t.created_at || '').slice(0, 16);
+      const desc = (t.description || '').slice(0, 60);
+      return `${i + 1}. ${emoji} <b>${formatPrice(Math.abs(t.amount))}</b> — ${label} <code>#${t.id}</code>\n` +
+             `   📅 ${date}\n` +
+             (desc ? `   📝 <i>${escapeHtml(desc)}</i>` : '');
+    }).join('\n\n');
+
+    // Build cancel buttons for first 5 deposits
+    const cancelRows = topups.slice(0, 5)
+      .filter(t => t.type === 'deposit' || t.type === 'admin_credit')
+      .map(t => [{
+        text: `❌ Cancel #${t.id} (${formatPrice(Math.abs(t.amount))})`,
+        callback_data: `admin_cancel_topup_${t.id}_${targetId}`,
+      }]);
+    cancelRows.push([{ text: '🔙 Back to User', callback_data: `admin_user_${targetId}` }]);
+
+    const total = totalDeposits + totalAdminCredits + totalRefunds + totalReferrals;
+
+    await bot.editMessageText(
+      `💳 <b>${escapeHtml(name)}'s Top-Up History</b>\n` +
+      `🆔 <code>${targetId}</code>\n\n` +
+      `📊 <b>Summary:</b>\n` +
+      `💰 User Top-Ups: <b>${formatPrice(totalDeposits)}</b>\n` +
+      `👨‍💼 Admin Credits: <b>${formatPrice(totalAdminCredits)}</b>\n` +
+      `↩️ Refunds: <b>${formatPrice(totalRefunds)}</b>\n` +
+      (totalReferrals > 0 ? `🎁 Referral Bonuses: <b>${formatPrice(totalReferrals)}</b>\n` : '') +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `💵 <b>Total Credited:</b> ${formatPrice(total)}\n\n` +
+      `📋 <b>Latest ${topups.length > 20 ? 20 : topups.length} transactions:</b>\n\n` +
+      lines +
+      (cancelRows.length > 1 ? `\n\n⚠️ <b>Cancel a fraudulent top-up below:</b>` : ''),
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: cancelRows } }
+    );
+    return;
+  }
+
+  // ── Cancel a top-up (fraud/mistake) ───────────────────────────────
+  if (/^admin_cancel_topup_\d+_\d+$/.test(data)) {
+    const parts = data.split('_');
+    const txId = parseInt(parts[3], 10);
+    const targetId = parseInt(parts[4], 10);
+
+    const tx = db.getTransactionById(txId);
+    if (!tx) { await answer('❌ Not found'); return; }
+    if (tx.user_id !== targetId) { await answer('❌ Mismatch'); return; }
+    if (!['deposit', 'admin_credit'].includes(tx.type)) {
+      await answer('❌ Only deposits or admin credits can be cancelled');
+      return;
+    }
+
+    const amount = Math.abs(Number(tx.amount));
+    const user = db.getUser(targetId);
+    const name = user?.username || user?.first_name || `User ${targetId}`;
+
+    await bot.editMessageText(
+      `⚠️ <b>Confirm Cancellation</b>\n\n` +
+      `🆔 Transaction #${tx.id}\n` +
+      `👤 User: ${escapeHtml(name)}\n` +
+      `💵 Amount to refund: <b>${formatPrice(amount)}</b>\n` +
+      `💰 Current balance: ${formatPrice(user?.balance || 0)}\n` +
+      `💵 After cancel: <b>${formatPrice((user?.balance || 0) - amount)}</b>\n\n` +
+      `📝 Reason: ${escapeHtml(tx.description || 'N/A')}\n\n` +
+      `<b>⚠️ This will:</b>\n` +
+      `• Subtract ${formatPrice(amount)} from user's balance\n` +
+      `• Mark this transaction as cancelled\n` +
+      `• Notify the user\n\n` +
+      `Are you sure?`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: '✅ Yes, Cancel & Refund', callback_data: `admin_confirm_cancel_topup_${txId}` }],
+          [{ text: '🔙 No, Go Back', callback_data: `admin_user_topups_${targetId}` }],
+        ] } }
+    );
+    return;
+  }
+
+  if (/^admin_confirm_cancel_topup_\d+$/.test(data)) {
+    const txId = parseInt(data.split('_').pop(), 10);
+    const tx = db.getTransactionById(txId);
+    if (!tx) { await answer('❌ Not found'); return; }
+
+    const amount = Math.abs(Number(tx.amount));
+    const targetId = tx.user_id;
+    const user = db.getUser(targetId);
+
+    // Subtract from balance
+    db.updateBalance(targetId, -amount);
+
+    // Add a cancel transaction record
+    db.addTransaction({
+      userId: targetId,
+      type: 'admin_cancel',
+      amount: -amount,
+      description: `Admin cancelled tx #${txId} (was: ${tx.type})`,
+      refId: tx.ref_id || null,
+      orderId: null,
+    });
+
+    // Notify the user
+    try {
+      await bot.sendMessage(targetId,
+        `⚠️ <b>Top-Up Cancelled</b>\n\n` +
+        `Your top-up of <b>${formatPrice(amount)}</b> has been cancelled by admin.\n\n` +
+        `If you believe this is a mistake, please contact support.`,
+        { parse_mode: 'HTML' }
+      );
+    } catch (e) {
+      logger.warn(`Cancel notify failed: ${e.message}`);
+    }
+
+    const updated = db.getUser(targetId);
+    await bot.editMessageText(
+      `✅ <b>Top-Up Cancelled</b>\n\n` +
+      `💵 Amount removed: <b>${formatPrice(amount)}</b>\n` +
+      `💰 New balance: <b>${formatPrice(updated?.balance || 0)}</b>\n\n` +
+      `User has been notified.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: '🔙 Back to User', callback_data: `admin_user_${targetId}` }],
+        ] } }
+    );
+    return;
+  }
+
+  // ── View User's Purchases ─────────────────────────────────────────
+  // Pagination: admin_user_orders_p_USERID_PAGE
+  if (/^admin_user_orders_p_\d+_\d+$/.test(data)) {
+    const parts = data.split('_');
+    const targetId = parseInt(parts[4], 10);
+    const page = parseInt(parts[5], 10);
+    const user = db.getUser(targetId);
+    if (!user) { await answer('❌ Not found.'); return; }
+    const orders = db.getUserOrders(targetId);
+    const name = user.username || user.first_name || `User ${targetId}`;
+    const delivered = orders.filter(o => o.status === 'delivered').length;
+    const totalSpent = orders.filter(o => o.status === 'delivered').reduce((s, o) => s + (o.total_price || 0), 0);
+    await bot.editMessageText(
+      `📦 <b>${escapeHtml(name)}'s Purchases</b>\n\n` +
+      `🆔 User: <code>${targetId}</code>\n` +
+      `📊 Total Orders: <b>${orders.length}</b>\n` +
+      `✅ Delivered: <b>${delivered}</b>\n` +
+      `💰 Total Spent: <b>${formatPrice(totalSpent)}</b>\n\n` +
+      `Tap an order to see details (page ${page + 1}):`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: adminUserOrdersKb(targetId, orders, page) }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_user_orders_\d+$/.test(data)) {
+    const targetId = parseInt(data.split('_').pop(), 10);
+    const user     = db.getUser(targetId);
+    if (!user) { await answer('❌ Not found.'); return; }
+    const orders = db.getUserOrders(targetId);
+    const name = user.username || user.first_name || `User ${targetId}`;
+
+    if (!orders.length) {
+      await bot.editMessageText(
+        `📦 <b>${escapeHtml(name)}'s Purchases</b>\n\nNo orders yet.`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '🔙 Back to User', callback_data: `admin_user_${targetId}` }]] } }
+      );
+      return;
+    }
+
+    // Stats
+    const delivered  = orders.filter(o => o.status === 'delivered').length;
+    const totalSpent = orders.filter(o => o.status === 'delivered').reduce((s, o) => s + (o.total_price || 0), 0);
+
+    await bot.editMessageText(
+      `📦 <b>${escapeHtml(name)}'s Purchases</b>\n\n` +
+      `🆔 User: <code>${targetId}</code>\n` +
+      `📊 Total Orders: <b>${orders.length}</b>\n` +
+      `✅ Delivered: <b>${delivered}</b>\n` +
+      `💰 Total Spent: <b>${formatPrice(totalSpent)}</b>\n\n` +
+      `Tap an order to see details (showing latest 15):`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: adminUserOrdersKb(targetId, orders) }
+    );
+    return;
+  }
+
+  // ── View single order from user purchases ─────────────────────────
+  if (/^admin_user_order_\d+$/.test(data)) {
+    const orderId = parseInt(data.split('_').pop(), 10);
+    const order = db.getOrder(orderId);
+    if (!order) { await answer('❌ Order not found.'); return; }
+
+    const product = db.getProduct(order.product_id);
+    const statusEmoji = { pending: '⏳', delivered: '✅', cancelled: '❌' };
+    const emoji = statusEmoji[order.status] || '❓';
+
+    // Main info (no delivered content yet)
+    const mainText =
+      `📦 <b>Order #${order.id}</b>\n\n` +
+      `${emoji} <b>Status:</b> ${order.status.toUpperCase()}\n` +
+      `🛒 <b>Product:</b> ${escapeHtml(order.product_title || (product?.title || ''))}\n` +
+      `🔢 <b>Quantity:</b> ${order.quantity}\n` +
+      (order.email ? `📧 <b>Email:</b> ${escapeHtml(order.email)}\n` : '') +
+      `💵 <b>Total:</b> ${formatPrice(order.total_price)}\n` +
+      `💳 <b>Method:</b> ${order.payment_method || 'n/a'}\n` +
+      `👤 <b>User:</b> <code>${order.user_id}</code>\n` +
+      `📅 <b>Created:</b> ${(order.created_at || '').slice(0, 16)}\n` +
+      (order.paid_at ? `✅ <b>Paid:</b> ${(order.paid_at || '').slice(0, 16)}\n` : '');
+
+    await bot.editMessageText(
+      mainText,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: order.delivered_content ? undefined : adminUserOrderDetailKb(order.user_id) }
+    );
+
+    // Send full delivered content if exists (in chunks)
+    if (order.delivered_content) {
+      const fullContent = order.delivered_content;
+      const MAX_CHUNK = 3500;
+
+      await bot.sendMessage(
+        chatId,
+        `━━━━━━━━━━━━━━━━━━━━\n🎁 <b>Delivered Content (Full):</b>\n━━━━━━━━━━━━━━━━━━━━`,
+        { parse_mode: 'HTML' }
+      );
+
+      for (let i = 0; i < fullContent.length; i += MAX_CHUNK) {
+        const chunk = fullContent.slice(i, i + MAX_CHUNK);
+        try {
+          await bot.sendMessage(chatId, `<code>${escapeHtml(chunk)}</code>`, { parse_mode: 'HTML' });
+        } catch (e) {
+          await bot.sendMessage(chatId, chunk).catch(() => {});
+        }
+      }
+
+      await bot.sendMessage(
+        chatId,
+        `━━━━━━━━━━━━━━━━━━━━\n📦 End of order content`,
+        { parse_mode: 'HTML', reply_markup: adminUserOrderDetailKb(order.user_id) }
+      );
+    }
+    return;
+  }
+
+  // ── Orders ────────────────────────────────────────────────────────
+  // Pagination: admin_orders_p_PAGE
+  if (/^admin_orders_p_\d+$/.test(data)) {
+    const page = parseInt(data.split('_').pop(), 10);
+    const orders = db.getAllOrders ? db.getAllOrders() : [];
+    await bot.editMessageText(`📋 <b>All Orders</b> (${orders.length} total, page ${page + 1})`, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: adminOrdersKb(orders, page),
+    }).catch(() => {});
+    return;
+  }
+
+  if (data === 'admin_orders' || /^admin_orders_page_\d+$/.test(data)) {
+    const dbRaw   = require('../database/db');
+    const page    = data.startsWith('admin_orders_page_') ? parseInt(data.split('_').pop(), 10) : 0;
+    const perPage = 50;
+    const total   = dbRaw.prepare("SELECT COUNT(*) AS n FROM orders").get().n;
+    const orders  = dbRaw.prepare(`
+      SELECT o.*, p.title AS product_title, u.username
+      FROM orders o
+      LEFT JOIN products p ON o.product_id = p.id
+      LEFT JOIN users u ON o.user_id = u.telegram_id
+      ORDER BY o.created_at DESC
+      LIMIT ? OFFSET ?
+    `).all(perPage, page * perPage);
+
+    const navRow = [];
+    if (page > 0)                             navRow.push({ text: '⬅️ Newer', callback_data: `admin_orders_page_${page - 1}` });
+    if ((page + 1) * perPage < total)         navRow.push({ text: 'Older ➡️', callback_data: `admin_orders_page_${page + 1}` });
+
+    const kb = [
+      [{ text: '🔍 Search by Order #', callback_data: 'admin_orders_search' }],
+      [{ text: '🏆 Top Buyers', callback_data: 'admin_top_buyers' }],
+      ...adminOrdersKb(orders).inline_keyboard,
+    ];
+    if (navRow.length) kb.push(navRow);
+
+    const from = page * perPage + 1;
+    const to   = Math.min((page + 1) * perPage, total);
+    const txt  = `📋 <b>All Orders</b>\n${from}–${to} of ${total} total`;
+
+    try {
+      await bot.editMessageText(txt, {
+        chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: kb },
+      });
+    } catch (e) {
+      await bot.sendMessage(chatId, txt, {
+        parse_mode: 'HTML', reply_markup: { inline_keyboard: kb },
+      });
+    }
+    return;
+  }
+
+  // ── Search order by ID ─────────────────────────────────
+  if (data === 'admin_orders_search') {
+    session.set(userId, States.ADMIN_SEARCH_ORDER, {});
+    await bot.sendMessage(chatId,
+      '🔍 <b>Search Order</b>\n\nSend the order number (e.g. <code>1672</code>):',
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  // ── Top Buyers (leaderboard) ────────────────────────────
+  if (data === 'admin_top_buyers') {
+    const dbRaw = require('../database/db');
+    const top = dbRaw.prepare(`
+      SELECT user_id, COUNT(*) AS orders_count, COALESCE(SUM(total_price), 0) AS total_spent
+      FROM orders WHERE status='delivered'
+      GROUP BY user_id ORDER BY total_spent DESC LIMIT 20
+    `).all();
+
+    let txt = `🏆 <b>Top 20 Buyers</b>\n\n`;
+    if (!top.length) {
+      txt += '<i>No completed orders yet.</i>';
+    } else {
+      top.forEach((row, i) => {
+        const u = db.getUser(row.user_id);
+        const name = u ? (u.username ? '@' + u.username : (u.first_name || `User ${row.user_id}`)) : `User ${row.user_id}`;
+        const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i+1}.`;
+        txt += `${medal} ${escapeHtml(name)} — <b>${formatPrice(row.total_spent)}</b> (${row.orders_count} orders)\n`;
+      });
+    }
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Orders', callback_data: 'admin_orders' }]] }
+    }).catch(() => {});
+    return;
+  }
+
+  // ── Cancel an order + recover items + refund to wallet ──────────
+  // ── Admin: Force-cancel a pending order ─────────────────────────────────────
+  if (/^admin_force_cancel_\d+$/.test(data)) {
+    const orderId = parseInt(data.split('_').pop(), 10);
+    const order   = db.getOrder(orderId);
+    if (!order) { await answer('Order not found'); return; }
+    if (order.status !== 'pending') {
+      await answer(`Cannot cancel — status is "${order.status}"`);
+      return;
+    }
+    await bot.editMessageText(
+      `🚫 <b>Cancel Pending Order #${orderId}?</b>\n\n` +
+      `📦 Product: ${escapeHtml(order.product_title || 'N/A')}\n` +
+      `👤 Customer: <code>${order.user_id}</code>\n` +
+      `💵 Total: $${Number(order.total_price || 0).toFixed(2)}\n\n` +
+      `⚠️ No payment was taken (wallet orders are atomic).\n` +
+      `This will mark the order as cancelled.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: '✅ Yes, Cancel Order', callback_data: `admin_force_cancel_confirm_${orderId}` }],
+          [{ text: '🔙 Back', callback_data: `admin_order_view_${orderId}` }],
+        ]},
+      }
+    );
+    return;
+  }
+
+  if (/^admin_force_cancel_confirm_\d+$/.test(data)) {
+    const orderId = parseInt(data.split('_').pop(), 10);
+    const order   = db.getOrder(orderId);
+    if (!order || order.status !== 'pending') {
+      await answer('Order not found or already processed');
+      return;
+    }
+    db.updateOrderStatus(orderId, 'cancelled');
+    // Notify customer
+    try {
+      await bot.sendMessage(order.user_id,
+        `❌ <b>Order #${orderId} Cancelled</b>\n\n` +
+        `Your pending order has been cancelled by the admin.\n` +
+        `No payment was taken from your wallet.\n\n` +
+        `If you have questions, please contact support.`,
+        { parse_mode: 'HTML' }
+      );
+    } catch (e) {}
+    await bot.editMessageText(
+      `✅ <b>Order #${orderId} cancelled successfully.</b>\n\nCustomer has been notified.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '📋 All Orders', callback_data: 'admin_orders' }]] } }
+    );
+    return;
+  }
+
+  if (/^admin_order_cancel_\d+$/.test(data)) {
+    const orderId = parseInt(data.split('_').pop(), 10);
+    const order = db.getOrder(orderId);
+    if (!order) { await answer('❌ Order not found'); return; }
+
+    await bot.editMessageText(
+      `⚠️ <b>Cancel Order #${orderId}?</b>\n\n` +
+      `👤 User: <code>${order.user_id}</code>\n` +
+      `📦 ${escapeHtml(order.product_title || '')}\n` +
+      `🔢 Qty: ${order.quantity}\n` +
+      `💵 ${formatPrice(order.total_price)}\n` +
+      `⚡ Status: ${order.status}\n\n` +
+      `This will:\n` +
+      `• DELETE the order permanently\n` +
+      `• Items will NOT return to stock\n` +
+      `• <b>NO refund</b> to user`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: '🗑 Yes, DELETE order', callback_data: `admin_order_cancel_yes_${orderId}` }],
+          [{ text: '🔙 No, keep', callback_data: `admin_order_${orderId}` }],
+        ] } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_order_cancel_yes_\d+$/.test(data)) {
+    const orderId = parseInt(data.split('_').pop(), 10);
+    const order = db.getOrder(orderId);
+    if (!order) { await answer('❌ Order not found'); return; }
+
+    try {
+      // DELETE the order permanently — no recovery, no refund
+      const dbRaw = require('../database/db');
+      dbRaw.prepare(`DELETE FROM orders WHERE id = ?`).run(orderId);
+      try { dbRaw.prepare(`DELETE FROM transactions WHERE order_id = ?`).run(orderId); } catch (e) {}
+
+      await bot.editMessageText(
+        `🗑 <b>Order #${orderId} DELETED</b>\n\n` +
+        `📦 ${escapeHtml(order.product_title || '')}\n` +
+        `❌ No refund issued\n` +
+        `🚫 Order removed from database`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [
+            [{ text: '🔙 Back to Orders', callback_data: 'admin_orders' }],
+          ] } }
+      ).catch(() => {});
+      logger.info(`Admin ${userId} DELETED order #${orderId}`);
+    } catch (e) {
+      logger.error(`Cancel order failed: ${e.message}`);
+      await answer(`❌ ${e.message}`);
+    }
+    return;
+  }
+
+  if (/^admin_order_\d+$/.test(data)) {
+    const orderId = parseInt(data.split('_').pop(), 10);
+    const order   = db.getOrder(orderId);
+    if (!order) { await answer('❌ Not found.'); return; }
+    const u = db.getUser(order.user_id);
+    const username = u?.username ? `@${u.username}` : '—';
+    const fullName = [u?.first_name, u?.last_name].filter(Boolean).join(' ') || '—';
+    const isVip = u && db.isVIP(order.user_id) ? '👑 VIP' : '';
+
+    const text =
+      `📋 <b>Order #${orderId}</b> ${isVip}\n\n` +
+      `👤 <b>Customer</b>\n` +
+      `   Name: ${escapeHtml(fullName)}\n` +
+      `   Username: ${escapeHtml(username)}\n` +
+      `   ID: <code>${order.user_id}</code>\n` +
+      `   Balance: ${formatPrice(u?.balance || 0)}\n\n` +
+      `📦 <b>Product:</b> ${escapeHtml(order.product_title || 'Unknown')}\n` +
+      `🔢 <b>Qty:</b> ${order.quantity}\n` +
+      (order.email ? `📧 <b>Email:</b> ${escapeHtml(order.email)}\n` : '') +
+      `💵 <b>Total:</b> ${formatPrice(order.total_price)}\n` +
+      `💳 <b>Payment:</b> ${escapeHtml(order.payment_method || 'N/A')}\n` +
+      `⚡ <b>Status:</b> ${escapeHtml(order.status)}\n` +
+      `📅 <b>Date:</b> ${(order.created_at || '').slice(0, 16)}` +
+      (order.delivered_content ? `\n\n🎁 <b>Delivered:</b>\n<code>${escapeHtml(String(order.delivered_content).slice(0, 300))}</code>` : '');
+
+    const kb = { inline_keyboard: [
+      [{ text: '👤 View Customer Profile', callback_data: `admin_user_${order.user_id}` }],
+      ...(order.status === 'pending' ? [[{ text: '🚫 Cancel Pending Order', callback_data: `admin_force_cancel_${orderId}` }]] : []),
+      [{ text: '🗑 Delete Order', callback_data: `admin_order_cancel_${orderId}` }],
+      [{ text: '🔙 Back to Orders', callback_data: 'admin_orders' }],
+    ] };
+
+    try {
+      await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: kb });
+    } catch (e) {
+      logger.warn(`Order view failed: ${e.message}`);
+      try { await bot.deleteMessage(chatId, msgId); } catch (e2) {}
+      await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: kb });
+    }
+    return;
+  }
+
+  // ── Pending payments ──────────────────────────────────────────────
+  if (data === 'admin_pending') {
+    const payments = db.getPendingPayments();
+    if (!payments.length) {
+      await bot.editMessageText('💳 <b>No pending payments.</b>', {
+        chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminBackKb(),
+      });
+      return;
+    }
+    const lines = payments.map((p) => {
+      const name = p.username || p.first_name || `User ${p.user_id}`;
+      return `• #${p.id} — ${name} — $${Number(p.amount).toFixed(2)} — ${p.type} — ${(p.created_at || '').slice(0, 16)}`;
+    }).join('\n');
+    await bot.editMessageText(`💳 <b>Pending Payments (${payments.length})</b>\n\n${lines}`, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminBackKb(),
+    });
+    return;
+  }
+
+  // ── Broadcast ─────────────────────────────────────────────────────
+  if (data === 'admin_broadcast') {
+    session.set(userId, States.ADMIN_BROADCAST_MSG, {});
+    await bot.editMessageText(
+      '📣 <b>Broadcast</b>\n\nWrite the message to send to ALL users.\nSupports HTML formatting.',
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminBackKb() }
+    );
+    return;
+  }
+  if (data === 'admin_confirm_broadcast') {
+    const d = session.get(userId).data;
+    session.clear(userId);
+    await bot.editMessageText('📣 Broadcasting…', { chat_id: chatId, message_id: msgId });
+    const { sent, failed } = await broadcastToUsers(bot, d.broadcastText);
+    await bot.editMessageText(
+      `✅ <b>Broadcast Complete!</b>\n\n✅ Sent: ${sent}\n❌ Failed: ${failed}`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminBackKb() }
+    );
+    return;
+  }
+
+  // ── Statistics ────────────────────────────────────────────────────
+  // ── When do customers actually buy? ───────────────────────────────
+  if (data === 'admin_besttime' || /^admin_besttime_\d+$/.test(data)) {
+    const days = /^admin_besttime_\d+$/.test(data) ? parseInt(data.split('_').pop(), 10) : 30;
+    const offset = parseFloat(db.getSetting('shop_timezone_offset', '1')) || 0;
+    const r = db.salesByHour(days, offset);
+
+    if (!r.total) {
+      await bot.editMessageText(
+        `🕐 <b>Best selling hours</b>\n\nNo sales in the last ${days} days.`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminBackKb() }
+      ).catch(() => {});
+      return;
+    }
+
+    const peak = Math.max(...r.hours.map((h) => h.count));
+    const pad2 = (n) => String(n).padStart(2, '0');
+
+    // A bar per hour. Numbers alone make you hunt for the peak; a bar shows it
+    // at a glance, which is the entire question being asked.
+    const chart = r.hours.map((h, i) => {
+      const filled = peak ? Math.round((h.count / peak) * 12) : 0;
+      const bar = '█'.repeat(filled) + '░'.repeat(12 - filled);
+      return `${pad2(i)}h ${bar} ${String(h.count).padStart(3)}`;
+    }).join('\n');
+
+    // Best three-hour window — a single hour is noisy on small samples, and you
+    // cannot act on "18:00 exactly" anyway.
+    let bestStart = 0, bestSum = -1;
+    for (let i = 0; i < 24; i++) {
+      const sum = r.hours[i].count + r.hours[(i + 1) % 24].count + r.hours[(i + 2) % 24].count;
+      if (sum > bestSum) { bestSum = sum; bestStart = i; }
+    }
+
+    const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    const bestDay = r.dows.reduce((a, b, i) => (b.count > r.dows[a].count ? i : a), 0);
+    const topHours = r.hours.map((h, i) => ({ ...h, i }))
+      .sort((a, b) => b.count - a.count).slice(0, 3);
+
+    await bot.editMessageText(
+      `🕐 <b>Best selling hours</b>\n` +
+      `<i>Last ${days} days · ${r.total} orders · ${formatPrice(r.revenue)}</i>\n` +
+      `🌍 Times shown in UTC${offset >= 0 ? '+' : ''}${offset}\n\n` +
+      `🔥 <b>Busiest window: ${pad2(bestStart)}:00 – ${pad2((bestStart + 3) % 24)}:00</b>\n` +
+      `   ${bestSum} orders (${Math.round((bestSum / r.total) * 100)}% of all sales)\n` +
+      `📅 <b>Best day: ${dayNames[bestDay]}</b> — ${r.dows[bestDay].count} orders\n\n` +
+      `<b>Top hours</b>\n` +
+      topHours.map((h) => `  ${pad2(h.i)}:00 — ${h.count} orders · ${formatPrice(h.revenue)}`).join('\n') +
+      `\n\n<code>${chart}</code>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: `${days === 7 ? '✅ ' : ''}7 days`,  callback_data: 'admin_besttime_7' },
+           { text: `${days === 30 ? '✅ ' : ''}30 days`, callback_data: 'admin_besttime_30' },
+           { text: `${days === 90 ? '✅ ' : ''}90 days`, callback_data: 'admin_besttime_90' }],
+          [{ text: `🌍 Timezone (UTC${offset >= 0 ? '+' : ''}${offset})`, callback_data: 'admin_shop_tz' }],
+          [{ text: '🔙 Back', callback_data: 'admin_panel' }],
+        ] } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (data === 'admin_shop_tz') {
+    const cur = String(db.getSetting('shop_timezone_offset', '1'));
+    const opts = ['-5', '-3', '0', '1', '2', '3', '4', '5.5', '8'];
+    const rows = [];
+    for (let i = 0; i < opts.length; i += 3) {
+      rows.push(opts.slice(i, i + 3).map((o) => ({
+        text: `${cur === o ? '✅ ' : ''}UTC${Number(o) >= 0 ? '+' : ''}${o}`,
+        callback_data: `admin_shop_tz_${o}`,
+      })));
+    }
+    rows.push([{ text: '🔙 Back', callback_data: 'admin_besttime' }]);
+    await bot.editMessageText(
+      `🌍 <b>Your timezone</b>\n\nOrders are stored in UTC. Set your offset so the ` +
+      `hours below are the ones on your own clock.\n\nTunisia is <b>UTC+1</b>.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_shop_tz_/.test(data)) {
+    db.setSetting('shop_timezone_offset', data.replace('admin_shop_tz_', ''));
+    return handleAdminCallback(bot, { ...query, data: 'admin_besttime' });
+  }
+
+  if (data === 'admin_stats') {
+    const s = db.getStats();
+    const topList = s.topProducts
+      .map((p, i) => `  ${i + 1}. ${p.title} — ${p.sales_count || p.sold_count || 0} sold`)
+      .join('\n') || '  No data yet';
+    await bot.editMessageText(
+      `📊 <b>Store Statistics</b>\n\n` +
+      `👥 Total Users: <b>${s.totalUsers}</b>\n🆕 New Today: <b>${s.newToday}</b>\n\n` +
+      `📦 Total Orders: <b>${s.totalOrders}</b>\n✅ Delivered: <b>${s.delivered}</b>\n⏳ Pending: <b>${s.pending}</b>\n\n` +
+      `💰 Revenue: <b>${formatPrice(s.revenue)}</b>\n\n🏆 <b>Top Products:</b>\n${topList}`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminBackKb() }
+    );
+    return;
+  }
+
+  // ══════════════════════════════════════════════════════════════════
+  // PRODUCT ORDERING — pick one list, pick a product up, drop it
+  // ══════════════════════════════════════════════════════════════════
+  if (data === 'admin_sort_products') {
+    // Coming in from the panel always starts clean.
+    sortHeld.delete(userId);
+    sortScope.delete(userId);
+    await renderSortPicker();
+    return;
+  }
+
+  // Choose which customer-facing list to arrange.
+  if (/^admin_sortscope_(other|\d+)$/.test(data)) {
+    const raw = data.split('_').pop();
+    sortScope.set(userId, raw === 'other' ? null : parseInt(raw, 10));
+    sortHeld.delete(userId);
+    await renderSortScreen(0);
+    return;
+  }
+
+  if (/^admin_sort_p_\d+$/.test(data)) {
+    await renderSortScreen(parseInt(data.split('_').pop(), 10));
+    return;
+  }
+
+  // Pick a product up.
+  if (/^admin_sortgrab_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const list = scopeProducts(userId);
+    const idx  = list.findIndex((p) => p.id === productId);
+    if (idx === -1) { await renderSortScreen(0, '❌ That product is no longer in this list.'); return; }
+
+    sortHeld.set(userId, productId);
+    await renderSortScreen(Math.floor(idx / SORT_PAGE_SIZE));
+    return;
+  }
+
+  // Drop it on an exact position.
+  if (/^admin_sortdrop_\d+$/.test(data)) {
+    const target = parseInt(data.split('_').pop(), 10);
+    const productId = sortHeld.get(userId);
+    if (!productId) { await renderSortScreen(0, '👆 Pick a product first.'); return; }
+
+    const newIdx = moveProductTo(userId, productId, target - 1);
+    if (newIdx === -1) { sortHeld.delete(userId); await renderSortScreen(0, '❌ That product is no longer in this list.'); return; }
+    await renderSortScreen(Math.floor(newIdx / SORT_PAGE_SIZE), `✅ Moved to <b>#${newIdx + 1}</b>`);
+    return;
+  }
+
+  // Nudge / send to an end. The product stays in hand so corrections chain.
+  if (/^admin_sortmv_(top|up|dn|bot)$/.test(data)) {
+    const dir = data.split('_').pop();
+    const productId = sortHeld.get(userId);
+    if (!productId) { await renderSortScreen(0, '👆 Pick a product first.'); return; }
+
+    const list = scopeProducts(userId);
+    const idx  = list.findIndex((p) => p.id === productId);
+    if (idx === -1) { sortHeld.delete(userId); await renderSortScreen(0, '❌ That product is no longer in this list.'); return; }
+
+    const targets = { top: 0, up: idx - 1, dn: idx + 1, bot: list.length - 1 };
+    const wanted  = targets[dir];
+    if (wanted === idx || wanted < 0 || wanted > list.length - 1) {
+      const edge = (dir === 'up' || dir === 'top') ? '⛔ Already first' : '⛔ Already last';
+      await renderSortScreen(Math.floor(idx / SORT_PAGE_SIZE), edge);
+      return;
+    }
+
+    const newIdx = moveProductTo(userId, productId, wanted);
+    await renderSortScreen(Math.floor(newIdx / SORT_PAGE_SIZE), `✅ Moved to <b>#${newIdx + 1}</b>`);
+    return;
+  }
+
+  // Put it down — back to browsing this list.
+  if (data === 'admin_sortdone') {
+    const productId = sortHeld.get(userId);
+    sortHeld.delete(userId);
+    const list = scopeProducts(userId);
+    const idx  = productId ? list.findIndex((p) => p.id === productId) : -1;
+    await renderSortScreen(
+      idx >= 0 ? Math.floor(idx / SORT_PAGE_SIZE) : 0,
+      idx >= 0 ? `✅ Saved at <b>#${idx + 1}</b>` : ''
+    );
+    return;
+  }
+
+  // Back to the list picker.
+  if (data === 'admin_sortlists') {
+    sortHeld.delete(userId);
+    await renderSortPicker();
+    return;
+  }
+
+  // ── Legacy ordering buttons ───────────────────────────────────────
+  // The screen no longer prints any of these, but a message an admin scrolled
+  // back to still carries them. They all land on the list picker rather than
+  // acting: the old buttons were built against one flat, global list, and
+  // honouring them now would reorder products across category boundaries.
+  if (/^admin_(sortitem|moveup|movedown|setorder)_\d+$/.test(data) ||
+      data === 'admin_sortbynum' || data === 'admin_resetorder') {
+    sortHeld.delete(userId);
+    sortScope.delete(userId);
+    await renderSortPicker();
+    return;
+  }
+
+  // ── Profits ──────────────────────────────────────────────────────
+  if (data === 'admin_profits') {
+    await bot.editMessageText(
+      '📈 <b>Profit Reports</b>\n\nSelect a time period:',
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminProfitsKb() }
+    );
+    return;
+  }
+  // Helper: format a profit block
+  const formatProfitBlock = (label, data) => {
+    const margin = data.revenue > 0 ? ((data.net_profit / data.revenue) * 100).toFixed(1) : '0.0';
+    return `<b>${label}</b>\n\n` +
+      `📦 Orders: <b>${data.orders_count || 0}</b>\n` +
+      `💰 Revenue: <b>${formatPrice(data.revenue || 0)}</b>\n` +
+      `💸 Cost: <b>${formatPrice(data.cost || 0)}</b>\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `📈 <b>Net Profit: ${formatPrice(data.net_profit || 0)}</b>\n` +
+      `📊 Margin: <b>${margin}%</b>`;
+  };
+
+  if (data === 'admin_profit_today') {
+    const stats = db.getProfitToday();
+    await bot.editMessageText(
+      `📅 ${formatProfitBlock("Today's Profit", stats)}\n\n` +
+      `<i>💡 Add cost prices in Edit Product → Cost Price for accurate profit.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminProfitsKb() }
+    );
+    return;
+  }
+  if (data === 'admin_profit_7days') {
+    const stats = db.getProfitLast7Days();
+    await bot.editMessageText(
+      `📆 ${formatProfitBlock('Last 7 Days Profit', stats)}`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminProfitsKb() }
+    );
+    return;
+  }
+  if (data === 'admin_profit_month') {
+    const stats = db.getProfitThisMonth();
+    await bot.editMessageText(
+      `🗓 ${formatProfitBlock("This Month's Profit", stats)}`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminProfitsKb() }
+    );
+    return;
+  }
+  if (data === 'admin_profit_breakdown') {
+    const rows = db.getProfitByDay();
+    if (!rows.length) {
+      await bot.editMessageText('📊 No sales data yet.', {
+        chat_id: chatId, message_id: msgId, reply_markup: adminProfitsKb(),
+      });
+      return;
+    }
+    const lines = rows.map((r) => {
+      return `📅 <b>${r.day}</b> — 📈 ${formatPrice(r.net_profit)} (${r.orders_count} orders, rev ${formatPrice(r.revenue)})`;
+    }).join('\n');
+    await bot.editMessageText(
+      `📊 <b>Daily Net Profit Breakdown (Last 30 days)</b>\n\n${lines}`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminProfitsKb() }
+    );
+    return;
+  }
+
+  // ── Pre-Orders Main Menu ──────────────────────────────────────────
+  if (data === 'admin_preorders') {
+    const stats = db.getPreorderStats();
+    await bot.editMessageText(
+      `🔜 <b>Pre-Orders</b>\n\n` +
+      `📊 Total: <b>${stats.total || 0}</b>\n` +
+      `⏳ Reserved: <b>${stats.reserved || 0}</b>\n` +
+      `✅ Delivered: <b>${stats.delivered || 0}</b>\n` +
+      `💰 Total Revenue: <b>${formatPrice(stats.total_revenue || 0)}</b>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminPreordersMainKb() }
+    );
+    return;
+  }
+
+  if (data === 'admin_preorders_list') {
+    const all = db.getAllPreorders();
+    if (!all.length) {
+      await bot.editMessageText('🔜 No pre-orders yet.', {
+        chat_id: chatId, message_id: msgId, reply_markup: adminPreordersMainKb(),
+      });
+      return;
+    }
+    await bot.editMessageText(
+      `📋 <b>All Pre-Orders</b> (showing latest 15)`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: adminPreordersListKb(all) }
+    );
+    return;
+  }
+
+  if (data === 'admin_preorders_manage') {
+    const products = db.getAllActiveProducts();
+    if (!products.length) {
+      await bot.editMessageText('📦 No products available.', {
+        chat_id: chatId, message_id: msgId, reply_markup: adminPreordersMainKb(),
+      });
+      return;
+    }
+    await bot.editMessageText(
+      `⚙️ <b>Manage Pre-Orders by Product</b>\n\n` +
+      `Format: ✅ = enabled, ⚪ = disabled\n` +
+      `(reserved / max)`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: adminPreorderProductsKb(products) }
+    );
+    return;
+  }
+
+  // ── Confirm pre-order delivery (after stock was added) ────────────
+  if (/^admin_pre_confirm_deliver_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const pending = db.getReservedPreordersByProduct(productId);
+    if (!pending.length) {
+      await bot.editMessageText('ℹ️ No pending pre-orders for this product.', {
+        chat_id: chatId, message_id: msgId, reply_markup: adminBackKb(),
+      });
+      return;
+    }
+    const productLatest = db.getProduct(productId);
+    let delivered = 0;
+    let failed = 0;
+    let lastError = null;
+
+    for (const r of pending) {
+      try {
+        const itemContent = db.deliverOrder(0, productId, r.quantity, 'preorder', r.user_id);
+        if (!itemContent) {
+          failed++;
+          continue;
+        }
+        db.markPreorderDelivered(r.id, itemContent);
+
+        const now = new Date();
+        const pad = (n) => String(n).padStart(2, '0');
+        const dateStr =
+          pad(now.getDate()) + '/' + pad(now.getMonth() + 1) + '/' + now.getFullYear() +
+          ' ' + pad(now.getHours()) + ':' + pad(now.getMinutes());
+
+        const instr = (productLatest && productLatest.instruction)
+          ? `\n━━━━━━━━━━━━━━━━━━━━\n📌 <b>Instructions:</b>\n${escapeHtml(productLatest.instruction)}\n` : '';
+
+        const msg =
+          `🎉 <b>Your Pre-Order is Ready!</b>\n\n` +
+          `📦 ${escapeHtml(productLatest?.title || '')} ×${r.quantity}\n` +
+          (r.email ? `📧 ${escapeHtml(r.email)}\n` : '') +
+          `💵 ${formatPrice(r.total_paid)}\n` +
+          `📅 Delivered: ${dateStr}\n\n` +
+          `━━━━━━━━━━━━━━━━━━━━\n` +
+          `🎁 <b>Your Product(s):</b>\n\n<code>${escapeHtml(itemContent)}</code>\n` +
+          `━━━━━━━━━━━━━━━━━━━━${instr}\n` +
+          `✨ Thank you for your patience!`;
+
+        try {
+          await bot.sendMessage(r.user_id, msg, { parse_mode: 'HTML' });
+          delivered++;
+          logger.info(`[PREORDER AUTO] Delivered preorder #${r.id} to user ${r.user_id}`);
+        } catch (sendErr) {
+          try {
+            const plainMsg = msg.replace(/<\/?[^>]+>/g, '');
+            await bot.sendMessage(r.user_id, plainMsg);
+            delivered++;
+          } catch (e2) {
+            lastError = e2.message;
+            failed++;
+            logger.error(`[PREORDER AUTO FAIL] ${r.user_id}: ${e2.message}`);
+          }
+        }
+      } catch (e) {
+        lastError = e.message;
+        failed++;
+      }
+    }
+
+    await bot.editMessageText(
+      `✅ <b>Pre-Order Delivery Complete</b>\n\n` +
+      `📦 Product: ${escapeHtml(productLatest?.title || '')}\n` +
+      `✅ Delivered: <b>${delivered}</b>\n` +
+      (failed > 0 ? `⚠️ Failed: <b>${failed}</b>${lastError ? `\n(${escapeHtml(lastError)})` : ''}` : ''),
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Admin Panel', callback_data: 'admin_panel' }]] } }
+    );
+    return;
+  }
+
+  if (/^admin_pre_skip_deliver_\d+$/.test(data)) {
+    await bot.editMessageText(
+      `🚫 <b>Pre-Order delivery skipped.</b>\n\n` +
+      `The stock you added remains in inventory.\n` +
+      `You can deliver pre-orders manually from Pre-Orders → View All.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Admin Panel', callback_data: 'admin_panel' }]] } }
+    );
+    return;
+  }
+
+  // ── Search User ───────────────────────────────────────────────────
+  if (data === 'admin_user_search') {
+    session.set(userId, States.ADMIN_USER_SEARCH, {});
+    await bot.editMessageText(
+      `🔍 <b>Search User</b>\n\n` +
+      `Type any of:\n` +
+      `• User ID (e.g. <code>5626665035</code>)\n` +
+      `• @username (with or without @)\n` +
+      `• First name or last name\n\n` +
+      `Partial matches are supported.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'admin_users' }]] } }
+    );
+    return;
+  }
+
+  // Setup pre-order for a specific product
+  if (/^admin_pre_setup_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product = db.getProduct(productId);
+    if (!product) { await answer('Not found'); return; }
+    await bot.editMessageText(
+      `⚙️ <b>Pre-Order: ${product.title}</b>\n\n` +
+      `Status: ${product.preorder_enabled ? '✅ <b>ENABLED</b>' : '⚪ Disabled'}\n` +
+      `Max Quantity: <b>${product.preorder_max || 0}</b>\n` +
+      `Reserved So Far: <b>${product.preorder_count || 0}</b>\n` +
+      `Remaining Slots: <b>${Math.max(0, (product.preorder_max || 0) - (product.preorder_count || 0))}</b>\n` +
+      `Price: <b>${formatPrice(product.price)}</b>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: adminPreorderSetupKb(productId, !!product.preorder_enabled) }
+    );
+    return;
+  }
+
+  // Toggle enable/disable
+  if (/^admin_pre_toggle_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product = db.getProduct(productId);
+    const newVal = product.preorder_enabled ? 0 : 1;
+    db.updateProduct(productId, 'preorder_enabled', newVal);
+    await answer(newVal ? '✅ Pre-Order enabled' : '❌ Pre-Order disabled');
+    const updated = db.getProduct(productId);
+    await bot.editMessageText(
+      `⚙️ <b>Pre-Order: ${updated.title}</b>\n\n` +
+      `Status: ${updated.preorder_enabled ? '✅ <b>ENABLED</b>' : '⚪ Disabled'}\n` +
+      `Max Quantity: <b>${updated.preorder_max || 0}</b>\n` +
+      `Reserved So Far: <b>${updated.preorder_count || 0}</b>\n` +
+      `Remaining Slots: <b>${Math.max(0, (updated.preorder_max || 0) - (updated.preorder_count || 0))}</b>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: adminPreorderSetupKb(productId, !!updated.preorder_enabled) }
+    );
+    return;
+  }
+
+  // Set max quantity
+  if (/^admin_pre_setmax_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product = db.getProduct(productId);
+    session.set(userId, States.ADMIN_PRE_SET_MAX, { preProductId: productId });
+    await bot.editMessageText(
+      `🔢 <b>Set Max Pre-Order Quantity</b>\n\n` +
+      `Product: ${product.title}\n` +
+      `Current max: <b>${product.preorder_max || 0}</b>\n\n` +
+      `Enter new max quantity (number of slots customers can reserve):`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: `admin_pre_setup_${productId}` }]] } }
+    );
+    return;
+  }
+
+  // View reservations for a product
+  if (/^admin_pre_reservations_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product = db.getProduct(productId);
+    const reservations = db.getReservedPreordersByProduct(productId);
+    if (!reservations.length) {
+      await bot.editMessageText(
+        `📋 <b>${product.title}</b>\n\nNo active reservations yet.`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: `admin_pre_setup_${productId}` }]] } }
+      );
+      return;
+    }
+    const lines = reservations.map((r, i) => {
+      const name = r.username || r.first_name || `User ${r.user_id}`;
+      const email = r.email ? `📧 ${r.email}` : '';
+      return `${i+1}. <b>${name}</b> (<code>${r.user_id}</code>)\n` +
+             `   Qty: ${r.quantity} | Paid: ${formatPrice(r.total_paid)} | ${(r.created_at || '').slice(0, 16)}\n` +
+             (email ? `   ${email}\n` : '');
+    }).join('\n');
+    await bot.editMessageText(
+      `📋 <b>Reservations for ${product.title}</b>\n\n${lines}`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: '📦 Deliver All Now', callback_data: `admin_pre_deliverall_${productId}` }],
+          [{ text: '🔙 Back', callback_data: `admin_pre_setup_${productId}` }],
+        ] } }
+    );
+    return;
+  }
+
+  // Deliver all reservations of a product (uses available stock)
+  if (/^admin_pre_deliverall_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product = db.getProduct(productId);
+    const reservations = db.getReservedPreordersByProduct(productId);
+    if (!reservations.length) {
+      await answer('No reservations');
+      return;
+    }
+    let delivered = 0;
+    let failed    = 0;
+    for (const r of reservations) {
+      try {
+        const content = db.deliverOrder(0, productId, r.quantity, 'preorder', r.user_id);
+        if (!content) { failed++; continue; }
+        db.markPreorderDelivered(r.id, content);
+
+        // Send to user
+        const purchaseDate = new Date().toLocaleString();
+        const instr = product.instruction
+          ? `\n━━━━━━━━━━━━━━━━━━━━\n📌 <b>Instructions:</b>\n${product.instruction}\n` : '';
+        await bot.sendMessage(
+          r.user_id,
+          `🎉 <b>Your Pre-Order is Ready!</b>\n\n` +
+          `📦 Order: ${product.title} ×${r.quantity}\n` +
+          (r.email ? `📧 ${r.email}\n` : '') +
+          `💵 ${formatPrice(r.total_paid)}\n` +
+          `📅 Delivered: ${purchaseDate}\n\n` +
+          `━━━━━━━━━━━━━━━━━━━━\n` +
+          `🎁 <b>Your Product(s):</b>\n\n${content}\n` +
+          `━━━━━━━━━━━━━━━━━━━━${instr}\n` +
+          `✨ Thank you for your patience!`,
+          { parse_mode: 'HTML' }
+        ).catch(() => {});
+
+        delivered++;
+      } catch (e) {
+        logger.warn(`Pre-order deliver fail #${r.id}: ${e.message}`);
+        failed++;
+      }
+    }
+    await bot.editMessageText(
+      `📦 <b>Bulk Delivery Complete</b>\n\n` +
+      `✅ Delivered: ${delivered}\n` +
+      `❌ Failed (out of stock): ${failed}`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: `admin_pre_setup_${productId}` }]] } }
+    );
+    return;
+  }
+
+  // Pre-order detail
+  if (/^admin_pre_detail_\d+$/.test(data)) {
+    const preId = parseInt(data.split('_').pop(), 10);
+    const pr = db.getPreorderById(preId);
+    if (!pr) { await answer('Not found'); return; }
+    const product = db.getProduct(pr.product_id);
+    const user = db.getUser(pr.user_id);
+    const name = user?.username || user?.first_name || `User ${pr.user_id}`;
+
+    // ── Product full details block ─────────────────────────────────
+    let productBlock = '';
+    if (product) {
+      productBlock =
+        `━━━━━━━━━━━━━━━━━━━━\n` +
+        `📦 <b>PRODUCT DETAILS</b>\n\n` +
+        `🛒 <b>Name:</b> ${escapeHtml(product.title || '')}\n` +
+        `📝 <b>Description:</b> ${escapeHtml((product.description || '').slice(0, 200))}\n` +
+        `💵 <b>Price:</b> ${formatPrice(product.price)}\n` +
+        (product.cost_price ? `💸 <b>Cost:</b> ${formatPrice(product.cost_price)}\n` : '') +
+        `🛡 <b>Warranty:</b> ${product.warranty || 'N/A'}\n` +
+        `📦 <b>Current Stock:</b> ${product.stock_quantity || 0}\n` +
+        `📈 <b>Total Sales:</b> ${product.sales_count || 0}\n` +
+        `🔜 <b>Pre-Order Reservations:</b> ${product.preorder_count || 0} / ${product.preorder_max || 0}\n` +
+        (product.instruction ? `📌 <b>Instructions:</b>\n${escapeHtml(product.instruction.slice(0, 200))}\n` : '') +
+        `━━━━━━━━━━━━━━━━━━━━\n`;
+    }
+
+    // Main info block (without delivered content)
+    const mainText =
+      `🔜 <b>Pre-Order #${pr.id}</b>\n\n` +
+      `👤 <b>User:</b> ${escapeHtml(name)} (<code>${pr.user_id}</code>)\n` +
+      `💰 <b>User Balance:</b> ${formatPrice(user?.balance || 0)}\n` +
+      `🔢 <b>Quantity:</b> ${pr.quantity}\n` +
+      (pr.email ? `📧 <b>Email:</b> ${escapeHtml(pr.email)}\n` : '') +
+      `💵 <b>Paid:</b> ${formatPrice(pr.total_paid)}\n` +
+      `💳 <b>Method:</b> ${pr.payment_method || 'n/a'}\n` +
+      `📅 <b>Created:</b> ${(pr.created_at || '').slice(0, 16)}\n` +
+      `📊 <b>Status:</b> ${pr.status.toUpperCase()}` +
+      (pr.delivered_at ? `\n✅ <b>Delivered At:</b> ${(pr.delivered_at || '').slice(0, 16)}` : '') +
+      `\n\n` + productBlock;
+
+    // Send main info
+    await bot.editMessageText(
+      mainText,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: pr.status === 'delivered' ? undefined : adminPreorderDetailKb(pr.id, pr.status) }
+    );
+
+    // If delivered, send the full delivered content in separate messages (no truncation)
+    if (pr.status === 'delivered' && pr.delivered_content) {
+      const fullContent = pr.delivered_content;
+      const MAX_CHUNK = 3500; // Safe Telegram chunk size
+
+      // Header for delivered content
+      await bot.sendMessage(
+        chatId,
+        `━━━━━━━━━━━━━━━━━━━━\n🎁 <b>Delivered Content (Full):</b>\n━━━━━━━━━━━━━━━━━━━━`,
+        { parse_mode: 'HTML' }
+      );
+
+      // Split into chunks if too long
+      for (let i = 0; i < fullContent.length; i += MAX_CHUNK) {
+        const chunk = fullContent.slice(i, i + MAX_CHUNK);
+        try {
+          await bot.sendMessage(
+            chatId,
+            `<code>${escapeHtml(chunk)}</code>`,
+            { parse_mode: 'HTML' }
+          );
+        } catch (e) {
+          // Fallback: send plain text
+          await bot.sendMessage(chatId, chunk).catch(() => {});
+        }
+      }
+
+      // Footer with back button
+      await bot.sendMessage(
+        chatId,
+        `━━━━━━━━━━━━━━━━━━━━\n📦 End of delivered content for Pre-Order #${pr.id}`,
+        { parse_mode: 'HTML', reply_markup: adminPreorderDetailKb(pr.id, pr.status) }
+      );
+    }
+    return;
+  }
+
+  // Deliver single pre-order — ASK ADMIN FOR THE CONTENT (manual delivery)
+  if (/^admin_pre_deliver_\d+$/.test(data)) {
+    const preId = parseInt(data.split('_').pop(), 10);
+    const pr = db.getPreorderById(preId);
+    if (!pr || pr.status !== 'reserved') { await answer('Not deliverable'); return; }
+    const product = db.getProduct(pr.product_id);
+    const user = db.getUser(pr.user_id);
+    const name = user?.username || user?.first_name || `User ${pr.user_id}`;
+    session.set(userId, States.ADMIN_PRE_SEND_CONTENT, { sendPreId: preId });
+    logger.info(`[PREORDER DELIVER] Admin ${userId} preparing to send preorder #${preId} to user ${pr.user_id}`);
+    await bot.editMessageText(
+      `📦 <b>Send Pre-Order #${pr.id}</b>\n\n` +
+      `👤 To: <b>${escapeHtml(name)}</b> (<code>${pr.user_id}</code>)\n` +
+      `🛒 Product: ${escapeHtml(product?.title || '')}\n` +
+      `🔢 Quantity: <b>${pr.quantity}</b>\n` +
+      (pr.email ? `📧 Email: ${escapeHtml(pr.email)}\n` : '') +
+      `💵 Paid: ${formatPrice(pr.total_paid)}\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `📝 <b>Now type the content to send to the customer.</b>\n\n` +
+      `Example: Login email + password\n` +
+      `Use # to separate multiple accounts if quantity > 1`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Cancel', callback_data: `admin_pre_detail_${preId}` }]] } }
+    );
+    return;
+  }
+
+  // Refund single pre-order
+  if (/^admin_pre_refund_\d+$/.test(data)) {
+    const preId = parseInt(data.split('_').pop(), 10);
+    const pr = db.getPreorderById(preId);
+    if (!pr || pr.status !== 'reserved') { await answer('Cannot refund'); return; }
+    db.updateBalance(pr.user_id, pr.total_paid);
+    db.addTransaction({
+      userId:      pr.user_id,
+      type:        'refund',
+      amount:      pr.total_paid,
+      description: `Pre-Order #${pr.id} refund`,
+      refId:       null,
+      orderId:     pr.order_id || null,
+    });
+    db.markPreorderRefunded(pr.id);
+    db.incrementPreorderCount(pr.product_id, -pr.quantity);
+    await bot.sendMessage(
+      pr.user_id,
+      `💸 Your pre-order #${pr.id} has been refunded.\n` +
+      `Amount: <b>${formatPrice(pr.total_paid)}</b> added to your wallet.`,
+      { parse_mode: 'HTML' }
+    ).catch(() => {});
+    await answer('✅ Refunded');
+    await bot.editMessageText(
+      `💸 <b>Pre-Order #${pr.id} Refunded</b>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'admin_preorders_list' }]] } }
+    );
+    return;
+  }
+
+  // ── Emoji Library ─────────────────────────────────────────────────
+  // ── Emoji Picker (used during field editing) ──────────────────────
+  if (data === 'admin_emoji_picker') {
+    const emojis = db.getAllEmojis();
+    if (!emojis.length) {
+      await answer('Library is empty. Add emojis first.');
+      return;
+    }
+    // Show as a grid of buttons (up to 30 emojis)
+    const rows = [];
+    let current = [];
+    for (let i = 0; i < emojis.length && i < 30; i++) {
+      const e = emojis[i];
+      current.push({ text: `${e.fallback} ${e.name}`, callback_data: `admin_emoji_use_${e.id}` });
+      if (current.length === 2) {
+        rows.push(current);
+        current = [];
+      }
+    }
+    if (current.length) rows.push(current);
+    rows.push([{ text: '🔙 Cancel', callback_data: 'admin_panel' }]);
+
+    await bot.sendMessage(
+      chatId,
+      `🎨 <b>Pick an Emoji</b>\n\n` +
+      `Tap one — the code will be sent to you as a copyable message.\n` +
+      `<i>Then long-press it → Copy → paste into your text above.</i>`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }
+    );
+    return;
+  }
+
+  // ── Use a specific emoji (sends it as copyable code) ──────────────
+  if (/^admin_emoji_use_\d+$/.test(data)) {
+    const emojiDbId = parseInt(data.split('_').pop(), 10);
+    const emoji = db.getEmojiById(emojiDbId);
+    if (!emoji) { await answer('Not found'); return; }
+    const code = `[emoji:${emoji.emoji_id}]${emoji.fallback}`;
+    await bot.sendMessage(
+      chatId,
+      `✅ <b>Tap below to copy:</b>\n\n` +
+      `<code>${code}</code>\n\n` +
+      `Preview: <tg-emoji emoji-id="${emoji.emoji_id}">${emoji.fallback}</tg-emoji>\n\n` +
+      `👆 Long-press → Copy → paste into your text above.`,
+      { parse_mode: 'HTML' }
+    );
+    await answer('✅ Copy from message above');
+    return;
+  }
+
+  if (data === 'admin_emojis') {
+    const emojis = db.getAllEmojis();
+    const emptyKb = { inline_keyboard: [
+      [{ text: '➕ Add New Emoji', callback_data: 'admin_emoji_add' }],
+      [{ text: '🔙 Back', callback_data: 'admin_panel' }],
+    ] };
+
+    if (!emojis.length) {
+      const emptyText = `🎨 <b>Emoji Library</b>\n\n📭 Empty.\n\nAdd premium emojis here to reuse them anywhere.\nType <code>/emojis</code> anytime to see your library.`;
+      try {
+        await bot.editMessageText(emptyText, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: emptyKb });
+      } catch (e) {
+        // Edit failed (was photo) - delete & send new
+        try { await bot.deleteMessage(chatId, msgId); } catch (e2) {}
+        await bot.sendMessage(chatId, emptyText, { parse_mode: 'HTML', reply_markup: emptyKb });
+      }
+      return;
+    }
+
+    // Build preview message with all emojis rendered live
+    let preview = `🎨 <b>Emoji Library</b> (${emojis.length} emoji)\n\n`;
+    preview += `Long-press any line to copy & paste it:\n\n`;
+    for (const e of emojis) {
+      preview += `<tg-emoji emoji-id="${e.emoji_id}">${e.fallback}</tg-emoji> <b>${escapeHtml(e.name)}</b>\n`;
+      preview += `<code>[emoji:${e.emoji_id}]${e.fallback}</code>\n\n`;
+    }
+
+    try {
+      await bot.editMessageText(preview, {
+        chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: adminEmojiLibraryKb(emojis),
+      });
+    } catch (e) {
+      // Edit failed - delete & send new
+      try { await bot.deleteMessage(chatId, msgId); } catch (e2) {}
+      await bot.sendMessage(chatId, preview, { parse_mode: 'HTML', reply_markup: adminEmojiLibraryKb(emojis) });
+    }
+    return;
+  }
+
+  if (data === 'admin_emoji_add') {
+    session.set(userId, States.ADMIN_EMOJI_ADD, {});
+    await bot.editMessageText(
+      `➕ <b>Add Emoji to Library</b>\n\n` +
+      `Send the emoji info in this format:\n\n` +
+      `<code>name|EMOJI_ID|fallback_emoji</code>\n\n` +
+      `<b>Example:</b>\n` +
+      `<code>fire|5368324170671202286|🔥</code>\n` +
+      `<code>gift|5345783234567890123|🎁</code>\n\n` +
+      `<b>Tips:</b>\n` +
+      `• <b>name</b>: short label (no spaces)\n` +
+      `• <b>EMOJI_ID</b>: numeric ID from @emojiidbot\n` +
+      `• <b>fallback</b>: emoji shown to non-Premium users`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Cancel', callback_data: 'admin_emojis' }]] } }
+    );
+    return;
+  }
+
+  if (/^admin_emoji_view_\d+$/.test(data)) {
+    const emojiId = parseInt(data.split('_').pop(), 10);
+    const emoji = db.getEmojiById(emojiId);
+    if (!emoji) { await answer('Not found'); return; }
+    await bot.sendMessage(
+      chatId,
+      `🎨 <b>${escapeHtml(emoji.name)}</b>\n\n` +
+      `Preview: <tg-emoji emoji-id="${emoji.emoji_id}">${emoji.fallback}</tg-emoji>\n\n` +
+      `Copy this and paste anywhere:\n` +
+      `<code>[emoji:${emoji.emoji_id}]${emoji.fallback}</code>`,
+      { parse_mode: 'HTML' }
+    );
+    await answer('Copied below ⬆');
+    return;
+  }
+
+  if (/^admin_emoji_del_\d+$/.test(data)) {
+    const emojiId = parseInt(data.split('_').pop(), 10);
+    db.deleteEmoji(emojiId);
+    await answer('✅ Deleted');
+    // Refresh library view
+    const emojis = db.getAllEmojis();
+    if (!emojis.length) {
+      await bot.editMessageText(
+        `🎨 <b>Emoji Library</b>\n\n📭 Empty.`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [
+            [{ text: '➕ Add New Emoji', callback_data: 'admin_emoji_add' }],
+            [{ text: '🔙 Back', callback_data: 'admin_panel' }],
+          ] } }
+      );
+      return;
+    }
+    let preview = `🎨 <b>Emoji Library</b> (${emojis.length} emoji)\n\n`;
+    for (const e of emojis) {
+      preview += `<tg-emoji emoji-id="${e.emoji_id}">${e.fallback}</tg-emoji> <b>${escapeHtml(e.name)}</b>\n`;
+      preview += `<code>[emoji:${e.emoji_id}]${e.fallback}</code>\n\n`;
+    }
+    await bot.editMessageText(preview, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: adminEmojiLibraryKb(emojis),
+    });
+    return;
+  }
+
+  // ── Refund Requests Panel ─────────────────────────────────────────
+  if (data === 'admin_refund_requests' || /^admin_refund_tab_\w+_\d+$/.test(data)) {
+    const allRequests = db.getAllRefundRequests();
+
+    // Parse tab and page from callback
+    let activeTab = 'pending';
+    let page = 0;
+    if (/^admin_refund_tab_\w+_\d+$/.test(data)) {
+      const parts = data.split('_');
+      // admin_refund_tab_{tab}_{page}
+      page = parseInt(parts.pop(), 10) || 0;
+      activeTab = parts.slice(3).join('_');
+    }
+
+    const pending    = allRequests.filter(r => r.status === 'pending');
+    const processing = allRequests.filter(r => r.status === 'processing');
+    const approved   = allRequests.filter(r => r.status === 'approved');
+    const rejected   = allRequests.filter(r => r.status === 'rejected');
+
+    const tabMap = { pending, processing, approved, rejected, all: allRequests };
+    const shown  = tabMap[activeTab] || allRequests;
+
+    const perPage = 10;
+    const total   = shown.length;
+    const slice   = shown.slice(page * perPage, (page + 1) * perPage);
+
+    const statusEmoji = { pending: '⏳', processing: '🔃', approved: '✅', rejected: '❌' };
+    const tabLabel    = { pending: '⏳ Pending', processing: '🔃 Processing', approved: '✅ Approved', rejected: '❌ Rejected', all: '📋 All' };
+
+    let txt = `🔄 <b>Refund Requests</b>\n\n`;
+    txt += `⏳ Pending: <b>${pending.length}</b>  🔃 Processing: <b>${processing.length}</b>\n`;
+    txt += `✅ Approved: <b>${approved.length}</b>  ❌ Rejected: <b>${rejected.length}</b>\n`;
+    txt += `📋 Total: <b>${allRequests.length}</b>\n\n`;
+    txt += `<b>Showing: ${tabLabel[activeTab]}</b> (${total} requests)`;
+
+    const rows = [];
+
+    // Tab filter buttons
+    const tabs = ['pending','processing','approved','rejected','all'];
+    const tabRow1 = tabs.slice(0,3).map(t => ({
+      text: (t === activeTab ? '✓ ' : '') + tabLabel[t],
+      callback_data: `admin_refund_tab_${t}_0`
+    }));
+    const tabRow2 = tabs.slice(3).map(t => ({
+      text: (t === activeTab ? '✓ ' : '') + tabLabel[t],
+      callback_data: `admin_refund_tab_${t}_0`
+    }));
+    rows.push(tabRow1);
+    rows.push(tabRow2);
+
+    // Refund request buttons
+    for (const r of slice) {
+      const emoji = statusEmoji[r.status] || '🔄';
+      const name  = r.username ? `@${r.username}` : (r.first_name || `User ${r.user_id}`);
+      const amt   = Number(r.total_price || 0).toFixed(2);
+      rows.push([{ text: `${emoji} #${r.id} · ${name.slice(0, 18)} · $${amt}`, callback_data: `admin_refund_view_${r.id}` }]);
+    }
+
+    // Pagination
+    const navRow = [];
+    if (page > 0)                           navRow.push({ text: '⬅️ Prev', callback_data: `admin_refund_tab_${activeTab}_${page - 1}` });
+    if ((page + 1) * perPage < total)       navRow.push({ text: 'Next ➡️', callback_data: `admin_refund_tab_${activeTab}_${page + 1}` });
+    if (navRow.length) rows.push(navRow);
+
+    rows.push([{ text: '🔙 Back', callback_data: 'admin_panel' }]);
+
+    try {
+      await bot.editMessageText(txt, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
+    } catch (e) {
+      try { await bot.deleteMessage(chatId, msgId); } catch (e2) {}
+      await bot.sendMessage(chatId, txt, { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
+    }
+    return;
+  }
+
+  if (/^admin_refund_view_\d+$/.test(data)) {
+    const refundId = parseInt(data.split('_').pop(), 10);
+    const r = db.getRefundRequestById(refundId);
+    if (!r) { await answer('Not found'); return; }
+    const user = db.getUser(r.user_id);
+    const name = user?.username || user?.first_name || `User ${r.user_id}`;
+
+    const statusEmoji = { pending: '⏳', approved: '✅', rejected: '❌' };
+    let txt =
+      `🔄 <b>Refund Request #${r.id}</b>\n\n` +
+      `👤 <b>User:</b> ${escapeHtml(name)} (<code>${r.user_id}</code>)\n` +
+      `💰 <b>Wallet:</b> ${formatPrice(user?.balance || 0)}\n\n` +
+      `📦 <b>Order #${r.order_id}</b>\n` +
+      `🛒 ${escapeHtml(r.product_title || 'Unknown')}\n` +
+      `💵 <b>Order Total:</b> ${formatPrice(r.total_price || 0)}\n` +
+      `📅 Order date: ${(r.order_date || '').slice(0, 16)}\n\n` +
+      `📝 <b>Customer Reason:</b>\n${escapeHtml(r.reason || '(no reason)')}\n`;
+
+    if (r.affected_account) {
+      txt += `\n🔑 <b>Affected Account:</b>\n<code>${escapeHtml(r.affected_account)}</code>\n`;
+    }
+    if (r.refund_method) {
+      txt += `\n💳 <b>Customer wants:</b> ${r.refund_method}`;
+      if (r.crypto_network) txt += ` (${r.crypto_network})`;
+      txt += `\n`;
+    }
+    if (r.wallet_address) {
+      txt += `📍 <b>Refund address:</b>\n<code>${escapeHtml(r.wallet_address)}</code>\n`;
+    }
+
+    txt += `\n📊 Status: ${statusEmoji[r.status]} <b>${r.status.toUpperCase()}</b>\n`;
+    txt += `📅 Requested: ${(r.created_at || '').slice(0, 16)}`;
+
+    if (r.status !== 'pending') {
+      txt += `\n📅 Resolved: ${(r.resolved_at || '').slice(0, 16)}`;
+      if (r.admin_note) txt += `\n📝 Admin note: ${escapeHtml(r.admin_note)}`;
+      if (r.amount) txt += `\n💵 Refunded: ${formatPrice(r.amount)}`;
+    }
+
+    if (r.photo_file_id) {
+      txt += `\n\n📸 <i>Customer attached a screenshot — see below.</i>`;
+    }
+
+    // ── Warranty-based suggested amount ──────────────────────────────
+    let suggestedAmount = null;
+    let warrantyInfo = '';
+    try {
+      const order = db.getOrder(r.order_id);
+      if (order) {
+        const product = db.getProduct(order.product_id);
+        const warranty = product?.warranty || '';
+        const m = warranty.match(/(\d+)\s*(day|d|month|m|year|y)/i);
+        if (m) {
+          const num = parseInt(m[1], 10);
+          const unit = m[2].toLowerCase();
+          const totalDays = unit.startsWith('d') ? num : (unit.startsWith('m') ? num * 30 : num * 365);
+          const orderDateStr = (order.paid_at || order.created_at || '').replace(' ', 'T');
+          const orderDate = new Date(orderDateStr + (orderDateStr.endsWith('Z') ? '' : 'Z'));
+          const now = new Date();
+          const elapsedDays = Math.max(0, Math.floor((now - orderDate) / (24 * 3600 * 1000)));
+          const remainingDays = Math.max(0, totalDays - elapsedDays);
+          const ratio = totalDays > 0 ? (remainingDays / totalDays) : 0;
+          suggestedAmount = Number((Number(r.total_price) * ratio).toFixed(2));
+          warrantyInfo =
+            `\n\n🛡 <b>Warranty Analysis:</b>\n` +
+            `   Total: ${totalDays} day(s)\n` +
+            `   Elapsed: ${elapsedDays} day(s)\n` +
+            `   Remaining: ${remainingDays} day(s)\n` +
+            `   💡 <b>Suggested refund:</b> ${formatPrice(suggestedAmount)} (${Math.round(ratio * 100)}%)`;
+        }
+      }
+    } catch (e) {
+      logger.warn(`Warranty calc failed: ${e.message}`);
+    }
+    txt += warrantyInfo;
+
+    const kb = { inline_keyboard: [] };
+
+    // Processing — show "Mark as Sent" button only
+    if (r.status === 'processing') {
+      kb.inline_keyboard.push([{ text: '✅ Mark as Sent (Confirm)', callback_data: `admin_refund_mark_sent_${r.id}` }]);
+    }
+
+    if (r.status === 'pending') {
+      if (suggestedAmount !== null && suggestedAmount > 0 && suggestedAmount < Number(r.total_price)) {
+        kb.inline_keyboard.push([{
+          text: `💡 Auto-Refund ${formatPrice(suggestedAmount)} (warranty-based)`,
+          callback_data: `admin_refund_auto_${r.id}`,
+        }]);
+      }
+      kb.inline_keyboard.push([{ text: `✅ Approve FULL (${formatPrice(r.total_price || 0)})`, callback_data: `admin_refund_full_${r.id}` }]);
+      kb.inline_keyboard.push([{ text: '💵 Approve CUSTOM Amount', callback_data: `admin_refund_custom_${r.id}` }]);
+      kb.inline_keyboard.push([{ text: '❌ Reject', callback_data: `admin_refund_reject_${r.id}` }]);
+    }
+    kb.inline_keyboard.push([{ text: '🔙 Back', callback_data: 'admin_refund_requests' }]);
+
+    try {
+      try { await bot.deleteMessage(chatId, msgId); } catch (e) {}
+      // Send photo first if exists
+      if (r.photo_file_id) {
+        try { await bot.sendPhoto(chatId, r.photo_file_id, { caption: '📸 Customer screenshot' }); } catch (e) {}
+      }
+      await bot.sendMessage(chatId, txt, { parse_mode: 'HTML', reply_markup: kb });
+    } catch (e) {
+      await bot.sendMessage(chatId, txt, { parse_mode: 'HTML', reply_markup: kb });
+    }
+    return;
+  }
+
+  // Approve FULL — pay full order_total to the customer's chosen method
+  if (/^admin_refund_full_\d+$/.test(data)) {
+    const refundId = parseInt(data.split('_').pop(), 10);
+    const r = db.getRefundRequestById(refundId);
+    if (!r || r.status !== 'pending') { await answer('❌ Already resolved'); return; }
+    await processRefundApproval(bot, chatId, msgId, r, Number(r.total_price) || 0);
+    return;
+  }
+
+  // Mark Refund as Sent (admin confirms manual transfer completed)
+  if (/^admin_refund_mark_sent_\d+$/.test(data)) {
+    const refundId = parseInt(data.split('_').pop(), 10);
+    await handleMarkRefundSent(bot, chatId, msgId, refundId, query);
+    return;
+  }
+
+    // Warranty-based auto-refund — ask confirmation first
+  if (/^admin_refund_auto_\d+$/.test(data)) {
+    const refundId = parseInt(data.split('_').pop(), 10);
+    const r = db.getRefundRequestById(refundId);
+    if (!r || r.status !== 'pending') { await answer('❌ Already resolved'); return; }
+
+    // Recompute suggested amount
+    let suggestedAmount = 0;
+    let breakdown = '';
+    try {
+      const order = db.getOrder(r.order_id);
+      const product = db.getProduct(order.product_id);
+      const warranty = product?.warranty || '';
+      const m = warranty.match(/(\d+)\s*(day|d|month|m|year|y)/i);
+      if (m) {
+        const num = parseInt(m[1], 10);
+        const unit = m[2].toLowerCase();
+        const totalDays = unit.startsWith('d') ? num : (unit.startsWith('m') ? num * 30 : num * 365);
+        const orderDateStr = (order.paid_at || order.created_at || '').replace(' ', 'T');
+        const orderDate = new Date(orderDateStr + (orderDateStr.endsWith('Z') ? '' : 'Z'));
+        const elapsedDays = Math.max(0, Math.floor((new Date() - orderDate) / (24 * 3600 * 1000)));
+        const remainingDays = Math.max(0, totalDays - elapsedDays);
+        const ratio = totalDays > 0 ? (remainingDays / totalDays) : 0;
+        suggestedAmount = Number((Number(r.total_price) * ratio).toFixed(2));
+        breakdown =
+          `🛡 Warranty: ${totalDays} days\n` +
+          `⏰ Elapsed: ${elapsedDays} days\n` +
+          `✨ Remaining: ${remainingDays} days (${Math.round(ratio * 100)}%)\n\n` +
+          `💰 Order total: ${formatPrice(r.total_price)}\n` +
+          `📐 Formula: ${remainingDays}/${totalDays} × ${formatPrice(r.total_price)}\n` +
+          `= <b>${formatPrice(suggestedAmount)}</b>`;
+      }
+    } catch (e) {}
+
+    if (suggestedAmount <= 0) {
+      await answer('❌ Could not calculate (no warranty period)');
+      return;
+    }
+
+    await bot.editMessageText(
+      `💡 <b>Auto-Refund Calculation</b>\n\n` +
+      breakdown + `\n\n` +
+      `Do you want to refund <b>${formatPrice(suggestedAmount)}</b> to the customer?`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: `✅ Yes, refund ${formatPrice(suggestedAmount)}`, callback_data: `admin_refund_auto_confirm_${refundId}_${Math.round(suggestedAmount * 100)}` }],
+          [{ text: '🔙 No, go back', callback_data: `admin_refund_view_${refundId}` }],
+        ] } }
+    );
+    return;
+  }
+
+  // Confirm warranty-based auto-refund: callback data has amount in cents
+  if (/^admin_refund_auto_confirm_\d+_\d+$/.test(data)) {
+    const parts = data.split('_');
+    const refundId = parseInt(parts[4], 10);
+    const cents = parseInt(parts[5], 10);
+    const amount = cents / 100;
+    const r = db.getRefundRequestById(refundId);
+    if (!r || r.status !== 'pending') { await answer('❌ Already resolved'); return; }
+    await processRefundApproval(bot, chatId, msgId, r, amount);
+    return;
+  }
+
+  // Approve CUSTOM amount
+  if (/^admin_refund_custom_\d+$/.test(data)) {
+    const refundId = parseInt(data.split('_').pop(), 10);
+    const r = db.getRefundRequestById(refundId);
+    if (!r) { await answer('Not found'); return; }
+    session.set(userId, States.ADMIN_REFUND_AMOUNT, { refundId });
+    await bot.editMessageText(
+      `💵 <b>Custom Refund Amount</b>\n\n` +
+      `Order total: ${formatPrice(r.total_price || 0)}\n\n` +
+      `Send the amount you want to refund (e.g. <code>2.50</code>):`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: `admin_refund_view_${refundId}` }]] } }
+    );
+    return;
+  }
+
+  // Approve refund → wallet
+  if (/^admin_refund_approve_wallet_\d+$/.test(data)) {
+    const refundId = parseInt(data.split('_').pop(), 10);
+    const r = db.getRefundRequestById(refundId);
+    if (!r || r.status !== 'pending') { await answer('❌ Already resolved'); return; }
+    const amount = Number(r.total_price) || 0;
+
+    // Add to wallet
+    db.updateBalance(r.user_id, amount);
+    db.addTransaction({
+      userId: r.user_id, type: 'refund', amount: amount,
+      description: `Refund for order #${r.order_id}`,
+      refId: `refund_${refundId}`, orderId: r.order_id,
+    });
+    db.updateRefundRequest(refundId, 'approved', `Refunded to wallet: ${amount}$`, amount, 'wallet');
+
+    try {
+      await bot.sendMessage(r.user_id,
+        `✅ <b>Your Refund Has Been Approved!</b>\n\n` +
+        `🆔 Refund #${r.id}\n` +
+        `📦 Order #${r.order_id}\n` +
+        `💵 Refunded: <b>${formatPrice(amount)}</b>\n` +
+        `💳 Method: Wallet\n\n` +
+        `Your wallet balance has been updated.`,
+        { parse_mode: 'HTML' }
+      );
+    } catch (e) {}
+
+    await answer('✅ Refund approved');
+    await bot.editMessageText(
+      `✅ Refund #${refundId} approved and credited to wallet.`,
+      { chat_id: chatId, message_id: msgId,
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'admin_refund_requests' }]] } }
+    );
+    return;
+  }
+
+  // Approve refund → USDT (mark as approved, admin sends manually)
+  if (/^admin_refund_approve_usdt_\d+$/.test(data)) {
+    const refundId = parseInt(data.split('_').pop(), 10);
+    const r = db.getRefundRequestById(refundId);
+    if (!r || r.status !== 'pending') { await answer('❌ Already resolved'); return; }
+    const amount = Number(r.total_price) || 0;
+    db.updateRefundRequest(refundId, 'approved', `Refunded ${amount}$ via USDT (manual transfer)`, amount, 'usdt');
+
+    try {
+      await bot.sendMessage(r.user_id,
+        `✅ <b>Your Refund Has Been Approved!</b>\n\n` +
+        `🆔 Refund #${r.id}\n` +
+        `📦 Order #${r.order_id}\n` +
+        `💵 Amount: <b>${formatPrice(amount)}</b>\n` +
+        `💳 Method: USDT (manual transfer)\n\n` +
+        `Our team will contact you for your USDT address.`,
+        { parse_mode: 'HTML' }
+      );
+    } catch (e) {}
+
+    await answer('✅ Approved (USDT)');
+    await bot.editMessageText(
+      `✅ Refund #${refundId} approved for USDT transfer.\n\n` +
+      `📝 <b>Remember:</b> Contact the user via Support to get their USDT address.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'admin_refund_requests' }]] } }
+    );
+    return;
+  }
+
+  if (/^admin_refund_reject_\d+$/.test(data)) {
+    const refundId = parseInt(data.split('_').pop(), 10);
+    const r = db.getRefundRequestById(refundId);
+    if (!r || r.status !== 'pending') { await answer('❌ Already resolved'); return; }
+    db.updateRefundRequest(refundId, 'rejected', 'Rejected by admin', 0, null);
+
+    try {
+      await bot.sendMessage(r.user_id,
+        `❌ <b>Refund Request Rejected</b>\n\n` +
+        `🆔 Refund #${r.id}\n` +
+        `📦 Order #${r.order_id}\n\n` +
+        `If you believe this is a mistake, please contact support.`,
+        { parse_mode: 'HTML' }
+      );
+    } catch (e) {}
+
+    await answer('❌ Rejected');
+    await bot.editMessageText(
+      `❌ Refund #${refundId} rejected. User notified.`,
+      { chat_id: chatId, message_id: msgId,
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'admin_refund_requests' }]] } }
+    );
+    return;
+  }
+
+  // ── Deposit Cutoff Panel ──────────────────────────────────────────
+  if (data === 'admin_cutoff') {
+    const cutoff = parseInt(db.getSetting('deposit_cutoff_ms', '0'), 10);
+    const cutoffDate = cutoff > 0 ? new Date(cutoff).toISOString().replace('T', ' ').slice(0, 19) : 'Not set';
+    await bot.editMessageText(
+      `🛡️ <b>Deposit Cutoff Protection</b>\n\n` +
+      `Current cutoff: <b>${cutoffDate}</b> UTC\n\n` +
+      `Any USDT deposit or Binance Pay transfer dated <b>BEFORE</b> this time will be rejected.\n\n` +
+      `This prevents fraud where a user reuses an old TXID from before you started the bot.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: '🔄 Reset cutoff to NOW', callback_data: 'admin_cutoff_now' }],
+          [{ text: '🔙 Back', callback_data: 'admin_panel' }],
+        ] } }
+    );
+    return;
+  }
+  if (data === 'admin_cutoff_now') {
+    const now = Date.now();
+    db.setSetting('deposit_cutoff_ms', String(now));
+    await answer('✅ Cutoff updated to NOW');
+    await bot.editMessageText(
+      `✅ <b>Cutoff Updated</b>\n\n` +
+      `New cutoff: <b>${new Date(now).toISOString().replace('T', ' ').slice(0, 19)}</b> UTC\n\n` +
+      `All deposits before this time will now be rejected.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'admin_panel' }]] } }
+    );
+    return;
+  }
+
+    // ── VIP Control Panel ─────────────────────────────────────────────
+  if (data === 'admin_vip_toggle') {
+    const broadcastEnabled = db.getSetting('vip_auto_broadcast', '0') === '1';
+    const systemEnabled = db.getSetting('vip_system_enabled', '1') === '1';
+    const totalVips = db.countVIPs();
+    await bot.editMessageText(
+      `👑 <b>VIP Control Panel</b>\n\n` +
+      `<b>1) VIP System:</b> ${systemEnabled ? '🟢 OPEN' : '🔴 CLOSED'}\n` +
+      `<i>${systemEnabled ? 'New users can become VIP' : 'No new VIPs accepted'}</i>\n\n` +
+      `<b>2) Auto Broadcast:</b> ${broadcastEnabled ? '🟢 ON' : '🔴 OFF'}\n` +
+      `<i>Every 30min posts VIP invite to channel & group</i>\n\n` +
+      `📊 <b>Stats:</b>\n` +
+      `• Current VIPs: <b>${totalVips}</b>\n` +
+      `• VIP Limit: <b>${parseInt(db.getSetting('vip_limit', '1000'), 10).toLocaleString()}</b>\n` +
+      `• Slots: <b>${Math.max(0, parseInt(db.getSetting('vip_limit', '1000'), 10) - totalVips)}</b>\n` +
+      `• Broadcast Interval: <b>${db.getSetting('vip_broadcast_interval_min', '30')} min</b>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          systemEnabled
+            ? [{ text: '🔴 CLOSE VIP System', callback_data: 'admin_vip_system_off' }]
+            : [{ text: '🟢 OPEN VIP System', callback_data: 'admin_vip_system_on' }],
+          broadcastEnabled
+            ? [{ text: '🔴 Turn OFF Broadcast', callback_data: 'admin_vip_off' }]
+            : [{ text: '🟢 Turn ON Broadcast', callback_data: 'admin_vip_on' }],
+          [{ text: '📢 Post Now', callback_data: 'admin_vip_post_now' }],
+          [{ text: '🖼 Set VIP Image', callback_data: 'admin_vip_image' }],
+          [{ text: '🔢 Edit VIP Limit', callback_data: 'admin_vip_limit' }],
+          [{ text: '⏱ Edit Broadcast Interval', callback_data: 'admin_vip_interval' }],
+          [
+            { text: db.getSetting('referral_enabled', '1') === '1' ? '🔴 Disable Referral' : '🟢 Enable Referral', callback_data: 'admin_referral_toggle' },
+            { text: db.getSetting('vip_new_only', '0') === '1' ? '👥 Allow All' : '🆕 New Only', callback_data: 'admin_vip_new_only_toggle' },
+          ],
+          [{ text: '💰 VIP Earnings Stats', callback_data: 'admin_vip_stats' }],
+          [{ text: '🔙 Back', callback_data: 'admin_panel' }],
+        ] } }
+    );
+    return;
+  }
+  if (data === 'admin_vip_limit') {
+    session.set(userId, States.ADMIN_VIP_LIMIT, {});
+    const current = parseInt(db.getSetting('vip_limit', '1000'), 10);
+    await bot.editMessageText(
+      `🔢 <b>Edit VIP Limit</b>\n\n` +
+      `Current limit: <b>${current.toLocaleString()}</b>\n\n` +
+      `Send the new VIP limit (e.g. <code>2000</code>):\n\n` +
+      `<i>This is the maximum number of customers who can become VIP.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Cancel', callback_data: 'admin_vip_toggle' }]] } }
+    );
+    return;
+  }
+
+    if (data === 'admin_vip_interval') {
+    session.set(userId, States.ADMIN_VIP_INTERVAL, {});
+    const current = db.getSetting('vip_broadcast_interval_min', '30');
+    await bot.editMessageText(
+      `⏱ <b>Edit Broadcast Interval</b>\n\n` +
+      `Current: <b>${current} minutes</b>\n\n` +
+      `Send the new interval in minutes (e.g. <code>60</code> for 1 hour, <code>120</code> for 2 hours):\n\n` +
+      `<i>Minimum: 5 minutes. Maximum: 1440 (24 hours).</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Cancel', callback_data: 'admin_vip_toggle' }]] } }
+    );
+    return;
+  }
+
+    if (data === 'admin_vip_image') {
+    session.set(userId, States.ADMIN_VIP_IMAGE, {});
+    const currentImg = db.getSetting('vip_image_file_id', '');
+    await bot.editMessageText(
+      `🖼 <b>Set VIP Broadcast Image</b>\n\n` +
+      (currentImg ? '✅ Image is currently set.\n\n' : '❌ No image set yet.\n\n') +
+      `Send a photo to use in VIP broadcasts (channel, group, intro).\n\n` +
+      `Type <code>clear</code> to remove the image.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'admin_vip_toggle' }]] } }
+    );
+    return;
+  }
+
+  // ── 🕵️ AUDIT: Find users who paid → got product AND got money in wallet ─────
+  if (data === 'admin_audit_wallets') {
+    const dbRaw = require('../database/db');
+    // BUG PATTERN: deposit + same order delivered = customer paid once, got product + wallet credit
+    // We find all deposits linked to a DELIVERED order
+    // (For wallet top-ups: order_id is NULL, so they're excluded)
+    const suspicious = dbRaw.prepare(`
+      SELECT 
+        t.user_id, 
+        u.username, 
+        u.first_name, 
+        u.balance,
+        SUM(t.amount) AS total_credited,
+        COUNT(DISTINCT t.order_id) AS orders_count,
+        COUNT(*) AS bug_count,
+        GROUP_CONCAT(DISTINCT t.order_id) AS order_ids
+      FROM transactions t
+      LEFT JOIN users u ON t.user_id = u.telegram_id
+      LEFT JOIN orders o ON t.order_id = o.id
+      WHERE t.type = 'deposit'
+        AND t.order_id IS NOT NULL
+        AND o.id IS NOT NULL
+        AND (
+          t.description LIKE '%Underpayment%' OR
+          t.description LIKE '%Out-of-stock%' OR
+          t.description LIKE '%Overpayment%' OR
+          t.description LIKE '%refund%(Order%' OR
+          t.description LIKE '%(Order #%'
+        )
+        AND t.description NOT LIKE '%top-up%'
+        AND t.description NOT LIKE '%admin%'
+        AND t.description NOT LIKE '%Referral%'
+      GROUP BY t.user_id
+      ORDER BY total_credited DESC
+      LIMIT 30
+    `).all();
+
+    let txt = `🕵️ <b>Wallet Bug Audit</b>\n\n`;
+    if (!suspicious.length) {
+      txt += `✅ <b>No suspicious wallet credits detected.</b>\n\n`;
+      txt += `<i>This audit finds users who got money in their wallet from the CryptoBot/Binance/USDT payment bug (underpayment, overpayment, or out-of-stock during direct payment).</i>`;
+    } else {
+      txt += `Found <b>${suspicious.length}</b> user(s) with suspicious wallet credits.\n\n`;
+      let totalLost = 0;
+      suspicious.slice(0, 15).forEach((s, i) => {
+        const name = s.username ? '@' + s.username : (s.first_name || `User ${s.user_id}`);
+        const credited = Number(s.total_credited) || 0;
+        const balance = Number(s.balance) || 0;
+        totalLost += credited;
+        const orderIds = (s.order_ids || '').split(',').slice(0, 5).join(', #');
+        txt += `${i+1}. ${escapeHtml(name)}\n`;
+        txt += `   ID: <code>${s.user_id}</code>\n`;
+        txt += `   🐛 Stolen: <b>${formatPrice(credited)}</b> from ${s.orders_count} order(s)\n`;
+        txt += `   📦 Orders: #${orderIds}\n`;
+        txt += `   💰 Current balance: <b>${formatPrice(balance)}</b>\n\n`;
+      });
+      if (suspicious.length > 15) {
+        txt += `<i>... and ${suspicious.length - 15} more</i>\n\n`;
+      }
+      txt += `\n💸 <b>Total bug credits: ${formatPrice(totalLost)}</b>`;
+    }
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        ...(suspicious.length > 0 ? [[
+          { text: '⚠️ Deduct ALL bug credits', callback_data: 'admin_audit_deduct_all' }
+        ]] : []),
+        [{ text: '🔙 Back to Admin', callback_data: 'admin_panel' }]
+      ] }
+    }).catch(() => {});
+    return;
+  }
+
+  // ── Deduct all bug credits from suspicious wallets ──────────────────
+  if (data === 'admin_audit_deduct_all') {
+    const dbRaw = require('../database/db');
+    const suspicious = dbRaw.prepare(`
+      SELECT t.user_id, SUM(t.amount) AS total_credited
+      FROM transactions t
+      WHERE t.type = 'deposit'
+        AND t.order_id IS NOT NULL
+        AND (
+          t.description LIKE '%Underpayment refunded%' OR
+          t.description LIKE '%Out-of-stock refund%' OR
+          t.description LIKE '%Overpayment credit%'
+        )
+      GROUP BY t.user_id
+    `).all();
+
+    let totalDeducted = 0;
+    let usersAffected = 0;
+    const txDeduct = dbRaw.transaction(() => {
+      for (const s of suspicious) {
+        const amount = Number(s.total_credited) || 0;
+        if (amount <= 0) continue;
+        // Get current balance
+        const u = dbRaw.prepare(`SELECT balance FROM users WHERE telegram_id=?`).get(s.user_id);
+        if (!u) continue;
+        const currentBal = Number(u.balance) || 0;
+        // Deduct only what's available (don't go negative)
+        const deduct = Math.min(amount, currentBal);
+        if (deduct > 0) {
+          dbRaw.prepare(`UPDATE users SET balance = balance - ? WHERE telegram_id=?`).run(deduct, s.user_id);
+          dbRaw.prepare(`
+            INSERT INTO transactions (user_id, type, amount, description)
+            VALUES (?, 'admin_adjust', ?, ?)
+          `).run(s.user_id, -deduct, `Bug credit reversal (admin audit)`);
+          totalDeducted += deduct;
+          usersAffected++;
+        }
+      }
+    });
+    txDeduct();
+
+    await bot.editMessageText(
+      `✅ <b>Bug Credits Reversed</b>\n\n` +
+      `👥 Users affected: <b>${usersAffected}</b>\n` +
+      `💸 Total deducted: <b>${formatPrice(totalDeducted)}</b>\n\n` +
+      `<i>Note: For users whose balance was lower than the bug credit, only the available balance was deducted.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'admin_panel' }]] } }
+    ).catch(() => {});
+    logger.info(`[ADMIN] Reversed ${formatPrice(totalDeducted)} from ${usersAffected} users (bug audit)`);
+    return;
+  }
+
+
+  // ════════════════════════════════════════════════════════
+  // 🗂 CATEGORIES MANAGEMENT
+  // ════════════════════════════════════════════════════════
+  if (data === 'admin_categories') {
+    const categories = db.getAllCategories();
+    let txt = `🗂 <b>Categories Management</b>\n\nTotal: ${categories.length}\n\n`;
+    const rows = categories.map(c => {
+      const productsCount = db.getProductsByCategory(c.id).length;
+      const iconId = kbIconIdFrom(c.emoji) || kbIconIdFrom(c.name);
+      const label = `${kbStripEmojiCodes(c.emoji || '📂').trim()} ${kbStripEmojiCodes(c.name).trim()} (${productsCount})`;
+      return [kbIconBtn(label, `admin_cat_edit_${c.id}`, { iconId, style: 'default' })];
+    });
+    if (categories.length === 0) txt += '<i>No categories yet. Create one!</i>';
+    rows.push([{ text: '➕ New Category', callback_data: 'admin_cat_new' }]);
+    rows.push([{ text: '🔙 Back', callback_data: 'admin_panel' }]);
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: rows },
+    }).catch(() => {});
+    return;
+  }
+
+  if (data === 'admin_cat_new') {
+    session.set(userId, 'ADMIN_CAT_NEW_NAME', {});
+    await bot.sendMessage(chatId,
+      '➕ <b>New Category</b>\n\nSend the category name (can include emoji at start):\n\nExamples:\n• <code>🤖 AI Tools</code>\n• <code>🎬 Streaming</code>\n• <code>📧 Email</code>',
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (/^admin_cat_edit_\d+$/.test(data)) {
+    const catId = parseInt(data.split('_').pop(), 10);
+    const cat = db.getCategoryById(catId);
+    if (!cat) { await answer('❌ Not found'); return; }
+    const products = db.getProductsByCategory(catId);
+    // escapeHtml leaves an [emoji:ID] marker untouched (no HTML chars in it), so
+    // expanding afterwards is safe and renders the real premium emoji.
+    let txt = `🗂 <b>${expandPremiumEmojis(escapeHtml(cat.emoji || '') + ' ' + escapeHtml(cat.name))}</b>\n\n`;
+    txt += `📦 Products: <b>${products.length}</b>\n`;
+    if (products.length) {
+      txt += '\n<b>Products in this category:</b>\n';
+      products.slice(0, 15).forEach(p => {
+        txt += `• ${escapeHtml(p.title.slice(0, 40))}\n`;
+      });
+    }
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: '✏️ Rename', callback_data: `admin_cat_rename_${catId}` }],
+        [{ text: '🗑 Delete Category', callback_data: `admin_cat_delete_${catId}` }],
+        [{ text: '🔙 Back', callback_data: 'admin_categories' }],
+      ] },
+    }).catch(() => {});
+    return;
+  }
+
+  if (/^admin_cat_rename_\d+$/.test(data)) {
+    const catId = parseInt(data.split('_').pop(), 10);
+    session.set(userId, 'ADMIN_CAT_RENAME', { catId });
+    await bot.sendMessage(chatId,
+      '✏️ Send the new name (can include emoji):',
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (/^admin_cat_delete_\d+$/.test(data)) {
+    const catId = parseInt(data.split('_').pop(), 10);
+    db.deleteCategory(catId);
+    await answer('🗑 Category deleted');
+    return await handleAdminCallback(bot, { ...query, data: 'admin_categories' });
+  }
+
+  // Edit product → assign category
+  if (/^admin_assigncat_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const categories = db.getAllCategories();
+    const product = db.getProduct(productId);
+    let txt = `🗂 <b>Assign Category</b>\n\nProduct: <b>${escapeHtml(product?.title || '')}</b>\n\n`;
+    // Markers stripped rather than expanded: this is a short inline label, and a
+    // <tg-emoji> tag inside it adds noise for no gain.
+    const curCat = product?.category_id ? db.getCategoryById(product.category_id) : null;
+    const curName = curCat ? kbStripEmojiCodes(curCat.name || '').trim() || 'Unknown' : '(none)';
+    txt += `Current: ${escapeHtml(curName)}\n\nSelect:`;
+    const rows = categories.map(c => [kbIconBtn(
+      `${kbStripEmojiCodes(c.emoji || '📂').trim()} ${kbStripEmojiCodes(c.name).trim()}`,
+      `admin_setcat_${productId}_${c.id}`,
+      { iconId: kbIconIdFrom(c.emoji) || kbIconIdFrom(c.name), style: 'default' }
+    )]);
+    rows.push([{ text: '❌ Remove from category', callback_data: `admin_setcat_${productId}_0` }]);
+    rows.push([{ text: '🔙 Back', callback_data: `admin_edit_p_${productId}` }]);
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: rows },
+    }).catch(() => {});
+    return;
+  }
+
+  if (/^admin_setcat_\d+_\d+$/.test(data)) {
+    const parts = data.split('_');
+    const productId = parseInt(parts[2], 10);
+    const catId = parseInt(parts[3], 10);
+    db.setProductCategory(productId, catId);
+    await answer('✅ Category set');
+    return await handleAdminCallback(bot, { ...query, data: `admin_edit_p_${productId}` });
+  }
+
+
+  // ── Toggle ChatGPT Business mode for a product ──
+  if (/^admin_toggle_cgb_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product = db.getProduct(productId);
+    if (!product) { await answer('❌ Not found'); return; }
+    const newVal = product.is_chatgpt_business ? 0 : 1;
+    const dbRaw = require('../database/db');
+    dbRaw.prepare('UPDATE products SET is_chatgpt_business=? WHERE id=?').run(newVal, productId);
+    await answer(newVal ? '✅ ChatGPT Business Mode ON' : '❌ Mode OFF', true);
+    return await handleAdminCallback(bot, { ...query, data: `admin_edit_p_${productId}` });
+  }
+
+  // ── ChatGPT Business main panel ──
+  // Pause or resume ChatGPT Business sales. Stored as a flag rather than a
+  // stock count: a seat is not taken off a shelf, either you can serve another
+  // customer or you cannot.
+  if (data === 'admin_cgb_stock') {
+    const nowOut = db.getSetting('cgb_out_of_stock', '0') === '1';
+    db.setSetting('cgb_out_of_stock', nowOut ? '0' : '1');
+    logger.info(`Admin ${userId} set ChatGPT Business out_of_stock=${nowOut ? 0 : 1}`);
+    await answer(nowOut ? '🟢 Selling again' : '🔴 Sales paused');
+    return await handleAdminCallback(bot, { ...query, data: 'admin_cgb_panel' });
+  }
+
+  if (data === 'admin_cgb_panel') {
+    const cycles = db.getBillingCycles();
+    const dbRaw = require('../database/db');
+    const price = parseFloat((dbRaw.prepare(`SELECT value FROM settings WHERE key='chatgpt_monthly_price'`).get()?.value) || '50');
+    const stats = db.getCgbStats();
+
+    const cgbOut = db.getSetting('cgb_out_of_stock', '0') === '1';
+
+    let txt = `🤖 <b>ChatGPT Business — Admin Panel</b>\n\n`;
+    txt += cgbOut
+      ? `🔴 <b>SALES PAUSED</b> — customers see an out-of-stock notice\n\n`
+      : `🟢 <b>Selling</b> — seats are available\n\n`;
+    txt += `💰 Monthly Price: <b>$${price.toFixed(2)}</b>\n`;
+    txt += `📅 Active Billing Cycles: <b>${cycles.length}</b>\n\n`;
+    txt += `━━━━━━━━━━━━━━━━━\n`;
+    txt += `📊 <b>Subscriptions</b>\n`;
+    txt += `  🟢 Active: <b>${stats.active}</b>\n`;
+    txt += `  ⏳ Awaiting Activation: <b>${stats.awaitingActivation}</b>\n`;
+    txt += `  📦 Total All-Time: <b>${stats.total}</b>\n`;
+    if (stats.expiringSoon > 0) {
+      txt += `  ⚠️ Expiring in 7 days: <b>${stats.expiringSoon}</b>\n`;
+    }
+    txt += `\n💵 <b>Revenue</b>\n`;
+    txt += `  📅 This Month: <b>$${Number(stats.revenueThisMonth).toFixed(2)}</b>\n`;
+    txt += `  💰 All-Time: <b>$${Number(stats.totalRevenue).toFixed(2)}</b>\n`;
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: cgbOut ? '🟢 Resume selling' : '🔴 Mark out of stock',
+           callback_data: 'admin_cgb_stock' }],
+        [{ text: '✏️ Out-of-stock message', callback_data: 'admin_setting_cgb_out_of_stock_message' }],
+        [{ text: '📊 Recent Orders', callback_data: 'admin_cgb_stats' }],
+        [{ text: '📋 Active Subscriptions', callback_data: 'admin_cgb_active' }],
+        [{ text: '💰 Set Monthly Price', callback_data: 'admin_cgb_setprice' }],
+        [{ text: '📅 Manage Cycles', callback_data: 'admin_cgb_cycles' }],
+        [{ text: '🔄 Renewals', callback_data: 'admin_cgb_renewals' }],
+        [{ text: '🕒 Cycle end time', callback_data: 'admin_cgb_manual' }],
+        [{ text: '🔙 Back', callback_data: 'admin_panel' }],
+      ] }
+    }).catch(() => {});
+    return;
+  }
+
+  // ── CGB: set the exact moment the current cycle ends ──────────────
+  if (data === 'admin_cgb_manual') {
+    const manual = cgbCycles.manualCycle();
+    const best   = cgbCycles.calculateBestCycle();
+    const raw    = db.getSetting('cgb_manual_cycle_end', '');
+
+    let txt = `🕒 <b>Cycle end time</b>\n\n`;
+    if (manual) {
+      txt += `🟢 <b>Manual override ACTIVE</b>\n` +
+             `Ends: <b>${escapeHtml(String(raw))}</b>\n` +
+             `⏳ ${manual.daysRemaining} day(s) sold to new customers\n\n` +
+             `<i>Day-of-month cycles are ignored while this is set.</i>`;
+    } else {
+      txt += `⚪️ <b>No override</b> — using day-of-month cycles.\n` +
+             (best ? `Current end: <b>${best.endDate.toISOString().slice(0, 10)}</b> (${best.daysRemaining} days)\n` : '') +
+             (raw ? `\n<i>A previous override (${escapeHtml(String(raw))}) has passed and is being ignored.</i>` : '');
+    }
+    txt += `\n\n<i>Set the exact moment the current cycle closes. Everything sold ` +
+           `from now until then ends at that time; after it passes, the next cycle ` +
+           `takes over automatically.</i>`;
+
+    const pad = (n) => String(n).padStart(2, '0');
+    const at = (days, hour) => {
+      const d = new Date();
+      d.setDate(d.getDate() + days);
+      d.setHours(hour, 0, 0, 0);
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(hour)}:00`;
+    };
+    const enc = (v) => Buffer.from(v).toString('base64url');
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: '⏭ Start next cycle NOW', callback_data: 'admin_cgb_nextcycle' }],
+        [{ text: '🌙 Tonight 23:59', callback_data: `admin_cgbend_${enc(at(0, 23) .replace('23:00', '23:59'))}` }],
+        [{ text: '➕ 7 days',  callback_data: `admin_cgbend_${enc(at(7, 23).replace('23:00', '23:59'))}` },
+         { text: '➕ 14 days', callback_data: `admin_cgbend_${enc(at(14, 23).replace('23:00', '23:59'))}` }],
+        [{ text: '➕ 30 days', callback_data: `admin_cgbend_${enc(at(30, 23).replace('23:00', '23:59'))}` }],
+        [{ text: `🕓 Boundary time (${db.getSetting('cgb_cycle_end_time', '23:59')})`, callback_data: 'admin_cgb_bt' },
+         { text: `🌍 UTC${Number(db.getSetting('cgb_timezone_offset', '0')) >= 0 ? '+' : ''}${db.getSetting('cgb_timezone_offset', '0')}`, callback_data: 'admin_cgb_tz' }],
+        [{ text: '✏️ Type exact date & time', callback_data: 'admin_cgb_setend' }],
+        [{ text: '🗑 Remove override', callback_data: 'admin_cgbend_clear' }],
+        [{ text: '🔙 Back', callback_data: 'admin_cgb_panel' }],
+      ] }
+    }).catch(() => {});
+    return;
+  }
+
+  // ── One button: close the current cycle, open the next ────────────
+  if (data === 'admin_cgb_nextcycle') {
+    const next = cgbCycles.nextCycleAfterCurrent();
+    if (!next) { await answer('❌ No cycle configured'); return; }
+
+    const monthly = cgbCycles.getMonthlyPrice();
+    const pad = (n) => String(n).padStart(2, '0');
+    const d = next.endDate;
+    const stamp = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+
+    await bot.editMessageText(
+      `⏭ <b>Start the next cycle now?</b>\n\n` +
+      `<b>Changes:</b>\n` +
+      `• Current period closes immediately\n` +
+      `• New customers get <b>${next.daysRemaining}</b> day(s), ending <b>${escapeHtml(stamp)}</b>\n` +
+      `• They pay <b>${formatPrice((next.daysRemaining / 30) * monthly)}</b> instead of ` +
+      `${formatPrice((next.replaces.daysRemaining / 30) * monthly)}\n\n` +
+      `<b>Does NOT change:</b>\n` +
+      `• Seats already sold — every existing customer keeps the end date they ` +
+      `paid for. Cutting those short would take back time people bought.\n\n` +
+      `<i>Reversible: remove the override to go back to the calendar cycles.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: '✅ Yes, start next cycle', callback_data: `admin_cgbend_${Buffer.from(stamp).toString('base64url')}` }],
+          [{ text: '❌ Cancel', callback_data: 'admin_cgb_manual' }],
+        ] } }
+    ).catch(() => {});
+    return;
+  }
+
+  // ── What time of day a cycle boundary falls on ────────────────────
+  if (data === 'admin_cgb_bt') {
+    const cur = db.getSetting('cgb_cycle_end_time', '23:59');
+    await bot.editMessageText(
+      `🕓 <b>Cycle boundary time</b>\n\n` +
+      `Currently: <b>${escapeHtml(String(cur))}</b>\n\n` +
+      `This is the moment a cycle day ends.\n\n` +
+      `• <b>23:59</b> — the end day is INCLUDED. A seat "until the 25th" works ` +
+      `all through the 25th. This is what customers assume.\n` +
+      `• <b>00:00</b> — the end day is NOT included. The seat stops the instant ` +
+      `that day begins, so the 25th is not usable.\n\n` +
+      `<i>Applies to the calendar cycles and to “start next cycle” alike.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: `${cur === '00:00' ? '✅ ' : ''}00:00 — start of day`, callback_data: 'admin_cgb_bt_00:00' }],
+          [{ text: `${cur === '12:00' ? '✅ ' : ''}12:00 — midday`,       callback_data: 'admin_cgb_bt_12:00' }],
+          [{ text: `${cur === '23:59' ? '✅ ' : ''}23:59 — end of day`,   callback_data: 'admin_cgb_bt_23:59' }],
+          [{ text: '🔙 Back', callback_data: 'admin_cgb_manual' }],
+        ] } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_cgb_bt_\d{2}:\d{2}$/.test(data)) {
+    db.setSetting('cgb_cycle_end_time', data.replace('admin_cgb_bt_', ''));
+    return handleAdminCallback(bot, { ...query, data: 'admin_cgb_bt' });
+  }
+
+  // ── Which clock the bot calls "today" ─────────────────────────────
+  if (data === 'admin_cgb_tz') {
+    const cur = String(db.getSetting('cgb_timezone_offset', '0'));
+    const serverNow = new Date();
+    const shopNow = cgbCycles.localNow(serverNow);
+    const fmt = (d) => d.toISOString().slice(0, 16).replace('T', ' ');
+
+    const opts = ['-5', '-3', '0', '1', '2', '3', '4', '5.5', '8'];
+    const rows = [];
+    for (let i = 0; i < opts.length; i += 3) {
+      rows.push(opts.slice(i, i + 3).map((o) => ({
+        text: `${cur === o ? '✅ ' : ''}UTC${Number(o) >= 0 ? '+' : ''}${o}`,
+        callback_data: `admin_cgb_tz_${o}`,
+      })));
+    }
+    rows.push([{ text: '🔙 Back', callback_data: 'admin_cgb_manual' }]);
+
+    await bot.editMessageText(
+      `🌍 <b>Your timezone</b>\n\n` +
+      `🖥 Server clock: <b>${fmt(serverNow)}</b> (UTC)\n` +
+      `🏠 Shop clock: <b>${fmt(shopNow)}</b>\n\n` +
+      `<i>The server runs on UTC. If your day starts before the server's does, ` +
+      `a cycle beginning on the 5th stays on the 4th for the bot during those ` +
+      `first hours — you see the 5th, the bot does not. Setting your offset ` +
+      `puts them on the same day.</i>\n\n` +
+      `Tunisia is <b>UTC+1</b>.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: rows } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_cgb_tz_/.test(data)) {
+    db.setSetting('cgb_timezone_offset', data.replace('admin_cgb_tz_', ''));
+    return handleAdminCallback(bot, { ...query, data: 'admin_cgb_tz' });
+  }
+
+  if (data === 'admin_cgbend_clear') {
+    db.setSetting('cgb_manual_cycle_end', '');
+    return handleAdminCallback(bot, { ...query, data: 'admin_cgb_manual' });
+  }
+
+  if (/^admin_cgbend_/.test(data)) {
+    let val = '';
+    try { val = Buffer.from(data.replace('admin_cgbend_', ''), 'base64url').toString('utf8'); } catch (_) {}
+    if (val) {
+      db.setSetting('cgb_manual_cycle_end', val);
+      logger.info(`[CGB] cycle end set manually to ${val} by ${userId}`);
+    }
+    return handleAdminCallback(bot, { ...query, data: 'admin_cgb_manual' });
+  }
+
+  if (data === 'admin_cgb_setend') {
+    session.set(userId, States.ADMIN_CGB_CYCLE_END, {});
+    await bot.sendMessage(chatId,
+      `🕒 <b>Cycle end</b>\n\nSend the exact date and time:\n` +
+      `<code>YYYY-MM-DD HH:MM</code>\n\n` +
+      `Example: <code>2026-09-30 20:00</code>\n\n` +
+      `<i>Uses the server's clock. Send <code>off</code> to remove the override.</i>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  // ── CGB renewals: who is staying next cycle, and reminder settings ──
+  if (data === 'admin_cgb_renewals') {
+    const reserved = db.getCgbReserved();
+    const on   = db.getSetting('cgb_reminder_enabled', '1') === '1';
+    const days = db.getSetting('cgb_reminder_days', '2');
+    const ws   = db.getSetting('cgb_workspace_name', 'chatgpt_Team');
+    const cfg  = db.getSetting('cgb_renew_discounts', '3:5,6:10,12:15');
+    const monthly = cgbCycles.getMonthlyPrice();
+
+    // Same threshold reading as the customer bot uses, so the preview cannot
+    // promise a price the bot would not charge.
+    const tiers = String(cfg).split(',').map((pair) => {
+      const [m, p] = pair.split(':').map((x) => parseFloat(String(x).trim()));
+      return { m, p };
+    }).filter((t) => Number.isFinite(t.m) && Number.isFinite(t.p)).sort((a, b) => a.m - b.m);
+    const pctFor = (months) => { let v = 0; for (const t of tiers) if (months >= t.m) v = t.p; return v; };
+
+    const priceTable = [1, 3, 6, 9, 12].map((m) => {
+      const pct = pctFor(m);
+      const price = (monthly * m * (1 - pct / 100));
+      return `${String(m).padStart(2)}mo  $${price.toFixed(2).padStart(7)}` +
+             (pct ? `  -${pct}%` : '');
+    }).join('\n');
+    const givenAway = monthly * 12 * (pctFor(12) / 100);
+
+    let txt =
+      `🔄 <b>ChatGPT Business — Renewals</b>\n\n` +
+      `⏰ Reminder: ${on ? `🟢 <b>ON</b> — sent <b>${escapeHtml(String(days))}</b> day(s) before expiry` : '🔴 <b>OFF</b>'}\n` +
+      `🏢 Workspace shown to customers: <b>${escapeHtml(String(ws))}</b>\n` +
+      `🏷 Renewal discounts: <code>${escapeHtml(String(cfg))}</code>\n` +
+      `<i>Thresholds — <code>3:5,6:10</code> means 3+ months get 5%, 6+ get 10%.</i>\n\n` +
+      // The setting is abstract; the prices are not. Showing what a customer
+      // would actually be charged is the only way to judge whether a discount
+      // is too generous before it costs a sale.
+      `💵 <b>What customers pay</b> (monthly $${monthly.toFixed(2)})\n` +
+      `<code>${priceTable}</code>\n` +
+      `<i>Giving away: <b>$${givenAway.toFixed(2)}</b> on a 12-month renewal.</i>\n\n` +
+      `✅ <b>${reserved.length}</b> seat${reserved.length === 1 ? '' : 's'} reserved for the next cycle`;
+
+    if (reserved.length) {
+      txt += `\n\n` + reserved.slice(0, 20).map((r) =>
+        `• <code>${escapeHtml(r.email || '')}</code> — ends ${r.end_date}`).join('\n');
+      if (reserved.length > 20) txt += `\n<i>…and ${reserved.length - 20} more</i>`;
+    }
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: on ? '🔴 Turn OFF reminders' : '🟢 Turn ON reminders', callback_data: 'admin_cgb_rem_toggle' }],
+        [{ text: `⏰ Reminder days (${days})`, callback_data: 'admin_setting_cgb_reminder_days' }],
+        [{ text: '🏢 Workspace name', callback_data: 'admin_setting_cgb_workspace_name' }],
+        [{ text: '🏷 Renewal discounts', callback_data: 'admin_setting_cgb_renew_discounts' }],
+        [{ text: '🔙 Back', callback_data: 'admin_cgb_panel' }],
+      ] }
+    }).catch(() => {});
+    return;
+  }
+
+  if (data === 'admin_cgb_rem_toggle') {
+    const on = db.getSetting('cgb_reminder_enabled', '1') === '1';
+    db.setSetting('cgb_reminder_enabled', on ? '0' : '1');
+    return handleAdminCallback(bot, { ...query, data: 'admin_cgb_renewals' });
+  }
+
+  // ── CGB Full Stats / Recent Orders ──
+  if (data === 'admin_cgb_stats') {
+    const stats = db.getCgbStats();
+    const payMethodLabel = (m) => ({
+      pay_binance:   '🟡 Binance Pay',
+      pay_bep20:     '💎 USDT BEP20',
+      pay_trc20:     '💎 USDT TRC20',
+      pay_cryptobot: '🤖 CryptoBot',
+    }[m] || (m || '—'));
+
+    const sEmoji = (s) => ({ active: '🟢', pending: '⏳', cancelled: '🔴' }[s] || '⚪');
+
+    let txt = `📊 <b>ChatGPT Business — All Orders (Last 10)</b>\n\n`;
+    txt += `🟢 Active: <b>${stats.active}</b>  ⏳ Pending: <b>${stats.pending}</b>  📦 Total: <b>${stats.total}</b>\n`;
+    txt += `💵 Revenue this month: <b>$${Number(stats.revenueThisMonth).toFixed(2)}</b>\n`;
+    txt += `💰 Revenue all-time: <b>$${Number(stats.totalRevenue).toFixed(2)}</b>\n`;
+    if (stats.expiringSoon > 0) {
+      txt += `⚠️ Expiring in 7 days: <b>${stats.expiringSoon}</b>\n`;
+    }
+    txt += `\n━━━━━━━━━━━━━━━━━\n\n`;
+
+    if (!stats.recentOrders.length) {
+      txt += '<i>No orders yet.</i>';
+    } else {
+      stats.recentOrders.forEach((r, i) => {
+        const date = r.created_at ? r.created_at.slice(0, 10) : '—';
+        txt += `${i + 1}. ${sEmoji(r.status)} <b>#${r.order_id}</b> — <code>${escapeHtml(r.email || '')}</code>\n`;
+        txt += `   💵 <b>$${Number(r.final_price).toFixed(2)}</b> · ${payMethodLabel(r.payment_method)}\n`;
+        txt += `   📅 Until: ${r.end_date} · 🗓 Ordered: ${date}\n\n`;
+      });
+    }
+
+    // Telegram message limit — trim if too long
+    if (txt.length > 4000) txt = txt.slice(0, 3990) + '\n<i>…truncated</i>';
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: '📋 Active Subscriptions', callback_data: 'admin_cgb_active' }],
+        [{ text: '🔙 Back', callback_data: 'admin_cgb_panel' }],
+      ] }
+    }).catch(() => {});
+    return;
+  }
+
+  // ── Set Monthly Price ──
+  if (data === 'admin_cgb_setprice') {
+    session.set(userId, 'ADMIN_CGB_PRICE', {});
+    await bot.sendMessage(chatId,
+      '💰 <b>Set Monthly Price</b>\n\nEnter the new monthly price in USD (e.g. <code>50</code>):',
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  // ── Manage Cycles ──
+  if (data === 'admin_cgb_cycles') {
+    const cycles = db.getBillingCycles();
+    const best = cgbCycles.calculateBestCycle();
+    const monthly = cgbCycles.getMonthlyPrice();
+
+    let txt = `📅 <b>Billing Cycles</b>\n\n`;
+    if (!cycles.length) {
+      txt += `<i>None configured — falling back to the built-in defaults ` +
+             `(26→25 and 16→15). Add one to take control.</i>\n\n`;
+    }
+
+    // The panel used to list cycles without saying which one was in force, so
+    // adding a cycle looked like it had no effect. It is not replaced: the bot
+    // quotes whichever ACTIVE cycle gives the customer the most days.
+    if (best && best.cycle.manual) {
+      // The override silences the day-based cycles entirely, so saying so here
+      // is the difference between "my edits do nothing" and "of course".
+      txt += `🕒 <b>MANUAL OVERRIDE IS ACTIVE</b>\n` +
+             `Ends: <b>${escapeHtml(String(best.cycle.ends_at))}</b>\n` +
+             `⏳ ${best.daysRemaining} day(s) · $${((best.daysRemaining / 30) * monthly).toFixed(2)}\n\n` +
+             `⚠️ <i>The cycles below are IGNORED while this is set.</i>\n\n`;
+    } else if (best) {
+      const d = best.endDate;
+      const price = ((best.daysRemaining / 30) * monthly).toFixed(2);
+      txt += `🟢 <b>In use right now</b>\n` +
+             `Day ${best.cycle.start_day} → Day ${best.cycle.end_day}` +
+             `${best.cycle.is_default ? ' <i>(built-in default)</i>' : ''}\n` +
+             `📅 A purchase today ends: <b>${d.toISOString().slice(0, 10)}</b>\n` +
+             `⏳ Days given: <b>${best.daysRemaining}</b>  💰 Price: <b>$${price}</b>\n\n`;
+
+      if (best.all.length > 1) {
+        txt += `<b>All active cycles</b>\n` +
+          best.all.map((e) =>
+            `${e === best ? '👉' : '  '} Day ${e.cycle.start_day} → ${e.cycle.end_day} — ` +
+            `${e.daysRemaining} day(s)`
+          ).join('\n') +
+          `\n\n⚠️ <i>The bot always uses the cycle with the MOST days. Adding a ` +
+          `cycle does not replace the others — delete the ones you no longer want, ` +
+          `or the old one keeps winning.</i>\n`;
+      }
+    }
+
+    const rows = cycles.map(c => [{
+      text: `🗑 Delete: Day ${c.start_day} → Day ${c.end_day}`,
+      callback_data: `admin_cgb_delcycle_${c.id}`
+    }]);
+    rows.push([{ text: '⏭ Start next cycle now', callback_data: 'admin_cgb_nextcycle' }]);
+    rows.push([{ text: '🕒 Set exact end time', callback_data: 'admin_cgb_manual' }]);
+    rows.push([{ text: '➕ Add Cycle', callback_data: 'admin_cgb_addcycle' }]);
+    rows.push([{ text: '🔙 Back', callback_data: 'admin_cgb_panel' }]);
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: rows }
+    }).catch(() => {});
+    return;
+  }
+
+  if (data === 'admin_cgb_addcycle') {
+    session.set(userId, 'ADMIN_CGB_ADDCYCLE', {});
+    await bot.sendMessage(chatId,
+      '📅 <b>Add Billing Cycle</b>\n\nSend in format <code>START-END</code>\n' +
+      'Example: <code>26-25</code> (cycle from day 26 to day 25 of next month)\n' +
+      'Example: <code>1-30</code> (cycle from day 1 to day 30)',
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (/^admin_cgb_delcycle_\d+$/.test(data)) {
+    const cycleId = parseInt(data.split('_').pop(), 10);
+    db.removeBillingCycle(cycleId);
+    await answer('🗑 Deleted', true);
+    return await handleAdminCallback(bot, { ...query, data: 'admin_cgb_cycles' });
+  }
+
+  // ── Active Subscriptions ──
+  if (data === 'admin_cgb_active') {
+    const active = db.getActiveCgbSubs();
+    let txt = `📊 <b>Active Subscriptions (${active.length})</b>\n\n`;
+    if (!active.length) txt += '<i>No active subscriptions.</i>';
+    active.slice(0, 20).forEach((s, i) => {
+      txt += `${i+1}. Order #${s.order_id} — <code>${escapeHtml(s.email || '')}</code>\n`;
+      txt += `   Until: ${s.end_date} | $${Number(s.final_price).toFixed(2)}\n\n`;
+    });
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'admin_cgb_panel' }]] }
+    }).catch(() => {});
+    return;
+  }
+
+
+  // ════════════════════════════════════════════════════════
+  // 🏪 RESELLERS MANAGEMENT
+  // ════════════════════════════════════════════════════════
+  if (data === 'admin_resellers') {
+    const resellers = db.getAllResellers();
+    let txt = `🏪 <b>Resellers</b>\n\nTotal: ${resellers.length}\n\n`;
+    const rows = resellers.slice(0, 20).map(r => {
+      const status = r.is_active ? '✅' : '🚫';
+      return [{
+        text: `${status} ${r.name} — $${Number(r.balance).toFixed(2)} (${r.orders_count})`,
+        callback_data: `admin_reseller_${r.id}`
+      }];
+    });
+    rows.push([{ text: '➕ Add New Reseller', callback_data: 'admin_reseller_new' }]);
+    rows.push([{ text: '📖 API Docs URL', callback_data: 'admin_reseller_docs' }]);
+    rows.push([{ text: '🔙 Back', callback_data: 'admin_panel' }]);
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: rows }
+    }).catch(() => {});
+    return;
+  }
+
+  if (data === 'admin_reseller_new') {
+    session.set(userId, 'ADMIN_RESELLER_NEW_NAME', {});
+    await bot.sendMessage(chatId,
+      '➕ <b>New Reseller</b>\n\nSend the reseller name (e.g. <code>MyShop Reseller</code>):',
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (data === 'admin_reseller_docs') {
+    const url = process.env.RAILWAY_PUBLIC_DOMAIN
+      ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}/api/v1/docs`
+      : 'https://your-railway-url.up.railway.app/api/v1/docs';
+    await bot.sendMessage(chatId,
+      `📖 <b>API Documentation</b>\n\nShare this URL with your resellers:\n\n<code>${url}</code>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (/^admin_reseller_\d+$/.test(data)) {
+    const id = parseInt(data.split('_').pop(), 10);
+    const r = db.getResellerById(id);
+    if (!r) { await answer('❌ Not found'); return; }
+
+    let txt = `🏪 <b>${escapeHtml(r.name)}</b>\n\n`;
+    txt += `🔑 API Key:\n<code>${escapeHtml(r.api_key)}</code>\n\n`;
+    txt += `💰 Balance: <b>$${Number(r.balance).toFixed(2)}</b>\n`;
+    txt += `💵 Total Spent: <b>$${Number(r.total_spent).toFixed(2)}</b>\n`;
+    txt += `📦 Orders: <b>${r.orders_count}</b>\n`;
+    txt += `Status: ${r.is_active ? '✅ Active' : '🚫 Inactive'}\n`;
+    txt += `Created: ${(r.created_at || '').slice(0, 16)}`;
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: '💰 Add Balance', callback_data: `admin_reseller_balance_${id}` }],
+        [{ text: '📦 View Orders', callback_data: `admin_reseller_orders_${id}` }],
+        [{ text: r.is_active ? '🚫 Deactivate' : '✅ Activate', callback_data: `admin_reseller_toggle_${id}` }],
+        [{ text: '🗑 Delete', callback_data: `admin_reseller_delete_${id}` }],
+        [{ text: '🔙 Back', callback_data: 'admin_resellers' }],
+      ] }
+    }).catch(() => {});
+    return;
+  }
+
+  if (/^admin_reseller_balance_\d+$/.test(data)) {
+    const id = parseInt(data.split('_').pop(), 10);
+    session.set(userId, 'ADMIN_RESELLER_BALANCE', { resellerId: id });
+    await bot.sendMessage(chatId,
+      '💰 Enter amount to add (e.g. <code>10</code>) or negative to subtract (<code>-5</code>):',
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (/^admin_reseller_toggle_\d+$/.test(data)) {
+    const id = parseInt(data.split('_').pop(), 10);
+    const r = db.getResellerById(id);
+    if (!r) return;
+    db.toggleReseller(id, r.is_active ? 0 : 1);
+    await answer(r.is_active ? '🚫 Deactivated' : '✅ Activated', true);
+    return await handleAdminCallback(bot, { ...query, data: `admin_reseller_${id}` });
+  }
+
+  if (/^admin_reseller_delete_\d+$/.test(data)) {
+    const id = parseInt(data.split('_').pop(), 10);
+    db.deleteReseller(id);
+    await answer('🗑 Deleted', true);
+    return await handleAdminCallback(bot, { ...query, data: 'admin_resellers' });
+  }
+
+  if (/^admin_reseller_orders_\d+$/.test(data)) {
+    const id = parseInt(data.split('_').pop(), 10);
+    const orders = db.getResellerOrders(id);
+    let txt = `📦 <b>Orders (${orders.length})</b>\n\n`;
+    orders.slice(0, 15).forEach(o => {
+      txt += `#${o.id} • ${escapeHtml((o.product_title || '').slice(0, 30))}\n`;
+      txt += `   ${o.quantity}× × $${Number(o.unit_price).toFixed(2)} = $${Number(o.total).toFixed(2)}\n`;
+      txt += `   ${o.created_at?.slice(0, 16)}\n\n`;
+    });
+    if (!orders.length) txt += '<i>No orders yet.</i>';
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: `admin_reseller_${id}` }]] }
+    }).catch(() => {});
+    return;
+  }
+
+  // Set wholesale price (used from product edit menu)
+  if (/^admin_edit_field_\d+_wholesale_price$/.test(data)) {
+    const m = data.match(/^admin_edit_field_(\d+)_wholesale_price$/);
+    const productId = parseInt(m[1], 10);
+    session.set(userId, 'ADMIN_EDIT_FIELD', { productId, field: 'wholesale_price' });
+    await bot.sendMessage(chatId,
+      '🏪 <b>Wholesale Price</b>\n\nEnter the wholesale price (for resellers).\nExample: <code>4.50</code>\nUse <code>0</code> to disable resale for this product.',
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+
+  // ── 🚨 SPECIFIC: Out-of-Stock Exploit Audit ──────────────────────
+  if (data === 'admin_audit_oos') {
+    const dbRaw = require('../database/db');
+    // Find deposits with descriptions matching the OOS exploit
+    const suspicious = dbRaw.prepare(`
+      SELECT 
+        t.user_id, 
+        u.username, 
+        u.first_name, 
+        u.balance,
+        SUM(t.amount) AS total_credited,
+        COUNT(DISTINCT t.order_id) AS orders_count,
+        GROUP_CONCAT(DISTINCT t.order_id) AS order_ids,
+        MIN(t.created_at) AS first_exploit,
+        MAX(t.created_at) AS last_exploit
+      FROM transactions t
+      LEFT JOIN users u ON t.user_id = u.telegram_id
+      WHERE (t.type = 'deposit' OR t.type = 'refund')
+        AND t.order_id IS NOT NULL
+        AND (
+          t.description LIKE '%Out-of-stock%' OR
+          t.description LIKE '%out of stock%' OR
+          t.description LIKE '%OOS%' OR
+          t.description LIKE '%Auto-refund%' OR
+          t.description LIKE '%out_of_stock%'
+        )
+      GROUP BY t.user_id
+      ORDER BY total_credited DESC
+      LIMIT 30
+    `).all();
+
+    let txt = `🚨 <b>Out-of-Stock Exploit Audit</b>\n\n`;
+    if (!suspicious.length) {
+      txt += `✅ <b>No out-of-stock exploits detected.</b>\n\n`;
+      txt += `<i>This finds users who got wallet credit from the "buy out-of-stock product" bug.</i>`;
+    } else {
+      txt += `Found <b>${suspicious.length}</b> user(s).\n\n`;
+      let totalLost = 0;
+      suspicious.slice(0, 15).forEach((s, i) => {
+        const name = s.username ? '@' + s.username : (s.first_name || `User ${s.user_id}`);
+        const credited = Number(s.total_credited) || 0;
+        const balance = Number(s.balance) || 0;
+        totalLost += credited;
+        const orderIds = (s.order_ids || '').split(',').slice(0, 5).join(', #');
+        txt += `${i+1}. ${escapeHtml(name)}\n`;
+        txt += `   ID: <code>${s.user_id}</code>\n`;
+        txt += `   🚨 Stolen: <b>${formatPrice(credited)}</b> from ${s.orders_count} OOS order(s)\n`;
+        txt += `   📦 Orders: #${orderIds}\n`;
+        txt += `   💰 Current balance: <b>${formatPrice(balance)}</b>\n\n`;
+      });
+      if (suspicious.length > 15) txt += `<i>... and ${suspicious.length - 15} more</i>\n\n`;
+      txt += `\n💸 <b>Total stolen via OOS: ${formatPrice(totalLost)}</b>`;
+    }
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        ...(suspicious.length > 0 ? [[
+          { text: '⚠️ Deduct ALL stolen', callback_data: 'admin_audit_oos_deduct' }
+        ]] : []),
+        [{ text: '🔙 Back', callback_data: 'admin_panel' }]
+      ] }
+    }).catch(() => {});
+    return;
+  }
+
+  if (data === 'admin_audit_oos_deduct') {
+    const dbRaw = require('../database/db');
+    const suspicious = dbRaw.prepare(`
+      SELECT t.user_id, SUM(t.amount) AS total_credited
+      FROM transactions t
+      WHERE t.type = 'deposit' AND t.order_id IS NOT NULL
+        AND (t.description LIKE '%Out-of-stock%' OR t.description LIKE '%out of stock%' OR t.description LIKE '%OOS%')
+      GROUP BY t.user_id
+    `).all();
+
+    let totalDeducted = 0, usersAffected = 0;
+    const tx = dbRaw.transaction(() => {
+      for (const s of suspicious) {
+        const amount = Number(s.total_credited) || 0;
+        if (amount <= 0) continue;
+        const u = dbRaw.prepare(`SELECT balance FROM users WHERE telegram_id=?`).get(s.user_id);
+        if (!u) continue;
+        const deduct = Math.min(amount, Number(u.balance) || 0);
+        if (deduct > 0) {
+          dbRaw.prepare(`UPDATE users SET balance = balance - ? WHERE telegram_id=?`).run(deduct, s.user_id);
+          dbRaw.prepare(`INSERT INTO transactions (user_id, type, amount, description) VALUES (?, 'admin_adjust', ?, ?)`)
+            .run(s.user_id, -deduct, 'OOS exploit reversal (admin audit)');
+          totalDeducted += deduct;
+          usersAffected++;
+        }
+      }
+    });
+    tx();
+
+    await bot.editMessageText(
+      `✅ <b>OOS Exploit Reversed</b>\n\n` +
+      `👥 Users affected: <b>${usersAffected}</b>\n` +
+      `💸 Total deducted: <b>${formatPrice(totalDeducted)}</b>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'admin_panel' }]] } }
+    ).catch(() => {});
+    logger.info(`[ADMIN] OOS reversal: ${formatPrice(totalDeducted)} from ${usersAffected} users`);
+    return;
+  }
+
+  // ── Toggle referral system ───────────────────────────────────────
+  if (data === 'admin_referral_toggle') {
+    const current = db.getSetting('referral_enabled', '1') === '1';
+    db.setSetting('referral_enabled', current ? '0' : '1');
+    await answer(current ? '🔴 Referral DISABLED' : '🟢 Referral ENABLED');
+    return await handleAdminCallback(bot, { ...query, data: 'admin_vip_toggle' });
+  }
+
+  // ── Toggle VIP new-only mode ─────────────────────────────────────
+  if (data === 'admin_vip_new_only_toggle') {
+    const current = db.getSetting('vip_new_only', '0') === '1';
+    db.setSetting('vip_new_only', current ? '0' : '1');
+    await answer(current ? '👥 All can earn VIP' : '🆕 Only NEW customers');
+    return await handleAdminCallback(bot, { ...query, data: 'admin_vip_toggle' });
+  }
+
+  // ── VIP Earnings Statistics ──────────────────────────────────────
+  if (data === 'admin_vip_stats') {
+    const dbRaw = require('../database/db');
+    const vips = dbRaw.prepare(`SELECT telegram_id, username, first_name, balance FROM users WHERE is_vip=1`).all();
+    let totalReferralRewards = 0;
+    let totalSpent = 0;
+    const vipDetails = [];
+    for (const v of vips) {
+      const refRewards = dbRaw.prepare(`SELECT COALESCE(SUM(amount), 0) AS total FROM transactions WHERE user_id=? AND type='referral'`).get(v.telegram_id);
+      const earned = Number(refRewards?.total) || 0;
+      totalReferralRewards += earned;
+      const spent = dbRaw.prepare(`SELECT COALESCE(SUM(total_price), 0) AS total FROM orders WHERE user_id=? AND status='delivered'`).get(v.telegram_id);
+      const spentAmount = Number(spent?.total) || 0;
+      totalSpent += spentAmount;
+      vipDetails.push({
+        name: v.username ? '@' + v.username : (v.first_name || `User ${v.telegram_id}`),
+        earned, spent: spentAmount,
+      });
+    }
+    vipDetails.sort((a, b) => b.earned - a.earned);
+
+    let txt = `💰 <b>VIP Earnings Report</b>\n\n`;
+    txt += `👑 Total VIPs: <b>${vips.length}</b>\n`;
+    txt += `💸 Referral Rewards paid: <b>${formatPrice(totalReferralRewards)}</b>\n`;
+    txt += `🛒 Total spent by VIPs: <b>${formatPrice(totalSpent)}</b>\n\n`;
+    txt += `<b>Top earners (⚠️ = scam alert):</b>\n`;
+    for (const v of vipDetails.slice(0, 15)) {
+      const warning = v.earned > 5 && v.spent === 0 ? ' ⚠️' : '';
+      txt += `${escapeHtml(v.name)} — earned ${formatPrice(v.earned)}, spent ${formatPrice(v.spent)}${warning}\n`;
+    }
+    txt += `\n⚠️ = Earned referral money but never purchased anything (possible scam)`;
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'admin_vip_toggle' }]] }
+    }).catch(() => {});
+    return;
+  }
+
+  if (data === 'admin_vip_system_on') {
+    db.setSetting('vip_system_enabled', '1');
+    await answer('🟢 VIP System OPEN');
+    return;
+  }
+  if (data === 'admin_vip_system_off') {
+    db.setSetting('vip_system_enabled', '0');
+    await answer('🔴 VIP System CLOSED');
+    return;
+  }
+  if (data === 'admin_vip_on') {
+    db.setSetting('vip_auto_broadcast', '1');
+    await answer('🟢 Auto broadcast ON');
+    // Simulate refresh by re-calling
+    return await handleAdminCallback(bot, { ...query, data: 'admin_vip_toggle' });
+  }
+  if (data === 'admin_vip_off') {
+    db.setSetting('vip_auto_broadcast', '0');
+    await answer('🔴 Auto broadcast OFF');
+    return;
+  }
+  if (data === 'admin_vip_post_now') {
+    await answer('⏳ Posting...');
+    const totalVips = db.countVIPs();
+    const slotsLeft = Math.max(0, parseInt(db.getSetting('vip_limit', '1000'), 10) - totalVips);
+    const botUser = await bot.getMe().catch(() => ({ username: 'YourBot' }));
+    const text =
+      `👑 <b>VIP FOR LIFE</b> 👑\n\n` +
+      `🚨 <b>Important:</b> ⏳ VIP closes at <b>${parseInt(db.getSetting('vip_limit', '1000'), 10).toLocaleString()} customers</b>\n` +
+      `📊 Only <b>${slotsLeft} slots remaining</b>\n\n` +
+      `Invite only <b>3 friends</b> and unlock VIP <b>forever</b>!\n\n` +
+      `🎁 <b>VIP Benefits:</b>\n` +
+      `💸 5% discount on every purchase for life\n` +
+      `🤝 Earn rewards from your team's purchases\n` +
+      `🚀 Early access to new and rare products\n` +
+      `⚡️ Priority support and faster replies\n\n` +
+      `🔥 Invite <b>3 friends</b> today!`;
+    const kb = { inline_keyboard: [
+      [{ text: '🚀 Open Bot & Invite Friends', url: `https://t.me/${botUser.username}?start=vip` }],
+      [{ text: '👑 Become VIP Now', url: `https://t.me/${botUser.username}?start=vip` }],
+    ] };
+    const { publishToChannel, publishToGroup } = require('../services/notifications');
+    const vipImg = db.getSetting('vip_image_file_id', '');
+    if (vipImg) {
+      const channelId = updatesChannelId();
+      const groupId   = updatesGroupId();
+      if (channelId) await bot.sendPhoto(channelId, vipImg, { caption: text, parse_mode: 'HTML', reply_markup: kb }).catch(() => {});
+      if (groupId)   await bot.sendPhoto(groupId, vipImg, { caption: text, parse_mode: 'HTML', reply_markup: kb }).catch(() => {});
+    } else {
+      await publishToChannel(bot, text, kb).catch(() => {});
+      await publishToGroup(bot, text, kb).catch(() => {});
+    }
+    await bot.sendMessage(chatId, '✅ Posted to channel and group.');
+    return;
+  }
+
+  // ── Maintenance Mode ──────────────────────────────────────────────
+  if (data === 'admin_maintenance') {
+    const enabled = db.getSetting('maintenance_mode', '0') === '1';
+    const msg = db.getSetting('maintenance_message', 'The bot is currently under maintenance. Please try again later.');
+
+    await bot.editMessageText(
+      `🚧 <b>Maintenance Mode</b>\n\n` +
+      `Current status: ${enabled ? '🔴 <b>ON</b> (bot is locked)' : '🟢 <b>OFF</b> (bot is open)'}\n\n` +
+      `<b>When ON:</b>\n` +
+      `• Customers cannot buy, top-up, or place orders\n` +
+      `• They see your maintenance message\n` +
+      `• Admin functions remain working\n\n` +
+      `<b>Current message shown to customers:</b>\n` +
+      `<i>${escapeHtml(msg)}</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          enabled
+            ? [{ text: '🟢 Turn OFF Maintenance', callback_data: 'admin_maintenance_off' }]
+            : [{ text: '🔴 Turn ON Maintenance', callback_data: 'admin_maintenance_on' }],
+          [{ text: '✏️ Edit Message', callback_data: 'admin_maintenance_msg' }],
+          [{ text: '🔙 Back', callback_data: 'admin_panel' }],
+        ] } }
+    );
+    return;
+  }
+
+  if (data === 'admin_maintenance_on') {
+    db.setSetting('maintenance_mode', '1');
+    await answer('🔴 Maintenance ON');
+    // Broadcast to channel + group
+    try {
+      const msg = db.getSetting('maintenance_message', 'The bot is currently under maintenance.');
+      const announcement =
+        `🚧 <b>Bot Under Maintenance</b>\n\n` +
+        `${msg}\n\n` +
+        `⏰ Service will resume shortly. Thank you for your patience.`;
+      const channelId = updatesChannelId();
+      const groupId = updatesGroupId();
+      if (channelId) {
+        try { await bot.sendMessage(channelId, announcement, { parse_mode: 'HTML' }); } catch (e) { logger.warn(`Channel notify failed: ${e.message}`); }
+      }
+      if (groupId) {
+        try { await bot.sendMessage(groupId, announcement, { parse_mode: 'HTML' }); } catch (e) { logger.warn(`Group notify failed: ${e.message}`); }
+      }
+    } catch (e) { logger.warn(`Maintenance broadcast failed: ${e.message}`); }
+    // Refresh view
+    const msg = db.getSetting('maintenance_message', 'The bot is currently under maintenance. Please try again later.');
+    await bot.editMessageText(
+      `🚧 <b>Maintenance Mode</b>\n\n` +
+      `Current status: 🔴 <b>ON</b> (bot is locked)\n\n` +
+      `Customers see: <i>${escapeHtml(msg)}</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: '🟢 Turn OFF Maintenance', callback_data: 'admin_maintenance_off' }],
+          [{ text: '✏️ Edit Message', callback_data: 'admin_maintenance_msg' }],
+          [{ text: '🔙 Back', callback_data: 'admin_panel' }],
+        ] } }
+    );
+    return;
+  }
+
+  if (data === 'admin_maintenance_off') {
+    db.setSetting('maintenance_mode', '0');
+    await answer('🟢 Maintenance OFF');
+    // Broadcast back-online to channel + group
+    try {
+      const announcement =
+        `✅ <b>Bot is Back Online!</b>\n\n` +
+        `🎉 Maintenance complete — service is fully operational again.\n` +
+        `Thank you for your patience! 💚`;
+      const channelId = updatesChannelId();
+      const groupId = updatesGroupId();
+      if (channelId) {
+        try { await bot.sendMessage(channelId, announcement, { parse_mode: 'HTML' }); } catch (e) { logger.warn(`Channel notify failed: ${e.message}`); }
+      }
+      if (groupId) {
+        try { await bot.sendMessage(groupId, announcement, { parse_mode: 'HTML' }); } catch (e) { logger.warn(`Group notify failed: ${e.message}`); }
+      }
+    } catch (e) { logger.warn(`Maintenance broadcast failed: ${e.message}`); }
+    await bot.editMessageText(
+      `🚧 <b>Maintenance Mode</b>\n\n` +
+      `Current status: 🟢 <b>OFF</b> (bot is open)\n\n` +
+      `Bot is fully operational for customers.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: '🔴 Turn ON Maintenance', callback_data: 'admin_maintenance_on' }],
+          [{ text: '✏️ Edit Message', callback_data: 'admin_maintenance_msg' }],
+          [{ text: '🔙 Back', callback_data: 'admin_panel' }],
+        ] } }
+    );
+    return;
+  }
+
+  if (data === 'admin_maintenance_msg') {
+    session.set(userId, States.ADMIN_MAINTENANCE_MSG, {});
+    await bot.editMessageText(
+      `✏️ <b>Edit Maintenance Message</b>\n\n` +
+      `Send the new message that customers will see when the bot is in maintenance mode.\n\n` +
+      `<i>Current:</i>\n` +
+      `${escapeHtml(db.getSetting('maintenance_message', 'The bot is currently under maintenance.'))}`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Cancel', callback_data: 'admin_maintenance' }]] } }
+    );
+    return;
+  }
+
+  // ── Refund ────────────────────────────────────────────────────────
+  if (data === 'admin_refund') {
+    session.set(userId, States.ADMIN_REFUND_ORDER_ID, {});
+    await bot.editMessageText(
+      '💸 <b>Issue Refund</b>\n\n' +
+      'Step 1: Enter the <b>Order ID</b> to refund:',
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminBackKb() }
+    );
+    return;
+  }
+  if (/^admin_refund_confirm_\d+$/.test(data)) {
+    const orderId = parseInt(data.split('_').pop(), 10);
+    const sess = session.get(userId);
+    const { order, refundEndDate, warrantyDays, daysRemaining, refundAmount } = sess.data;
+    session.clear(userId);
+
+    if (!order || refundAmount === undefined) {
+      await bot.editMessageText('❌ Refund session expired. Please start again.', {
+        chat_id: chatId, message_id: msgId, reply_markup: adminBackKb(),
+      });
+      return;
+    }
+
+    // Credit the user's wallet
+    db.updateBalance(order.user_id, refundAmount);
+    db.addTransaction({
+      userId:      order.user_id,
+      type:        'refund',
+      amount:      refundAmount,
+      description: `Refund for Order #${orderId} — ${daysRemaining}/${warrantyDays} days remaining`,
+      refId:       null,
+      orderId:     orderId,
+    });
+
+    // Save refund record
+    db.createRefund({
+      orderId,
+      userId:        order.user_id,
+      productId:     order.product_id,
+      originalPrice: order.total_price,
+      refundAmount,
+      warrantyDays,
+      endDate:       refundEndDate,
+    });
+
+    // Notify user
+    try {
+      await bot.sendMessage(
+        order.user_id,
+        `💸 <b>Refund Issued!</b>\n\n` +
+        `📦 Order #${orderId} — ${order.product_title}\n` +
+        `⏳ Days remaining: <b>${daysRemaining}</b> / ${warrantyDays}\n` +
+        `💰 Refunded: <b>${formatPrice(refundAmount)}</b> → added to your wallet\n\n` +
+        `Thank you for your trust! 🙏`,
+        { parse_mode: 'HTML' }
+      );
+    } catch (e) {
+      logger.warn(`Could not notify user ${order.user_id} about refund: ${e.message}`);
+    }
+
+    await bot.editMessageText(
+      `✅ <b>Refund Issued!</b>\n\n` +
+      `📦 Order #${orderId}\n` +
+      `👤 User: <code>${order.user_id}</code>\n` +
+      `💰 Refunded: <b>${formatPrice(refundAmount)}</b>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminBackKb() }
+    );
+    return;
+  }
+
+  // ── Delete single stock item (works for both product_items and legacy stock) ──
+  if (/^admin_del_stock_item_[is]_\d+$/.test(data)) {
+    if (!isAdmin(userId)) { await rejectNonAdmin(bot, query.id); return; }
+    const parts2  = data.split('_');
+    const type    = parts2[parts2.length - 2]; // 'i' or 's'
+    const itemId  = parseInt(parts2[parts2.length - 1], 10);
+
+    let productId = null;
+    let deleted   = false;
+
+    if (type === 'i') {
+      // product_items table
+      const item = items.getItem(itemId);
+      if (item && item.status === 'available') {
+        productId = item.product_id;
+        const changes = items.deleteItem(itemId);
+        deleted = changes > 0;
+      }
+    } else {
+      // legacy stock table
+      const stockItem = db.getStockItemById(itemId);
+      if (stockItem) {
+        productId = stockItem.product_id;
+        db.deleteStockItem(itemId);
+        deleted = true;
+      }
+    }
+
+    if (!deleted || !productId) {
+      await answer('❌ Item not found or already deleted.');
+      return;
+    }
+
+    // Decrease stock_quantity by 1
+    db.adjustStockQuantity(productId, -1);
+    const product = db.getProduct(productId);
+
+    // Get remaining items (both types)
+    const remainingItems  = items.getAllAvailable(productId);
+    const remainingLegacy = db.getStockItems(productId);
+    const remaining = [
+      ...remainingItems.map((it) => ({ id: it.id, content: it.raw_content, type: 'item' })),
+      ...remainingLegacy.map((it) => ({ id: it.id, content: it.content, type: 'stock' })),
+    ];
+
+    await answer('✅ Item deleted');
+
+    if (remaining.length === 0) {
+      await bot.editMessageText(
+        `✅ <b>Item deleted.</b>\n\n📦 ${product.title}\n📊 No more stock items.`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: backToProductEditKb(productId) }
+      );
+    } else {
+      // Build new keyboard with remaining items
+      const rows = remaining.slice(0, 20).map((it) => {
+        const preview = String(it.content || '').slice(0, 30);
+        const prefix  = it.type === 'item' ? 'i' : 's';
+        return [{ text: `🗑 #${it.id}: ${preview}`, callback_data: `admin_del_stock_item_${prefix}_${it.id}` }];
+      });
+      rows.push([{ text: '🔙 Back to Product', callback_data: `admin_edit_p_${productId}` }]);
+
+      await bot.editMessageText(
+        `✅ <b>Item deleted.</b> ${remaining.length} item(s) remaining.\n\n` +
+        `Select another item to delete:`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }
+      );
+    }
+    return;
+  }
+
+  // ── Support tickets ───────────────────────────────────────────────
+  if (data === 'admin_tickets') {
+    const tickets = db.getOpenTickets();
+    if (!tickets.length) {
+      await bot.editMessageText('🎫 <b>No open tickets.</b>', {
+        chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminBackKb(),
+      });
+      return;
+    }
+    await bot.editMessageText(`🎫 <b>Open Tickets</b> (${tickets.length})`, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminTicketsKb(tickets),
+    });
+    return;
+  }
+  if (/^admin_ticket_\d+$/.test(data)) {
+    const ticketId = parseInt(data.split('_').pop(), 10);
+    const ticket   = db.getTicket(ticketId);
+    if (!ticket) { await answer('❌ Not found.'); return; }
+    await bot.editMessageText(
+      `🎫 <b>Ticket #${ticketId}</b>\n\n👤 User: <code>${ticket.user_id}</code>\n📅 ${(ticket.created_at || '').slice(0, 16)}\n\n📝 <b>Message:</b>\n${ticket.message}`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminTicketActionsKb(ticketId) }
+    );
+    return;
+  }
+  if (/^admin_reply_ticket_\d+$/.test(data)) {
+    const ticketId = parseInt(data.split('_').pop(), 10);
+    session.set(userId, States.ADMIN_REPLY_TICKET, { replyTicketId: ticketId });
+    await bot.editMessageText(`✉️ <b>Reply to Ticket #${ticketId}</b>\n\nEnter your reply:`, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminBackKb(),
+    });
+    return;
+  }
+
+  // ── Settings ──────────────────────────────────────────────────────
+  if (data === 'admin_settings') {
+    await bot.editMessageText('⚙️ <b>Settings</b>\n\nSelect a setting to edit:', {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminSettingsKb(),
+    });
+    return;
+  }
+  // ── Broadcast health check ────────────────────────────────────────
+  // Auto-posting fails silently by design — a publish error is logged and
+  // swallowed so a broken channel never blocks a sale. That leaves no way to
+  // tell "not configured" from "bot was kicked" from "notifications switched
+  // off", so this asks Telegram directly and reports each cause by name.
+  if (data === 'admin_broadcast_check' || data === 'admin_broadcast_test') {
+    const doTest = data === 'admin_broadcast_test';
+    const stockOn = db.getSetting('stock_notifications_enabled', '1') === '1';
+
+    const targets = [
+      { label: '📡 Channel', id: updatesChannelId(),
+        source: db.getSetting('updates_channel_id', '') ? 'Updates Channel' : 'Required Channel (fallback)' },
+      { label: '💬 Group',   id: updatesGroupId(),
+        source: db.getSetting('updates_group_id', '')   ? 'Updates Group'   : 'Required Group (fallback)' },
+    ];
+
+    const lines = [];
+    for (const t of targets) {
+      if (!t.id) {
+        lines.push(`${t.label}: ⚪️ <b>Not set</b> — nothing will be posted here.`);
+        continue;
+      }
+      try {
+        const chat = await bot.getChat(t.id);
+        const me   = await bot.getChatMember(t.id, (await bot.getMe()).id);
+        // "administrator" is what actually matters: a plain member cannot post
+        // to a channel, and Telegram reports that only when you try to send.
+        const canPost = me.status === 'administrator' || me.status === 'creator';
+        lines.push(
+          `${t.label}: ${canPost ? '🟢' : '🔴'} <b>${escapeHtml(chat.title || String(t.id))}</b>\n` +
+          `   <code>${escapeHtml(String(t.id))}</code> · from ${t.source}\n` +
+          `   Bot status: <b>${me.status}</b>${canPost ? '' : ' — needs to be an admin to post'}`
+        );
+      } catch (e) {
+        lines.push(
+          `${t.label}: 🔴 <b>Unreachable</b>\n` +
+          `   <code>${escapeHtml(String(t.id))}</code> · from ${t.source}\n` +
+          `   ${escapeHtml(e.message)}`
+        );
+      }
+    }
+
+    if (doTest) {
+      const sent = await autoPublish(bot,
+        `🩺 <b>Test post</b>\n\nIf you can read this, automatic stock updates will appear here.`
+      ).catch(() => false);
+      lines.push(`\n${sent ? '✅ Test post delivered.' : '❌ Test post could not be delivered.'}`);
+    }
+
+    await bot.editMessageText(
+      `🩺 <b>Broadcast Check</b>\n\n` +
+      `📦 Stock notifications: ${stockOn ? '🟢 <b>ON</b>' : '🔴 <b>OFF</b> — turn on “Stock Notifs” in settings'}\n\n` +
+      lines.join('\n\n') +
+      `\n\n<i>Posts go to the Updates Channel/Group when set, otherwise to the ` +
+      `required-subscription chats.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: '🚀 Send test post', callback_data: 'admin_broadcast_test' }],
+          [{ text: '📡 Set Updates Channel', callback_data: 'admin_setting_updates_channel_id' },
+           { text: '💬 Set Updates Group',   callback_data: 'admin_setting_updates_group_id' }],
+          [{ text: '🔙 Back to Settings', callback_data: 'admin_settings' }],
+        ] } }
+    ).catch(() => {});
+    return;
+  }
+
+  // ══════════════════════════════════════════════════════════════════
+  // SPEND RANKS — thresholds and percentages, fully editable
+  // ══════════════════════════════════════════════════════════════════
+  if (data === 'admin_ranks') {
+    const tiers   = db.getRankTiers();
+    const on      = db.getSetting('rank_system_enabled', '1') === '1';
+    const vipPct  = db.getSetting('legacy_vip_discount_pct', '5');
+    const started = db.getSetting('rank_system_started_at', '—');
+    const vipCount = db.countVIPs();
+    const vipOpen  = db.getSetting('vip_system_enabled', '1') === '1';
+
+    const rows = tiers.map((t) => ([{
+      text: `${t.emoji || '🏅'} ${t.name} — $${Number(t.min_spend).toFixed(0)}+ → ${Number(t.discount_pct)}%`,
+      callback_data: `admin_rank_${t.id}`,
+    }]));
+    rows.push([{ text: '➕ Add tier', callback_data: 'admin_rank_add' }]);
+    rows.push([{ text: on ? '🔴 Turn OFF ranks' : '🟢 Turn ON ranks', callback_data: 'admin_rank_toggle' }]);
+    rows.push([{ text: `👑 Legacy VIP discount: ${vipPct}%`, callback_data: 'admin_rank_vippct' }]);
+    rows.push([{ text: `👑 VIP members (${vipCount}) — review & revoke`, callback_data: 'admin_vip_review' }]);
+    rows.push([{ text: '🔙 Back', callback_data: 'admin_panel' }]);
+
+    await bot.editMessageText(
+      `🏆 <b>Spend Ranks</b>\n\n` +
+      `Status: ${on ? '🟢 <b>ON</b>' : '🔴 <b>OFF</b>'}\n` +
+      `Counting since: <b>${escapeHtml(String(started))}</b>\n\n` +
+      `<b>Tiers</b> — tap one to edit its threshold or percentage:\n` +
+      tiers.map((t) => `${t.emoji || '🏅'} <b>${escapeHtml(t.name)}</b> — spend $${Number(t.min_spend).toFixed(0)}+ → <b>${Number(t.discount_pct)}%</b> off`).join('\n') +
+      `\n\n👑 <b>${vipCount}</b> old VIP member${vipCount === 1 ? '' : 's'} keep <b>${escapeHtml(String(vipPct))}%</b> for life — ` +
+      `they only ever move up, never down.\n` +
+      `🔒 VIP is <b>permanently closed</b> — no new member can be granted it. ` +
+      `Existing holders keep their discount.\n\n` +
+      `<i>Spending is counted from zero starting the day ranks were switched on. ` +
+      `Purchases made before that do not count.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (data === 'admin_rank_toggle') {
+    const on = db.getSetting('rank_system_enabled', '1') === '1';
+    db.setSetting('rank_system_enabled', on ? '0' : '1');
+    return handleAdminCallback(bot, { ...query, data: 'admin_ranks' });
+  }
+
+  // ── Review and revoke VIP grants ──────────────────────────────────
+  if (data === 'admin_vip_review' || /^admin_vip_review_\d+$/.test(data)) {
+    const days = /^admin_vip_review_\d+$/.test(data) ? parseInt(data.split('_').pop(), 10) : 30;
+    const since = new Date(Date.now() - days * 86400000).toISOString().slice(0, 19).replace('T', ' ');
+    const recent = db.vipsGrantedSince(since);
+    const total  = db.countVIPs();
+
+    const who = (u) => u.username ? `@${escapeHtml(u.username)}` : escapeHtml(u.first_name || String(u.telegram_id));
+
+    let txt =
+      `👑 <b>VIP members</b>\n\n` +
+      `Total: <b>${total}</b>\n` +
+      `Granted in the last ${days} days: <b>${recent.length}</b>\n\n`;
+
+    if (recent.length) {
+      txt += recent.slice(0, 20).map((u) =>
+        `• ${who(u)} · <code>${u.telegram_id}</code>\n  ${escapeHtml(String(u.vip_unlocked_at || '').slice(0, 16))}`
+      ).join('\n');
+      if (recent.length > 20) txt += `\n<i>…and ${recent.length - 20} more</i>`;
+      txt += `\n\n⚠️ <i>Revoking removes their 5% discount. Members granted before ` +
+             `this window are not touched — their discount was promised for life.</i>`;
+    } else {
+      txt += `<i>Nobody was granted VIP in this window.</i>`;
+    }
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: `${days === 7 ? '✅ ' : ''}7d`,  callback_data: 'admin_vip_review_7' },
+         { text: `${days === 30 ? '✅ ' : ''}30d`, callback_data: 'admin_vip_review_30' },
+         { text: `${days === 90 ? '✅ ' : ''}90d`, callback_data: 'admin_vip_review_90' }],
+        ...(recent.length ? [[{ text: `🗑 Revoke all ${recent.length} from this window`, callback_data: `admin_vip_revoke_${days}` }]] : []),
+        [{ text: '✏️ Revoke one by user id', callback_data: 'admin_vip_revoke_one' }],
+        [{ text: '🔙 Back', callback_data: 'admin_ranks' }],
+      ] }
+    }).catch(() => {});
+    return;
+  }
+
+  if (/^admin_vip_revoke_\d+$/.test(data)) {
+    const days = parseInt(data.split('_').pop(), 10);
+    const since = new Date(Date.now() - days * 86400000).toISOString().slice(0, 19).replace('T', ' ');
+    const list = db.vipsGrantedSince(since);
+
+    let n = 0;
+    for (const u of list) { if (db.revokeVIP(u.telegram_id)) n++; }
+    logger.info(`[VIP] ${n} grant(s) from the last ${days} days revoked by ${userId}`);
+
+    await bot.editMessageText(
+      `✅ <b>${n} VIP grant(s) revoked</b>\n\n` +
+      `They now pay the normal price, or whatever their spend rank earns them.\n` +
+      `👑 Remaining VIP members: <b>${db.countVIPs()}</b>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '👑 VIP members', callback_data: 'admin_vip_review' }]] } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (data === 'admin_vip_revoke_one') {
+    session.set(userId, States.ADMIN_VIP_REVOKE, {});
+    await bot.sendMessage(chatId, '🗑 Send the user id whose VIP should be removed.');
+    return;
+  }
+
+  if (data === 'admin_rank_vipclose') {
+    // Closing VIP does not touch a single is_vip row — it only stops new ones
+    // being granted, which is what keeps the promise to existing members.
+    const open = db.getSetting('vip_system_enabled', '1') === '1';
+    db.setSetting('vip_system_enabled', open ? '0' : '1');
+    return handleAdminCallback(bot, { ...query, data: 'admin_ranks' });
+  }
+
+  if (data === 'admin_rank_vippct') {
+    session.set(userId, States.ADMIN_RANK_EDIT, { rankId: 0, field: 'legacy_vip' });
+    await bot.sendMessage(chatId,
+      `👑 <b>Legacy VIP discount</b>\n\nSend the percentage old VIP members keep for life (e.g. <code>5</code>).`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (data === 'admin_rank_add') {
+    session.set(userId, States.ADMIN_RANK_ADD, {});
+    await bot.sendMessage(chatId,
+      `➕ <b>New tier</b>\n\nSend it as: <code>NAME | EMOJI | MIN_SPEND | DISCOUNT%</code>\n\n` +
+      `Example: <code>ELITE | 👑 | 3000 | 20</code>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (/^admin_rank_\d+$/.test(data)) {
+    const tierId = parseInt(data.split('_').pop(), 10);
+    const t = db.getRankTier(tierId);
+    if (!t) { await bot.sendMessage(chatId, '❌ Tier not found.'); return; }
+    await bot.editMessageText(
+      `${t.emoji || '🏅'} <b>${escapeHtml(t.name)}</b>\n\n` +
+      `Unlocks at: <b>$${Number(t.min_spend).toFixed(2)}</b>\n` +
+      `Discount: <b>${Number(t.discount_pct)}%</b>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+        [{ text: '💵 Edit amount', callback_data: `admin_rankf_${tierId}_min_spend` },
+         { text: '📉 Edit discount', callback_data: `admin_rankf_${tierId}_discount_pct` }],
+        [{ text: '✏️ Rename', callback_data: `admin_rankf_${tierId}_name` },
+         { text: '😀 Emoji', callback_data: `admin_rankf_${tierId}_emoji` }],
+        [{ text: '🗑 Delete tier', callback_data: `admin_rankdel_${tierId}` }],
+        [{ text: '🔙 Back', callback_data: 'admin_ranks' }],
+      ] } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_rankf_\d+_(min_spend|discount_pct|name|emoji)$/.test(data)) {
+    const parts  = data.split('_');
+    const tierId = parseInt(parts[2], 10);
+    const field  = parts.slice(3).join('_');
+    session.set(userId, States.ADMIN_RANK_EDIT, { rankId: tierId, field });
+    const prompt = {
+      min_spend:    'Send the amount a customer must spend to unlock this tier (e.g. <code>600</code>).',
+      discount_pct: 'Send the discount percentage (e.g. <code>5</code>).',
+      name:         'Send the new tier name.',
+      emoji:        'Send the emoji for this tier.',
+    }[field];
+    await bot.sendMessage(chatId, `✏️ ${prompt}`, { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (/^admin_rankdel_\d+$/.test(data)) {
+    const tierId = parseInt(data.split('_').pop(), 10);
+    const tiers = db.getRankTiers();
+    if (tiers.length <= 1) {
+      await bot.sendMessage(chatId, '❌ At least one tier must remain — it is the starting rank every customer sits in.');
+      return;
+    }
+    db.deleteRankTier(tierId);
+    return handleAdminCallback(bot, { ...query, data: 'admin_ranks' });
+  }
+
+  // ── Emoji health check ────────────────────────────────────────────
+  // Premium emoji depend on things this code cannot see: the bot owner's
+  // Telegram Premium subscription, and whether each stored emoji_id is real.
+  // Both fail the same way — a plain emoji where an animated one should be —
+  // so this asks Telegram itself and reports the actual error.
+  if (data === 'admin_emoji_check') {
+    const iconsOn  = db.getSetting('button_icons_enabled', '1') === '1';
+    const autoOn   = db.getSetting('emoji_auto_upgrade', '1') === '1';
+    const library  = db.getAllEmojis();
+
+    const lines = [
+      `🎨 Button icons: ${iconsOn ? '🟢 ON' : '🔴 OFF — premium icons are disabled everywhere'}`,
+      `♻️ Auto-upgrade: ${autoOn ? '🟢 ON' : '🔴 OFF'}`,
+      `📚 Emoji library: <b>${library.length}</b> entr${library.length === 1 ? 'y' : 'ies'}`,
+    ];
+
+    // Test each library id individually — one bad id is enough to make every
+    // message fall back to plain, and only a per-id test can name which.
+    const bad = [];
+    for (const row of library.slice(0, 12)) {
+      try {
+        await bot.sendMessage(chatId,
+          `<tg-emoji emoji-id="${row.emoji_id}">${row.fallback || '🎁'}</tg-emoji> ${escapeHtml(row.name || '')}`,
+          { parse_mode: 'HTML', disable_notification: true });
+      } catch (e) {
+        bad.push(`• <code>${escapeHtml(row.name || row.emoji_id)}</code> — ${escapeHtml(e.message)}`);
+      }
+    }
+
+    let verdict;
+    if (bad.length) {
+      verdict = `🔴 <b>${bad.length} broken entr${bad.length === 1 ? 'y' : 'ies'}</b>\n` + bad.join('\n') +
+        `\n\n<i>Fix or delete these in the Emoji Library. Until then, messages containing ` +
+        `them fall back to plain emoji.</i>`;
+    } else if (!library.length) {
+      verdict = `⚪️ Library is empty — only products with their own <code>[emoji:ID]</code> show premium icons.`;
+    } else {
+      verdict = `🟢 Every library entry was accepted by Telegram.\n\n` +
+        `<i>If icons still look plain: the messages above are the real test. Plain there ` +
+        `means the bot owner's account has no active Telegram Premium — Telegram only ` +
+        `lets a bot send custom emoji while its owner is Premium.</i>`;
+    }
+
+    // A product's emoji lives in its title, not the library, so the library can
+    // be spotless while every product still fails. This tests the real ids.
+    const prodBad = [];
+    for (const p of db.getAllProductsForSorting().slice(0, 10)) {
+      const id = productEmojiId(p);
+      if (!id) continue;
+      try {
+        await bot.sendMessage(chatId,
+          `<tg-emoji emoji-id="${id}">🛍</tg-emoji> ${escapeHtml(kbStripEmojiCodes(String(p.title || '')).trim().slice(0, 40))}`,
+          { parse_mode: 'HTML', disable_notification: true });
+      } catch (e) {
+        prodBad.push(`• <code>${escapeHtml(kbStripEmojiCodes(String(p.title || '')).trim().slice(0, 28))}</code> — ${escapeHtml(e.message)}`);
+      }
+    }
+    if (prodBad.length) {
+      verdict += `\n\n🔴 <b>${prodBad.length} product emoji rejected</b>\n` + prodBad.join('\n') +
+        `\n\n<i>DOCUMENT_INVALID here means the bot cannot use that emoji id. ` +
+        `Re-pick the emoji on the product, or check Telegram Premium on the bot owner account.</i>`;
+    }
+
+    await bot.sendMessage(chatId,
+      `🩺 <b>Emoji Check</b>\n\n${lines.join('\n')}\n\n${verdict}`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+        [{ text: iconsOn ? '🔴 Turn OFF icons' : '🟢 Turn ON icons', callback_data: 'admin_setting_button_icons_enabled' }],
+        [{ text: autoOn ? '🔴 Turn OFF auto-upgrade' : '🟢 Turn ON auto-upgrade', callback_data: 'admin_setting_emoji_auto_upgrade' }],
+        [{ text: '🔙 Settings', callback_data: 'admin_settings' }],
+      ] } });
+    return;
+  }
+
+  // ── Supplier lookup: "who sold me this dead account?" ─────────────
+  if (data === 'admin_supplier_lookup') {
+    session.set(userId, States.ADMIN_SUPPLIER_LOOKUP, {});
+    await bot.sendMessage(chatId,
+      `🏷 <b>Find the supplier</b>\n\n` +
+      `Send any part of the account — an email, a key, a username.\n\n` +
+      `<i>You will get the supplier, the product, when it was added, and whether ` +
+      `it was sold and to whom.</i>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (data === 'admin_suppliers') {
+    const list = items.listSuppliers();
+    if (!list.length) {
+      await bot.editMessageText(
+        `🏷 <b>Suppliers</b>\n\nNo supplier recorded yet.\n\n` +
+        `<i>Names are attached when stock is added — the next batch you add will ` +
+        `ask for one.</i>`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminBackKb() }
+      ).catch(() => {});
+      return;
+    }
+    const rows = list.slice(0, 20).map((r) => ([{
+      text: `🏷 ${String(r.supplier).slice(0, 24)} — ${r.in_stock} left / ${r.sold} sold`,
+      callback_data: `admin_sup_${Buffer.from(String(r.supplier)).toString('base64url').slice(0, 50)}`,
+    }]));
+    rows.push([{ text: '⚠️ Reported dead accounts', callback_data: 'admin_sup_reported' }]);
+    rows.push([{ text: '🔎 Find supplier of an account', callback_data: 'admin_supplier_lookup' }]);
+    rows.push([{ text: '🔙 Back', callback_data: 'admin_panel' }]);
+    await bot.editMessageText(
+      `🏷 <b>Suppliers</b>\n\n` +
+      list.slice(0, 20).map((r) =>
+        `• <b>${escapeHtml(String(r.supplier))}</b> — ${r.total} item(s): ${r.in_stock} in stock, ${r.sold} sold`
+      ).join('\n'),
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }
+    ).catch(() => {});
+    return;
+  }
+
+  // ── Which supplier keeps sending accounts that die ────────────────
+  if (data === 'admin_sup_reported') {
+    const reports = items.reportedAccounts(40);
+    if (!reports.length) {
+      await bot.editMessageText(
+        `⚠️ <b>Reported accounts</b>\n\nNo customer has reported a broken account yet.`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '🔙 Suppliers', callback_data: 'admin_suppliers' }]] } }
+      ).catch(() => {});
+      return;
+    }
+
+    // Grouped by supplier, worst first. A flat list would show the same thing
+    // but would not answer the question — which supplier is the problem.
+    const bySupplier = new Map();
+    for (const r of reports) {
+      const key = r.supplier || '__unknown__';
+      if (!bySupplier.has(key)) bySupplier.set(key, []);
+      bySupplier.get(key).push(r);
+    }
+    const groups = [...bySupplier.entries()].sort((a, b) => b[1].length - a[1].length);
+
+    let txt = `⚠️ <b>Reported dead accounts</b>\n` +
+              `<i>Last ${reports.length} refund requests, grouped by who supplied the account.</i>\n`;
+
+    for (const [supplier, list] of groups) {
+      const name = supplier === '__unknown__'
+        ? '❓ <i>Supplier not recorded</i>'
+        : `🏷 <b>${escapeHtml(supplier)}</b>`;
+      txt += `\n${name} — <b>${list.length}</b> report${list.length === 1 ? '' : 's'}\n`;
+      for (const r of list.slice(0, 6)) {
+        txt += `  • <code>${escapeHtml(String(r.probe || '').slice(0, 34))}</code>` +
+               ` · #${r.order_id} · ${escapeHtml(r.status || '')}\n`;
+      }
+      if (list.length > 6) txt += `  <i>…and ${list.length - 6} more</i>\n`;
+    }
+
+    const unknown = bySupplier.get('__unknown__');
+    if (unknown && unknown.length) {
+      txt += `\n<i>Accounts with no supplier were added before suppliers were ` +
+             `recorded, or the batch was saved without a name.</i>`;
+    }
+
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: '🔎 Look up one account', callback_data: 'admin_supplier_lookup' }],
+        [{ text: '🔙 Suppliers', callback_data: 'admin_suppliers' }],
+      ] }
+    }).catch(() => {});
+    return;
+  }
+
+  if (/^admin_sup_/.test(data)) {
+    let name = '';
+    try { name = Buffer.from(data.replace('admin_sup_', ''), 'base64url').toString('utf8'); } catch (_) {}
+    const rows = items.itemsBySupplier(name);
+    const lines = rows.slice(0, 15).map((r) =>
+      `• ${r.status === 'sold' ? '🔴' : '🟢'} ${escapeHtml(kbStripEmojiCodes(String(r.product_title || '')).trim().slice(0, 24))} — ` +
+      `<code>${escapeHtml(String(r.raw_content || '').slice(0, 30))}</code>`
+    ).join('\n');
+    await bot.editMessageText(
+      `🏷 <b>${escapeHtml(name)}</b>\n\n${lines || '<i>Nothing found.</i>'}` +
+      (rows.length > 15 ? `\n\n<i>…and ${rows.length - 15} more</i>` : ''),
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Suppliers', callback_data: 'admin_suppliers' }]] } }
+    ).catch(() => {});
+    return;
+  }
+
+  // ── In-bot announcements ──────────────────────────────────────────
+  if (data === 'admin_notices') {
+    const names = { store: '🛍 Main store bot', cgb: '🤖 ChatGPT Business bot', support: '🎫 Support bot' };
+    const rows = [];
+    let txt = `📢 <b>In-bot announcements</b>\n\n` +
+              `<i>Shown at the top of each bot's main screen — to whoever opens it, ` +
+              `for as long as it is relevant. Not a broadcast.</i>\n`;
+
+    for (const b of notices.BOTS) {
+      const n = notices.peek(b);
+      const live = notices.get(b);
+      let state;
+      if (!n || !n.text) state = '⚪️ none';
+      else if (live) state = '🟢 showing';
+      else if (n.expires_at && new Date(String(n.expires_at).replace(' ', 'T')) <= new Date()) state = '⏰ expired';
+      else state = '⏸ off';
+
+      txt += `\n${names[b]} — <b>${state}</b>\n`;
+      if (n && n.text) {
+        txt += `<i>${escapeHtml(String(n.text).slice(0, 90))}${String(n.text).length > 90 ? '…' : ''}</i>\n`;
+        if (n.expires_at) txt += `⏰ until ${escapeHtml(String(n.expires_at))}\n`;
+      }
+      rows.push([{ text: `${names[b]}`, callback_data: `admin_notice_${b}` }]);
+    }
+
+    rows.push([{ text: '🔙 Back', callback_data: 'admin_panel' }]);
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows },
+    }).catch(() => {});
+    return;
+  }
+
+  if (/^admin_notice_(store|cgb|support)$/.test(data)) {
+    const b = data.split('_').pop();
+    const n = notices.peek(b);
+    const names = { store: '🛍 Main store bot', cgb: '🤖 ChatGPT Business bot', support: '🎫 Support bot' };
+
+    const rows = [[{ text: n && n.text ? '✏️ Change text' : '✏️ Write announcement', callback_data: `admin_noticeset_${b}` }]];
+    if (n && n.text) {
+      rows.push([{ text: '📨 Send it as a message now', callback_data: `admin_noticepush_${b}` }]);
+      rows.push([{ text: n.enabled ? '⏸ Turn off banner' : '▶️ Turn on banner', callback_data: `admin_noticetog_${b}` }]);
+      rows.push([{ text: '⏰ Auto-hide after…', callback_data: `admin_noticeexp_${b}` }]);
+      rows.push([{ text: '🗑 Delete', callback_data: `admin_noticedel_${b}` }]);
+    }
+    rows.push([{ text: '🔙 Back', callback_data: 'admin_notices' }]);
+
+    await bot.editMessageText(
+      `📢 <b>${names[b]}</b>\n\n` +
+      (n && n.text
+        ? `<b>Preview</b>\n${notices.banner(b) || '<i>(currently hidden)</i>\n'}` +
+          (n.expires_at ? `\n⏰ Hides automatically after <b>${escapeHtml(String(n.expires_at))}</b>` : '')
+        : `<i>No announcement set for this bot.</i>`),
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_noticeset_(store|cgb|support)$/.test(data)) {
+    const b = data.split('_').pop();
+    session.set(userId, States.ADMIN_NOTICE_TEXT, { noticeBot: b });
+    await bot.sendMessage(chatId,
+      `✏️ Send the announcement text.\n\n` +
+      `<i>HTML is allowed: <b>bold</b>, <i>italic</i>, <code>code</code>. ` +
+      `Send <code>-</code> to cancel.</i>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  // ── Send the notice as a message ──────────────────────────────────
+  if (/^admin_noticepush_(store|cgb|support)$/.test(data)) {
+    const b = data.split('_').pop();
+    const n = notices.peek(b);
+    if (!n || !n.text) { await answer('❌ Write the announcement first'); return; }
+
+    const audience = {
+      store:   'customers who have bought at least once',
+      cgb:     'customers with an active ChatGPT Business seat',
+      support: 'support staff',
+    }[b];
+
+    // Confirmed before sending. A broadcast cannot be recalled, and the button
+    // sits next to ones that are harmless.
+    await bot.editMessageText(
+      `📨 <b>Send this as a message?</b>\n\n` +
+      `👥 To: <b>${audience}</b>\n\n` +
+      `<b>They will receive:</b>\n\n📢 <b>Announcement</b>\n\n${n.text}\n\n` +
+      `⚠️ <i>This cannot be undone.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+        [{ text: '✅ Send now', callback_data: `admin_noticepushgo_${b}` }],
+        [{ text: '❌ Cancel', callback_data: `admin_notice_${b}` }],
+      ] } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_noticepushgo_(store|cgb|support)$/.test(data)) {
+    const b = data.split('_').pop();
+
+    await bot.editMessageText('📨 Sending…', { chat_id: chatId, message_id: msgId }).catch(() => {});
+
+    // Each bot sends with its OWN token, so the message arrives in the chat the
+    // customer associates with it — a ChatGPT notice appearing in the store bot
+    // would be confusing and unattributable.
+    let sender = bot;
+    try {
+      // The two modules export differently — chatgpt-bot exports an object with
+      // a .bot property, support-bot exports the instance itself. Checked rather
+      // than assumed, because guessing wrong sends every announcement from the
+      // store bot with no error.
+      if (b === 'cgb') {
+        const m = require('../chatgpt-bot');
+        sender = (m && m.bot) || bot;
+      }
+      if (b === 'support') {
+        const m = require('../support-bot');
+        sender = (m && typeof m.sendMessage === 'function') ? m : ((m && m.bot) || bot);
+      }
+    } catch (e) {
+      logger.warn(`[NOTICE] could not load ${b} bot, sending with the store bot: ${e.message}`);
+    }
+
+    const r = await notices.push(sender, b, async (done, total) => {
+      await bot.editMessageText(`📨 Sending… ${done}/${total}`, { chat_id: chatId, message_id: msgId }).catch(() => {});
+    });
+
+    await bot.editMessageText(
+      r.error
+        ? `❌ ${escapeHtml(r.error)}`
+        : `✅ <b>Announcement sent</b>\n\n` +
+          `📨 Delivered: <b>${r.sent}</b>\n` +
+          (r.failed ? `🚫 Could not reach: <b>${r.failed}</b> <i>(blocked the bot or never started it)</i>\n` : '') +
+          `👥 Audience: ${r.total}`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '📢 Announcements', callback_data: 'admin_notices' }]] } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_noticetog_(store|cgb|support)$/.test(data)) {
+    const b = data.split('_').pop();
+    notices.toggle(b);
+    return handleAdminCallback(bot, { ...query, data: `admin_notice_${b}` });
+  }
+
+  if (/^admin_noticedel_(store|cgb|support)$/.test(data)) {
+    const b = data.split('_').pop();
+    notices.clear(b);
+    return handleAdminCallback(bot, { ...query, data: 'admin_notices' });
+  }
+
+  if (/^admin_noticeexp_(store|cgb|support)$/.test(data)) {
+    const b = data.split('_').pop();
+    const n = notices.peek(b);
+    if (!n || !n.text) { await answer('❌ Write the announcement first'); return; }
+
+    const pad = (x) => String(x).padStart(2, '0');
+    const stamp = (hours) => {
+      const d = new Date(Date.now() + hours * 3600000);
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    };
+    const enc = (v) => Buffer.from(v).toString('base64url');
+
+    await bot.editMessageText(
+      `⏰ <b>Auto-hide</b>\n\nWhen should this announcement stop showing?\n\n` +
+      `<i>The text is kept either way, so it can be switched back on later.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+        [{ text: '6 hours',  callback_data: `admin_noticeexpv_${b}_${enc(stamp(6))}` },
+         { text: '24 hours', callback_data: `admin_noticeexpv_${b}_${enc(stamp(24))}` }],
+        [{ text: '3 days',   callback_data: `admin_noticeexpv_${b}_${enc(stamp(72))}` },
+         { text: '7 days',   callback_data: `admin_noticeexpv_${b}_${enc(stamp(168))}` }],
+        [{ text: '♾ Never',  callback_data: `admin_noticeexpv_${b}_none` }],
+        [{ text: '🔙 Back',  callback_data: `admin_notice_${b}` }],
+      ] } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_noticeexpv_(store|cgb|support)_/.test(data)) {
+    const rest = data.replace('admin_noticeexpv_', '');
+    const b = rest.split('_')[0];
+    const encoded = rest.slice(b.length + 1);
+    let when = null;
+    if (encoded !== 'none') {
+      try { when = Buffer.from(encoded, 'base64url').toString('utf8'); } catch (_) {}
+    }
+    const n = notices.peek(b);
+    if (n && n.text) notices.set(b, n.text, when);
+    return handleAdminCallback(bot, { ...query, data: `admin_notice_${b}` });
+  }
+
+  // ── TxID tracer ───────────────────────────────────────────────────
+  if (data === 'admin_txid_search') {
+    session.set(userId, States.ADMIN_TXID_SEARCH, {});
+    await bot.sendMessage(chatId,
+      `🔎 <b>Trace a payment</b>\n\n` +
+      `Send a TxID, a Binance transfer id, or an invoice id.\n\n` +
+      `<i>You will get: did it arrive, was it credited, how much, and what the ` +
+      `customer bought with it afterwards. A partial id works too.</i>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (/^admin_txid_user_\d+$/.test(data)) {
+    const target = parseInt(data.split('_').pop(), 10);
+    return handleAdminCallback(bot, { ...query, data: `admin_user_${target}` });
+  }
+
+  if (/^admin_setting_/.test(data)) {
+    const key     = data.replace('admin_setting_', '');
+    const current = db.getSetting(key);
+    session.set(userId, States.ADMIN_SETTING_VALUE, { settingKey: key });
+    await bot.editMessageText(
+      `⚙️ <b>Edit: ${key}</b>\n\nCurrent: <code>${current || '(empty)'}</code>\n\nEnter new value:`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminBackKb() }
+    );
+    return;
+  }
+
+  // ── Announcement ──────────────────────────────────────────────────
+  if (data === 'admin_announcement') {
+    session.set(userId, States.ADMIN_ANN_MSG, {});
+    await bot.editMessageText(
+      '📢 <b>Announcement</b>\n\nWrite your announcement.\n\n' +
+      '<b>Formatting:</b>\n' +
+      '• HTML: <code>&lt;b&gt;bold&lt;/b&gt;</code>, <code>&lt;i&gt;italic&lt;/i&gt;</code>\n' +
+      '• Premium Emoji: <code>[emoji:ID]</code> or use 🎨 button below\n\n' +
+      '💡 Get IDs from @emojiidbot',
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: '🎨 Choose Emoji from Library', callback_data: 'admin_emoji_picker' }],
+          [{ text: '🔙 Back', callback_data: 'admin_panel' }],
+        ] } }
+    );
+    return;
+  }
+  if (data === 'ann_btn_skip') {
+    const sessData = session.get(userId).data;
+    session.set(userId, States.ADMIN_ANN_TARGET, { annText: sessData.annText });
+    await bot.editMessageText(
+      `📢 Where to send the announcement?`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: announcementTargetKb() }
+    );
+    return;
+  }
+  if (data === 'ann_btn_product') {
+    session.set(userId, States.ADMIN_ANN_BUTTON_TEXT, session.get(userId).data);
+    await bot.editMessageText(
+      `🛒 <b>Add Buy Button</b>\n\nSend the button text and the product ID separated by <code>|</code>:\n\n` +
+      `<b>Format:</b> <code>Button Text|PRODUCT_ID</code>\n\n` +
+      `<b>Example:</b> <code>🛒 Buy Now|5</code>\n\n` +
+      `Get product IDs from /admin → ✏️ Edit Product.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'admin_panel' }]] } }
+    );
+    return;
+  }
+
+  if (/^ann_(channel|users|both)$/.test(data)) {
+    const choice  = data.split('_')[1];
+    const sessData = session.get(userId).data;
+    const rawText = sessData.annText || '';
+    const annText = expandPremiumEmojis(rawText);
+    const annButton = sessData.annButton || null; // { text, callback or product_id }
+    session.clear(userId);
+
+    // Build reply markup if announcement button was set
+    let annKb = undefined;
+    if (annButton) {
+      if (annButton.product_id) {
+        // Buy button - opens the product
+        const botUser = await bot.getMe().catch(() => ({ username: '' }));
+        annKb = { inline_keyboard: [
+          [{ text: annButton.text, url: `https://t.me/${botUser.username}?start=p_${annButton.product_id}` }],
+        ] };
+      } else if (annButton.url) {
+        annKb = { inline_keyboard: [[{ text: annButton.text, url: annButton.url }]] };
+      }
+    }
+
+    const results = [];
+    if (choice !== 'users') {
+      const okChannel = await publishToChannel(bot, annText, annKb);
+      results.push(`📢 Channel: ${okChannel ? '✅' : '❌'}`);
+      const okGroup = await publishToGroup(bot, annText, annKb);
+      results.push(`💬 Group: ${okGroup ? '✅' : '❌'}`);
+    }
+    if (choice !== 'channel') {
+      const { sent, failed } = await broadcastToUsers(bot, annText, annKb);
+      results.push(`👥 Bot Users: ${sent} sent, ${failed} failed`);
+    }
+    await bot.editMessageText(`✅ <b>Announcement Sent!</b>\n\n${results.join('\n')}`, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminBackKb(),
+    });
+    return;
+  }
+
+  // ── Notification targets ──────────────────────────────────────────
+  if (/^notif_(product|stock)_(channel|both|skip)$/.test(data)) {
+    const [, type, choice] = data.match(/^notif_(product|stock)_(channel|both|skip)$/);
+    const pending = pendingNotifs.get(userId);
+    pendingNotifs.delete(userId);
+
+    if (!pending || choice === 'skip') {
+      await bot.editMessageText('🚫 Notification skipped.', {
+        chat_id: chatId, message_id: msgId, reply_markup: adminBackKb(),
+      });
+      return;
+    }
+
+    const product = db.getProduct(pending.productId);
+    const text    = type === 'product'
+      ? buildNewProductText(product)
+      : buildStockUpdateText(product, pending.added);
+
+    const results = [];
+    const okChannel = await publishToChannel(bot, text);
+    results.push(`📢 Channel: ${okChannel ? '✅' : '❌'}`);
+    const okGroup = await publishToGroup(bot, text);
+    results.push(`💬 Group: ${okGroup ? '✅' : '❌'}`);
+    if (choice === 'both') {
+      const { sent, failed } = await broadcastToUsers(bot, text);
+      results.push(`👥 Bot Users: ${sent} sent, ${failed} failed`);
+    }
+
+    await bot.editMessageText(
+      `✅ <b>Notification Sent!</b>\n\n${results.join('\n')}`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminBackKb() }
+    );
+    return;
+  }
+
+  // ── Manual balance management (Add / Remove) ─────────────────────
+  // Confirm a pre-filled amount straight from the trace.
+  if (/^admin_balgo_\d+_\d+$/.test(data)) {
+    const parts  = data.split('_');
+    const target = parseInt(parts[2], 10);
+    const cents  = parseInt(parts[3], 10);
+    const amount = cents / 100;
+
+    // Re-read the session rather than trusting the button alone: the amount is
+    // in the callback data, which the client supplies.
+    const sess = session.get(userId);
+    if (sess.state !== States.ADMIN_BALANCE_AMOUNT_ADD || Number(sess.data.balanceTargetId) !== target) {
+      await answer('❌ Session expired — start again');
+      return;
+    }
+
+    session.set(userId, States.ADMIN_BALANCE_AMOUNT_ADD, sess.data);
+    return handleAdminText(bot, {
+      from: { id: userId }, chat: { id: chatId }, text: String(amount),
+    });
+  }
+
+  if (/^admin_addbal_\d+$/.test(data)) {
+    const amount = parseInt(data.split('_').pop(), 10) / 100;
+    session.set(userId, States.ADMIN_BALANCE_USER_ID, {
+      balanceOp: 'add', prefillAmount: amount,
+      prefillNote: 'Amount taken from the payment trace',
+    });
+    await bot.sendMessage(chatId,
+      `➕ <b>Add ${formatPrice(amount)}</b>\n\n` +
+      `Who should receive it? Send their Telegram ID or <code>@username</code>.`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (data === 'admin_add_balance') {
+    session.set(userId, States.ADMIN_BALANCE_USER_ID, { balanceOp: 'add' });
+    await bot.editMessageText(
+      '➕ <b>Add User Balance</b>\n\n' +
+      'Send the customer\'s <b>Telegram ID</b> or <b>@username</b>:',
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminBackKb() }
+    );
+    return;
+  }
+  if (data === 'admin_remove_balance') {
+    session.set(userId, States.ADMIN_BALANCE_USER_ID, { balanceOp: 'remove' });
+    await bot.editMessageText(
+      '➖ <b>Remove User Balance</b>\n\n' +
+      'Send the customer\'s <b>Telegram ID</b> or <b>@username</b>:',
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminBackKb() }
+    );
+    return;
+  }
+}
+
+
+// ── Recover delivered items from a user's orders ─────────────────────
+// Marks items as 'available' again and increases stock_quantity
+async function recoverDeliveredItems(bot, chatId, userId, targetUserId, productId) {
+  const items = require('../database/items');
+  const result = items.recoverItemsFromUser(targetUserId, productId);
+  const product = db.getProduct(productId);
+  await bot.sendMessage(chatId,
+    `🔄 <b>Items Recovered</b>\n\n` +
+    `👤 From user: <code>${targetUserId}</code>\n` +
+    `📦 Product: ${product?.title || productId}\n` +
+    `✅ Recovered: <b>${result.count}</b> item(s)\n` +
+    `📊 Stock restored to: ${product?.stock_quantity || 0}`,
+    { parse_mode: 'HTML' }
+  );
+  logger.info(`Admin ${userId} recovered ${result.count} items from user ${targetUserId} product ${productId}`);
+}
+
+// ── Process refund approval with given amount ─────────────────────────────────
+async function processRefundApproval(bot, chatId, msgId, r, amount) {
+  const method = r.refund_method || 'wallet';
+  const orderId = r.order_id;
+
+  // ── WALLET = instant ─────────────────────────────────────────
+  if (method === 'wallet') {
+    db.updateBalance(r.user_id, amount);
+    db.addTransaction({
+      userId: r.user_id, type: 'refund', amount: amount,
+      description: `Refund for order #${orderId}`,
+      refId: `refund_${r.id}`, orderId: orderId,
+    });
+    db.updateRefundRequest(r.id, 'approved', `Refunded ${amount} to wallet`, amount, 'wallet');
+
+    // A refund undoes the sale, so it must undo the rank the sale bought.
+    const rank = db.reduceRankSpend(r.user_id, amount);
+    logger.info(
+      `Refund #${r.id}: credited ${amount} to user ${r.user_id} wallet; ` +
+      `rank spend now ${rank.spend}${rank.demoted ? ` (${rank.before} → ${rank.after})` : ''}`
+    );
+
+    // Notify user
+    try {
+      await bot.sendMessage(r.user_id,
+        `✅ <b>Your Refund Has Been Completed!</b>\n\n` +
+        `🆔 Refund #${r.id}\n` +
+        `📦 Order #${orderId}\n` +
+        `💵 Refunded: <b>${formatPrice(amount)}</b>\n` +
+        `💳 Method: 💰 Wallet (credited automatically)`,
+        { parse_mode: 'HTML' });
+    } catch (e) {}
+
+    const confirmText = `✅ Refund #${r.id} completed.\n\n💵 ${formatPrice(amount)} credited to wallet.` +
+      `\n🏆 Rank spend reduced to ${formatPrice(rank.spend)}` +
+      (rank.demoted ? ` — customer dropped from <b>${escapeHtml(String(rank.before))}</b> to <b>${escapeHtml(String(rank.after))}</b>.` : '.');
+    const kb = { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'admin_refund_requests' }]] };
+    try {
+      await bot.editMessageText(confirmText, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: kb });
+    } catch (e) {
+      try { await bot.deleteMessage(chatId, msgId); } catch (e2) {}
+      await bot.sendMessage(chatId, confirmText, { parse_mode: 'HTML', reply_markup: kb });
+    }
+    return;
+  }
+
+  // ── BINANCE / CRYPTO = mark as PROCESSING, show admin a "Mark as Sent" button ─────
+  let methodLabel = '';
+  let instructions = '';
+  if (method === 'binance') {
+    methodLabel = '🟡 Binance Pay';
+    instructions =
+      `📋 <b>Manual Transfer Required</b>\n\n` +
+      `1️⃣ Open Binance app\n` +
+      `2️⃣ Go to Pay → Send\n` +
+      `3️⃣ Enter Binance ID: <code>${r.wallet_address}</code>\n` +
+      `4️⃣ Send <b>${formatPrice(amount)} USDT</b>\n` +
+      `5️⃣ Once sent, press the button below`;
+  } else if (method === 'crypto') {
+    methodLabel = `💎 ${r.crypto_network} USDT`;
+    instructions =
+      `📋 <b>Manual Transfer Required</b>\n\n` +
+      `1️⃣ Open your wallet (${r.crypto_network})\n` +
+      `2️⃣ Send <b>${formatPrice(amount)} USDT</b>\n` +
+      `3️⃣ To this address:\n<code>${r.wallet_address}</code>\n` +
+      `4️⃣ Once sent, press the button below`;
+  }
+
+  // Mark as 'processing' with amount stored
+  db.updateRefundRequest(r.id, 'processing', `Approved ${amount} for ${method} transfer (awaiting admin confirmation)`, amount, method);
+
+  // Notify user that refund is being processed
+  try {
+    await bot.sendMessage(r.user_id,
+      `⏳ <b>Your Refund is Being Processed</b>\n\n` +
+      `🆔 Refund #${r.id}\n` +
+      `📦 Order #${orderId}\n` +
+      `💵 Amount: <b>${formatPrice(amount)}</b>\n` +
+      `💳 Method: ${methodLabel}\n\n` +
+      `Our team is processing your refund. You'll be notified once it's sent.`,
+      { parse_mode: 'HTML' });
+  } catch (e) {}
+
+  // Admin sees instructions + Mark as Sent button
+  const adminText =
+    `⏳ <b>Refund #${r.id} — PENDING TRANSFER</b>\n\n` +
+    `👤 User: <code>${r.user_id}</code>\n` +
+    `💵 Amount: <b>${formatPrice(amount)}</b>\n` +
+    `💳 ${methodLabel}\n` +
+    `📍 Address: <code>${r.wallet_address}</code>\n\n` +
+    instructions;
+
+  const kb = { inline_keyboard: [
+    [{ text: '✅ Mark as Sent (Confirm)', callback_data: `admin_refund_mark_sent_${r.id}` }],
+    [{ text: '🔙 Back to refunds', callback_data: 'admin_refund_requests' }],
+  ] };
+
+  try {
+    await bot.editMessageText(adminText, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: kb });
+  } catch (e) {
+    try { await bot.deleteMessage(chatId, msgId); } catch (e2) {}
+    await bot.sendMessage(chatId, adminText, { parse_mode: 'HTML', reply_markup: kb });
+  }
+}
+
+// Handle admin clicking "Mark as Sent" — finalize the refund
+async function handleMarkRefundSent(bot, chatId, msgId, refundId, query) {
+  const r = db.getRefundRequestById(refundId);
+  if (!r) { return; }
+  if (r.status !== 'processing') {
+    await bot.answerCallbackQuery(query.id, { text: '❌ Already finalized', show_alert: true });
+    return;
+  }
+
+  const amount = Number(r.amount) || 0;
+  const method = r.refund_method;
+  const methodLabel = method === 'binance' ? '🟡 Binance Pay' : `💎 ${r.crypto_network} USDT`;
+
+  // Mark as approved (final)
+  db.updateRefundRequest(r.id, 'approved', `${method} transfer confirmed sent by admin`, amount, method);
+
+  // Same reversal as the wallet path: the money left, so the rank goes with it.
+  // Applied here rather than at approval time because a crypto refund is only
+  // real once the transfer is actually sent.
+  const rank = db.reduceRankSpend(r.user_id, amount);
+  logger.info(
+    `Refund #${r.id} sent via ${method}; rank spend now ${rank.spend}` +
+    `${rank.demoted ? ` (${rank.before} → ${rank.after})` : ''}`
+  );
+
+  // Notify user
+  try {
+    await bot.sendMessage(r.user_id,
+      `✅ <b>Your Refund Has Been Sent!</b>\n\n` +
+      `🆔 Refund #${r.id}\n` +
+      `📦 Order #${r.order_id}\n` +
+      `💵 Amount: <b>${formatPrice(amount)}</b>\n` +
+      `💳 Method: ${methodLabel}\n` +
+      `📍 To: <code>${r.wallet_address}</code>\n\n` +
+      `The transfer has been completed. Check your wallet/account.`,
+      { parse_mode: 'HTML' });
+  } catch (e) {}
+
+  await bot.editMessageText(
+    `✅ <b>Refund #${r.id} Completed</b>\n\n` +
+    `💵 ${formatPrice(amount)} sent via ${methodLabel}\n` +
+    `User has been notified.`,
+    { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'admin_refund_requests' }]] } }
+  ).catch(async () => {
+    await bot.sendMessage(chatId, `✅ Refund #${r.id} marked as sent.`);
+  });
+}
+
+module.exports = {
+  runTxidTrace,
+  isAdmin,
+  showAdminPanel,
+  startAddProduct,
+  handleAdminText,
+  handleAdminPhoto,
+  handleAdminCallback,
+  recoverDeliveredItems,
+};

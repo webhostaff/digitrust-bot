@@ -254,7 +254,16 @@ async function showCalculation(chatId, userId, extraMonth = false) {
     `⏳ <b>Days you'll get:</b> ${totalDays} day${totalDays === 1 ? '' : 's'}\n` +
     `💰 <b>Price:</b> $${finalPrice.toFixed(2)}\n\n` +
     (extraMonth ? '✅ Full month added!\n\n' : '') +
-    `💡 <i>For a full month at $${monthlyPrice}, wait for one of these dates:</i>\n${upcomingTxt}`;
+    // Only shown when waiting would actually get them more.
+    //
+    // It used to print unconditionally, so a customer already being offered a
+    // full 30 days was told to "wait for a full month" — advice to delay a
+    // purchase that needs no delaying, on the screen where they were about to
+    // buy. 28 rather than 30, because a day or two short is not worth waiting
+    // a month for either.
+    (totalDays >= 28 || extraMonth
+      ? ''
+      : `💡 <i>For a full month at $${monthlyPrice}, wait for one of these dates:</i>\n${upcomingTxt}`);
 
   setSession(userId, 'AWAITING_ACTION', {
     daysRemaining: best.daysRemaining,
@@ -266,17 +275,26 @@ async function showCalculation(chatId, userId, extraMonth = false) {
     monthlyPrice,
   });
 
-  const buttons = [];
-  if (!extraMonth) {
-    buttons.push([{ text: `➕ Add Full Month (+$${monthlyPrice})`, callback_data: 'add_month' }]);
-  } else {
-    buttons.push([{ text: '➖ Remove Full Month', callback_data: 'remove_month' }]);
-  }
-  buttons.push([{ text: `🛒 Order Now — $${finalPrice.toFixed(2)}`, callback_data: 'order_now' }]);
+  // Buy first, then the optional extra, then the ways out.
+  //
+  // Telegram gives no button colours, so order and weight are what remain: the
+  // action the customer came for goes on top with the price on it, and Support
+  // and Cancel share the last row instead of each taking a full-width row that
+  // makes leaving look as important as buying.
+  const buttons = [
+    [{ text: `🛒  Order Now — $${finalPrice.toFixed(2)}`, callback_data: 'order_now' }],
+  ];
+
+  buttons.push(extraMonth
+    ? [{ text: '➖  Remove extra month', callback_data: 'remove_month' }]
+    : [{ text: `➕  Add a full month  ·  +$${monthlyPrice}`, callback_data: 'add_month' }]);
+
+  const lastRow = [];
   if (SUPPORT_BOT_USERNAME) {
-    buttons.push([{ text: '📞 Support', url: `https://t.me/${SUPPORT_BOT_USERNAME}` }]);
+    lastRow.push({ text: '💬 Support', url: `https://t.me/${SUPPORT_BOT_USERNAME}` });
   }
-  buttons.push([{ text: '❌ Cancel', callback_data: 'cancel' }]);
+  lastRow.push({ text: '✖️ Cancel', callback_data: 'cancel' });
+  buttons.push(lastRow);
 
   await bot.sendMessage(chatId, txt, {
     parse_mode: 'HTML',

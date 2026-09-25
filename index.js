@@ -665,38 +665,6 @@ bot.onText(/^\/emojireset$/i, async (msg) => {
     `♻️ Cleared the pause and ${n} quarantined id(s). Icons will be tried again on the next message.`);
 });
 
-/**
- * Open the assistant.
- *
- * The link carries the token, so it is sent privately and never posted. Adding
- * it to a phone's home screen turns it into an app-like icon with no install.
- */
-bot.onText(/^\/agent$/i, async (msg) => {
-  if (!adminHandler.isAdmin(msg.from.id)) return;
-  const base = resolveApiBase();
-
-  if (!isRealBase(base)) {
-    await bot.sendMessage(msg.chat.id,
-      `🤖 <b>Shop Assistant</b>\n\n` +
-      `❌ Needs a public address first.\n\n` +
-      `Railway → Settings → Networking → <b>Generate Domain</b>, then redeploy.`,
-      { parse_mode: 'HTML' });
-    return;
-  }
-
-  const url = `${base}/agent/?t=${agentChat.ACCESS_TOKEN}`;
-  await bot.sendMessage(msg.chat.id,
-    `🤖 <b>Shop Assistant</b>\n\n` +
-    `Ask about sales, stock, customers, payments or support — in Arabic or English.\n\n` +
-    `📱 <b>On your phone:</b> open the link, then <i>Share → Add to Home Screen</i>. ` +
-    `It behaves like an app.\n\n` +
-    `🔒 <b>Read-only.</b> It cannot send messages, change balances, edit stock or ` +
-    `issue refunds — those tools do not exist in it.\n\n` +
-    `⚠️ <i>Anyone with this link can read your shop data. Do not forward it.</i>`,
-    { parse_mode: 'HTML', disable_web_page_preview: true,
-      reply_markup: { inline_keyboard: [[{ text: '🤖 Open Assistant', url }]] } });
-});
-
 /** Admin: inspect, re-save or force-restore the premium icons. */
 bot.onText(/^\/emoji(backup|restore|list)?$/i, async (msg, match) => {
   if (!adminHandler.isAdmin(msg.from.id)) return;
