@@ -1310,3 +1310,17 @@ delivers the personal join link automatically, with no human step.
 Note: automating Canva Teams carries account risk (it is against Canva's terms
 and their anti-automation checks can suspend the team). The safeguards above
 reduce it; they do not remove it. The manual fast lane remains the safe default.
+
+# Part 38 — Canva login "nothing happened": diagnosis + reliable Chromium
+
+The remote-login page hung on "opening Canva…" because Chromium could not start
+on the server and the failure was swallowed.
+
+* The page now shows the real error and a retry button instead of hanging.
+* Chromium resolution is robust: a system Chromium (installed by nixpacks) or
+  `CHROMIUM_PATH` is preferred over the Lambda-tuned bundled binary; a missing
+  system library is named in the error.
+* `nixpacks.toml` now installs `chromium` and sets `CHROMIUM_PATH`.
+* `/canva` gained a "🧪 Test browser" button (`selfTest`) that opens the browser,
+  loads a test page and reports exactly what works or what is missing — run it
+  before logging in.

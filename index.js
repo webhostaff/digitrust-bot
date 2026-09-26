@@ -693,7 +693,7 @@ bot.onText(/^\/canva$/i, async (msg) => {
   const url = agentChat.canvaLoginUrl ? agentChat.canvaLoginUrl() : '';
   const rows = [];
   if (url) rows.push([{ text: st.logged_in ? '🔁 Re-login' : '🔐 Log in to Canva', url }]);
-  rows.push([{ text: '🔄 Check status', callback_data: 'canva_check' }]);
+  rows.push([{ text: '🧪 Test browser', callback_data: 'canva_test' }, { text: '🔄 Check login', callback_data: 'canva_check' }]);
   if (st.logged_in) rows.push([{ text: '🗑 Forget session', callback_data: 'canva_forget' }]);
   await bot.sendMessage(msg.chat.id,
     `🎨 <b>Canva automation</b>\n\n` +
@@ -709,6 +709,13 @@ bot.on('callback_query', async (q) => {
   if (q.data === 'canva_check') {
     const st = await canva.checkLogin();
     await bot.answerCallbackQuery(q.id, { text: st.ok ? '✅ Logged in and reachable' : `🔴 ${st.reason}`, show_alert: true }).catch(() => {});
+  } else if (q.data === 'canva_test') {
+    await bot.answerCallbackQuery(q.id, { text: '⏳ Testing the browser…' }).catch(() => {});
+    const r = await canva.selfTest();
+    await bot.sendMessage(q.message.chat.id, r.ok
+      ? `✅ <b>Browser works.</b>\n🌐 Chromium: <code>${escapeHtml(String(r.chromium))}</code>\nLoaded a test page fine. You can log in now.`
+      : `🔴 <b>Browser test failed</b>\n\n<code>${escapeHtml(String(r.error))}</code>\n\n<i>Usually means Chromium or a library is missing — redeploy after the nixpacks change, or set CHROMIUM_PATH.</i>`,
+      { parse_mode: 'HTML' }).catch(() => {});
   } else if (q.data === 'canva_forget') {
     canva.forgetSession();
     await bot.answerCallbackQuery(q.id, { text: '🗑 Session cleared. Run /canva to log in again.', show_alert: true }).catch(() => {});

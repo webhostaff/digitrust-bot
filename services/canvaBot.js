@@ -62,16 +62,68 @@ let browser = null;
 let lastInviteAt = 0;
 let chain = Promise.resolve(); // serialises everything that drives the browser
 
+let launchError = null;
+
+/**
+ * Where Chromium is. A real system Chromium (installed by nixpacks) is tried
+ * first — it is the most reliable on Railway — then CHROMIUM_PATH if set, then
+ * the @sparticuz/chromium binary as a last resort.
+ */
+async function resolveExecutable() {
+  const fsx = require('fs');
+  const candidates = [];
+  if (process.env.CHROMIUM_PATH) candidates.push(process.env.CHROMIUM_PATH);
+  candidates.push('/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable', '/root/.nix-profile/bin/chromium');
+  for (const c of candidates) { try { if (c && fsx.existsSync(c)) return { path: c, system: true }; } catch (_) {} }
+  const sp = await chromium.executablePath();
+  if (sp) return { path: sp, system: false };
+  return null;
+}
+
 async function launch() {
   if (browser && browser.isConnected()) return browser;
-  const execPath = await chromium.executablePath();
-  browser = await playwright.chromium.launch({
-    args: [...chromium.args, '--no-sandbox', '--disable-dev-shm-usage'],
-    executablePath: execPath,
-    headless: true,
-  });
+  const exec = await resolveExecutable();
+  if (!exec) throw new Error('No Chromium found. Add "chromium" to nixpacks.toml and redeploy, or set CHROMIUM_PATH.');
+  // A system Chromium does not want the Lambda-specific flags; the bundled one does.
+  const baseArgs = exec.system ? [] : chromium.args;
+  try {
+    browser = await playwright.chromium.launch({
+      args: [...baseArgs, '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+      executablePath: exec.path,
+      headless: true,
+    });
+  } catch (e) {
+    launchError = `${exec.path}: ${e.message}`;
+    const lib = (e.message.match(/error while loading shared libraries: ([^:]+)/) || [])[1];
+    throw new Error(lib
+      ? `Chromium is missing a system library (${lib}). Redeploy so nixpacks.toml installs it.`
+      : `Chromium could not start (${exec.path}): ${e.message.slice(0, 160)}`);
+  }
+  launchError = null;
+  logger.info(`[canva] chromium launched: ${exec.path}${exec.system ? ' (system)' : ' (bundled)'}`);
   browser.on('disconnected', () => { browser = null; });
   return browser;
+}
+
+/** A one-shot self-test for /canva: does the browser open and load a page? */
+async function selfTest() {
+  if (!available()) return { ok: false, error: 'automation off' };
+  return exclusive(async () => {
+    let ctx;
+    try {
+      const exec = await resolveExecutable();
+      ctx = await newContext(false);
+      const page = await ctx.newPage();
+      await page.goto('https://example.com', { waitUntil: 'domcontentloaded', timeout: 20000 });
+      const title = await page.title();
+      return { ok: true, chromium: exec ? exec.path : '?', loaded: title || 'page loaded' };
+    } catch (e) {
+      return { ok: false, error: e.message.slice(0, 200) };
+    } finally {
+      if (ctx) await ctx.close().catch(() => {});
+    }
+  });
 }
 
 async function newContext(withSession = true) {
@@ -143,13 +195,23 @@ async function isOnPeoplePage(page) {
 let loginSession = null; // { context, page, id, createdAt }
 
 async function startLogin() {
-  if (!available()) return { ok: false, error: 'Automation is off (set CANVA_AUTOMATION=1 and install Playwright).' };
+  if (!available()) return { ok: false, error: 'Automation is off (set CANVA_AUTOMATION=1 and redeploy).' };
   await endLogin();
-  const ctx = await newContext(false);
-  const page = await ctx.newPage();
-  await page.goto('https://www.canva.com/login', { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT }).catch(() => {});
-  loginSession = { context: ctx, page, id: Math.random().toString(36).slice(2, 10), createdAt: Date.now() };
-  return { ok: true, id: loginSession.id };
+  try {
+    const ctx = await newContext(false);
+    const page = await ctx.newPage();
+    let navErr = null;
+    await page.goto('https://www.canva.com/login', { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT })
+      .catch((e) => { navErr = e.message; });
+    if (navErr && !page.url().includes('canva')) {
+      await ctx.close().catch(() => {});
+      return { ok: false, error: `Opened the browser but could not reach Canva: ${navErr}` };
+    }
+    loginSession = { context: ctx, page, id: Math.random().toString(36).slice(2, 10), createdAt: Date.now() };
+    return { ok: true, id: loginSession.id };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
 }
 
 async function loginShot() {
@@ -313,11 +375,12 @@ async function status() {
     logged_in: hasSession(),
     last_login: mem.getState('canva_last_login', null),
     login_in_progress: !!loginSession,
+    launch_error: launchError,
   };
 }
 
 module.exports = {
-  available, status, checkLogin, inviteEmail,
+  available, status, checkLogin, inviteEmail, selfTest,
   startLogin, loginShot, loginClick, loginType, loginKey, finishLogin, endLogin,
   forgetSession,
 };

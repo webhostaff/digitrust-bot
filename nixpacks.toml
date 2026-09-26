@@ -1,12 +1,17 @@
 # Railway build config.
-# The Canva automation runs a headless Chromium (@sparticuz/chromium). It needs
-# a few system libraries present in the image; listing them here keeps the build
-# working whether or not CANVA_AUTOMATION is on (they are tiny and harmless when
-# unused).
+#
+# The Canva automation runs a headless Chromium. Installing a real Chromium here
+# and pointing the code at it (CHROMIUM_PATH) is the reliable way on Railway —
+# more so than the Lambda-tuned bundled binary. The libraries below are what it
+# needs to start. All of this is harmless when CANVA_AUTOMATION is off.
 [phases.setup]
-nixPkgs = ["nodejs_20"]
+nixPkgs = ["nodejs_20", "chromium"]
 aptPkgs = [
   "libnss3", "libatk1.0-0", "libatk-bridge2.0-0", "libcups2", "libdrm2",
   "libxkbcommon0", "libxcomposite1", "libxdamage1", "libxfixes3", "libxrandr2",
   "libgbm1", "libasound2", "libpango-1.0-0", "libcairo2", "libatspi2.0-0"
 ]
+
+[variables]
+# nixpacks puts the chromium binary on PATH; this points Playwright straight at it.
+CHROMIUM_PATH = "/root/.nix-profile/bin/chromium"

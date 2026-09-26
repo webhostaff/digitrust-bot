@@ -84,9 +84,18 @@ const $=(id)=>document.getElementById(id);
 let live=false, timer=null;
 
 async function start(){
-  $('tip').textContent='⏳ يحل Canva…';
-  const r=await (await post('canva/start')).json();
-  if(!r.ok){ $('tip').innerHTML='<span class="bad">'+(r.error||'ما نجّمش يبدا')+'</span>'; return; }
+  $('tip').style.display='grid'; $('screen').style.display='none'; $('hint').style.display='none'; $('kbd').style.display='none';
+  $('tip').innerHTML='⏳ يحل Canva… (ينجم ياخذ 20 ثانية أول مرة)';
+  let r;
+  try{ r=await (await post('canva/start')).json(); }
+  catch(e){ r={ok:false,error:'ما وصلش للسيرفر: '+e.message}; }
+  if(!r.ok){
+    $('tip').innerHTML='<div style="max-width:440px"><div style="font-size:40px">⚠️</div>'+
+      '<p class="bad" style="font-size:15px">'+(r.error||'ما نجّمش يحل المتصفّح')+'</p>'+
+      '<p style="font-size:13px;color:#8b95a7">أغلب سبب: مكتبات Chromium ناقصة في السيرفر. أعمل Redeploy في Railway باش يتركّبو، ومبعد عاود.</p>'+
+      '<button class="g" onclick="start()" style="margin-top:6px">↻ عاود</button></div>';
+    return;
+  }
   live=true; $('tip').style.display='none'; $('screen').style.display='block'; $('hint').style.display='block'; $('kbd').style.display='flex';
   loop();
 }
