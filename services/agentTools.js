@@ -1070,10 +1070,132 @@ async function performAction(a, bot) {
     }
     return out;
   }
+  if (a.kind === 'credit') {
+    const { userId, amount, reason } = a.payload;
+    const before = Number((raw.prepare('SELECT balance FROM users WHERE telegram_id = ?').get(userId) || {}).balance || 0);
+    db.updateBalance(userId, amount);
+    try { db.addTransaction({ userId, type: 'admin_credit', amount, description: reason, refId: `yamen_${Date.now()}`, orderId: null }); } catch (_) {}
+    // Let the customer know, quietly.
+    if (bot) {
+      try { await bot.sendMessage(userId, `💰 <b>$${amount.toFixed(2)}</b> was added to your balance.
+${reason ? '📝 ' + reason : ''}`, { parse_mode: 'HTML' }); } catch (_) {}
+    }
+    return { ok: true, message: `✅ تزادو $${amount.toFixed(2)} لرصيد الحريف — من ${before.toFixed(2)} لـ ${(before + amount).toFixed(2)}` };
+  }
+
   const r = await require('./agentStudio').perform(a, bot);
   if (r) return r;
   return { ok: false, error: 'unknown action' };
 }
+
+// ── Add balance to a customer (capped, owner taps to confirm) ────────────────
+
+const CREDIT_CAP = Number(process.env.AGENT_CREDIT_CAP || 20); // max Yamen may propose at once
+
+TOOLS.propose_credit = {
+  description:
+    `Prepare adding balance to a customer's wallet — a refund, compensation, a bonus. Yamen may propose up to ` +
+    `$${CREDIT_CAP}; more than that, tell the owner to do it from /admin. Nothing is credited until the owner taps. ` +
+    `Find the customer by @username or numeric id first (customer_lookup).`,
+  input: {
+    user: 'customer @username or telegram id',
+    amount: 'dollars to add (positive), max ' + CREDIT_CAP,
+    reason: 'short reason shown in the wallet history and to the owner',
+  },
+  run: ({ user, amount, reason }) => {
+    const amt = Number(String(amount).replace(/[$,\s]/g, ''));
+    if (!Number.isFinite(amt) || amt <= 0) return { error: 'amount must be a positive number' };
+    if (amt > CREDIT_CAP) return { error: `over the $${CREDIT_CAP} limit — amounts above $${CREDIT_CAP} must be added by the owner in /admin` };
+    const key = String(user || '').trim().replace(/^@/, '');
+    let u = /^\d+$/.test(key) ? raw.prepare('SELECT * FROM users WHERE telegram_id = ?').get(Number(key))
+      : raw.prepare('SELECT * FROM users WHERE lower(username) = lower(?)').get(key);
+    if (!u) return { error: `customer "${user}" not found` };
+    const id = newAction('credit', { userId: u.telegram_id, amount: Number(amt.toFixed(2)), reason: String(reason || 'Added by Yamen').slice(0, 120) });
+    return {
+      action_id: id, kind: 'credit',
+      title: `💰 ${u.username ? '@' + u.username : u.telegram_id}`,
+      summary: `➕ $${amt.toFixed(2)} → balance ${Number(u.balance || 0).toFixed(2)} → ${(Number(u.balance || 0) + amt).toFixed(2)}` +
+        (reason ? `\n📝 ${String(reason).slice(0, 80)}` : ''),
+      confirm: `💰 زيد $${amt.toFixed(2)}`,
+    };
+  },
+};
+
+// ── Web search (fallback for non-OpenAI-Responses paths) ─────────────────────
+// OpenAI's Responses path has a native web_search tool. This gives the same
+// ability to the Anthropic and gpt-4 paths, with no API key: a DuckDuckGo
+// search, and a reader that pulls the readable text from one result page.
+
+const axios2 = require('axios');
+const stripTags = (h) => String(h || '')
+  .replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ')
+  .replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
+  .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#39;|&apos;/g, "'").replace(/&quot;/g, '"')
+  .replace(/\s+/g, ' ').trim();
+
+TOOLS.web_search = {
+  description:
+    'Search the web when the answer is not in the shop data or your knowledge — how to activate a service, ' +
+    'a current error, steps for a product, whether a site is down. Returns titles, links and snippets. ' +
+    'Follow with web_read on the best link for detail.',
+  input: { query: 'what to search for' },
+  run: async ({ query }) => {
+    const q = String(query || '').trim();
+    if (!q) return { error: 'empty query' };
+    const UA = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36',
+      'Accept-Language': 'en-US,en;q=0.9' };
+
+    // 1) DuckDuckGo's JSON "instant answer" API (often enough, and key-free).
+    try {
+      const j = (await axios2.get('https://api.duckduckgo.com/', {
+        params: { q, format: 'json', no_html: 1, skip_disambig: 1 }, timeout: 10000, headers: UA })).data;
+      const res = [];
+      if (j.AbstractText) res.push({ title: j.Heading || q, url: j.AbstractURL || '', snippet: j.AbstractText });
+      for (const t of (j.RelatedTopics || [])) {
+        const items = t.Topics || [t];
+        for (const it of items) if (it.Text && it.FirstURL && res.length < 6) res.push({ title: it.Text.slice(0, 120), url: it.FirstURL, snippet: it.Text });
+      }
+      if (res.length) return { query: q, results: res.slice(0, 6), source: 'duckduckgo' };
+    } catch (_) {}
+
+    // 2) DuckDuckGo Lite HTML.
+    for (const base of ['https://lite.duckduckgo.com/lite/', 'https://html.duckduckgo.com/html/']) {
+      try {
+        const html = (await axios2.get(base, { params: { q }, timeout: 12000, headers: UA })).data;
+        const out = [];
+        const re = /<a[^>]*class="[^"]*result(?:__a|-link)[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+        let m;
+        while ((m = re.exec(html)) && out.length < 6) {
+          let link = m[1]; const dd = link.match(/uddg=([^&]+)/);
+          if (dd) { try { link = decodeURIComponent(dd[1]); } catch (_) {} }
+          if (/^https?:/.test(link)) out.push({ title: stripTags(m[2]).slice(0, 140), url: link });
+        }
+        const snips = []; const sre = /<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
+        while ((m = sre.exec(html)) && snips.length < 6) snips.push(stripTags(m[1]).slice(0, 240));
+        out.forEach((o, i) => { o.snippet = snips[i] || ''; });
+        if (out.length) return { query: q, results: out, source: 'duckduckgo' };
+      } catch (_) {}
+    }
+    return { error: 'search unavailable right now — answer from what you know, or ask the owner' };
+  },
+};
+
+TOOLS.web_read = {
+  description: 'Read the main text of one web page (a link from web_search) for the details.',
+  input: { url: 'the page URL' },
+  run: async ({ url }) => {
+    const u = String(url || '').trim();
+    if (!/^https?:\/\//.test(u)) return { error: 'bad url' };
+    try {
+      const r = await axios2.get(u, { timeout: 14000, maxContentLength: 4e6,
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36' } });
+      const title = (String(r.data).match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1];
+      return { url: u, title: stripTags(title || '').slice(0, 160), text: stripTags(r.data).slice(0, 4000) };
+    } catch (e) {
+      return { error: `could not read: ${e.message}` };
+    }
+  },
+};
 
 TOOLS.canva_status = {
   description: 'Whether Canva auto-invites are on and logged in (for "is Canva working?", "did the invite go out?").',
@@ -1157,6 +1279,33 @@ TOOLS.propose_reply = {
       why: String(why || ''),
       status: 'awaiting_approval',
     };
+  },
+};
+
+TOOLS.send_reply_now = {
+  description:
+    'Send a reply to a customer WITHOUT waiting for the owner — allowed ONLY for simple, factual, low-risk ' +
+    'questions (how to top up, delivery time, where the instructions are, is a product in stock). NEVER for ' +
+    'anything about money owed, refunds, complaints, promises, prices, account problems, or anything you are ' +
+    'unsure about — use propose_reply for those. Requires the owner to have turned auto-reply on; if it is off ' +
+    'this becomes a normal draft.',
+  input: {
+    user_id: 'the customer',
+    text: 'the exact message to send',
+    category: 'one of: how_to | delivery_time | instructions | stock | greeting — the safe kind this is',
+  },
+  run: ({ user_id, text, category }) => {
+    const uid = Number(user_id);
+    const body = String(text || '').trim();
+    if (!Number.isFinite(uid) || !body) return { error: 'user_id and text required' };
+    const SAFE = ['how_to', 'delivery_time', 'instructions', 'stock', 'greeting'];
+    const on = (() => { try { return require('./agentMemory').getState('auto_reply', '0') === '1'; } catch (_) { return false; } })();
+    // Off, or not a whitelisted kind → fall back to a draft the owner approves.
+    if (!on || !SAFE.includes(String(category))) {
+      const d = TOOLS.propose_reply.run({ user_id: uid, text: body, why: `auto-reply held (${!on ? 'auto-reply off' : 'needs review: ' + category})` });
+      return { ...d, auto: false, held_reason: !on ? 'auto_reply_off' : 'not_a_safe_category' };
+    }
+    return { __auto_send: { user_id: uid, text: body, category }, sent: 'pending' };
   },
 };
 

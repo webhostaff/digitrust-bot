@@ -97,6 +97,19 @@ function stepDown(tier) {
 /** The gpt-4 family does not reason and lives on chat/completions. */
 const isReasoningOpenAI = (m) => !/^gpt-4/i.test(m);
 
+// Which models can actually SEE an image. The cheap luna line is text-mostly,
+// so a message with a photo is lifted to a vision model for that turn.
+const VISION = {
+  openai: ['gpt-6-sol', 'gpt-5.6-sol', 'gpt-4o'],
+  anthropic: ['claude-sonnet-5', 'claude-opus-5-5', 'claude-sonnet-4-6'],
+};
+function visionModel() {
+  const chain = VISION[PROVIDER] || [];
+  // Prefer one already known to work (the deep chain has stepped down if needed).
+  for (const m of chain) if (TIER_CHAIN.deep.includes(m) || TIER_CHAIN.fast.includes(m)) return m;
+  return chain[0] || modelFor('deep');
+}
+
 // ── Token budget ─────────────────────────────────────────────────────────────
 //
 // Every call's usage is added to today's total. Past the daily budget, Sahbi
@@ -200,6 +213,19 @@ HOW YOU WORK
 - Short by default. A greeting gets one line back plus anything urgent from the snapshot. Long only when the question is.
 - Unsure? Say which part and what would settle it.
 - You cannot change balances, refunds or prices, or send messages yourself — say which admin screen does it. Stock is the exception, below.
+
+ANSWERING CUSTOMERS
+- Default: draft with propose_reply; the owner taps Send. This is the safe path and the right one for anything about money, refunds, complaints, promises, prices, account problems, or anything you are not fully sure of.
+- If AUTO-REPLY is ON (see the flag in your context) you MAY answer a customer yourself with send_reply_now, but ONLY for simple factual questions: how to top up, how long delivery takes, where the instructions are, whether something is in stock, a greeting. When in any doubt, draft instead. One wrong sent message costs more than ten drafts, so err toward drafting.
+
+ADDING BALANCE
+- propose_credit adds up to the wallet limit ($20 by default) (refund, compensation, bonus). The owner taps to confirm. Above the limit, tell the owner to do it in /admin. Always look the customer up first and say who and why.
+
+SEARCHING THE WEB
+- You can search the web. Use it when the answer is not in the shop data or your own knowledge: how to activate/redeem a specific service, a current error a customer hit, setup steps, whether a provider is down, a fact you are unsure of. Search, read the best result, then answer in your own words — short, and say briefly where it came from when it matters. Do not search for things you already know or for shop data (that is what your tools are for).
+
+READING IMAGES
+- You CAN see images the owner sends. When one arrives, actually read it: describe what matters, pull out the text/numbers, and act (a product screenshot → offer to create/edit the product from it; a payment proof → read the amount and TxID and check it with txid_check; an error screen → say what it means). Never say you cannot see images.
 
 BE THE PARTNER WHO THINKS AHEAD
 - You watch the shop even when the owner is not asking: you send alerts (customers waiting, stuck deliveries, a winner running out, refund abuse, a silent shop) and a morning and evening brief. RECENT ALERTS below shows what you already told them — follow up on those instead of repeating them.
@@ -395,6 +421,7 @@ async function streamResponse(body, emit, signal) {
         let ev;
         try { ev = JSON.parse(data); } catch (_) { continue; }
         if (ev.type === 'response.output_text.delta' && ev.delta) emit({ type: 'delta', text: ev.delta });
+        else if (ev.type === 'response.web_search_call.searching' || (ev.type === 'response.output_item.added' && ev.item && ev.item.type === 'web_search_call')) emit({ type: 'status', text: '🌐 يبحث في الويب' });
         else if (ev.type === 'response.completed' || ev.type === 'response.incomplete') done = ev.response;
         else if (ev.type === 'response.failed') {
           const m = ev.response?.error?.message || 'The model failed to answer';
@@ -453,6 +480,22 @@ async function runTools(calls, ctx) {
       ctx.drafts.push(out);
       ctx.emit({ type: 'draft', draft: out });
     }
+    // Yamen chose to answer a safe question itself (auto-reply is on).
+    if (out && out.__auto_send) {
+      const { user_id, text } = out.__auto_send;
+      const bot = require('./agentChat')._storeBot || (globalThis.__STORE_BOT__);
+      const sb = bot || null;
+      let done = { ok: false };
+      try {
+        const b = require('../support-bot');
+        await b.sendMessage(user_id, text);
+        require('./agentMemory').logChat('event', `🤝 يمان جاوب الحريف وحدو: "${String(text).slice(0, 80)}"`);
+        done = { ok: true };
+      } catch (e) { done = { ok: false, error: e.message }; }
+      ctx.emit({ type: 'auto_reply', to: user_id, text, ok: done.ok });
+      // Replace the tool result the model sees with a plain outcome.
+      return { id: c.id, output: JSON.stringify(done.ok ? { sent: true } : { sent: false, error: done.error }) };
+    }
     if (out && out.action_id) ctx.emit({ type: 'action', action: out });
     if (c.name === 'propose_stock' && out && out.stock_draft_id) {
       ctx.drafts.push({ ...out, kind: 'stock' });
@@ -485,11 +528,16 @@ function anthropicImage(dataUrl) {
 }
 
 /** OpenAI Responses API — tools + reasoning together, streamed, chained. */
+const WEB_SEARCH_ON = process.env.WEB_SEARCH !== '0';
+
 async function turnOpenAIResponses(ctx) {
   const { tier, emit, signal } = ctx;
-  const tools = toolSchemas().map((t) => ({
-    type: 'function', name: t.name, description: t.description, parameters: t.input_schema,
-  }));
+  // On the Responses API, OpenAI's native web search replaces our fallback
+  // web_search/web_read functions, so drop those to avoid a name clash.
+  const tools = toolSchemas()
+    .filter((t) => !(WEB_SEARCH_ON && (t.name === 'web_search' || t.name === 'web_read')))
+    .map((t) => ({ type: 'function', name: t.name, description: t.description, parameters: t.input_schema }));
+  if (WEB_SEARCH_ON) tools.push({ type: 'web_search' });
   const first = { role: 'user', content: ownerContent(ctx, 'responses') };
   let previous = mem.getState('openai_prev') || null;
   let input = previous ? [first] : [...recap(), first];
@@ -500,7 +548,8 @@ async function turnOpenAIResponses(ctx) {
     if (overBudget()) throw new BudgetError('budget');
     let response;
     try {
-      response = await callWithFallback(tier, (model) => {
+      response = await callWithFallback(tier, (model0) => {
+        const model = ctx.forcedModel || model0;
         const body = { model, instructions: buildInstructions(tier), input, tools };
         if (previous) body.previous_response_id = previous;
         if (!isRefused(model, 'max_output_tokens')) body.max_output_tokens = tier === 'deep' ? 6000 : 4000;
@@ -562,8 +611,8 @@ async function turnOpenAIChat(ctx) {
     { role: 'user', content: ownerContent(ctx, 'chat') }];
   for (let round = 0; round < MAX_ROUNDS; round++) {
     if (overBudget()) throw new BudgetError('budget');
-    const res = await callWithFallback(tier, (model) => axios.post('https://api.openai.com/v1/chat/completions', {
-      model, messages, tools, tool_choice: 'auto', max_tokens: 3000,
+    const res = await callWithFallback(tier, (model0) => axios.post('https://api.openai.com/v1/chat/completions', {
+      model: ctx.forcedModel || model0, messages, tools, tool_choice: 'auto', max_tokens: 3000,
     }, { headers: { Authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' }, timeout: 240000, signal }));
     const u = res.data.usage || {};
     addUsage(res.data.model || modelFor(tier), u.prompt_tokens, u.prompt_tokens_details?.cached_tokens, u.completion_tokens);
@@ -597,8 +646,8 @@ async function turnAnthropic(ctx) {
 
   for (let round = 0; round < MAX_ROUNDS; round++) {
     if (overBudget()) throw new BudgetError('budget');
-    const res = await callWithFallback(tier, (model) => axios.post('https://api.anthropic.com/v1/messages', {
-      model, max_tokens: tier === 'deep' ? 4000 : 3000, system: buildInstructions(tier), tools, messages,
+    const res = await callWithFallback(tier, (model0) => axios.post('https://api.anthropic.com/v1/messages', {
+      model: ctx.forcedModel || model0, max_tokens: tier === 'deep' ? 4000 : 3000, system: buildInstructions(tier), tools, messages,
     }, {
       headers: { 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
       timeout: 240000, signal,
@@ -629,21 +678,25 @@ const CAREFUL = /(مخزون|ستوك|stock|زيد|زيدل|اضف|أضف|ضيف
 
 /** One owner message, end to end. */
 async function runTurn({ text, mode, emit, signal, proactive = null, images = [] }) {
-  const tier = pickTier(text, mode);
+  let tier = pickTier(text, mode);
   const pics = (images || []).filter((u) => /^data:image\/(png|jpe?g|webp|gif);base64,/.test(String(u))).slice(0, 4);
-  const effort = tier === 'deep' ? EFFORT.deep : (pics.length || CAREFUL.test(text) ? 'medium' : EFFORT.fast);
-  const ctx = { text, images: pics, tier, effort, emit, signal, drafts: [], used: [] };
-  emit({ type: 'start', tier, model: modelFor(tier) });
+  // A photo needs a model that can see and a moment to think.
+  const forcedModel = pics.length ? visionModel() : null;
+  if (pics.length) tier = 'deep';
+  const effort = tier === 'deep' ? EFFORT.deep : (CAREFUL.test(text) ? 'medium' : EFFORT.fast);
+  const ctx = { text, images: pics, tier, effort, forcedModel, emit, signal, drafts: [], used: [] };
+  emit({ type: 'start', tier, model: forcedModel || modelFor(tier) });
   // A brief Sahbi writes on its own has no visible question; the prompt is
   // stored as 'auto' so it is neither shown nor replayed as the owner's words.
   mem.logChat(proactive ? 'auto' : 'user', text, { tier, proactive, images: pics.length || undefined });
 
+  const activeModel = forcedModel || modelFor(tier);
   const fn = PROVIDER === 'anthropic' ? turnAnthropic
-    : (isReasoningOpenAI(modelFor(tier)) ? turnOpenAIResponses : turnOpenAIChat);
+    : (isReasoningOpenAI(activeModel) ? turnOpenAIResponses : turnOpenAIChat);
   const reply = await fn(ctx);
   // Photos make the chained context heavy; start the next message fresh.
   if (pics.length) mem.setState('openai_prev', null);
-  const meta = { tier, model: modelFor(tier), tools: [...new Set(ctx.used)],
+  const meta = { tier, model: forcedModel || modelFor(tier), tools: [...new Set(ctx.used)],
     drafts: ctx.drafts.map((d) => ({ ...d })), proactive };
   mem.logChat('assistant', reply, meta);
   emit({ type: 'done', ...meta });
@@ -792,7 +845,7 @@ router.get('/brief', requireToken, (req, res) => {
 });
 
 function costSettings() {
-  return { daily_budget_usd: String(budget()), allow_deep: mem.getState('allow_deep', '1'), usage_today: usageToday() };
+  return { daily_budget_usd: String(budget()), allow_deep: mem.getState('allow_deep', '1'), auto_reply: mem.getState('auto_reply', '0'), usage_today: usageToday() };
 }
 // ── Voice ────────────────────────────────────────────────────────────────────
 //
@@ -884,6 +937,7 @@ router.post('/settings', requireToken, (req, res) => {
     mem.setState('daily_budget_usd', String(v));
   }
   if (b.allow_deep !== undefined) mem.setState('allow_deep', b.allow_deep === '1' || b.allow_deep === true ? '1' : '0');
+  if (b.auto_reply !== undefined) mem.setState('auto_reply', b.auto_reply === '1' || b.auto_reply === true ? '1' : '0');
   res.json({ ...require('./agentWatch').saveSettings(b), ...costSettings() });
 });
 

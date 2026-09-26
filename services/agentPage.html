@@ -254,7 +254,9 @@ header .sub{font-size:11.5px;color:var(--dim);white-space:nowrap;overflow:hidden
     <div class="set">
       <span>💸 الحد اليومي للصرف ($) — كي يوصلو يوقف الـ AI لين غدوة</span><input type="number" min="0" max="100" step="0.1" id="s_budget">
       <span>🧠 نسمحلو يستعمل الموديل الغالي للحوصلات والتحليل</span><input type="checkbox" class="sw" id="s_deep">
+      <span>💬 نسمحلو يجاوب الحرفاء وحدو (أسئلة سهلة برك: الشحن، وقت التسليم، التعليمات)</span><input type="checkbox" class="sw" id="s_auto">
     </div>
+    <div class="small">⚠️ حتى كي تشعلو، أي سؤال فيه فلوس ولا استرجاع ولا وعد، يمان يحضّرو ويستناك — ما يبعثش وحدو.</div>
     <div class="small" id="usage"></div>
     <div class="small">يمان يراقب المحل كل 5 دقايق وكي يلقى حاجة يقلك هوني في التطبيق برك — ما يكتب شي في البوتات (مجاني، بلاش AI).</div>
     <div class="set"><span>📳 إشعار في التليفون كي يجي تنبيه</span><button id="notif" style="background:var(--card);border:1px solid var(--line);color:#c3cbd9;border-radius:9px;padding:6px 10px">شغّل</button></div>
@@ -530,6 +532,7 @@ async function send(text){
         else if(ev.type==='draft'){ showDraft(ev.draft); }
         else if(ev.type==='stock_draft'){ showStock(ev.draft); }
         else if(ev.type==='action'){ showAction(ev.action); }
+        else if(ev.type==='auto_reply'){ addNote('event', ev.ok?('🤝 يمان جاوب الحريف وحدو: "'+ev.text.slice(0,60)+'"'):'⚠️ محاولة رد أوتوماتيكي فشلت'); }
         else if(ev.type==='done'){ meta=ev; }
         else if(ev.type==='error'){ failed=true; addErr(ev.error); }
       }
@@ -830,7 +833,7 @@ async function loadSettings(){
   $('s_wait').value=s.wait_minutes; $('s_qs').value=s.quiet_start.padStart(5,'0'); $('s_qe').value=s.quiet_end.padStart(5,'0');
   const t5=v=>v?String(v).padStart(5,'0'):'';
   $('s_bm').value=t5(s.brief_morning); $('s_be').value=t5(s.brief_evening);
-  $('s_budget').value=s.daily_budget_usd; $('s_deep').checked=s.allow_deep==='1';
+  $('s_budget').value=s.daily_budget_usd; $('s_deep').checked=s.allow_deep==='1'; $('s_auto').checked=s.auto_reply==='1';
   showUsage(s.usage_today, parseFloat(s.daily_budget_usd));
 }
 function showUsage(u,b){
@@ -841,10 +844,10 @@ async function saveSettings(){
   await post('settings',{watch_enabled:$('s_watch').checked?'1':'0',briefs_enabled:$('s_brief').checked?'1':'0',
     wait_minutes:$('s_wait').value,quiet_start:$('s_qs').value,quiet_end:$('s_qe').value,
     brief_morning:$('s_bm').value,brief_evening:$('s_be').value,
-    daily_budget_usd:$('s_budget').value,allow_deep:$('s_deep').checked?'1':'0'});
+    daily_budget_usd:$('s_budget').value,allow_deep:$('s_deep').checked?'1':'0',auto_reply:$('s_auto').checked?'1':'0'});
   $('sstate').textContent='✅ تسجّل';
 }
-['s_watch','s_brief','s_wait','s_qs','s_qe','s_bm','s_be','s_budget','s_deep'].forEach(id=>$(id).addEventListener('change',saveSettings));
+['s_watch','s_brief','s_wait','s_qs','s_qe','s_bm','s_be','s_budget','s_deep','s_auto'].forEach(id=>$(id).addEventListener('change',saveSettings));
 $('bnow').onclick=async()=>{ $('sstate').textContent='⏳ يكتب في الحوصلة… (تظهر هوني في الشات)';
   const r=await post('brief/now',{kind:new Date().getHours()<15?'morning':'evening'}); const j=await r.json();
   $('sstate').textContent=j.ok?'✅ وصلت':'❌ '+(j.error||''); pollNew(); };

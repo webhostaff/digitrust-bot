@@ -1337,3 +1337,33 @@ was correct; Railway was still serving an older build.
   (old build)" when the deploy is stale).
 * The login page now detects an HTML (non-JSON) reply and says plainly that the
   deploy is stale and needs a full Redeploy, instead of a raw parse error.
+
+# Part 40 — Yamen: sees images, adds balance, can auto-reply
+
+* **Images now read.** A message with a photo is routed to a vision model
+  (gpt-6-sol / claude-sonnet-5) for that turn instead of the text-only luna, so
+  Yamen actually reads screenshots, payment proofs and error screens and acts on
+  them. (The plumbing existed; the cheap model could not see.)
+* **Add balance** — `propose_credit`: a refund/compensation/bonus up to
+  `AGENT_CREDIT_CAP` ($20 default), owner taps to confirm; above the cap it
+  refuses and points to /admin. Credits the wallet, logs a transaction, and DMs
+  the customer.
+* **Optional auto-reply** — `send_reply_now`, gated by an app toggle (default
+  OFF) AND a safe-category whitelist (how-to, delivery time, instructions,
+  stock, greeting). Anything about money, refunds, complaints, promises, prices
+  or account problems is always turned into a draft the owner approves — even
+  with the toggle on. Setting: app → 🧠 → 🔔 → "💬 نسمحلو يجاوب الحرفاء وحدو".
+
+# Part 41 — Yamen searches the web
+
+* On the OpenAI Responses path, Yamen now has OpenAI's native `web_search`
+  (no key, no scraping). It decides when to use it — activation steps, a current
+  error, a fact not in the shop data — and a "🌐 يبحث في الويب" status shows while
+  it searches. Off with `WEB_SEARCH=0`.
+* For the Anthropic / gpt-4 paths, key-free fallback tools `web_search`
+  (DuckDuckGo instant-answer API → Lite HTML) and `web_read` (readable page
+  text). They degrade gracefully to "search unavailable — answer from what you
+  know" if the host blocks them; the native path is unaffected. The fallback
+  pair is dropped on the Responses path to avoid a name clash.
+* Persona: search only when the answer is not in shop data or Yamen's knowledge;
+  read the best result and answer in its own words.

@@ -72,3 +72,6 @@
 2026-09-26T00:08:42.962Z [INFO] [canva] auto-delivered order #9001 to auto@gmail.com
 2026-09-26T00:08:42.966Z [WARN] [canva] auto-invite failed for #9002: session expired (needs re-login) — handing to manual
 2026-09-26T00:20:26.600Z [INFO] [canva] chromium launched: /tmp/chromium (bundled)
+2026-09-26T21:55:15.352Z [INFO] [agent] propose_credit({"user":"@DarkDragonCE","amount":"8","reason":"refund for late delivery"})
+2026-09-26T21:57:36.023Z [INFO] [agent] web_search({"query":"how to redeem canva pro invite"})
+2026-09-26T21:58:00.641Z [INFO] [agent] web_search({"query":"what is canva"})
