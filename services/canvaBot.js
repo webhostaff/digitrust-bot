@@ -52,7 +52,33 @@ function resolveDataDir() {
 }
 const DATA_DIR = resolveDataDir();
 const STORAGE = path.join(DATA_DIR, 'storage.json');
-const PERSISTENT = !DATA_DIR.startsWith('/tmp');
+/**
+ * Is DATA_DIR really on a mounted volume? v109 only checked "not /tmp", which
+ * would happily say ✅ for a folder inside the image that a deploy wipes too.
+ * On Linux, /proc/mounts lists every mount: the deepest mount point containing
+ * DATA_DIR tells us. The container root ('/', usually overlay) is NOT
+ * persistent; a Railway volume shows up as its own mount (e.g. /app/data).
+ * Returns null when it cannot tell (non-Linux dev machine).
+ */
+function volumeCheck(dir) {
+  try {
+    const target = path.resolve(dir);
+    let best = null;
+    for (const line of fs.readFileSync('/proc/mounts', 'utf8').split('\n')) {
+      const [, mp, type] = line.split(' ');
+      if (!mp) continue;
+      const m = mp.replace(/\\040/g, ' ');
+      if (target === m || target.startsWith(m === '/' ? '/' : m + '/')) {
+        if (!best || m.length > best.mp.length) best = { mp: m, type };
+      }
+    }
+    if (!best) return null;
+    const persistent = best.mp !== '/' && !['tmpfs', 'overlay', 'ramfs'].includes(best.type);
+    return { persistent, mount: best.mp, type: best.type };
+  } catch (_) { return null; }
+}
+const VOLUME = volumeCheck(DATA_DIR);
+const PERSISTENT = VOLUME ? VOLUME.persistent : !DATA_DIR.startsWith('/tmp');
 const PEOPLE_URL = 'https://www.canva.com/settings/people';
 const MIN_GAP_MS = 20 * 1000;             // never two invites closer than this
 const NAV_TIMEOUT = 45 * 1000;
@@ -197,7 +223,10 @@ async function launch() {
     launchError = `${exec.path}: ${e.message}`;
     const lib = (e.message.match(/error while loading shared libraries: ([^:]+)/) || [])[1];
     throw new Error(lib
-      ? `Chromium is missing a system library (${lib}). Redeploy so nixpacks.toml installs it.`
+      // Only the bundled fallback lacks libraries; a system Chromium brings its
+      // own. So this means the build did not install Chromium at all — i.e.
+      // Railway is not using our Dockerfile (the Dockerfile fixes exactly this).
+      ? `Chromium is missing a system library (${lib}) — the build did not install Chromium. Make sure the Dockerfile is in the repo root and redeploy (Railway → Settings → Builder should say Dockerfile).`
       : `Chromium could not start (${exec.path}): ${e.message.slice(0, 160)}`);
   }
   launchError = null;
@@ -478,6 +507,7 @@ async function status() {
     launch_error: launchError,
     data_dir: DATA_DIR,
     persistent: PERSISTENT,
+    mount: VOLUME ? VOLUME.mount : null,
     env_session: process.env.CANVA_SESSION ? (envImport.error ? `error: ${envImport.error}` : `${envImport.count} cookies`) : null,
   };
 }
@@ -489,5 +519,5 @@ module.exports = {
   available, status, checkLogin, inviteEmail, selfTest,
   startLogin, loginShot, loginClick, loginType, loginKey, finishLogin, endLogin,
   forgetSession, importEnvSession,
-  _test: { parseSessionText, resolveDataDir, DATA_DIR, STORAGE },
+  _test: { parseSessionText, resolveDataDir, volumeCheck, DATA_DIR, STORAGE },
 };

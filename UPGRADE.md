@@ -1391,3 +1391,26 @@ was correct; Railway was still serving an older build.
   CANVA_SESSION state (cookie count or the parse error).
 * The error on the login page now shows the HTTP code and URL instead of
   guessing a cause.
+
+# Part 43 — Chromium on Railway: a Dockerfile (v110)
+
+* **Why "libnss3.so missing".** Newer Railway projects build with Railpack,
+  which ignores `nixpacks.toml` — so neither Chromium nor its libraries were
+  ever installed, and the bundled fallback Chromium could not start.
+* **`Dockerfile` added.** Railway always uses a Dockerfile when one exists, so
+  the build no longer depends on Railway's default builder. Base
+  `node:20-bookworm-slim` + Debian's `chromium` package (pulls every library
+  it needs) + fonts; `CHROMIUM_PATH=/usr/bin/chromium`. `WORKDIR /app` kept so
+  the volume at `/app/data` stays where it was. `.dockerignore` keeps local
+  `data/`, logs and `.env` out of the image. `nixpacks.toml` kept as fallback.
+* **`package-lock.json` synced.** It lacked `playwright-core` and
+  `@sparticuz/chromium`, so `npm ci` refused to install. Existing dependency
+  versions unchanged.
+* **Real volume check.** v109 said "volume ✅" for any path outside /tmp. The
+  session folder is now checked against `/proc/mounts`: only a real separate
+  mount (not the container root / overlay / tmpfs) counts. `/canva` shows the
+  mount point.
+* Error messages now point at the builder setting instead of nixpacks.
+* Tested: the bot's own launch code starts a real Chromium and streams a
+  screenshot; volume detection against real mounts; the whole v109 suite.
+  The Docker build itself cannot run in the sandbox (no Docker).

@@ -1,3 +1,6 @@
+# NOTE: Railway uses the Dockerfile when one exists, so this file is now
+# ignored. It is kept only as a fallback if the Dockerfile is ever removed.
+#
 # Railway build config.
 #
 # The Canva automation runs a headless Chromium. Installing a real Chromium here

@@ -700,7 +700,7 @@ bot.onText(/^\/canva$/i, async (msg) => {
     `${st.logged_in ? '✅ Logged in — invites are automatic.' : '🔴 Not logged in — Canva orders fall back to manual.'}\n` +
     (st.last_login ? `🕒 Last login: ${escapeHtml(String(st.last_login).slice(0, 16).replace('T', ' '))} UTC\n` : '') +
     // Where the session lives: a /tmp folder is wiped by every deploy, so say so.
-    `💾 Session: <code>${escapeHtml(String(st.data_dir))}</code> ${st.persistent ? '(volume ✅ survives deploys)' : '(⚠️ /tmp — lost on every deploy; set DB_PATH to a volume)'}\n` +
+    `💾 Session: <code>${escapeHtml(String(st.data_dir))}</code> ${st.persistent ? `(volume ✅${st.mount ? ' ' + escapeHtml(st.mount) : ''} — survives deploys)` : '(⚠️ not on a volume — lost on every deploy; put DB_PATH on a Railway volume)'}\n` +
     (st.env_session ? `🔑 CANVA_SESSION: ${escapeHtml(String(st.env_session))}\n` : '') +
     `\n<i>Log in once through the remote browser, or paste your canva.com cookies into the CANVA_SESSION variable. Only the session is kept — no password.</i>`,
     { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
@@ -717,7 +717,7 @@ bot.on('callback_query', async (q) => {
     const r = await canva.selfTest();
     await bot.sendMessage(q.message.chat.id, r.ok
       ? `✅ <b>Browser works.</b>\n🌐 Chromium: <code>${escapeHtml(String(r.chromium))}</code>\nLoaded a test page fine. You can log in now.`
-      : `🔴 <b>Browser test failed</b>\n\n<code>${escapeHtml(String(r.error))}</code>\n\n<i>Usually means Chromium or a library is missing — redeploy after the nixpacks change, or set CHROMIUM_PATH.</i>`,
+      : `🔴 <b>Browser test failed</b>\n\n<code>${escapeHtml(String(r.error))}</code>\n\n<i>Usually means Railway did not build with the Dockerfile. Check Settings → Build → Builder = Dockerfile, then redeploy.</i>`,
       { parse_mode: 'HTML' }).catch(() => {});
   } else if (q.data === 'canva_forget') {
     canva.forgetSession();
