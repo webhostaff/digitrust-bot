@@ -1367,3 +1367,27 @@ was correct; Railway was still serving an older build.
   pair is dropped on the Responses path to avoid a name clash.
 * Persona: search only when the answer is not in shop data or Yamen's knowledge;
   read the best result and answer in its own words.
+
+# Part 42 — Canva login: the real bug, a persistent session, CANVA_SESSION (v109)
+
+* **The real cause of the dead login page.** Part 39 blamed a stale deploy; that
+  was wrong. The page lives at `/agent/canva/login` and called `canva/start`
+  with a *relative* path, which the browser resolves to
+  `/agent/canva/canva/start` — a route that never existed → Express's HTML 404
+  → "not JSON". Every call is now built from the page's own folder. The page
+  script sits inside a template literal (which eats backslashes), so the URL
+  building uses plain string ops, not regex. Tested by serving the page and
+  hitting every route from both `/login` and `/login/`.
+* **Session survives deploys.** It used to live in `/tmp/canva-session`, which
+  Railway wipes on each deploy (silent logout). It now sits next to the
+  database on the volume (`dirname(DB_PATH)/canva-session`). An explicit
+  `CANVA_DATA_DIR` still wins, except the old `/tmp` default.
+* **`CANVA_SESSION` variable.** Log in on your own computer, export canva.com
+  cookies (Cookie-Editor → Export → JSON), paste into Railway. Raw JSON or
+  base64; Cookie-Editor arrays and Playwright storageState both accepted;
+  non-Canva cookies dropped. It seeds the session file only when its content
+  changes, so a redeploy keeps the fresher on-disk session the bot maintains.
+* `/canva` now shows where the session is stored (volume ✅ / /tmp ⚠️) and the
+  CANVA_SESSION state (cookie count or the parse error).
+* The error on the login page now shows the HTTP code and URL instead of
+  guessing a cause.

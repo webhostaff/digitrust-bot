@@ -699,7 +699,10 @@ bot.onText(/^\/canva$/i, async (msg) => {
     `🎨 <b>Canva automation</b>\n\n` +
     `${st.logged_in ? '✅ Logged in — invites are automatic.' : '🔴 Not logged in — Canva orders fall back to manual.'}\n` +
     (st.last_login ? `🕒 Last login: ${escapeHtml(String(st.last_login).slice(0, 16).replace('T', ' '))} UTC\n` : '') +
-    `\n<i>Tap to log in once in a remote browser. Only the Canva session is kept — no password is stored here.</i>`,
+    // Where the session lives: a /tmp folder is wiped by every deploy, so say so.
+    `💾 Session: <code>${escapeHtml(String(st.data_dir))}</code> ${st.persistent ? '(volume ✅ survives deploys)' : '(⚠️ /tmp — lost on every deploy; set DB_PATH to a volume)'}\n` +
+    (st.env_session ? `🔑 CANVA_SESSION: ${escapeHtml(String(st.env_session))}\n` : '') +
+    `\n<i>Log in once through the remote browser, or paste your canva.com cookies into the CANVA_SESSION variable. Only the session is kept — no password.</i>`,
     { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
 });
 

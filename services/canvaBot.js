@@ -31,8 +31,28 @@ const logger = require('../utils/logger');
 const mem = require('./agentMemory');
 
 const ENABLED = process.env.CANVA_AUTOMATION === '1';
-const DATA_DIR = process.env.CANVA_DATA_DIR || '/tmp/canva-session';
+
+/**
+ * Where the Canva session lives.
+ *
+ * It used to default to /tmp, which Railway wipes on every deploy — so every
+ * redeploy silently logged Canva out and orders fell back to manual. Now it
+ * sits next to the database (DB_PATH is on the persistent volume). An explicit
+ * CANVA_DATA_DIR still wins, EXCEPT the old '/tmp/canva-session' value that
+ * .env.example used to suggest: nobody chose that on purpose, and honouring it
+ * would keep the "logged out after every deploy" bug alive.
+ */
+const LEGACY_TMP_DIR = '/tmp/canva-session';
+function resolveDataDir() {
+  const explicit = (process.env.CANVA_DATA_DIR || '').trim();
+  if (explicit && explicit !== LEGACY_TMP_DIR) return explicit;
+  const dbPath = (process.env.DB_PATH || '').trim();
+  if (dbPath) return path.join(path.dirname(path.resolve(dbPath)), 'canva-session');
+  return LEGACY_TMP_DIR; // no volume configured — nothing better to do
+}
+const DATA_DIR = resolveDataDir();
 const STORAGE = path.join(DATA_DIR, 'storage.json');
+const PERSISTENT = !DATA_DIR.startsWith('/tmp');
 const PEOPLE_URL = 'https://www.canva.com/settings/people';
 const MIN_GAP_MS = 20 * 1000;             // never two invites closer than this
 const NAV_TIMEOUT = 45 * 1000;
@@ -53,6 +73,86 @@ const available = () => !!(ENABLED && playwright && chromium);
 // ── Session on disk ───────────────────────────────────────────────────────────
 
 function ensureDir() { try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (_) {} }
+
+// ── Session from a Railway variable (CANVA_SESSION) ───────────────────────────
+//
+// For owners who would rather log in on their own computer than through the
+// remote-login page: export the canva.com cookies (e.g. the "Cookie-Editor"
+// browser extension → Export → JSON) and paste them into CANVA_SESSION.
+// Accepted shapes, raw or base64-encoded:
+//   - Cookie-Editor / EditThisCookie export: a JSON ARRAY of cookies
+//   - a Playwright storageState object: { cookies: [...], origins: [...] }
+//
+// The variable only SEEDS the session file. The bot keeps refreshing that file
+// after each invite (Canva rotates cookies), so the file is usually fresher
+// than the variable. We therefore import the variable only when its content
+// CHANGED since the last import (hash kept in agent_state) — pasting a new
+// value re-seeds; a mere redeploy keeps the warmer on-disk session.
+
+const SAME_SITE = { no_restriction: 'None', none: 'None', lax: 'Lax', strict: 'Strict' };
+
+/** Parse CANVA_SESSION text into a Playwright storageState, or throw a clear error. */
+function parseSessionText(raw) {
+  let txt = String(raw || '').trim();
+  if (!txt) throw new Error('empty');
+  // Railway sometimes gets the value wrapped in quotes by copy-paste.
+  if (/^['"].*['"]$/s.test(txt)) txt = txt.slice(1, -1).trim();
+  if (!/^[\[{]/.test(txt)) {
+    // Not JSON — try base64 (handy when pasting through tools that mangle JSON).
+    try { txt = Buffer.from(txt, 'base64').toString('utf8').trim(); } catch (_) {}
+  }
+  let data;
+  try { data = JSON.parse(txt); } catch (e) { throw new Error('not valid JSON (paste the full export, starting with [ or {)'); }
+
+  const list = Array.isArray(data) ? data : Array.isArray(data && data.cookies) ? data.cookies : null;
+  if (!list) throw new Error('no cookies found in the value');
+
+  const cookies = [];
+  for (const c of list) {
+    if (!c || !c.name || c.value === undefined) continue;
+    let domain = String(c.domain || '').trim();
+    if (!/canva\.com$/i.test(domain.replace(/^\./, ''))) continue; // only Canva's own cookies
+    // Cookie-Editor marks host-only cookies with hostOnly:true and no dot;
+    // Playwright wants a leading dot for domain-wide ones — keep as exported.
+    const expires = typeof c.expires === 'number' ? c.expires
+      : typeof c.expirationDate === 'number' ? Math.floor(c.expirationDate)
+      : -1; // session cookie
+    let sameSite = SAME_SITE[String(c.sameSite || '').toLowerCase()] || (['Strict', 'Lax', 'None'].includes(c.sameSite) ? c.sameSite : 'Lax');
+    const secure = !!c.secure || sameSite === 'None';
+    cookies.push({
+      name: String(c.name), value: String(c.value), domain,
+      path: c.path || '/', expires, httpOnly: !!c.httpOnly, secure, sameSite,
+    });
+  }
+  if (!cookies.length) throw new Error('the export has no canva.com cookies — export while on canva.com');
+  const origins = (!Array.isArray(data) && Array.isArray(data.origins)) ? data.origins : [];
+  return { cookies, origins };
+}
+
+let envImport = { used: false, error: null, count: 0 };
+
+/** Seed the session file from CANVA_SESSION when the variable is new or changed. */
+function importEnvSession() {
+  const raw = process.env.CANVA_SESSION;
+  if (!raw || !raw.trim()) return envImport;
+  const hash = require('crypto').createHash('sha256').update(raw.trim()).digest('hex').slice(0, 16);
+  try {
+    const state = parseSessionText(raw);
+    envImport = { used: false, error: null, count: state.cookies.length };
+    const seen = mem.getState('canva_env_hash', null);
+    if (seen === hash && hasSession()) return envImport; // already imported; disk copy is fresher
+    ensureDir();
+    fs.writeFileSync(STORAGE, JSON.stringify(state));
+    mem.setState('canva_env_hash', hash);
+    mem.setState('canva_last_login', new Date().toISOString());
+    envImport.used = true;
+    logger.info(`[canva] session imported from CANVA_SESSION (${state.cookies.length} cookies)`);
+  } catch (e) {
+    envImport = { used: false, error: e.message, count: 0 };
+    logger.warn(`[canva] CANVA_SESSION ignored: ${e.message}`);
+  }
+  return envImport;
+}
 function hasSession() { try { return fs.statSync(STORAGE).size > 50; } catch (_) { return false; } }
 function forgetSession() { try { fs.unlinkSync(STORAGE); } catch (_) {} }
 
@@ -376,11 +476,18 @@ async function status() {
     last_login: mem.getState('canva_last_login', null),
     login_in_progress: !!loginSession,
     launch_error: launchError,
+    data_dir: DATA_DIR,
+    persistent: PERSISTENT,
+    env_session: process.env.CANVA_SESSION ? (envImport.error ? `error: ${envImport.error}` : `${envImport.count} cookies`) : null,
   };
 }
+
+// Seed from CANVA_SESSION once at boot (only matters when automation is on).
+if (ENABLED) { try { importEnvSession(); } catch (_) {} }
 
 module.exports = {
   available, status, checkLogin, inviteEmail, selfTest,
   startLogin, loginShot, loginClick, loginType, loginKey, finishLogin, endLogin,
-  forgetSession,
+  forgetSession, importEnvSession,
+  _test: { parseSessionText, resolveDataDir, DATA_DIR, STORAGE },
 };

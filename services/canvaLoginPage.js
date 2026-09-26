@@ -78,7 +78,17 @@ button{font:inherit;border:none;border-radius:10px;padding:9px 12px;cursor:point
 </div>
 <script>
 const T='__T__';
-const api=(p)=>p+(p.includes('?')?'&':'?')+'t='+encodeURIComponent(T);
+// THE BUG THAT KEPT THIS PAGE DEAD: calls used relative paths like 'canva/start'.
+// The page lives at /agent/canva/login, so the browser resolved them to
+// /agent/canva/canva/start — a route that never existed — got Express's HTML
+// 404, and we blamed a "stale deploy". Every call is now built from this page's
+// own folder (/agent/canva/), whatever prefix the router is mounted under.
+// Plain string ops, no regex: this script sits inside a JS template literal,
+// which silently eats backslashes (a regex like /\/login/ arrives as //login,
+// i.e. a comment). Tested by serving the page and calling every route.
+const BASE=(function(){ let p=location.pathname; if(p.endsWith('/')) p=p.slice(0,-1);
+  if(p.endsWith('/login')) p=p.slice(0,-'/login'.length); return p+'/'; })();
+const api=(p)=>BASE+(p.indexOf('canva/')===0?p.slice('canva/'.length):p)+(p.includes('?')?'&':'?')+'t='+encodeURIComponent(T);
 const post=(p,b)=>fetch(api(p),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});
 const $=(id)=>document.getElementById(id);
 let live=false, timer=null;
@@ -90,14 +100,15 @@ async function start(){
   try{
     const resp=await post('canva/start');
     const txt=await resp.text();
+    // Say what actually happened (HTTP code + where) instead of guessing a cause.
     try{ r=JSON.parse(txt); }
-    catch(_){ r={ok:false,error:'النسخة المنشورة قديمة — صفحة Canva موجودة أما مسار /canva/start مش موجود. أعمل Redeploy كامل (موش Restart) للنسخة الجديدة.'}; }
+    catch(_){ r={ok:false,error:'السيرفر رجّع '+resp.status+' موش JSON على '+BASE+'start'}; }
   }
   catch(e){ r={ok:false,error:'ما وصلش للسيرفر: '+e.message}; }
   if(!r.ok){
     $('tip').innerHTML='<div style="max-width:440px"><div style="font-size:40px">⚠️</div>'+
       '<p class="bad" style="font-size:15px">'+(r.error||'ما نجّمش يحل المتصفّح')+'</p>'+
-      '<p style="font-size:13px;color:#8b95a7">أغلب سبب: مكتبات Chromium ناقصة في السيرفر. أعمل Redeploy في Railway باش يتركّبو، ومبعد عاود.</p>'+
+      '<p style="font-size:13px;color:#8b95a7">جرّب /canva ← 🧪 Test browser في البوت باش تعرف السبب. ولا حط الجلسة في CANVA_SESSION.</p>'+
       '<button class="g" onclick="start()" style="margin-top:6px">↻ عاود</button></div>';
     return;
   }
