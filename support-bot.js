@@ -1619,13 +1619,29 @@ bot.on('callback_query', async (q) => {
     if (/^md_deliver_\d+$/.test(data)) {
       const id = parseInt(data.split('_').pop(), 10);
       queries.setSetting(`support_state_${chatId}`, `AWAIT_MD_CONTENT:${id}`);
-      const t = queries.getManualDelivery(id);
-      await bot.sendMessage(chatId,
-        `✍️ <b>Send the content for task #${id}</b>\n\n` +
-        `👤 ${escapeHtml(displayName(t?.username, t?.first_name, t?.user_id))}\n` +
-        `📦 ${manualDelivery.cleanTitle(t?.product_title)} ×${t?.quantity}\n\n` +
-        `<i>Your next message will be delivered to the customer. Send /cancel to abort.</i>`,
-        { parse_mode: 'HTML' });
+      await sendFastCard(chatId, queries.getManualDelivery(id), false);
+      return;
+    }
+    if (/^md_force_\d+$/.test(data)) {
+      const id = parseInt(data.split('_').pop(), 10);
+      const held = safeJson(queries.getSetting(`support_md_held_${chatId}`, ''));
+      queries.setSetting(`support_md_held_${chatId}`, '');
+      if (!held || held.taskId !== id) { await bot.sendMessage(chatId, '⚠️ Nothing held for this task — paste it again.'); return; }
+      await deliverFast(chatId, id, held.content, true);
+      return;
+    }
+    if (/^md_skip_\d+$/.test(data)) {
+      const id = parseInt(data.split('_').pop(), 10);
+      const cur = queries.getManualDelivery(id);
+      const nxt = mdFast.nextTask(id, cur && cur.product_id);
+      if (!nxt || nxt.id === id) { queries.setSetting(`support_state_${chatId}`, ''); await bot.sendMessage(chatId, '✅ No other task waiting.'); return; }
+      await sendFastCard(chatId, nxt, true);
+      return;
+    }
+    if (data === 'md_stop') {
+      queries.setSetting(`support_state_${chatId}`, '');
+      await bot.sendMessage(chatId, `⏹ Stopped. ${mdFast.pendingCount()} task(s) still waiting.`,
+        { reply_markup: { inline_keyboard: [[{ text: '📦 Manual list', callback_data: 'md_list_pending_0' }]] } });
       return;
     }
     if (/^md_done_\d+$/.test(data)) {
@@ -1651,6 +1667,88 @@ bot.on('callback_query', async (q) => {
     await bot.sendMessage(chatId, `⚠️ Error: ${e.message}`).catch(() => {});
   }
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MANUAL DELIVERY — FAST LANE (services/mdFast.js)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const mdFast = require('./services/mdFast');
+
+/**
+ * /mdlink <productId> <url> [must-contain]
+ * The work page a task card opens for that product, and what a valid delivery
+ * must contain. Canva products get both by default; this is for the others.
+ *   /mdlink 12 https://admin.example.com/invite invite.example.com/join
+ *   /mdlink 12 off
+ */
+bot.onText(/^\/mdlink(?:\s+(\d+))?(?:\s+(\S+))?(?:\s+(\S+))?$/i, async (msg, m) => {
+  if (!isStaff(msg.from.id)) return;
+  const [, pid, url, expect] = m;
+  if (!pid) {
+    await bot.sendMessage(msg.chat.id,
+      '🔗 <b>Work link for a manual product</b>\n\n<code>/mdlink &lt;productId&gt; &lt;url&gt; [must-contain]</code>\n' +
+      '<code>/mdlink &lt;productId&gt; off</code>\n\n<i>Canva products are set up automatically.</i>', { parse_mode: 'HTML' });
+    return;
+  }
+  if (/^off$/i.test(url || '')) {
+    queries.setSetting(`md_link_${pid}`, ''); queries.setSetting(`md_expect_${pid}`, '');
+    await bot.sendMessage(msg.chat.id, `✅ Work link removed for product #${pid}.`); return;
+  }
+  if (!/^https?:\/\//.test(url || '')) { await bot.sendMessage(msg.chat.id, '❌ The link must start with https://'); return; }
+  queries.setSetting(`md_link_${pid}`, url); queries.setSetting(`md_expect_${pid}`, expect || '');
+  await bot.sendMessage(msg.chat.id, `✅ Product #${pid}: cards open ${url}` + (expect ? `, deliveries must contain “${expect}”.` : '.'));
+});
+function safeJson(s) { try { return JSON.parse(s); } catch (_) { return null; } }
+
+/** One task, ready to paste: copy email, open the work page, skip, stop. */
+async function sendFastCard(chatId, t, isNext) {
+  if (!t) return;
+  queries.setSetting(`support_state_${chatId}`, `AWAIT_MD_CONTENT:${t.id}`);
+  const left = mdFast.pendingCount();
+  const prof = mdFast.profileFor(t.product_id, t.product_title);
+  await bot.sendMessage(chatId,
+    `${isNext ? '⏭ <b>Next</b>' : '✍️ <b>Deliver</b>'} — task <b>#${t.id}</b>` +
+    `${left > 1 ? ` <i>(${left} waiting)</i>` : ''}\n\n` +
+    `👤 ${escapeHtml(displayName(t.username, t.first_name, t.user_id))}\n` +
+    `📦 ${manualDelivery.cleanTitle(t.product_title)} ×${t.quantity}\n` +
+    (t.email ? `📧 <code>${escapeHtml(t.email)}</code>\n` : '') +
+    `\n<i>${prof.expect ? 'Invite the email, copy the link, paste it here.' : 'Paste the content here.'} ` +
+    `/cancel to stop.</i>`,
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+      ...(mdFast.taskButtons(t).slice(0, 1).filter((r) => !r.some((b) => b.callback_data))),
+      [{ text: '⏭ Skip', callback_data: `md_skip_${t.id}` }, { text: '⏹ Stop', callback_data: 'md_stop' }],
+    ] } });
+}
+
+/** Check, deliver, and bring up the next task. */
+async function deliverFast(chatId, taskId, content, force) {
+  const task = queries.getManualDelivery(taskId);
+  if (!task) { await bot.sendMessage(chatId, `❌ Task #${taskId} not found.`); return; }
+  if (task.status === 'delivered') {
+    await bot.sendMessage(chatId, `ℹ️ Task #${taskId} was already delivered — nothing sent.`);
+    return;
+  }
+  const problem = force ? null : mdFast.checkContent(task, content);
+  if (problem) {
+    // Held, not sent: the customer never sees a pasted email or a wrong link.
+    queries.setSetting(`support_md_held_${chatId}`, JSON.stringify({ taskId, content }));
+    await bot.sendMessage(chatId,
+      `⚠️ <b>Not sent</b> — ${escapeHtml(problem)}.\n\n<code>${escapeHtml(String(content).slice(0, 200))}</code>\n\n` +
+      `<i>Paste the right one, or send this anyway.</i>`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+        [{ text: '📤 Send anyway', callback_data: `md_force_${taskId}` }],
+      ] } });
+    return;
+  }
+  queries.setSetting(`support_state_${chatId}`, '');
+  const res = await manualDelivery.completeManualDelivery(bot, taskId, content);
+  if (!res.ok) { await bot.sendMessage(chatId, `⚠️ Could not deliver #${taskId}: ${res.reason}`); return; }
+  const nxt = mdFast.nextTask(taskId, task.product_id);
+  await bot.sendMessage(chatId,
+    `✅ <b>#${taskId} delivered</b>${res.notified ? '' : ' — ⚠️ customer could not be messaged, content saved'}` +
+    `${nxt ? '' : '\n🎉 No more tasks waiting.'}`, { parse_mode: 'HTML' });
+  if (nxt) await sendFastCard(chatId, nxt, true);
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // MESSAGES
@@ -1695,20 +1793,22 @@ bot.on('message', async (msg) => {
       return;
     }
 
+    // Replying to a task card delivers to that task — no Deliver button needed.
+    const replied = msg.reply_to_message && (msg.reply_to_message.text || msg.reply_to_message.caption || '');
+    const repliedTask = replied && (replied.match(/Task:\s*#(\d+)/) || replied.match(/task\s*#(\d+)/i));
+    if (repliedTask && text) {
+      await deliverFast(chatId, parseInt(repliedTask[1], 10), text, false);
+      return;
+    }
+
     // Content for a manual-delivery task
     if (state.startsWith('AWAIT_MD_CONTENT:')) {
       const taskId = parseInt(state.split(':')[1], 10);
-      queries.setSetting(`support_state_${chatId}`, '');
       if (!text) {
         await bot.sendMessage(chatId, '❌ Content cannot be empty.');
         return;
       }
-      const res = await manualDelivery.completeManualDelivery(bot, taskId, text);
-      await bot.sendMessage(chatId, res.ok
-        ? `✅ <b>Task #${taskId} delivered.</b>${res.notified ? '' : '\n⚠️ Customer could not be messaged — content saved.'}`
-        : `⚠️ Could not deliver: ${res.reason}`,
-        { parse_mode: 'HTML',
-          reply_markup: { inline_keyboard: [[{ text: '📦 Manual list', callback_data: 'md_list_pending_0' }]] } });
+      await deliverFast(chatId, taskId, text, false);
       return;
     }
 

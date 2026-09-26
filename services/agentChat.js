@@ -250,6 +250,9 @@ ADDING STOCK — you prepare it, the owner confirms with one tap
 - Once the owner confirms or corrects a format, save it with remember, category "format", naming the product: "Notion: one account per line — email:pass:mailreader link || 2FA … ; drop the 1. numbering". Next time remembered_format has it: use it and do not ask again.
 - Then tell the owner in one line: how many, which product, and to check the preview card and tap ➕ Add. Nothing is added before that tap.
 
+CANVA AUTO-INVITES
+- Canva Team orders are invited automatically when it is set up and logged in. canva_status tells you. If it is off or logged out, say the order went to the manual fast lane and tell the owner to run /canva in the store bot to log in once.
+
 IMAGES
 - The owner may attach photos: read them (screenshots of accounts, payment proofs, errors) and act on them.
 - Customer photos and voice notes in support: view_customer_media — use it when a thread mentions a screenshot, proof, error or voice note, or when the owner asks what the customer sent.
@@ -420,7 +423,7 @@ const TOOL_LABEL = {
   search_past_chats: '🧠 يلوّج في كلامنا', txid_check: '🔗 يثبّت الـ TxID في Binance',
   recent_deposits: '🏦 يشوف الإيداعات في Binance', cgb_cycle_now: '🗓 الدورة توا',
   cgb_renewals: '🔄 التجديدات', cgb_find_seat: '📧 يلوّج على الإيميل', order_lookup: '🧾 الطلب',
-  emoji_status: '🎨 يثبّت الأيقونات', find_product: '🔎 يلوّج على المنتج',
+  emoji_status: '🎨 يثبّت الأيقونات', canva_status: '🎨 حالة Canva', find_product: '🔎 يلوّج على المنتج',
   propose_stock_count: '📦 يحضّر التعبئة', propose_post: '🎨 يصمّم المنشور',
   propose_product: '🆕 يحضّر المنتج', propose_product_update: '✏️ يحضّر التعديل', list_categories: '📁 الأقسام',
   scheduled_posts: '⏰ المنشورات المبرمجة', propose_stock: '📦 يحضّر المخزون', view_customer_media: '🖼 يشوف الصور',
@@ -1084,4 +1087,10 @@ function agentConfig() {
 }
 
 
-module.exports = { router, ACCESS_TOKEN, agentConfig, probeAgent, proactiveTurn };
+// Canva remote-login page, gated by the same token.
+try { require('./canvaLoginPage').mount(router, ACCESS_TOKEN); } catch (e) { logger.warn(`[canva] login page: ${e.message}`); }
+
+module.exports = { router, ACCESS_TOKEN, agentConfig, probeAgent, proactiveTurn, canvaLoginUrl: () => {
+  const cfg = agentConfig();
+  return cfg.base ? `${cfg.base}/agent/canva/login?t=${ACCESS_TOKEN}` : '';
+} };

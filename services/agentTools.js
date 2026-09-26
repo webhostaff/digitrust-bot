@@ -1075,6 +1075,12 @@ async function performAction(a, bot) {
   return { ok: false, error: 'unknown action' };
 }
 
+TOOLS.canva_status = {
+  description: 'Whether Canva auto-invites are on and logged in (for "is Canva working?", "did the invite go out?").',
+  input: {},
+  run: async () => { try { return await require('./canvaBot').status(); } catch (e) { return { error: e.message }; } },
+};
+
 TOOLS.emoji_status = {
   description: 'Why premium emoji icons are or are not showing on the bot buttons right now, with recent events.',
   input: {},

@@ -69,3 +69,5 @@
 2026-09-25T23:22:43.742Z [INFO] [agent] propose_post({"target":"channel","text":"⚡ <b>FLASH SALE</b> tonight!","schedule_at":"2026-09)
 2026-09-25T23:22:43.743Z [INFO] [agent] scheduled_posts({})
 2026-09-25T23:22:43.743Z [INFO] [agent] propose_post({"target":"users","text":"🎁 Weekend deal for our customers!"})
+2026-09-26T00:08:42.962Z [INFO] [canva] auto-delivered order #9001 to auto@gmail.com
+2026-09-26T00:08:42.966Z [WARN] [canva] auto-invite failed for #9002: session expired (needs re-login) — handing to manual

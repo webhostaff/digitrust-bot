@@ -1,6 +1,6 @@
 {
   "name": "digitrust-bot",
-  "version": "101.0.0",
+  "version": "103.0.0",
   "description": "Digital products store Telegram bot with manual USDT BEP20 deposits verified via Etherscan API V2",
   "main": "index.js",
   "scripts": {
@@ -14,7 +14,9 @@
     "axios": "^1.6.8",
     "better-sqlite3": "^9.4.3",
     "uuid": "^9.0.1",
-    "crypto": "^1.0.1"
+    "crypto": "^1.0.1",
+    "playwright-core": "^1.49.0",
+    "@sparticuz/chromium": "^131.0.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.0"

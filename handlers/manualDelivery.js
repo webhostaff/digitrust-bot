@@ -68,6 +68,45 @@ async function openManualDelivery(bot, order, paymentMethod) {
     return row;
   }
 
+  // ── Try the Canva auto-invite before troubling a human ────────────────────
+  // Only for Canva products, only when automation is on and logged in. Any
+  // failure falls straight through to the normal manual task below — the order
+  // is never left half-done, and a human sees it just as before.
+  try {
+    const canva = require('../services/canvaBot');
+    const isCanva = /canva/i.test(product?.title || order.product_title || '');
+    if (isCanva && order.email && canva.available()) {
+      const r = await canva.inviteEmail(order.email);
+      if (r.ok && r.link) {
+        const done = await completeManualDelivery(bot, row.id, r.link);
+        if (done.ok) {
+          logger.info(`[canva] auto-delivered order #${order.id} to ${order.email}`);
+          try {
+            const { notifyAdmin } = require('../services/adminNotify');
+            await notifyAdmin(bot, {
+              type: 'manual_delivery',
+              title: '🤖 Canva invite sent automatically',
+              body: `🆔 Task #${row.id} · Order #${order.id}\n📧 <code>${escapeHtml(order.email)}</code>\n` +
+                    `✅ Invited and delivered to the customer — no action needed.`,
+              dedupeKey: `canva_auto:${row.id}`, refType: 'manual_delivery', refId: row.id,
+            });
+          } catch (_) {}
+          return db.getManualDelivery(row.id);
+        }
+      } else {
+        logger.warn(`[canva] auto-invite failed for #${order.id}: ${r.reason}` +
+          (r.needLogin ? ' (needs re-login)' : '') + ' — handing to manual');
+        try {
+          require('./canvaAlert') && require('../services/agentMemory')
+            .logChat('event', `⚠️ Canva أوتوماتيك ما نجّمش (${r.reason}) — الطلب #${order.id} ولّى يدوي` +
+              (r.needLogin ? '. لازم تسجّل الدخول من جديد.' : ''));
+        } catch (_) {}
+      }
+    }
+  } catch (e) {
+    logger.warn(`[canva] auto path error for #${order.id}: ${e.message}`);
+  }
+
   // ── Tell the customer their order is queued, not lost ─────────────────────
   try {
     await bot.sendMessage(
@@ -108,7 +147,8 @@ async function openManualDelivery(bot, order, paymentMethod) {
       `💳 <b>Method:</b> ${escapeHtml(paymentMethod || 'n/a')}\n\n` +
       `👤 <b>Customer:</b> ${escapeHtml(buyerName)}\n` +
       `🆔 <b>User ID:</b> <code>${order.user_id}</code>\n` +
-      `🕒 <b>Placed:</b> ${stamp()}`,
+      `🕒 <b>Placed:</b> ${stamp()}\n\n` +
+    `<i>↩️ Reply to this message with the invite link / content to deliver it.</i>`,
     dedupeKey: `manual_delivery:${row.id}`,
     refType:   'manual_delivery',
     refId:     row.id,
@@ -116,10 +156,11 @@ async function openManualDelivery(bot, order, paymentMethod) {
       [{ text: '📦 Open task', callback_data: `admin_md_view_${row.id}` }],
       [{ text: '✅ Mark delivered', callback_data: `admin_md_deliver_${row.id}` }],
     ],
-    supportButtons: [
-      [{ text: '📦 Open task', callback_data: `md_view_${row.id}` }],
-      [{ text: '✅ Deliver now', callback_data: `md_deliver_${row.id}` }],
-    ],
+    // Fast lane: copy the email, open the work page, or simply reply to this
+    // card with the content (services/mdFast.js).
+    supportButtons: require('../services/mdFast').taskButtons(
+      { ...row, product_title: product?.title || order.product_title, email: order.email || row.email },
+      [[{ text: '📦 Open task', callback_data: `md_view_${row.id}` }]]),
   });
 
   db.markManualNotified(row.id);
@@ -164,10 +205,19 @@ async function completeManualDelivery(bot, taskId, content = null) {
     `💵 ${formatPrice(task.total_paid)}\n` +
     `📅 <b>Delivered:</b> ${stamp()}\n` +
     (content
-      ? `\n━━━━━━━━━━━━━━━━━━━━\n🎁 <b>Your Product:</b>\n\n<code>${escapeHtml(content)}</code>\n━━━━━━━━━━━━━━━━━━━━`
+      ? `\n━━━━━━━━━━━━━━━━━━━━\n🎁 <b>Your Product:</b>\n\n<code>${escapeHtml(content)}</code>\n━━━━━━━━━━━━━━━━━━━━` +
+        (/^https?:\/\/\S+$/.test(String(content).trim()) && task.email
+          ? `\n👉 Tap the button below and sign in with <b>${escapeHtml(task.email)}</b> to accept.`
+          : '')
       : '') +
     instr +
     `\n✨ Thank you for your purchase!`;
+
+  // A lone link (a Canva invite) becomes a big button the customer taps,
+  // instead of a long URL to copy.
+  const linkBtn = content ? require('../services/mdFast').customerButton(task, content) : null;
+  const kbRows = [[{ text: '📦 My Orders', callback_data: 'menu_orders' }]];
+  if (linkBtn) kbRows.unshift([linkBtn]);
 
   let sent = false;
   try {
@@ -175,7 +225,8 @@ async function completeManualDelivery(bot, taskId, content = null) {
     await bot.sendMessage(task.user_id, body, {
       plain_emoji: true,
       parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: [[{ text: '📦 My Orders', callback_data: 'menu_orders' }]] },
+      disable_web_page_preview: true,
+      reply_markup: { inline_keyboard: kbRows },
     });
     sent = true;
   } catch (e) {

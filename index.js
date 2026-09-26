@@ -679,6 +679,42 @@ bot.onText(/^\/emojistatus$/i, async (msg) => {
   await bot.sendMessage(msg.chat.id, txt, { parse_mode: 'HTML' });
 });
 
+bot.onText(/^\/canva$/i, async (msg) => {
+  if (!adminHandler.isAdmin(msg.from.id)) return;
+  const canva = require('./services/canvaBot');
+  const st = await canva.status();
+  if (!st.available) {
+    await bot.sendMessage(msg.chat.id,
+      `🎨 <b>Canva automation is OFF.</b>\n\nTo turn it on: set <code>CANVA_AUTOMATION=1</code> in Railway → Variables ` +
+      `and redeploy. Then run /canva again to log in.\n\n<i>While off, Canva orders use the manual fast lane as before.</i>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+  const url = agentChat.canvaLoginUrl ? agentChat.canvaLoginUrl() : '';
+  const rows = [];
+  if (url) rows.push([{ text: st.logged_in ? '🔁 Re-login' : '🔐 Log in to Canva', url }]);
+  rows.push([{ text: '🔄 Check status', callback_data: 'canva_check' }]);
+  if (st.logged_in) rows.push([{ text: '🗑 Forget session', callback_data: 'canva_forget' }]);
+  await bot.sendMessage(msg.chat.id,
+    `🎨 <b>Canva automation</b>\n\n` +
+    `${st.logged_in ? '✅ Logged in — invites are automatic.' : '🔴 Not logged in — Canva orders fall back to manual.'}\n` +
+    (st.last_login ? `🕒 Last login: ${escapeHtml(String(st.last_login).slice(0, 16).replace('T', ' '))} UTC\n` : '') +
+    `\n<i>Tap to log in once in a remote browser. Only the Canva session is kept — no password is stored here.</i>`,
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
+});
+
+bot.on('callback_query', async (q) => {
+  if (!adminHandler.isAdmin(q.from.id)) return;
+  const canva = require('./services/canvaBot');
+  if (q.data === 'canva_check') {
+    const st = await canva.checkLogin();
+    await bot.answerCallbackQuery(q.id, { text: st.ok ? '✅ Logged in and reachable' : `🔴 ${st.reason}`, show_alert: true }).catch(() => {});
+  } else if (q.data === 'canva_forget') {
+    canva.forgetSession();
+    await bot.answerCallbackQuery(q.id, { text: '🗑 Session cleared. Run /canva to log in again.', show_alert: true }).catch(() => {});
+  }
+});
+
 bot.onText(/^\/emojireset$/i, async (msg) => {
   if (!adminHandler.isAdmin(msg.from.id)) return;
   const n = require('./utils/emojiLayer').resetEmojiState();

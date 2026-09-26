@@ -1,0 +1,12 @@
+# Railway build config.
+# The Canva automation runs a headless Chromium (@sparticuz/chromium). It needs
+# a few system libraries present in the image; listing them here keeps the build
+# working whether or not CANVA_AUTOMATION is on (they are tiny and harmless when
+# unused).
+[phases.setup]
+nixPkgs = ["nodejs_20"]
+aptPkgs = [
+  "libnss3", "libatk1.0-0", "libatk-bridge2.0-0", "libcups2", "libdrm2",
+  "libxkbcommon0", "libxcomposite1", "libxdamage1", "libxfixes3", "libxrandr2",
+  "libgbm1", "libasound2", "libpango-1.0-0", "libcairo2", "libatspi2.0-0"
+]

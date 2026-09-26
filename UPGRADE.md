@@ -1270,3 +1270,43 @@ in an unrelated message.
   minute. `list_categories`.
 * Persona: a post-design playbook (launch, restock, flash sale, price drop,
   bundle, news) and a product-writing guide.
+
+# Part 36 — Manual delivery fast lane
+
+Personal invites (Canva Teams) stay manual — one invite per customer email,
+nothing automated touching the team — but everything around that step is gone.
+`services/mdFast.js` + support bot:
+
+* Task cards: 📋 Email (Telegram copy button — one tap copies the address) and
+  🔗 Canva (the team people page). `/mdlink <productId> <url> [must-contain]`
+  sets the page and expected content for any other manual product.
+* Reply to a task card with the content → delivered. No Deliver button needed.
+* Content check: a pasted email, or anything without `canva.com/brand/join`
+  for Canva products, is held with "📤 Send anyway" instead of being sent.
+* Assembly line: after each delivery the next pending task (same product
+  first) comes up armed — paste, next, paste. ⏭ Skip / ⏹ Stop.
+* Customers receive a single link as an "✅ Accept invitation" button, with a
+  line telling them which email to sign in with.
+* Replying to an already delivered task sends nothing.
+
+# Part 37 — Canva Teams auto-invite (opt-in)
+
+`services/canvaBot.js` + `services/canvaLoginPage.js`. Off unless
+`CANVA_AUTOMATION=1`; then a paid Canva order invites the customer's email and
+delivers the personal join link automatically, with no human step.
+
+* Headless Chromium (`playwright-core` + `@sparticuz/chromium`), logged in ONCE
+  via a remote-login page (`/agent/canva/login`, gated by AGENT_TOKEN): it
+  streams the login screen and relays taps/typing; only the Canva session is
+  saved to disk (`CANVA_DATA_DIR`), never a password.
+* Invites are serialised behind a lock with a ≥20 s gap and small random delays
+  — never two at once, never machine-gunned.
+* Fails safe: not logged in, page changed, or no link → the order drops to the
+  manual fast lane (Part 36); an order is never marked delivered without a real
+  link. Session expiry clears the saved session and tells the owner to re-login.
+* `/canva` in the store bot: status, remote-login link, check, forget session.
+  Yamen tool `canva_status`. `nixpacks.toml` adds Chromium's system libraries.
+
+Note: automating Canva Teams carries account risk (it is against Canva's terms
+and their anti-automation checks can suspend the team). The safeguards above
+reduce it; they do not remove it. The manual fast lane remains the safe default.
