@@ -1324,3 +1324,16 @@ on the server and the failure was swallowed.
 * `/canva` gained a "🧪 Test browser" button (`selfTest`) that opens the browser,
   loads a test page and reports exactly what works or what is missing — run it
   before logging in.
+
+# Part 39 — "Unexpected token '<'": it was a stale deploy
+
+That error means `/agent/canva/start` returned HTML, not JSON — i.e. the route
+did not exist on the running server, so it fell through to a 404 page. The code
+was correct; Railway was still serving an older build.
+
+* `/agent/ping` now reports the running `version` and whether `canva` is on, so
+  the deployed build can be confirmed at a glance.
+* `/version` in the store bot shows a Canva-automation line (and "module missing
+  (old build)" when the deploy is stale).
+* The login page now detects an HTML (non-JSON) reply and says plainly that the
+  deploy is stale and needs a full Redeploy, instead of a raw parse error.

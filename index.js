@@ -798,7 +798,8 @@ bot.onText(/^\/version$/i, async (msg) => {
   await bot.sendMessage(msg.chat.id,
     `🏷 <b>Build v${escapeHtml(version)}</b>\n\n` +
     `${tonFix ? '✅' : '❌'} TON hash matching (hex ⇄ base64)\n` +
-    `${resolveApiBase() ? '✅' : '❌'} Public API domain\n\n` +
+    `${resolveApiBase() ? '✅' : '❌'} Public API domain\n` +
+    `${(() => { try { return require('./services/canvaBot').available() ? '✅ Canva automation ON' : '⚪️ Canva automation off'; } catch (_) { return '❌ Canva module missing (old build)'; } })()}\n\n` +
     `<b>Deposit addresses</b>\n` +
     Object.entries(addr).map(([k, v]) =>
       `${v ? '✅' : '⚪️'} ${k}: ${v ? `<code>${escapeHtml(String(v).slice(0, 18))}…</code>` : '<i>not set</i>'}`

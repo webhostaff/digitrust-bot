@@ -988,7 +988,9 @@ self.addEventListener('notificationclick', e => {
 // Served as one self-contained page so it can be added to a home screen and
 // opened like an app, with no build step and nothing to install.
 // Reachability probe for the admin panel. Carries no data and needs no token.
-router.get('/ping', (req, res) => res.json({ ok: true, service: 'shop-assistant' }));
+router.get('/ping', (req, res) => res.json({ ok: true, service: 'shop-assistant',
+  version: (() => { try { return require('../package.json').version; } catch (_) { return '?'; } })(),
+  canva: (() => { try { return require('./canvaBot').available(); } catch (_) { return false; } })() }));
 
 router.get('/', (req, res) => {
   // The page calls chat, approve, manifest.json… by RELATIVE path. Opened as

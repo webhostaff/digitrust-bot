@@ -87,7 +87,12 @@ async function start(){
   $('tip').style.display='grid'; $('screen').style.display='none'; $('hint').style.display='none'; $('kbd').style.display='none';
   $('tip').innerHTML='⏳ يحل Canva… (ينجم ياخذ 20 ثانية أول مرة)';
   let r;
-  try{ r=await (await post('canva/start')).json(); }
+  try{
+    const resp=await post('canva/start');
+    const txt=await resp.text();
+    try{ r=JSON.parse(txt); }
+    catch(_){ r={ok:false,error:'النسخة المنشورة قديمة — صفحة Canva موجودة أما مسار /canva/start مش موجود. أعمل Redeploy كامل (موش Restart) للنسخة الجديدة.'}; }
+  }
   catch(e){ r={ok:false,error:'ما وصلش للسيرفر: '+e.message}; }
   if(!r.ok){
     $('tip').innerHTML='<div style="max-width:440px"><div style="font-size:40px">⚠️</div>'+
