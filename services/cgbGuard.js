@@ -133,4 +133,37 @@ function makeGuardWebhookHandler({ queries, logger: log, activateAndNotifySeat, 
   };
 }
 
-module.exports = { notifyGuardOfNewInvite, makeGuardWebhookHandler };
+/**
+ * Ask the guard bot to drop an email from its invite queue because the order
+ * was cancelled/refunded here — so it doesn't buy a seat and invite someone
+ * who got their money back. Never throws.
+ * Returns the guard's answer: 'removed' | 'processing' | 'already_invited' |
+ * 'not_found', or 'unreachable' if the call failed, or null when the
+ * integration isn't configured.
+ */
+async function cancelGuardInvite(email, { orderId = null } = {}) {
+  if (!GUARD_URL || !SHARED_SECRET) return null;
+  const clean = String(email || '').trim().toLowerCase();
+  if (!clean.includes('@')) return null;
+  try {
+    const url = new URL(GUARD_URL);
+    url.pathname = url.pathname.replace(/auto-invite\/?$/, 'cancel-invite');
+    const resp = await fetchWithTimeout(url.toString(), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Invite-Secret': SHARED_SECRET },
+      body: JSON.stringify({ email: clean, ...(GUARD_PANEL ? { panel: GUARD_PANEL } : {}) }),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok || !body.status) {
+      logger.warn(`[cgbGuard] cancel-invite for ${clean} (order #${orderId}) → HTTP ${resp.status}: ${JSON.stringify(body).slice(0, 200)}`);
+      return 'unreachable';
+    }
+    logger.info(`[cgbGuard] cancel-invite for ${clean} (order #${orderId}): ${body.status}`);
+    return body.status;
+  } catch (e) {
+    logger.warn(`[cgbGuard] could not reach the guard bot to cancel ${clean} (order #${orderId}): ${e.message}`);
+    return 'unreachable';
+  }
+}
+
+module.exports = { notifyGuardOfNewInvite, makeGuardWebhookHandler, cancelGuardInvite };

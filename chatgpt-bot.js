@@ -135,15 +135,19 @@ const BAND_GREEN = '🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩';
 // that must NOT be touched yet, and green would say "done" about one that still
 // needs activating — neither is true, so it gets its own colour.
 const BAND_BLUE  = '🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦';
+// Cancelled/refunded: neither "do this" (red) nor "done" (green).
+const BAND_GREY  = '⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛';
 
 /**
  * @param {object} d
  * @param {boolean} activated
  * @param {boolean} scheduled paid early — activate when the cycle opens
  */
-function orderCard(d, activated = false, scheduled = false) {
-  const band = activated ? BAND_GREEN : (scheduled ? BAND_BLUE : BAND_RED);
-  const head = activated
+function orderCard(d, activated = false, scheduled = false, cancelNote = null) {
+  const band = cancelNote ? BAND_GREY : activated ? BAND_GREEN : (scheduled ? BAND_BLUE : BAND_RED);
+  const head = cancelNote
+    ? '⚫ <b>CANCELLED</b> — no seat to activate'
+    : activated
     ? '🟢 <b>ACTIVATED</b> — customer notified'
     : scheduled
       ? '🔵 <b>PAID EARLY</b> — activate when the new cycle starts'
@@ -161,7 +165,9 @@ function orderCard(d, activated = false, scheduled = false) {
     `💵 Paid: <b>$${d.paid}</b>\n` +
     `💳 Method: <b>${d.method}</b>\n` +
     `🔗 ${d.refLabel}: <code>${d.ref}</code>\n\n` +
-    (activated
+    (cancelNote
+      ? `${cancelNote}\n`
+      : activated
       ? `✅ <i>Activated on ${d.activatedAt || 'now'}. The customer has been told.</i>\n`
       : scheduled
         ? `🗓 <i>This seat starts on ${d.startDate} (a renewal, or bought between ` +
@@ -179,7 +185,12 @@ function orderCardButtons(d) {
       // exactly what made the two states look alike.
       text: '🔔 Activate & Notify Customer',
       callback_data: `cgb_notify_${d.orderId}_${d.userId}_${d.days}_${encodeURIComponent(d.endDate)}`,
-    }]],
+    }], [
+      // For a customer who asks for a refund before the seat is activated.
+      // Opens a confirm step (refund to wallet / refunded outside) — never
+      // cancels on a single tap.
+      { text: '❌ Cancel order', callback_data: `cgb_ocx_ask_${d.orderId}` },
+    ]],
   };
 }
 
@@ -1114,6 +1125,10 @@ async function activateAndNotifySeat(orderIdRaw, { chatId = null, msgId = null }
   const sub = queries.getCgbSubscriptionByOrder(orderId);
   if (!sub) return { ok: false, reason: `no subscription found for order #${orderId}` };
   if (sub.status === 'active') return { ok: false, reason: 'already active' };
+  // A cancelled (refunded) order must never be activated — not by a stale
+  // button, and not by the invite bot reporting a success that raced the
+  // cancel.
+  if (sub.status === 'cancelled') return { ok: false, reason: 'this order was cancelled' };
 
   const ord = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
   const customerId = sub.user_id;
@@ -1204,6 +1219,93 @@ async function activateAndNotifySeat(orderIdRaw, { chatId = null, msgId = null }
   return { ok: true };
 }
 
+/** The fields the order card shows, rebuilt from the database for one order. */
+function seatCardData(orderId) {
+  const sub = queries.getCgbSubscriptionByOrder(orderId);
+  if (!sub) return null;
+  const ord = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
+  const u = db.prepare('SELECT username, first_name FROM users WHERE telegram_id = ?').get(Number(sub.user_id));
+  const who = u?.username ? '@' + u.username : (u?.first_name || `User ${sub.user_id}`);
+  return {
+    sub, ord,
+    card: {
+      orderId, userId: sub.user_id, days: sub.days_remaining,
+      name: escapeHtml(who), email: escapeHtml(sub.email || '—'),
+      startDate: sub.start_date || '—', endDate: sub.end_date || '—',
+      paid: Number(sub.final_price ?? ord?.total_price ?? 0).toFixed(2),
+      method: ord?.payment_method || '—', refLabel: 'Order', ref: String(orderId),
+    },
+  };
+}
+
+/**
+ * Cancel a not-yet-activated ChatGPT Business order (the customer asked for a
+ * refund). One shared path, returns { ok, reason?, refunded, amount, guard }.
+ *
+ * Order of operations matters:
+ *   1. flip the seat to 'cancelled' with a conditional UPDATE (only if it is
+ *      not already active/cancelled) — this is the lock: if the invite bot's
+ *      success callback activated it a moment earlier, changes === 0 and
+ *      NOTHING is refunded;
+ *   2. only then refund, through the shop's own all-or-nothing refundWallet,
+ *      under a fixed ref id so a double tap can never refund twice;
+ *   3. tell the invite bot to drop the email from its queue, so no seat is
+ *      bought for someone who got their money back.
+ */
+async function cancelSeatOrder(orderIdRaw, { refundToWallet }) {
+  const orderId = parseInt(orderIdRaw, 10);
+  const data = seatCardData(orderId);
+  if (!data) return { ok: false, reason: `no subscription found for order #${orderId}` };
+  const { sub } = data;
+  if (sub.status === 'active') return { ok: false, reason: 'the seat is already activated — cancel it in the workspace instead' };
+  if (sub.status === 'cancelled') return { ok: false, reason: 'already cancelled' };
+
+  const flipped = db.prepare(`
+    UPDATE chatgpt_subscriptions SET status = 'cancelled', updated_at = datetime('now')
+    WHERE order_id = ? AND COALESCE(status, '') NOT IN ('active', 'cancelled')
+  `).run(orderId).changes;
+  if (!flipped) return { ok: false, reason: 'the order changed a moment ago (activated or cancelled) — nothing was refunded' };
+  db.prepare(`UPDATE orders SET status = 'cancelled' WHERE id = ?`).run(orderId);
+
+  const amount = Number(sub.final_price ?? data.ord?.total_price ?? 0);
+  let refunded = false;
+  if (refundToWallet && amount > 0) {
+    const refId = `cgb_cancel_${orderId}`;
+    if (!queries.isRefIdUsed(refId)) {
+      queries.refundWallet(Number(sub.user_id), amount, {
+        refId, orderId, description: `Refund — ChatGPT Business order #${orderId} cancelled`,
+      });
+      refunded = true;
+    }
+  }
+
+  const guard = await cgbGuard.cancelGuardInvite(sub.email, { orderId }).catch(() => 'unreachable');
+
+  try {
+    await bot.sendMessage(Number(sub.user_id),
+      `❌ <b>Your ChatGPT Business order #${orderId} has been cancelled.</b>\n\n` +
+      (refunded
+        ? `💰 <b>$${amount.toFixed(2)}</b> has been refunded to your wallet balance.`
+        : `Our support team will handle your refund with you.`),
+      { parse_mode: 'HTML' });
+  } catch (e) {
+    logger.warn(`cancelSeatOrder: could not message customer ${sub.user_id}: ${e.message}`);
+  }
+  logger.info(`[CGB] order #${orderId} cancelled (wallet refund: ${refunded ? '$' + amount.toFixed(2) : 'no'}, invite bot: ${guard})`);
+  return { ok: true, refunded, amount, guard };
+}
+
+/** What the invite bot said, in one line for the admin card. */
+function guardCancelLine(guard) {
+  switch (guard) {
+    case 'removed':         return '🤖 Removed from the invite queue — no seat will be bought.';
+    case 'processing':      return '⚠️ The invite bot was buying/inviting it RIGHT NOW — check ChatGPT and revoke the invite if it went out.';
+    case 'already_invited': return '⚠️ Already invited in ChatGPT — revoke the pending invite (or remove the member) by hand.';
+    case 'unreachable':     return '⚠️ Could not reach the invite bot — check its /queue and remove this email.';
+    default:                return '';   // not queued there, or the integration is off
+  }
+}
+
 async function createSeatManually(chatId, target, email, endDate, adminId) {
   const today = new Date();
   const days = Math.max(0, Math.ceil(
@@ -1259,6 +1361,49 @@ bot.on('callback_query', async (q) => {
   if (data.startsWith('rnw_')) {
     if (String(userId) !== String(ADMIN_ID)) return;
     await handleRenewalsCallback(q);
+    return;
+  }
+
+  // ── Admin: cancel an order (customer asked for a refund) ───────────────────
+  if (data.startsWith('cgb_ocx_')) {
+    if (String(userId) !== String(ADMIN_ID)) return;
+    const [, , step, orderIdStr] = data.split('_');   // cgb_ocx_<step>_<orderId>
+    const orderId = parseInt(orderIdStr, 10);
+    const found = seatCardData(orderId);
+    if (!found) { await bot.sendMessage(chatId, `❌ Order #${orderId} not found.`); return; }
+    const amount = Number(found.card.paid);
+
+    if (step === 'ask') {
+      await bot.editMessageReplyMarkup({ inline_keyboard: [
+        [{ text: `💰 Cancel + refund $${amount.toFixed(2)} to wallet`, callback_data: `cgb_ocx_wallet_${orderId}` }],
+        [{ text: '🚫 Cancel only (refunded outside)', callback_data: `cgb_ocx_plain_${orderId}` }],
+        [{ text: '↩️ Back', callback_data: `cgb_ocx_back_${orderId}` }],
+      ] }, { chat_id: chatId, message_id: msgId }).catch(() => {});
+      return;
+    }
+    if (step === 'back') {
+      await bot.editMessageReplyMarkup(orderCardButtons(found.card), { chat_id: chatId, message_id: msgId }).catch(() => {});
+      return;
+    }
+    if (step === 'wallet' || step === 'plain') {
+      const r = await cancelSeatOrder(orderId, { refundToWallet: step === 'wallet' });
+      if (!r.ok) {
+        await bot.sendMessage(chatId, `❌ Could not cancel order #${orderId}: ${r.reason}`);
+        return;
+      }
+      const note =
+        (r.refunded
+          ? `💰 <i>Cancelled — $${r.amount.toFixed(2)} refunded to the customer's wallet. The customer has been told.</i>`
+          : `🚫 <i>Cancelled — refund handled outside the bot. The customer has been told.</i>`) +
+        (guardCancelLine(r.guard) ? `\n${guardCancelLine(r.guard)}` : '');
+      await bot.editMessageText(orderCard(found.card, false, false, note), {
+        chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '⚫ Cancelled', callback_data: 'noop' }]] },
+      }).catch(async () => {
+        await bot.sendMessage(chatId, `⚫ Order #${orderId} cancelled.\n${note}`, { parse_mode: 'HTML' }).catch(() => {});
+      });
+      return;
+    }
     return;
   }
 
@@ -2312,4 +2457,4 @@ if (ADMIN_ID) {
 
 bot.on('polling_error', e => logger.error(`CGB polling: ${e.message}`));
 
-module.exports = { bot, confirmCryptobotPayment, sendRenewalReminders, activateAndNotifySeat };
+module.exports = { bot, confirmCryptobotPayment, sendRenewalReminders, activateAndNotifySeat, cancelSeatOrder };

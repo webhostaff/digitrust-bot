@@ -1602,3 +1602,29 @@ match, unknown customer, and confirming the tool has no "amount" input at
 all so the model can never supply the credited figure) plus propose_debit,
 the performAction "debit" execution, and cgb_new_seats_since's date
 filtering and sort order.
+
+# Part 50 — "❌ Cancel order" on ChatGPT Business order cards (v117)
+
+For a customer who asks for a refund before their seat is activated.
+
+* The red (and blue "paid early") admin card now has **❌ Cancel order** under
+  Activate. It never cancels on one tap: it opens a confirm step with
+  **💰 Cancel + refund $X to wallet**, **🚫 Cancel only (refunded outside)**
+  and **↩️ Back**.
+* Cancelling flips the seat to `cancelled` with a conditional update first —
+  if it was activated a moment earlier (e.g. by the invite bot's callback)
+  nothing is refunded. The wallet refund goes through the shop's own
+  all-or-nothing `refundWallet` under ref `cgb_cancel_<order>`, so a double
+  tap can never refund twice. The order is marked cancelled, the customer is
+  told, and the card turns grey (⬛ CANCELLED).
+* **Invite bot**: the email is pulled out of its queue (new `/cancel-invite`
+  endpoint there, same shared secret) so no seat is bought for a refunded
+  order. If it was already being processed or already invited, the card says
+  so and tells you to revoke it in ChatGPT.
+* A cancelled order can never be activated again — not by an old Activate
+  button, not by the invite bot reporting success. Cancelled seats are left
+  out of the auto-activation lookup and of the revenue totals.
+* Tested: the full cancel flow on the real chatgpt-bot.js (confirm step, back,
+  wallet refund, double tap, cancel-only, active seat refused, activation race,
+  invite bot busy), the SQL on a real SQLite engine, the new invite-bot SQL on
+  a real PostgreSQL, and both ends of the bot-to-bot call.

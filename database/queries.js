@@ -1132,7 +1132,7 @@ const cgb_activateSub  = db.prepare(`UPDATE chatgpt_subscriptions SET status='ac
 // the admin still sees every callback logged either way.
 const cgb_getPendingSubByEmail = db.prepare(`
   SELECT * FROM chatgpt_subscriptions
-  WHERE email = ? COLLATE NOCASE AND status != 'active'
+  WHERE email = ? COLLATE NOCASE AND COALESCE(status, '') NOT IN ('active', 'cancelled')
   ORDER BY id DESC LIMIT 1
 `);
 const cgb_saveAdminCard = db.prepare(`
@@ -2081,14 +2081,17 @@ module.exports = {
     // All-time revenue = every subscription that was created (payment happened to reach this point)
     // We count ALL subscriptions regardless of order.status because old orders got stuck
     // at 'pending' due to the webhook bug — a chatgpt_subscriptions row = money was received.
+    // Cancelled (refunded) seats are not revenue.
     totalRevenue: db.prepare(`
       SELECT COALESCE(SUM(final_price), 0) AS n FROM chatgpt_subscriptions
+      WHERE COALESCE(status, '') != 'cancelled'
     `).get().n,
 
     // This month revenue
     revenueThisMonth: db.prepare(`
       SELECT COALESCE(SUM(final_price), 0) AS n FROM chatgpt_subscriptions
       WHERE strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')
+        AND COALESCE(status, '') != 'cancelled'
     `).get().n,
 
     // Expiring within 7 days (active subs)
