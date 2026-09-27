@@ -717,6 +717,19 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_manual_status ON manual_deliveries(status, id);
   CREATE INDEX IF NOT EXISTS idx_manual_user   ON manual_deliveries(user_id);
+
+  -- The chat_id/message_id of the red "not activated yet" card sent to the
+  -- admin for a seat, so a later automatic activation (see
+  -- services/cgbGuard.js's webhook, or the manual "Activate & Notify"
+  -- button) can repaint THAT SAME message green instead of only sending a
+  -- separate confirmation. One row per order; overwritten if a card is ever
+  -- resent for the same order.
+  CREATE TABLE IF NOT EXISTS cgb_admin_cards (
+    order_id   INTEGER PRIMARY KEY,
+    chat_id    INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
 `);
 
 // ── admin_notifications ──────────────────────────────────────────────────────

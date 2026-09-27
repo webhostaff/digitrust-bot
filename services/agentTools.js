@@ -491,6 +491,36 @@ const TOOLS = {
       due_now: (db.getCgbDueNow ? db.getCgbDueNow() : []).slice(0, 10),
     }),
   },
+  cgb_new_seats_since: {
+    description:
+      'Every ChatGPT Business seat created since a date: email, order id, cycle start/end, days left, status ' +
+      '(active/pending/expired). Use for "what came in since X", "who is expiring soon", or to answer any ' +
+      'question about a customer\'s cycle without being asked for specifics first. Sorted soonest-expiring first.',
+    input: { since: 'YYYY-MM-DD — defaults to 2026-09-26 if not given' },
+    run: ({ since } = {}) => {
+      const from = /^\d{4}-\d{2}-\d{2}$/.test(String(since || '')) ? since : '2026-09-26';
+      const rows = raw.prepare(`
+        SELECT cs.order_id, cs.user_id, cs.email, cs.start_date, cs.end_date, cs.status, cs.workspace,
+               u.username, u.first_name
+        FROM chatgpt_subscriptions cs
+        LEFT JOIN users u ON u.telegram_id = cs.user_id
+        WHERE cs.start_date >= ?
+        ORDER BY cs.end_date ASC
+      `).all(from);
+      const today = new Date().toISOString().slice(0, 10);
+      return {
+        since: from,
+        count: rows.length,
+        seats: rows.map((r) => ({
+          order_id: r.order_id, email: r.email,
+          customer: r.username ? `@${r.username}` : (r.first_name || `user ${r.user_id}`),
+          start: r.start_date, end: r.end_date, status: r.status,
+          days_left: Math.ceil((new Date(`${r.end_date}T00:00:00`) - new Date(`${today}T00:00:00`)) / 86400000),
+          workspace: r.workspace || null,
+        })),
+      };
+    },
+  },
 };
 
 // ── Memory & awareness ───────────────────────────────────────────────────────
@@ -696,6 +726,121 @@ TOOLS.txid_check = {
           : shop.used_in_shop ? 'on Binance AND already used in the shop'
             : 'on Binance, NOT used in the shop yet',
       binance: chain, shop,
+    };
+  },
+};
+
+// ── Autonomous crediting for small, VERIFIED deposits ────────────────────────
+//
+// Off by default (AGENT_AUTO_CREDIT_CAP / auto_credit gate below). When the
+// owner turns it on, this handles the exact scenario in the shop's own
+// transcripts: a customer's transfer arrived and matched nothing automatic,
+// but is small and genuinely verifiable on Binance. Rather than trust
+// anything the model or the customer claims, this tool RE-CHECKS BINANCE
+// ITSELF (the same lookup txid_check uses) and only ever credits the amount
+// Binance reports — never a number typed by the model or the customer.
+//
+// Every safety gate is enforced HERE, in code, not left to the model's
+// judgment (the same principle as send_reply_now's SAFE category list):
+//   - a settings toggle, off until the owner turns it on
+//   - a per-transaction cap (small dollar amounts only)
+//   - a rolling 24h total cap (a bug or an unusual run of deposits can't
+//     silently drain more than intended even one small credit at a time)
+//   - the TxID must not already be used anywhere in the shop
+//   - a real on-chain/Binance-Pay match is REQUIRED; no match, no credit
+// Any gate failing falls back to a normal propose_credit DRAFT instead of
+// simply refusing — the tool is useful either way, and the model does not
+// need to check any of this itself.
+//
+// The customer-facing message is a FIXED template (see agentChat.js's
+// runTools), never model-authored text, so this can't be talked into saying
+// something wrong about money. The owner is notified after every autonomous
+// credit — never silent — so it stays reviewable.
+const AUTO_CREDIT_CAP = Number(process.env.AGENT_AUTO_CREDIT_CAP || 10);
+const AUTO_CREDIT_DAILY_CAP = Number(process.env.AGENT_AUTO_CREDIT_DAILY_CAP || AUTO_CREDIT_CAP * 3);
+
+function todayAutoCreditedTotal() {
+  try {
+    const row = raw.prepare(`
+      SELECT COALESCE(SUM(amount), 0) AS total FROM transactions
+      WHERE type = 'auto_credit_verified_deposit' AND date(created_at) = date('now')
+    `).get();
+    return Number(row?.total || 0);
+  } catch (_) { return 0; }
+}
+
+TOOLS.auto_credit_verified_deposit = {
+  description:
+    `For a customer's own deposit that Binance itself confirms (a TxID or Binance Pay id) — credit it and reply ` +
+    `to them immediately, no owner tap needed. Only for SMALL amounts Binance verifies directly; everything else ` +
+    `(off, over the cap, already used, not found on Binance) automatically becomes a normal propose_credit draft ` +
+    `instead, so calling this is always safe and useful. Always look the customer up first if you don't already ` +
+    `know their id.`,
+  input: {
+    txid: 'the TxID or Binance Pay transaction/order id the customer gave',
+    user: 'customer @username or telegram id',
+  },
+  run: async ({ txid, user }) => {
+    const id = String(txid || '').trim();
+    if (id.length < 6) return { error: 'txid too short' };
+    const key = String(user || '').trim().replace(/^@/, '');
+    const u = /^\d+$/.test(key) ? raw.prepare('SELECT * FROM users WHERE telegram_id = ?').get(Number(key))
+      : raw.prepare('SELECT * FROM users WHERE lower(username) = lower(?)').get(key);
+    if (!u) return { error: `customer "${user}" not found` };
+
+    const draftFallback = (reason) => {
+      const d = TOOLS.propose_credit.run({ user, amount: 0.01, reason: `Verified deposit ${id}` });
+      return { ...d, auto: false, held_reason: reason, note: 'Prepared as a normal draft instead — set the right amount before sending if it changed.' };
+    };
+
+    const on = (() => { try { return mem.getState('auto_credit', '0') === '1'; } catch (_) { return false; } })();
+    if (!on) return draftFallback('auto_credit_off');
+
+    if (db.isTxidUsed(id)) return { error: `${id} was already used/credited in the shop — check txid_check before crediting again.` };
+
+    if (!binance) return draftFallback('binance_not_configured');
+    const [dep, pay] = await Promise.all([
+      binance.findDepositRaw(id).catch(() => ({ ok: false })),
+      binance.findPayTransactionRaw(id).catch(() => ({ ok: false })),
+    ]);
+    const depositMatch = (dep.matches || [])[0];
+    const payMatch = (pay.matches || [])[0];
+    if (!depositMatch && !payMatch) return draftFallback('not_found_on_binance');
+
+    // The amount is Binance's own reported figure — never the model's or the
+    // customer's claim. Rounded like every other wallet figure in this shop.
+    const rawAmount = Number(depositMatch ? depositMatch.amount : payMatch.amount);
+    if (!Number.isFinite(rawAmount) || rawAmount <= 0) return draftFallback('unreadable_amount');
+    const amount = Math.round(rawAmount * 100) / 100;
+
+    if (amount > AUTO_CREDIT_CAP) return draftFallback(`over_auto_cap_$${AUTO_CREDIT_CAP}`);
+    const todayTotal = todayAutoCreditedTotal();
+    if (todayTotal + amount > AUTO_CREDIT_DAILY_CAP) return draftFallback(`daily_auto_cap_reached_$${AUTO_CREDIT_DAILY_CAP}`);
+
+    const before = Number(u.balance || 0);
+    db.updateBalance(u.telegram_id, amount);
+    try {
+      db.addTransaction({
+        userId: u.telegram_id, type: 'auto_credit_verified_deposit', amount,
+        description: `Yamen: verified on-chain deposit ${id}`, refId: id, orderId: null,
+      });
+    } catch (_) {}
+    try {
+      db.saveUsedTxid({
+        txid: id, userId: u.telegram_id, amount,
+        network: depositMatch ? depositMatch.network : 'Binance Pay',
+        asset: depositMatch ? depositMatch.coin : (payMatch.currency || 'USDT'),
+      });
+    } catch (_) {}
+
+    return {
+      ok: true, auto: true, txid: id,
+      user: u.username ? `@${u.username}` : String(u.telegram_id),
+      amount, before, after: before + amount,
+      __auto_credit_notify: {
+        userId: u.telegram_id, amount, before, after: before + amount, txid: id,
+        network: depositMatch ? depositMatch.network : 'Binance Pay',
+      },
     };
   },
 };
@@ -1082,6 +1227,18 @@ ${reason ? '📝 ' + reason : ''}`, { parse_mode: 'HTML' }); } catch (_) {}
     }
     return { ok: true, message: `✅ تزادو $${amount.toFixed(2)} لرصيد الحريف — من ${before.toFixed(2)} لـ ${(before + amount).toFixed(2)}` };
   }
+  if (a.kind === 'debit') {
+    const { userId, amount, reason } = a.payload;
+    const before = Number((raw.prepare('SELECT balance FROM users WHERE telegram_id = ?').get(userId) || {}).balance || 0);
+    if (amount > before) return { ok: false, error: `balance is now only $${before.toFixed(2)} — deducting $${amount.toFixed(2)} would go negative. Not applied; check with the owner.` };
+    db.updateBalance(userId, -amount);
+    try { db.addTransaction({ userId, type: 'admin_debit', amount: -amount, description: reason, refId: `yamen_${Date.now()}`, orderId: null }); } catch (_) {}
+    if (bot) {
+      try { await bot.sendMessage(userId, `➖ <b>$${amount.toFixed(2)}</b> was deducted from your balance.
+${reason ? '📝 ' + reason : ''}`, { parse_mode: 'HTML' }); } catch (_) {}
+    }
+    return { ok: true, message: `✅ تنقّص $${amount.toFixed(2)} من رصيد الحريف — من ${before.toFixed(2)} لـ ${(before - amount).toFixed(2)}` };
+  }
 
   const r = await require('./agentStudio').perform(a, bot);
   if (r) return r;
@@ -1117,6 +1274,37 @@ TOOLS.propose_credit = {
       summary: `➕ $${amt.toFixed(2)} → balance ${Number(u.balance || 0).toFixed(2)} → ${(Number(u.balance || 0) + amt).toFixed(2)}` +
         (reason ? `\n📝 ${String(reason).slice(0, 80)}` : ''),
       confirm: `💰 زيد $${amt.toFixed(2)}`,
+    };
+  },
+};
+
+TOOLS.propose_debit = {
+  description:
+    `Prepare DEDUCTING balance from a customer's wallet — a correction, a chargeback, balance given by mistake. ` +
+    `Same cap as propose_credit ($${CREDIT_CAP}), same owner tap to confirm. Refuses if it would take the ` +
+    `balance below $0 — say so and let the owner decide instead of silently clamping it.`,
+  input: {
+    user: 'customer @username or telegram id',
+    amount: 'dollars to remove (positive number), max ' + CREDIT_CAP,
+    reason: 'short reason shown in the wallet history and to the owner',
+  },
+  run: ({ user, amount, reason }) => {
+    const amt = Number(String(amount).replace(/[$,\s]/g, ''));
+    if (!Number.isFinite(amt) || amt <= 0) return { error: 'amount must be a positive number' };
+    if (amt > CREDIT_CAP) return { error: `over the $${CREDIT_CAP} limit — amounts above $${CREDIT_CAP} must be removed by the owner in /admin` };
+    const key = String(user || '').trim().replace(/^@/, '');
+    let u = /^\d+$/.test(key) ? raw.prepare('SELECT * FROM users WHERE telegram_id = ?').get(Number(key))
+      : raw.prepare('SELECT * FROM users WHERE lower(username) = lower(?)').get(key);
+    if (!u) return { error: `customer "${user}" not found` };
+    const before = Number(u.balance || 0);
+    if (amt > before) return { error: `${u.username ? '@' + u.username : u.telegram_id} only has $${before.toFixed(2)} — deducting $${amt.toFixed(2)} would go negative. Confirm with the owner before doing this any other way.` };
+    const id = newAction('debit', { userId: u.telegram_id, amount: Number(amt.toFixed(2)), reason: String(reason || 'Removed by Yamen').slice(0, 120) });
+    return {
+      action_id: id, kind: 'debit',
+      title: `💰 ${u.username ? '@' + u.username : u.telegram_id}`,
+      summary: `➖ $${amt.toFixed(2)} → balance ${before.toFixed(2)} → ${(before - amt).toFixed(2)}` +
+        (reason ? `\n📝 ${String(reason).slice(0, 80)}` : ''),
+      confirm: `➖ نقّص $${amt.toFixed(2)}`,
     };
   },
 };

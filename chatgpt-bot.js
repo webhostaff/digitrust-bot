@@ -13,6 +13,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const Database    = require('better-sqlite3');
 const logger      = require('./utils/logger');
 const { verifyDepositByTxId, verifyBinancePayOrder, TXID_RE } = require('./services/binance');
+const cgbGuard = require('./services/cgbGuard');
 
 const CHATGPT_BOT_TOKEN = process.env.CHATGPT_BOT_TOKEN;
 const ADMIN_ID = parseInt(process.env.ADMIN_ID || '5626665035', 10);
@@ -1087,6 +1088,122 @@ async function showSeatCyclePicker(chatId, target, email) {
 }
 
 /** Write the seat, tell the customer, and hand it to the normal machinery. */
+/**
+ * Mark a seat's order active, notify the customer, and repaint its admin
+ * card green — the one shared path for BOTH the manual "🔔 Activate &
+ * Notify Customer" button and the automatic callback from ChatGPT Business
+ * Guard (services/cgbGuard.js's webhook) once it verifies an invite in
+ * Pending invites. Everything is derived from the DB rather than passed in
+ * by the caller, so either trigger works the same way.
+ *
+ * chatId/msgId are optional and only come from the button press (the exact
+ * message that was tapped); the webhook has neither, so it falls back to
+ * the card saved in cgb_admin_cards at send time, and if that's missing
+ * too (e.g. a seat added via /addseat with no card ever sent), a fresh
+ * confirmation message to ADMIN_ID is sent instead of silently doing
+ * nothing.
+ *
+ * Returns { ok, reason } — reason is set on failure or on a no-op (already
+ * active), never thrown, so callers (a Telegram handler or an HTTP route)
+ * can each report it their own way.
+ */
+async function activateAndNotifySeat(orderIdRaw, { chatId = null, msgId = null } = {}) {
+  const orderId = parseInt(orderIdRaw, 10);
+  if (!Number.isFinite(orderId)) return { ok: false, reason: 'invalid order id' };
+
+  const sub = queries.getCgbSubscriptionByOrder(orderId);
+  if (!sub) return { ok: false, reason: `no subscription found for order #${orderId}` };
+  if (sub.status === 'active') return { ok: false, reason: 'already active' };
+
+  const ord = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
+  const customerId = sub.user_id;
+  const days = sub.days_remaining;
+  const endDate = sub.end_date;
+
+  try {
+    await bot.sendMessage(Number(customerId),
+      `✅ <b>Your ChatGPT Business Subscription is Now Active!</b>\n\n` +
+      `🆔 Order: <b>#${orderId}</b>\n` +
+      `⏱ Duration: <b>${days} days</b>\n` +
+      `📅 Expiry date: <b>${endDate}</b>\n\n` +
+      `Your subscription has been successfully activated on the email you provided.\n` +
+      `If you face any issues, please contact our support team.`,
+      { parse_mode: 'HTML' }
+    );
+  } catch (e) {
+    logger.warn(`activateAndNotifySeat: could not message customer ${customerId}: ${e.message}`);
+    // Still activate below — a customer who muted/blocked the bot shouldn't
+    // keep their paid seat stuck as "not activated" forever.
+  }
+
+  try {
+    queries.activateCgbSubscription(orderId);
+    // Stamp the workspace onto the row at activation. Reading the setting
+    // later would show today's workspace on an old seat if the shop ever
+    // moves accounts, which is exactly the field a customer would query.
+    try {
+      if (!sub.workspace) {
+        const wsRow = db.prepare(`SELECT value FROM settings WHERE key='cgb_workspace_name'`).get();
+        queries.setCgbWorkspace(sub.id, wsRow?.value || 'chatgpt_Team');
+      }
+    } catch (e) { logger.warn(`workspace stamp: ${e.message}`); }
+    db.prepare(`UPDATE orders SET status='delivered' WHERE id=?`).run(orderId);
+  } catch (e) {
+    return { ok: false, reason: `could not mark order/sub active: ${e.message}` };
+  }
+
+  // Repaint the WHOLE card green, not just the button. Editing only the
+  // markup left the red band and "NOT ACTIVATED YET" in place, which is
+  // what made finished and pending orders look identical in the scrollback.
+  const card = queries.getCgbAdminCard ? queries.getCgbAdminCard(orderId) : null;
+  const targetChatId = chatId ?? card?.chat_id ?? null;
+  const targetMsgId = msgId ?? card?.message_id ?? null;
+
+  const u = db.prepare('SELECT username, first_name FROM users WHERE telegram_id = ?').get(Number(customerId));
+  const who = u?.username ? '@' + u.username : (u?.first_name || `User ${customerId}`);
+  const p2 = (n) => String(n).padStart(2, '0');
+  const now = new Date();
+  const greenCard = orderCard({
+    orderId,
+    userId:    customerId,
+    days,
+    name:      escapeHtml(who),
+    email:     escapeHtml(sub.email || '—'),
+    startDate: sub.start_date || '—',
+    endDate:   endDate,
+    paid:      Number(sub.final_price ?? ord?.total_price ?? 0).toFixed(2),
+    method:    ord?.payment_method || '—',
+    refLabel:  'Order',
+    ref:       String(orderId),
+    activatedAt: `${p2(now.getDate())}/${p2(now.getMonth() + 1)} ${p2(now.getHours())}:${p2(now.getMinutes())}`,
+  }, true);
+  const doneMarkup = { inline_keyboard: [[{ text: '✅ Done — customer notified', callback_data: 'noop' }]] };
+
+  if (targetChatId && targetMsgId) {
+    try {
+      await bot.editMessageText(greenCard, {
+        chat_id: targetChatId, message_id: targetMsgId, parse_mode: 'HTML', reply_markup: doneMarkup,
+      });
+      return { ok: true };
+    } catch (e) {
+      // Never leave the card looking untouched: if the repaint fails for any
+      // reason, at least flip the button so the state is still readable.
+      logger.warn(`activateAndNotifySeat: card repaint failed: ${e.message}`);
+      await bot.editMessageReplyMarkup(doneMarkup, { chat_id: targetChatId, message_id: targetMsgId }).catch(() => {});
+      return { ok: true };
+    }
+  }
+  // No known card to repaint (typically the webhook path when the original
+  // send-time save failed, or a hand-added seat) — a fresh green message is
+  // still better than silence.
+  try {
+    await bot.sendMessage(ADMIN_ID, greenCard, { parse_mode: 'HTML', reply_markup: doneMarkup });
+  } catch (e) {
+    logger.warn(`activateAndNotifySeat: could not send fallback confirmation: ${e.message}`);
+  }
+  return { ok: true };
+}
+
 async function createSeatManually(chatId, target, email, endDate, adminId) {
   const today = new Date();
   const days = Math.max(0, Math.ceil(
@@ -1148,92 +1265,14 @@ bot.on('callback_query', async (q) => {
   // ── Admin: Notify customer that subscription is activated ──────────────────
   if (data.startsWith('cgb_notify_')) {
     if (String(userId) !== String(ADMIN_ID)) return;
-    // format: cgb_notify_{orderId}_{customerId}_{days}_{endDate}
-    const parts      = data.split('_');
-    // parts: ['cgb','notify', orderId, customerId, days, ...endDate]
-    const orderId    = parts[2];
-    const customerId = parts[3];
-    const days       = parts[4];
-    const endDate    = decodeURIComponent(parts.slice(5).join('_'));
-    try {
-      await bot.sendMessage(Number(customerId),
-        `✅ <b>Your ChatGPT Business Subscription is Now Active!</b>\n\n` +
-        `🆔 Order: <b>#${orderId}</b>\n` +
-        `⏱ Duration: <b>${days} days</b>\n` +
-        `📅 Expiry date: <b>${endDate}</b>\n\n` +
-        `Your subscription has been successfully activated on the email you provided.\n` +
-        `If you face any issues, please contact our support team.`,
-        { parse_mode: 'HTML' }
-      );
-
-      // Mark subscription as active in the DB (was never done before — gap fix)
-      try {
-        queries.activateCgbSubscription(parseInt(orderId, 10));
-        // Stamp the workspace onto the row at activation. Reading the setting
-        // later would show today's workspace on an old seat if the shop ever
-        // moves accounts, which is exactly the field a customer would query.
-        try {
-          const activated = queries.getCgbSubscriptionByOrder(parseInt(orderId, 10));
-          if (activated && !activated.workspace) {
-            const wsRow = db.prepare(`SELECT value FROM settings WHERE key='cgb_workspace_name'`).get();
-            queries.setCgbWorkspace(activated.id, wsRow?.value || 'chatgpt_Team');
-          }
-        } catch (e) { logger.warn(`workspace stamp: ${e.message}`); }
-        db.prepare(`UPDATE orders SET status='delivered' WHERE id=?`).run(parseInt(orderId, 10));
-      } catch (e) {
-        logger.warn(`cgb_notify_: could not mark order/sub active: ${e.message}`);
-      }
-
-      // Repaint the WHOLE card green, not just the button. Editing only the
-      // markup left the red band and "NOT ACTIVATED YET" in place, which is
-      // what made finished and pending orders look identical in the scrollback.
-      //
-      // Rebuilt from the database rather than by parsing the old message text:
-      // q.message.text arrives with HTML already decoded, so re-escaping it by
-      // hand would mangle any address containing & or <.
-      try {
-        const sub = db.prepare(
-          'SELECT * FROM chatgpt_subscriptions WHERE order_id = ?'
-        ).get(parseInt(orderId, 10));
-        const ord = db.prepare('SELECT * FROM orders WHERE id = ?').get(parseInt(orderId, 10));
-        const u   = db.prepare(
-          'SELECT username, first_name FROM users WHERE telegram_id = ?'
-        ).get(Number(customerId));
-        const who = u?.username ? '@' + u.username : (u?.first_name || `User ${customerId}`);
-
-        const p2 = (n) => String(n).padStart(2, '0');
-        const now = new Date();
-
-        const greenCard = orderCard({
-          orderId,
-          userId:    customerId,
-          days,
-          name:      escapeHtml(who),
-          email:     escapeHtml(sub?.email || '—'),
-          startDate: sub?.start_date || '—',
-          endDate:   endDate,
-          paid:      Number(sub?.final_price ?? ord?.total_price ?? 0).toFixed(2),
-          method:    ord?.payment_method || '—',
-          refLabel:  'Order',
-          ref:       String(orderId),
-          activatedAt: `${p2(now.getDate())}/${p2(now.getMonth() + 1)} ${p2(now.getHours())}:${p2(now.getMinutes())}`,
-        }, true);
-
-        await bot.editMessageText(greenCard, {
-          chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
-          reply_markup: { inline_keyboard: [[{ text: '✅ Done — customer notified', callback_data: 'noop' }]] },
-        });
-      } catch (e) {
-        // Never leave the card looking untouched: if the repaint fails for any
-        // reason, at least flip the button so the state is still readable.
-        logger.warn(`cgb_notify_: card repaint failed: ${e.message}`);
-        await bot.editMessageReplyMarkup(
-          { inline_keyboard: [[{ text: '✅ Done — customer notified', callback_data: 'noop' }]] },
-          { chat_id: chatId, message_id: msgId }
-        ).catch(() => {});
-      }
-    } catch (e) {
-      await bot.sendMessage(chatId, `❌ Could not notify customer: ${e.message}`);
+    // format: cgb_notify_{orderId}_{customerId}_{days}_{endDate} — only
+    // orderId is actually used now (customerId/days/endDate are re-read
+    // from the DB by activateAndNotifySeat, so a stale/edited callback_data
+    // can't send someone the wrong duration or expiry date).
+    const orderId = data.split('_')[2];
+    const result = await activateAndNotifySeat(orderId, { chatId, msgId });
+    if (!result.ok) {
+      await bot.sendMessage(chatId, `❌ Could not notify customer: ${result.reason}`);
     }
     return;
   }
@@ -1917,10 +1956,12 @@ async function confirmPayment(chatId, userId, orderId, txid, sessionData) {
     const scheduled = !!(card.startDate &&
       new Date(`${card.startDate}T00:00:00`) > new Date(new Date().toDateString()));
 
-    await bot.sendMessage(ADMIN_ID, orderCard(card, false, scheduled), {
+    const sentCard = await bot.sendMessage(ADMIN_ID, orderCard(card, false, scheduled), {
       parse_mode: 'HTML',
       reply_markup: orderCardButtons(card),
     });
+    try { queries.saveCgbAdminCard(orderId, sentCard.chat.id, sentCard.message_id); } catch (e) {}
+    cgbGuard.notifyGuardOfNewInvite(sessionData.email, { orderId }).catch(() => {});
   } catch (e) {}
 }
 
@@ -2007,10 +2048,12 @@ async function confirmCryptobotPayment(invoiceId, paidAmount, orderId, userId) {
     const scheduled = !!(card.startDate &&
       new Date(`${card.startDate}T00:00:00`) > new Date(new Date().toDateString()));
 
-    await bot.sendMessage(ADMIN_ID, orderCard(card, false, scheduled), {
+    const sentCard = await bot.sendMessage(ADMIN_ID, orderCard(card, false, scheduled), {
       parse_mode: 'HTML',
       reply_markup: orderCardButtons(card),
     });
+    try { queries.saveCgbAdminCard(orderId, sentCard.chat.id, sentCard.message_id); } catch (e) {}
+    cgbGuard.notifyGuardOfNewInvite(sub.email, { orderId }).catch(() => {});
   } catch (e) {
     logger.warn(`confirmCryptobotPayment: could not notify admin: ${e.message}`);
   }
@@ -2269,4 +2312,4 @@ if (ADMIN_ID) {
 
 bot.on('polling_error', e => logger.error(`CGB polling: ${e.message}`));
 
-module.exports = { bot, confirmCryptobotPayment, sendRenewalReminders };
+module.exports = { bot, confirmCryptobotPayment, sendRenewalReminders, activateAndNotifySeat };

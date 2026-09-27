@@ -1125,6 +1125,21 @@ const cgb_dropUnpaid = db.prepare(`
 `);
 const cgb_getSubByOrder = db.prepare(`SELECT * FROM chatgpt_subscriptions WHERE order_id=?`);
 const cgb_activateSub  = db.prepare(`UPDATE chatgpt_subscriptions SET status='active', updated_at=datetime('now') WHERE order_id=?`);
+// Used by the guard-bot success callback (see services/cgbGuard.js) to find
+// WHICH order an invited email belongs to. Most recent non-active row for
+// that email, case-insensitive — a real edge case (the same email with two
+// pending orders at once) picks the newer one; rare enough to accept, and
+// the admin still sees every callback logged either way.
+const cgb_getPendingSubByEmail = db.prepare(`
+  SELECT * FROM chatgpt_subscriptions
+  WHERE email = ? COLLATE NOCASE AND status != 'active'
+  ORDER BY id DESC LIMIT 1
+`);
+const cgb_saveAdminCard = db.prepare(`
+  INSERT INTO cgb_admin_cards (order_id, chat_id, message_id) VALUES (?, ?, ?)
+  ON CONFLICT(order_id) DO UPDATE SET chat_id=excluded.chat_id, message_id=excluded.message_id, created_at=datetime('now')
+`);
+const cgb_getAdminCard = db.prepare(`SELECT * FROM cgb_admin_cards WHERE order_id = ?`);
 const cgb_getActive    = db.prepare(`SELECT * FROM chatgpt_subscriptions WHERE status='active' ORDER BY end_date ASC`);
 const cgb_getExpiringSubs = db.prepare(`
   SELECT cs.*, u.username, u.first_name 
@@ -1975,6 +1990,9 @@ module.exports = {
   createCgbSubscription: (orderId, userId, email, start, end, days, base, extra, final) =>
     cgb_insertSub.run(orderId, userId, email, start, end, days, base, extra, final).lastInsertRowid,
   getCgbSubscriptionByOrder: (orderId) => cgb_getSubByOrder.get(orderId),
+  getPendingCgbSubscriptionByEmail: (email) => cgb_getPendingSubByEmail.get(String(email || '').trim()),
+  saveCgbAdminCard: (orderId, chatId, messageId) => cgb_saveAdminCard.run(orderId, chatId, messageId),
+  getCgbAdminCard: (orderId) => cgb_getAdminCard.get(orderId),
   activateCgbSubscription: (orderId) => cgb_activateSub.run(orderId),
   markCgbSubscriptionPaid: (orderId) => cgb_markPaid.run(orderId).changes,
   dropUnpaidCgbSubscription: (orderId) => cgb_dropUnpaid.run(orderId).changes,

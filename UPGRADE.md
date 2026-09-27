@@ -1461,3 +1461,144 @@ the customer does not get two emails. Also stored as `canva_last_failure`.
 Tested with real Chromium through the full `inviteEmail()` against a fake
 Canva page: link in the network reply; link only behind "…" → Copy invite
 link; only the team link available (refused, no leak); reused-link rejection.
+
+# Part 46 — Canva invite rebuilt on the real People page (v113)
+
+The v112 failure screenshot (order #17991) showed Canva's real page and a bug
+that made every earlier "invited" report false:
+
+* **The search box was used as the invite box.** Its placeholder is "Search
+  members by name or email", which matched `input[placeholder*=email]`, so the
+  bot typed the customer's email into SEARCH and never opened the invite
+  window. Orders #17989/#17991 were most likely never invited. The invite box is
+  now only an input inside the `[role=dialog]` opened by "Invite people".
+* **Invite is verified**: after Send, the email is searched and a pending row
+  ("Invite is valid…" / Resend · Copy link) must exist. Send clicked but no row
+  → `invited: 'maybe'` (owner checks People before inviting again).
+* **Link from the row's own "Copy link"**, located as the smallest element
+  holding this email + "Copy link" + no other email address — another
+  customer's pending link (e.g. the row above) can never be clicked. The v112
+  page-wide "Copy link" fallback, which could have hit another row, is gone.
+* **Cookie banner** ("Accept all cookies") is accepted first; it covered the
+  lower rows. Saved with the session so it appears once.
+* **Already pending** → its existing link is reused, no second invite email.
+  **Already a member** → no invite, clear reason. Search not listing invites →
+  falls back to the full list.
+* Failure alert now says which: "Already invited — do NOT invite again",
+  "May already be invited — check first", or "Not invited yet".
+* Tested with real Chromium on a fake page copying the real layout: banner,
+  "…or email" search box, another customer's pending row with its own Copy
+  link, members, invite dialog with the team link. 7 scenarios incl. reuse,
+  member, broken Send, team-link and reused-link refusal.
+
+* **Matched to the real invite window** (owner's screenshot): "Invite people
+  to your team" · suggested-people chips · [Get invite link] · OR · email rows
+  "Enter email address…" + role · [Confirm and invite]. The confirm button is
+  matched by its exact label; the loose "any invite/send button" fallback is
+  gone because it could have hit **Get invite link**, which creates the team's
+  public link. No Enter key (several address rows). Dialog found by
+  `role=dialog` or, failing that, by its heading.
+* Links count only if they appear AFTER clicking the customer's row "Copy
+  link"; everything seen before (incl. a team link in the Send reply) is
+  baseline. Tested: 10 scenarios; "Get invite link" clicked 0 times.
+
+# Part 47 — the real "Invite sent!" step, and a network-link race closed (v114)
+
+The owner's screenshots showed the step after "Confirm and invite" that v113
+didn't know about: Canva shows **"Invite sent! Follow up with a unique
+link?"** with the customer's own email and a **Copy link** button, then
+**Done**. This is now the primary source — no need to search People at all —
+and only trusted when that step shows THIS email (Canva lowercases it) and no
+"Get invite link" button. Falls back to the People-row Copy link (v113's path)
+if the step doesn't appear, shows a different email, or gives nothing.
+
+**Race condition closed.** Testing found a way the public team link could
+still leak: if Canva's "Confirm and invite" network reply happened to carry
+the team link and the code read it a moment after the Copy-link click, it
+looked "new" and would have been delivered. Fixed three ways:
+* a network link only counts if its **request** started after the click (not
+  when the reply was read) — closes the timing race directly;
+* a link the click's own copy action produced is trusted first, network second;
+* any link ever seen as a team/baseline link is now **permanently banned**
+  (stored in agent state), so it can never be delivered on ANY later order,
+  even a fresh browser session.
+
+Tested: 12 scenarios with real Chromium, including the exact race (team link
+in the Send reply, every "Copy" silent) and the permanent ban surviving into
+a new invite. "Get invite link" clicked 0 times throughout.
+
+# Part 48 — ChatGPT Business ↔ ChatGPT Business Guard integration (v115)
+
+Wires this bot's ChatGPT Business Guard bot to the separate ChatGPT Business
+Guard service, so a paid seat is invited and activated automatically instead
+of the admin inviting by hand in Canva... in ChatGPT Business Admin, then
+tapping "Activate & Notify Customer" once they notice it worked.
+
+* **Outbound** (`services/cgbGuard.js`): right after a ChatGPT Business order
+  is confirmed (both the regular and CryptoBot payment paths), the customer's
+  email is POSTed to the guard's `/auto-invite`, joining its normal 10-minute
+  batch queue — completely optional, a silent no-op until `GUARD_SECRET` and
+  `GUARD_AUTO_INVITE_URL` are set. Never throws: the guard being briefly
+  unreachable must not break payment confirmation.
+* **Inbound** (`POST /webhook/cgb-guard-status`, mounted only when
+  `GUARD_SECRET` is set): the guard calls this back once a batch is verified
+  in Pending invites (or fails). On success, the matching pending seat is
+  found by email and activated automatically — same effect as the manual
+  "🔔 Activate & Notify Customer" button. On failure, the admin is alerted
+  with the reason instead, and the seat is left untouched.
+* **Shared logic extracted**: `activateAndNotifySeat(orderId)` in
+  `chatgpt-bot.js` now derives everything (customer id, days, expiry) from
+  the database instead of a callback_data string, so both the manual button
+  and the webhook activate a seat identically. It also survives the customer
+  having blocked the bot (the seat still activates; only the DM fails).
+* **`cgb_admin_cards` table** remembers each order's admin card (chat +
+  message id) so an automatic activation repaints the SAME red card green,
+  instead of only sending a separate confirmation. Falls back to a fresh
+  message when no card was saved (e.g. a hand-added `/addseat`).
+* Tested: 13 cases against the real `chatgpt-bot.js` (with only
+  better-sqlite3/node-telegram-bot-api mocked — native compilation is
+  unavailable in this sandbox) plus `services/cgbGuard.js` in isolation:
+  successful activation with and without a saved card, already-active
+  no-op, unknown order, a blocked customer, disabled-by-default, and the
+  full webhook success/failure/unmatched/unauthorized paths.
+
+# Part 49 — Yamen: autonomous crediting for small verified deposits, deduct balance, CGB seat lookup (v116)
+
+Three additions to Yamen ("services/agentTools.js" + "services/agentChat.js"),
+plus a settings toggle in the app (🧠 → settings):
+
+* **`auto_credit_verified_deposit`** — for the exact scenario in the shop's
+  own transcripts (a customer's transfer arrived, matched nothing automatic,
+  small amount): Yamen may credit it AND reply to the customer with no owner
+  tap, but ONLY when:
+  - the owner has turned this on (off by default — a new switch next to
+    auto-reply in the app),
+  - Binance ITSELF confirms the TxID/Pay id (the same check as "check this
+    txid" — never the model's or the customer's claim),
+  - the verified amount is within `AGENT_AUTO_CREDIT_CAP` (default $10),
+  - a rolling 24h total stays within `AGENT_AUTO_CREDIT_DAILY_CAP` (default
+    $30) — a circuit breaker so a bug or an unusual run of deposits can't
+    silently add up past what was intended,
+  - the TxID was never used before.
+  Every one of these is enforced in CODE, not left to the model's judgment.
+  Any check failing falls back to a normal `propose_credit` draft instead of
+  refusing outright — the tool is useful either way. The customer-facing
+  message is a FIXED template, never model-authored text. The owner gets a
+  Telegram alert after every autonomous credit — never silent.
+* **`propose_debit`** — the reverse of `propose_credit` (a correction, balance
+  given by mistake): same cap, same owner tap to confirm. Refuses instead of
+  going negative.
+* **`cgb_new_seats_since`** — every ChatGPT Business seat created since a
+  date (default 2026-09-26): email, cycle start/end, days left, status —
+  so "what came in since the 26th" or "who's expiring soon" can be answered
+  directly.
+* Standing instruction added: after a manual deposit correction, Yamen now
+  always reminds the customer to follow the deposit steps exactly next time.
+
+Tested (16 new cases): the full money-safety matrix (gate off, real credit,
+duplicate TxID rejected, over the per-transaction cap, the daily cap kicking
+in after several valid small deposits, not found on Binance, a Binance Pay
+match, unknown customer, and confirming the tool has no "amount" input at
+all so the model can never supply the credited figure) plus propose_debit,
+the performAction "debit" execution, and cgb_new_seats_since's date
+filtering and sort order.

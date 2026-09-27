@@ -307,7 +307,9 @@ async function checkLogin() {
 
 async function isOnPeoplePage(page) {
   if (/login|signup/i.test(page.url())) return false;
-  // The email field on the People/invite area is the reliable signal.
+  // Logged-in signal only: the member search box ("Search members by name or
+  // email") or an email field. NOT used to find the invite box — that mix-up
+  // was the v1/v2 bug; inviting uses the [role=dialog] opened by the button.
   const sel = 'input[type="email"], input[placeholder*="email" i]';
   try {
     await page.waitForSelector(sel, { timeout: 8000 });
@@ -403,20 +405,27 @@ async function inviteEmail(email) {
 
     let ctx, page;
     // What we saw, for the link hunt and for the owner's report on failure.
-    const trace = { phase: 'load', baseline: new Set(), net: new Set(), copied: new Set(), dom: new Set(), sent: false };
+    const trace = { baseline: new Set(), net: new Set(), copied: new Set(), dom: new Set(), sent: false, clickAt: 0, reqAfter: new WeakSet() };
     try {
       ctx = await newContext(true);
       await ctx.addInitScript(COPY_HOOK);
       await ctx.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: 'https://www.canva.com' }).catch(() => {});
       page = await ctx.newPage();
-      // Listen BEFORE navigating: links in the page-load responses are the
-      // team's own (baseline); links arriving after "send" are the customer's.
+      // Listen BEFORE navigating. A network link is a candidate ONLY if its
+      // REQUEST started after a "Copy link" click; everything else (page load,
+      // the invite reply, anything in flight) is baseline. Judging by request
+      // start, not by when the reply is read, closes a race the tests caught:
+      // a team link in the "Confirm and invite" reply, read a moment late,
+      // looked "new" after the click and was delivered.
+      page.on('request', (req) => { if (trace.clickAt) trace.reqAfter.add(req); });
       page.on('response', async (resp) => {
         try {
           const ct = (resp.headers()['content-type'] || '').toLowerCase();
           if (!/json|text|javascript/.test(ct)) return;
-          const found = findJoinLinks(await resp.text());
-          for (const l of found) (trace.phase === 'load' ? trace.baseline : trace.net).add(l);
+          const after = trace.reqAfter.has(resp.request());
+          for (const l of findJoinLinks(await resp.text())) {
+            if (after) trace.net.add(l); else addBaseline(trace, l);
+          }
         } catch (_) {}
       });
       await page.goto(PEOPLE_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
@@ -426,13 +435,18 @@ async function inviteEmail(email) {
         return { ok: false, reason: 'session expired', needLogin: true };
       }
 
-      const link = await doInvite(page, clean, trace);
+      const res = await doInvite(page, clean, trace);
       lastInviteAt = Date.now();
-      await saveSession(ctx); // keep the session warm
-      if (link) { rememberLink(link, clean); return { ok: true, link }; }
-      return { ok: false, reason: 'invited, but no link appeared', invited: true, debug: await failureDebug(page, trace) };
+      await saveSession(ctx); // keep the session warm (and the accepted cookie banner)
+      if (res.link) { rememberLink(res.link, clean); return { ok: true, link: res.link, reused: !!res.reused }; }
+      return {
+        ok: false,
+        reason: res.reason || (res.invited ? 'invited, but the link could not be copied' : 'not invited'),
+        invited: res.invited === 'maybe' ? 'maybe' : !!res.invited,
+        debug: await failureDebug(page, trace),
+      };
     } catch (e) {
-      return { ok: false, reason: e.message, invited: trace.sent, debug: page ? await failureDebug(page, trace) : null };
+      return { ok: false, reason: e.message, invited: trace.sent ? true : 'maybe', debug: page ? await failureDebug(page, trace) : null };
     } finally {
       if (ctx) await ctx.close().catch(() => {});
     }
@@ -440,108 +454,254 @@ async function inviteEmail(email) {
 }
 
 /**
- * Drive the invite UI and come back with THIS email's personal join link.
+ * Drive Canva's People page and come back with THIS email's personal link.
  *
- * v1 found the invite part fine but lost the link ("invited, but no link
- * appeared" — order #17989). The link is now caught three independent ways,
- * because Canva's page cannot be seen from the dev sandbox and its UI shifts:
- *   1. NETWORK — every JSON/text response Canva's own app receives is scanned
- *      for a brand/join URL. The invite API usually returns it; no UI needed.
- *   2. COPY HOOK — an init script wraps navigator.clipboard.writeText/write,
- *      execCommand('copy') and the copy event, so whatever a "Copy link"
- *      button copies is recorded even though headless Chromium cannot read
- *      the clipboard back.
- *   3. DOM — inputs, hrefs and page text, after also trying the pending
- *      invite's "…" menu → "Copy invite link".
+ * Written against the real page (screenshot from order #17991):
+ *   People (N) · [Search members by name or email] · [Invite people]
+ *   rows: <email> / "Invite is valid for N more days" / Resend · Copy link
+ *   + a cookie banner over the bottom of the page on a fresh browser.
  *
- * SAFETY — never hand out the team's PUBLIC link (the owner's hard rule):
- *   - every join link seen BEFORE the email is typed is baseline (the
- *     team-wide "invite via link") and is never accepted;
- *   - a link already delivered to a DIFFERENT email is rejected too (a
- *     personal link is unique; a repeat means it is shared);
- * so a doubtful case fails to the manual lane instead of leaking.
+ * What went wrong before (v1/v2): the search box's placeholder contains
+ * "email", so `input[placeholder*=email]` matched IT — the bot typed the
+ * customer's email into SEARCH, never opened the invite dialog, and reported
+ * "invited". The invite dialog is now found only as a [role=dialog] opened by
+ * the "Invite people" button, and the invite is VERIFIED by searching for the
+ * email afterwards (a pending row must exist) before anything is reported.
+ *
+ * The link comes from that one row's own "Copy link". The row is located as
+ * the smallest element holding this email AND a "Copy link" control AND no
+ * other email address — so another customer's link can never be clicked.
+ * The copy is caught by the network scan and the clipboard hook (headless
+ * Chromium cannot read the clipboard back).
+ *
+ * SAFETY (owner's hard rule — no public team link):
+ *   - join links seen before the invite (page load, dialog) are the team's
+ *     shared link and are never accepted;
+ *   - a link already delivered to a different email is never reused.
  */
 async function doInvite(page, email, trace) {
-  const emailSel = 'input[type="email"], input[placeholder*="email" i]';
-
-  // Baseline: links that exist before this invite belong to the team, not the customer.
-  await sleep(1500);
-  for (const l of await domLinks(page)) trace.baseline.add(l);
-  for (const l of trace.net) trace.baseline.add(l);
+  await acceptCookies(page);
+  await sleep(1200);
+  for (const l of await domLinks(page)) addBaseline(trace, l);
+  for (const l of trace.net) addBaseline(trace, l);
   trace.net.clear();
 
-  if (!(await visible(page, emailSel))) {
-    await clickAny(page, [
-      () => page.getByRole('button', { name: /invite (people|members|to team)/i }).first(),
-      () => page.getByRole('button', { name: /^invite/i }).first(),
-    ]);
-    await page.waitForSelector(emailSel, { timeout: 10000 });
-    await sleep(800);
-    for (const l of await domLinks(page)) trace.baseline.add(l); // the dialog's own team link
+  // 1) Already in the team? Reuse a pending invite instead of sending a second
+  //    email; stop if they are already a member.
+  const existing = await findRow(page, email);
+  if (existing === 'member') return { reason: 'already a member of the team', invited: false };
+  if (existing === 'pending') {
+    trace.sent = true; trace.reused = true;
+      return { link: await copyRowLink(page, email, trace), invited: true, reused: true };
   }
-  trace.phase = 'invite'; // from here on, network links count as the customer's
 
-  const box = page.locator(emailSel).first();
-  await box.click();
-  await box.fill(email);
-  await page.keyboard.press('Enter').catch(() => {});
-  await sleep(rand(600, 1200));
-
-  await clickAny(page, [
-    () => page.getByRole('button', { name: /send invit/i }).first(),
-    () => page.getByRole('button', { name: /confirm and invite/i }).first(),
-    () => page.getByRole('button', { name: /^invite$/i }).first(),
-    () => page.getByRole('button', { name: /^send$/i }).first(),
-    () => page.getByRole('button', { name: /confirm/i }).first(),
+  // 2) Open the invite dialog (never the search box).
+  //    Real dialog (owner's screenshot): "Invite people to your team" ·
+  //    Suggested people chips · [Get invite link] · OR · "Invite people via
+  //    email" rows [Enter email address…] [Team member ▾] · [Confirm and invite].
+  //    "Get invite link" makes the team's PUBLIC link — it is never clicked,
+  //    and no loose "any button with invite in it" fallback exists that could
+  //    land on it.
+  await clearSearch(page);
+  const opened = await clickAny(page, [
+    () => page.getByRole('button', { name: /^invite people$/i }).first(),
+    () => page.getByRole('button', { name: /invite (people|members)/i }).first(),
   ]);
+  if (!opened) return { reason: 'could not find the "Invite people" button', invited: false };
+  const dialog = await findInviteDialog(page);
+  if (!dialog) return { reason: 'the invite window did not open', invited: false };
+  await sleep(700);
+  for (const l of await domLinks(page)) addBaseline(trace, l); // anything already shown = team's
+
+  const input = dialog.locator('input[placeholder*="email" i]:not([placeholder*="search" i])').first();
+  try { await input.waitFor({ state: 'visible', timeout: 5000 }); }
+  catch (_) { return { reason: 'no email box in the invite window', invited: false }; }
+  await input.click();
+  await input.fill(email);
+  // No Enter: with several address rows Enter may jump rows or submit early.
+  await sleep(rand(700, 1300));
+
+  const confirm = dialog.getByRole('button', { name: /^\s*(confirm and invite|send invitations?|send invite)\s*$/i }).first();
+  let sent = false;
+  try {
+    if (await confirm.isVisible({ timeout: 3000 })) {
+      const label = (await confirm.innerText().catch(() => '')) || '';
+      if (/get invite link/i.test(label)) throw new Error('refusing the team-link button');
+      await confirm.click(); sent = true;
+    }
+  } catch (_) {}
+  if (!sent) return { reason: 'no "Confirm and invite" button in the invite window', invited: false };
+
+  // 3) The best source: Canva's own follow-up step (owner's screenshot):
+  //    "Invite sent! Follow up with a unique link?" · [<email>] [Copy link] · [Done]
+  //    That Copy link is THIS person's unique invite link. We only use it when
+  //    the step shows this exact email (Canva lowercases it) and the team-wide
+  //    "Get invite link" is not on screen.
+  const follow = await findFollowUp(page, email);
+  if (follow) {
+    trace.sent = true;
+    const btn = follow.getByRole('button', { name: /^\s*copy link\s*$/i }).first();
+    const link = await clickAndCatch(page, btn, email, trace);
+    await clickAny(page, [() => follow.getByRole('button', { name: /^\s*done\s*$/i }).first()]).catch(() => false);
+    if (link) return { link, invited: true };
+    // No link from the dialog — fall through to the People row, below.
+  } else {
+    await sleep(rand(1500, 2500));
+  }
+  await page.keyboard.press('Escape').catch(() => {}); // close whatever is still open
+  await sleep(800);
+
+  // 4) Fallback: verify via People search and use the row's own Copy link.
+  let row = null;
+  for (let i = 0; i < 4 && row !== 'pending'; i++) { row = await findRow(page, email); if (row !== 'pending') await sleep(1500); }
+  if (row !== 'pending') {
+    if (trace.sent) return { reason: 'invited, but the link could not be copied', invited: true };
+    // Send was clicked but nothing confirmed it: it MAY have gone out. 'maybe'
+    // makes the owner check People before inviting again (no double email).
+    return { reason: 'sent, but the invite does not show in People', invited: 'maybe' };
+  }
   trace.sent = true;
-  return readInviteLink(page, email, trace);
+  return { link: await copyRowLink(page, email, trace), invited: true };
 }
 
-async function readInviteLink(page, email, trace) {
-  const pick = () => {
-    const all = [...trace.net, ...trace.copied, ...trace.dom];
-    return all.find((l) => !trace.baseline.has(l) && !deliveredElsewhere(l, email)) || null;
-  };
-  const collect = async () => {
-    for (const l of await domLinks(page)) trace.dom.add(l);
-    for (const l of await copiedLinks(page)) trace.copied.add(l);
-  };
-  const deadline = Date.now() + 20000;
-  let triedMenu = false;
-  while (Date.now() < deadline) {
-    await collect();
-    const hit = pick(); if (hit) return hit;
-
-    // After a few seconds with nothing: the pending invite row for this email,
-    // "…" / More → "Copy invite link".
-    if (!triedMenu && Date.now() > deadline - 15000) {
-      triedMenu = true;
-      await page.keyboard.press('Escape').catch(() => {}); // close the invite dialog
-      await sleep(700);
-      try {
-        const row = page.getByText(email, { exact: false }).first();
-        if (await row.isVisible({ timeout: 2500 })) {
-          const box = row.locator('xpath=ancestor::*[.//button][1]');
-          await clickAny(page, [
-            () => box.getByRole('button', { name: /more|options|actions|…|\.\.\./i }).first(),
-            () => box.locator('button').last(),
-          ]);
-          await sleep(500);
-          await clickAny(page, [
-            () => page.getByRole('menuitem', { name: /copy (invite )?link/i }).first(),
-            () => page.getByRole('button', { name: /copy (invite )?link/i }).first(),
-            () => page.getByText(/copy (invite )?link/i).first(),
-          ]);
-          await sleep(600);
-        }
-      } catch (_) {}
-      continue;
-    }
-    await sleep(800);
+/**
+ * Canva's "Invite sent!" follow-up step for THIS email, or null. Accepted only
+ * if it shows the email (case-insensitive) and no "Get invite link" button.
+ */
+async function findFollowUp(page, email) {
+  const want = email.toLowerCase();
+  const byRole = page.locator('[role="dialog"]').filter({ hasText: /invite sent/i }).last();
+  let box = null;
+  try { await byRole.waitFor({ state: 'visible', timeout: 10000 }); box = byRole; } catch (_) {}
+  if (!box) {
+    try {
+      const h = page.getByText(/invite sent/i).first();
+      await h.waitFor({ state: 'visible', timeout: 3000 });
+      const anc = h.locator('xpath=ancestor::*[.//button[normalize-space(.)="Copy link"]][1]');
+      if (await anc.count()) box = anc.first();
+    } catch (_) {}
   }
-  await collect();
-  return pick();
+  if (!box) return null;
+  const ok = await box.evaluate((el, want) => {
+    const vals = [...el.querySelectorAll('input,textarea')].map((i) => (i.value || '').toLowerCase());
+    const text = (el.innerText || '').toLowerCase();
+    const showsEmail = vals.includes(want) || text.includes(want);
+    const teamBtn = /get invite link/i.test(el.innerText || '');
+    return showsEmail && !teamBtn;
+  }, want).catch(() => false);
+  return ok ? box : null;
+}
+
+/**
+ * Click a "Copy link" control and return the link it produces. Only links
+ * that appear AFTER this click count; everything seen before joins the
+ * baseline (team link, other rows), so it can never be handed out.
+ */
+async function clickAndCatch(page, locator, email, trace) {
+  for (const l of trace.net) addBaseline(trace, l);
+  for (const l of await copiedLinks(page)) addBaseline(trace, l);
+  trace.net.clear(); trace.copied.clear();
+  // What the click itself COPIED is the strongest evidence; network second.
+  const pick = () => [...trace.copied, ...trace.net]
+    .find((l) => !trace.baseline.has(l) && !isBanned(l, email)) || null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    trace.clickAt = Date.now();
+    try { await locator.click({ timeout: 5000 }); } catch (_) { return null; }
+    const until = Date.now() + 6000;
+    while (Date.now() < until) {
+      for (const l of await copiedLinks(page)) trace.copied.add(l);
+      const hit = pick(); if (hit) return hit;
+      await sleep(400);
+    }
+  }
+  return null;
+}
+
+/**
+ * The invite window: a [role=dialog] if Canva marks it so, otherwise the
+ * element around the "Invite people via email" heading. Returns a Locator.
+ */
+async function findInviteDialog(page) {
+  const byRole = page.locator('[role="dialog"]').filter({ hasText: /invite people/i }).last();
+  try { await byRole.waitFor({ state: 'visible', timeout: 6000 }); return byRole; } catch (_) {}
+  const heading = page.getByText(/invite people (to your team|via email)/i).first();
+  try {
+    await heading.waitFor({ state: 'visible', timeout: 4000 });
+    // Smallest ancestor that holds both an email box and the confirm button.
+    const box = heading.locator('xpath=ancestor::*[.//input[contains(translate(@placeholder,"EMAIL","email"),"email")] and .//button[contains(translate(normalize-space(.),"CONFIRMINVTE","confirminvte"),"confirm")]][1]');
+    if (await box.count()) return box.first();
+  } catch (_) {}
+  return null;
+}
+
+/** Type the email into the member search; report 'pending' | 'member' | null. */
+async function findRow(page, email) {
+  const search = page.locator('input[placeholder*="search" i], input[type="search"]').first();
+  let searched = false;
+  try {
+    if (await search.isVisible({ timeout: 2000 })) { await search.fill(''); await search.fill(email); await sleep(1500); searched = true; }
+  } catch (_) {}
+  let hit = await scanRows(page, email);
+  // Canva's search might not list pending invites — look at the full list too.
+  if (!hit && searched) { await clearSearch(page); hit = await scanRows(page, email); }
+  return hit;
+}
+
+function scanRows(page, email) {
+  return page.evaluate(({ email }) => {
+    const want = email.toLowerCase();
+    const EMAIL = /[^\s@]+@[^\s@]+\.[a-z]{2,}/gi;
+    const all = [...document.querySelectorAll('body *')].filter((el) =>
+      el.children.length === 0 && (el.textContent || '').toLowerCase().includes(want));
+    for (const leaf of all) {
+      let el = leaf;
+      for (let d = 0; el && d < 8; d++, el = el.parentElement) {
+        const t = (el.innerText || '');
+        const emails = (t.match(EMAIL) || []).map((x) => x.toLowerCase());
+        if (emails.some((x) => x !== want)) break;            // grew into another person's row
+        if (/copy link|resend|invite is valid/i.test(t)) return 'pending';
+        if (/team member|admin|owner|designer|student|teacher/i.test(t) && d >= 2) return 'member';
+      }
+    }
+    return null;
+  }, { email }).catch(() => null);
+}
+
+/** Click "Copy link" inside THIS email's row only, and collect the link. */
+async function copyRowLink(page, email, trace) {
+  const marked = await page.evaluate(({ email }) => {
+    document.querySelectorAll('[data-dt-copy]').forEach((e) => e.removeAttribute('data-dt-copy'));
+    const want = email.toLowerCase();
+    const EMAIL = /[^\s@]+@[^\s@]+\.[a-z]{2,}/gi;
+    const leaves = [...document.querySelectorAll('body *')].filter((el) =>
+      el.children.length === 0 && (el.textContent || '').toLowerCase().includes(want));
+    for (const leaf of leaves) {
+      let el = leaf;
+      for (let d = 0; el && d < 8; d++, el = el.parentElement) {
+        const emails = ((el.innerText || '').match(EMAIL) || []).map((x) => x.toLowerCase());
+        if (emails.some((x) => x !== want)) break;             // never leave this person's row
+        const ctl = [...el.querySelectorAll('button,a,[role="button"],span')]
+          .find((c) => /^\s*copy link\s*$/i.test(c.innerText || c.textContent || ''));
+        if (ctl) { ctl.setAttribute('data-dt-copy', '1'); return true; }
+      }
+    }
+    return false;
+  }, { email }).catch(() => false);
+  if (!marked) return null;
+  return clickAndCatch(page, page.locator('[data-dt-copy="1"]').first(), email, trace);
+}
+
+async function clearSearch(page) {
+  const search = page.locator('input[placeholder*="search" i], input[type="search"]').first();
+  try { if (await search.isVisible({ timeout: 1000 })) { await search.fill(''); await sleep(600); } } catch (_) {}
+}
+
+/** The cookie banner covers the bottom rows on a fresh browser — accept it once. */
+async function acceptCookies(page) {
+  await clickAny(page, [
+    () => page.getByRole('button', { name: /accept all cookies/i }).first(),
+    () => page.getByRole('button', { name: /^accept( all)?$/i }).first(),
+  ]).catch(() => false);
 }
 
 // ── Link finding ──────────────────────────────────────────────────────────────
@@ -598,6 +758,24 @@ const COPY_HOOK = `(() => {
     document.addEventListener('copy', (e) => { try { rec(String(document.getSelection())); } catch (_) {} }, true);
   } catch (_) {}
 })();`;
+
+/**
+ * A team (baseline) link: remembered for this invite AND permanently, so a
+ * link once seen as the team's can never be delivered, in any later order.
+ */
+function addBaseline(trace, l) {
+  trace.baseline.add(l);
+  try {
+    const ban = mem.getState('canva_team_links', null) || {};
+    const k = linkKey(l);
+    if (!ban[k]) { ban[k] = Date.now(); mem.setState('canva_team_links', ban); }
+  } catch (_) {}
+  return false;
+}
+function isBanned(link, email) {
+  const ban = mem.getState('canva_team_links', null) || {};
+  return !!ban[linkKey(link)] || deliveredElsewhere(link, email);
+}
 
 /** Remember which email got which link, to spot a shared (public) link. */
 function linkKey(l) { return require('crypto').createHash('sha256').update(l).digest('hex').slice(0, 20); }
@@ -676,5 +854,5 @@ module.exports = {
   available, status, checkLogin, inviteEmail, selfTest,
   startLogin, loginShot, loginClick, loginType, loginKey, finishLogin, endLogin,
   forgetSession, importEnvSession,
-  _test: { parseSessionText, resolveDataDir, volumeCheck, findJoinLinks, doInvite, COPY_HOOK, rememberLink, deliveredElsewhere, DATA_DIR, STORAGE },
+  _test: { parseSessionText, resolveDataDir, volumeCheck, findJoinLinks, doInvite, findRow, COPY_HOOK, rememberLink, deliveredElsewhere, isBanned, DATA_DIR, STORAGE },
 };

@@ -220,6 +220,9 @@ ANSWERING CUSTOMERS
 
 ADDING BALANCE
 - propose_credit adds up to the wallet limit ($20 by default) (refund, compensation, bonus). The owner taps to confirm. Above the limit, tell the owner to do it in /admin. Always look the customer up first and say who and why.
+- propose_debit removes balance the same way (a correction, balance given by mistake). Same cap, same owner tap. It refuses instead of going negative — tell the owner if a bigger correction is needed.
+- After crediting a MANUAL deposit correction for a customer (their transfer arrived but wasn't auto-detected), always add one line reminding them to follow the deposit steps exactly next time (right network, right address/memo, wait for the confirmation message) so future top-ups are detected automatically and don't need this again. Keep it short and friendly, not a lecture.
+- auto_credit_verified_deposit: for a customer's OWN transfer that Binance itself confirms is real and matches (via the same check as txid_check), you may credit it AND reply to the customer without waiting for a tap — but only when the owner has turned this on (a setting, off by default) and the verified amount is small (a few dollars; the cap is configurable). Anything above the cap, already used, or not verifiable on Binance falls back to a normal propose_credit draft automatically — you don't need to check the cap yourself, the tool does. Never claim you credited something this way unless the tool itself reports it did.
 
 SEARCHING THE WEB
 - You can search the web. Use it when the answer is not in the shop data or your own knowledge: how to activate/redeem a specific service, a current error a customer hit, setup steps, whether a provider is down, a fact you are unsure of. Search, read the best result, then answer in your own words — short, and say briefly where it came from when it matters. Do not search for things you already know or for shop data (that is what your tools are for).
@@ -454,6 +457,7 @@ const TOOL_LABEL = {
   propose_stock_count: '📦 يحضّر التعبئة', propose_post: '🎨 يصمّم المنشور',
   propose_product: '🆕 يحضّر المنتج', propose_product_update: '✏️ يحضّر التعديل', list_categories: '📁 الأقسام',
   scheduled_posts: '⏰ المنشورات المبرمجة', propose_stock: '📦 يحضّر المخزون', view_customer_media: '🖼 يشوف الصور',
+  propose_debit: '➖ يحضّر نقص رصيد', cgb_new_seats_since: '🤖 مقاعد جديدة', auto_credit_verified_deposit: '⚡️ إيداع متحقق منو',
 };
 
 /**
@@ -495,6 +499,40 @@ async function runTools(calls, ctx) {
       ctx.emit({ type: 'auto_reply', to: user_id, text, ok: done.ok });
       // Replace the tool result the model sees with a plain outcome.
       return { id: c.id, output: JSON.stringify(done.ok ? { sent: true } : { sent: false, error: done.error }) };
+    }
+    // Yamen verified a small deposit itself and credited it (auto_credit is
+    // on). The customer message is a FIXED template, never model text — see
+    // the tool's own comment for why. The owner always gets an FYI, since
+    // this is the one case where money moved with no tap.
+    if (out && out.__auto_credit_notify) {
+      const { userId, amount, before, after, txid, network } = out.__auto_credit_notify;
+      const bot = require('./agentChat')._storeBot || (globalThis.__STORE_BOT__);
+      let sentToCustomer = false;
+      try {
+        if (bot) {
+          await bot.sendMessage(userId,
+            `💰 <b>$${amount.toFixed(2)}</b> was added to your balance.\n` +
+            `📝 Verified deposit (TxID <code>${String(txid).slice(0, 24)}</code>)`,
+            { parse_mode: 'HTML' });
+          sentToCustomer = true;
+        }
+      } catch (_) {}
+      try {
+        const raw = require('../database/db');
+        const u = raw.prepare('SELECT username, first_name FROM users WHERE telegram_id = ?').get(userId);
+        const who = u?.username ? '@' + u.username : (u?.first_name || String(userId));
+        await require('./adminNotify').notifyAdmin(bot, {
+          type: 'agent_auto_credit',
+          title: '⚡️ يمان زاد رصيد أوتوماتيك (بلا تأكيد)',
+          body: `👤 ${who}\n➕ $${amount.toFixed(2)} → balance ${before.toFixed(2)} → ${after.toFixed(2)}\n` +
+                `🔗 TxID: <code>${String(txid).slice(0, 40)}</code> · ${network}\n` +
+                `<i>تحقق منو Binance مباشرة، ما فاتش الحد المسموح.</i>`,
+          dedupeKey: `agent_auto_credit:${txid}`,
+        });
+      } catch (_) {}
+      require('./agentMemory').logChat('event', `⚡️ يمان زاد $${amount.toFixed(2)} أوتوماتيك (TxID ${txid}) بلا تأكيد`);
+      ctx.emit({ type: 'auto_credit', user_id: userId, amount, txid, ok: true });
+      return { id: c.id, output: JSON.stringify({ credited: true, amount, customer_notified: sentToCustomer }) };
     }
     if (out && out.action_id) ctx.emit({ type: 'action', action: out });
     if (c.name === 'propose_stock' && out && out.stock_draft_id) {
@@ -845,7 +883,9 @@ router.get('/brief', requireToken, (req, res) => {
 });
 
 function costSettings() {
-  return { daily_budget_usd: String(budget()), allow_deep: mem.getState('allow_deep', '1'), auto_reply: mem.getState('auto_reply', '0'), usage_today: usageToday() };
+  return { daily_budget_usd: String(budget()), allow_deep: mem.getState('allow_deep', '1'),
+    auto_reply: mem.getState('auto_reply', '0'), auto_credit: mem.getState('auto_credit', '0'),
+    usage_today: usageToday() };
 }
 // ── Voice ────────────────────────────────────────────────────────────────────
 //
@@ -938,6 +978,7 @@ router.post('/settings', requireToken, (req, res) => {
   }
   if (b.allow_deep !== undefined) mem.setState('allow_deep', b.allow_deep === '1' || b.allow_deep === true ? '1' : '0');
   if (b.auto_reply !== undefined) mem.setState('auto_reply', b.auto_reply === '1' || b.auto_reply === true ? '1' : '0');
+  if (b.auto_credit !== undefined) mem.setState('auto_credit', b.auto_credit === '1' || b.auto_credit === true ? '1' : '0');
   res.json({ ...require('./agentWatch').saveSettings(b), ...costSettings() });
 });
 

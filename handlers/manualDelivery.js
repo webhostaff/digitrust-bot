@@ -108,7 +108,9 @@ async function openManualDelivery(bot, order, paymentMethod) {
                   (r.needLogin ? '\n🔑 Session expired — paste a fresh CANVA_SESSION.' : '') +
                   // The invite may already be in Canva: inviting again would
                   // send the customer a second email. Say so loudly.
-                  (r.invited ? '\n\n⚠️ <b>Already invited in Canva — do NOT invite again.</b> Open People → this email\'s pending invite → copy its link.' : '') +
+                  (r.invited === true ? '\n\n⚠️ <b>Already invited in Canva — do NOT invite again.</b> People → search this email → <b>Copy link</b>.'
+                    : r.invited === 'maybe' ? '\n\n🔎 <b>May already be invited</b> — search this email in People first; invite only if it is not there.'
+                    : '\n\n➕ <b>Not invited yet</b> — invite this email as usual.') +
                   `\n\n<i>The manual task below is ready as usual.</i>`,
             dedupeKey: `canva_fail:${row.id}`, refType: 'manual_delivery', refId: row.id,
           });

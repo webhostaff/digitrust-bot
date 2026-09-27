@@ -2222,5 +2222,26 @@ try {
 
 // ── Start Support Bot ─────────────────────────────────────────────────
 require('./support-bot');
-try { require('./chatgpt-bot'); } catch (e) { logger.warn('chatgpt-bot load: ' + e.message); }
+let chatgptBotModule = null;
+try { chatgptBotModule = require('./chatgpt-bot'); } catch (e) { logger.warn('chatgpt-bot load: ' + e.message); }
+
+// ── ChatGPT Business Guard integration (separate bot/service) ──────────
+// Inbound: the guard bot reports back whether an invite it sent was
+// verified in Pending invites, so a seat can be activated automatically
+// instead of the admin needing to notice and tap the button by hand.
+// Mounted only when GUARD_SECRET is configured, so the route doesn't
+// exist at all (rather than existing but always 401) until set up.
+if (process.env.GUARD_SECRET) {
+  if (chatgptBotModule && chatgptBotModule.activateAndNotifySeat) {
+    const { makeGuardWebhookHandler } = require('./services/cgbGuard');
+    const { notifyAdmin } = require('./services/adminNotify');
+    app.post('/webhook/cgb-guard-status', makeGuardWebhookHandler({
+      queries: db, logger, bot, notifyAdmin,
+      activateAndNotifySeat: chatgptBotModule.activateAndNotifySeat,
+    }));
+    logger.info('ChatGPT Business Guard callback route mounted at /webhook/cgb-guard-status');
+  } else {
+    logger.warn('GUARD_SECRET is set but the ChatGPT Business bot did not load — /webhook/cgb-guard-status not mounted.');
+  }
+}
 
