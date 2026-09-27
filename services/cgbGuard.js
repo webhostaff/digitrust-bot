@@ -33,7 +33,30 @@
 
 const logger = require('../utils/logger');
 
-const GUARD_URL    = (process.env.GUARD_AUTO_INVITE_URL || '').trim();      // e.g. https://chatgpt-business-guard-production.up.railway.app/auto-invite
+/**
+ * Forgive the usual copy-paste mistakes in GUARD_AUTO_INVITE_URL (a real case
+ * logged "Invalid URL" on every paid order): surrounding quotes or spaces, no
+ * "https://", or just the domain without "/auto-invite". Anything still not a
+ * valid address is kept as typed so the startup log and /guardtest can show
+ * the owner exactly what is wrong with it (e.g. a literal "<...>" left from
+ * the example).
+ */
+function normalizeGuardUrl(raw) {
+  let v = String(raw || '').trim().replace(/^['"\s]+|['"\s]+$/g, '');
+  if (!v) return '';
+  if (!/^https?:\/\//i.test(v)) v = 'https://' + v.replace(/^\/+/, '');
+  try {
+    const u = new URL(v);
+    if (!u.hostname.includes('.')) return String(raw).trim();
+    if (u.pathname === '/' || u.pathname === '') u.pathname = '/auto-invite';
+    return u.toString();
+  } catch (_) {
+    return String(raw).trim();
+  }
+}
+const GUARD_URL_RAW = process.env.GUARD_AUTO_INVITE_URL || '';
+const GUARD_URL    = normalizeGuardUrl(GUARD_URL_RAW);
+function guardUrlValid() { try { new URL(GUARD_URL); return true; } catch (_) { return false; } }      // e.g. https://chatgpt-business-guard-production.up.railway.app/auto-invite
 const GUARD_PANEL   = (process.env.GUARD_PANEL_ID || '').trim();            // e.g. panel26 — omit if the guard only has one panel
 const SHARED_SECRET = (process.env.GUARD_SECRET || '').trim();
 const FETCH_TIMEOUT_MS = 10000;
@@ -56,7 +79,11 @@ async function fetchWithTimeout(url, opts) {
  * takes over from here; results come back later via handleGuardCallback.
  */
 async function notifyGuardOfNewInvite(email, { orderId = null } = {}) {
-  if (!GUARD_URL || !SHARED_SECRET) return; // integration not configured — silent no-op
+  if (!GUARD_URL || !SHARED_SECRET) return; // integration not configured (the startup log says so)
+  if (!guardUrlValid()) {
+    logger.warn(`[cgbGuard] order #${orderId} NOT sent to the invite bot: GUARD_AUTO_INVITE_URL is not a valid address ("${GUARD_URL_RAW}")`);
+    return;
+  }
   const clean = String(email || '').trim().toLowerCase();
   if (!clean || !clean.includes('@')) return;
   try {
@@ -98,6 +125,12 @@ function makeGuardWebhookHandler({ queries, logger: log, activateAndNotifySeat, 
     const clean = String(email || '').trim().toLowerCase();
     if (!clean || !clean.includes('@')) {
       return res.status(400).json({ error: 'email required' });
+    }
+
+    // /digitrusttest from the invite bot: answer OK, touch nothing.
+    if (clean === 'connection-test@digitrust.invalid') {
+      log.info('[cgbGuard] connection test from the invite bot — OK');
+      return res.json({ ok: true, test: true });
     }
 
     const sub = queries.getPendingCgbSubscriptionByEmail(clean);
@@ -166,4 +199,69 @@ async function cancelGuardInvite(email, { orderId = null } = {}) {
   }
 }
 
-module.exports = { notifyGuardOfNewInvite, makeGuardWebhookHandler, cancelGuardInvite };
+// Say at startup whether the integration is on — "nothing happens" used to
+// look exactly the same whether a variable was missing or misspelled.
+if (GUARD_URL && SHARED_SECRET && !guardUrlValid()) {
+  logger.warn(`[cgbGuard] integration OFF — GUARD_AUTO_INVITE_URL is not a valid address: "${GUARD_URL_RAW}". It must look like https://your-invite-bot.up.railway.app/auto-invite`);
+} else if (GUARD_URL && SHARED_SECRET) {
+  logger.info(`[cgbGuard] integration ON → ${GUARD_URL}${GUARD_PANEL ? ` (panel ${GUARD_PANEL})` : ''}${GUARD_URL !== GUARD_URL_RAW.trim() ? ` (fixed from "${GUARD_URL_RAW}")` : ''}`);
+} else {
+  logger.warn(`[cgbGuard] integration OFF — missing: ${[!GUARD_URL && 'GUARD_AUTO_INVITE_URL', !SHARED_SECRET && 'GUARD_SECRET'].filter(Boolean).join(', ')}`);
+}
+
+/**
+ * /guardtest — checks the whole DIGITRUST → invite-bot connection WITHOUT
+ * queueing anyone or buying anything, and says in plain words what is wrong.
+ * Uses /cancel-invite with an address that can never be queued, which needs
+ * the right address, the right secret and a ready panel — the same three
+ * things a real invite needs. Returns { ok, lines }.
+ */
+async function diagnose() {
+  const lines = [];
+  if (!GUARD_URL) lines.push('❌ <b>GUARD_AUTO_INVITE_URL</b> is empty in DIGITRUST → Variables.');
+  if (!SHARED_SECRET) lines.push('❌ <b>GUARD_SECRET</b> is empty in DIGITRUST → Variables.');
+  if (!GUARD_URL || !SHARED_SECRET) return { ok: false, lines };
+
+  let url;
+  try { url = new URL(GUARD_URL); } catch (_) {
+    lines.push(`❌ GUARD_AUTO_INVITE_URL is not a valid address: <code>${String(GUARD_URL_RAW).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</code>\nIt must look like <code>https://your-invite-bot.up.railway.app/auto-invite</code> — no spaces, no quotes, no &lt; &gt;.`);
+    return { ok: false, lines };
+  }
+  if (!/\/auto-invite\/?$/.test(url.pathname)) {
+    lines.push('⚠️ GUARD_AUTO_INVITE_URL should end with <code>/auto-invite</code>.');
+  }
+  lines.push(`🔗 Invite bot: <code>${url.origin}</code>${GUARD_PANEL ? ` · panel <code>${GUARD_PANEL}</code>` : ''}`);
+
+  try {
+    const h = await fetchWithTimeout(`${url.origin}/health`, { method: 'GET' });
+    if (!h.ok) { lines.push(`❌ The invite bot answered HTTP ${h.status} — is it running?`); return { ok: false, lines }; }
+    lines.push('✅ The invite bot is reachable.');
+  } catch (e) {
+    lines.push(`❌ Cannot reach the invite bot at that address (${e.name === 'AbortError' ? 'timeout' : e.message}). Check the domain.`);
+    return { ok: false, lines };
+  }
+
+  const cancelUrl = new URL(url.toString());
+  cancelUrl.pathname = cancelUrl.pathname.replace(/auto-invite\/?$/, 'cancel-invite');
+  try {
+    const r = await fetchWithTimeout(cancelUrl.toString(), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Invite-Secret': SHARED_SECRET },
+      body: JSON.stringify({ email: 'connection-test@digitrust.invalid', ...(GUARD_PANEL ? { panel: GUARD_PANEL } : {}) }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (r.status === 401) { lines.push('❌ <b>The secret does not match.</b> GUARD_SECRET here must be exactly the same as AUTO_INVITE_SECRET in the invite bot.'); return { ok: false, lines }; }
+    if (r.status === 404) { lines.push('⚠️ The invite bot is an older version (no /cancel-invite). Deploy its latest file, then test again.'); return { ok: false, lines }; }
+    if (r.status === 503) { lines.push(`⚠️ Secret OK, but panel <code>${body.panel || GUARD_PANEL || '?'}</code> is not ready in the invite bot (session not uploaded, or wrong GUARD_PANEL_ID).`); return { ok: false, lines }; }
+    if (!r.ok || !body.status) { lines.push(`❌ Unexpected answer: HTTP ${r.status}`); return { ok: false, lines }; }
+    lines.push('✅ Secret matches and the panel is ready.');
+  } catch (e) {
+    lines.push(`❌ Connection check failed: ${e.message}`);
+    return { ok: false, lines };
+  }
+  lines.push('✅ <b>DIGITRUST → invite bot works.</b> Paid orders will be queued automatically.');
+  lines.push('<i>For the other direction (green card), send /digitrusttest to the invite bot.</i>');
+  return { ok: true, lines };
+}
+
+module.exports = { notifyGuardOfNewInvite, makeGuardWebhookHandler, cancelGuardInvite, diagnose, _normalizeGuardUrl: normalizeGuardUrl };

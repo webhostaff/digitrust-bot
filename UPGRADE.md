@@ -1628,3 +1628,36 @@ For a customer who asks for a refund before their seat is activated.
   wallet refund, double tap, cancel-only, active seat refused, activation race,
   invite bot busy), the SQL on a real SQLite engine, the new invite-bot SQL on
   a real PostgreSQL, and both ends of the bot-to-bot call.
+
+# Part 51 — /guardtest: see exactly why the two bots aren't talking (v118)
+
+"Nothing happened in the invite bot" looked the same for every cause: a
+missing or misspelled variable silently disabled the integration, with not
+even a log line.
+
+* Startup log now says `[cgbGuard] integration ON → <url>` or
+  `integration OFF — missing: GUARD_AUTO_INVITE_URL, GUARD_SECRET`.
+* **/guardtest** (ChatGPT Business bot, admin only, in the ☰ menu) checks the
+  whole DIGITRUST → invite-bot link WITHOUT queueing anyone or buying
+  anything, and answers in plain words: variable missing, address not a URL,
+  invite bot unreachable, secret mismatch, panel not ready, invite bot too old,
+  or ✅ ready. It uses /cancel-invite with an address that can never be queued.
+* The invite bot's matching **/digitrusttest** checks the other direction
+  (green cards). DIGITRUST answers that test address with OK and touches no
+  order.
+* Tested with the real invite-bot web server and the real DIGITRUST endpoint,
+  both directions, five situations each.
+
+# Part 52 — GUARD_AUTO_INVITE_URL copy-paste mistakes (v119)
+
+A real case: every paid order logged `[cgbGuard] could not reach the guard
+bot … Invalid URL` — the variable was set, but not a valid address.
+
+* The value is now cleaned up automatically when the mistake is obvious:
+  surrounding quotes/spaces, missing `https://`, or only the domain (then
+  `/auto-invite` is added).
+* If it still isn't a valid address (e.g. the example's `<…>` copied
+  literally), the startup log says `integration OFF — GUARD_AUTO_INVITE_URL
+  is not a valid address: "…"`, each order logs the same instead of a bare
+  "Invalid URL", and /guardtest shows the exact value and what it must look
+  like.

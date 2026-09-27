@@ -906,6 +906,16 @@ async function handleRenewalsCallback(q) {
   }).catch(() => {});
 }
 
+// Admin: test the link to the invite bot (no queueing, no purchase).
+bot.onText(/^\/guardtest$/i, async (msg) => {
+  if (String(msg.from.id) !== String(ADMIN_ID)) return;
+  const wait = await bot.sendMessage(msg.chat.id, '⏳ Testing the connection to the invite bot…').catch(() => null);
+  const r = await cgbGuard.diagnose().catch((e) => ({ ok: false, lines: [`❌ ${e.message}`] }));
+  const text = `${r.ok ? '🟢' : '🔴'} <b>Invite bot connection</b>\n\n${r.lines.join('\n')}`;
+  if (wait) await bot.editMessageText(text, { chat_id: msg.chat.id, message_id: wait.message_id, parse_mode: 'HTML' }).catch(() => bot.sendMessage(msg.chat.id, text, { parse_mode: 'HTML' }));
+  else await bot.sendMessage(msg.chat.id, text, { parse_mode: 'HTML' });
+});
+
 bot.onText(/^\/renewals?$/i, async (msg) => {
   if (String(msg.from.id) !== String(ADMIN_ID)) return; // silent for everyone else
   const view = renewalsHome(renewalBoard());
@@ -2450,6 +2460,7 @@ if (ADMIN_ID) {
     { command: 'addseat',  description: '➕ Add a seat manually (admin)' },
     { command: 'setprice', description: '💰 Custom price for a customer (admin)' },
     { command: 'prices',   description: '💰 List custom prices (admin)' },
+    { command: 'guardtest', description: '🔌 Test the link to the invite bot (admin)' },
   ], { scope: { type: 'chat', chat_id: Number(ADMIN_ID) } })
     .then(() => logger.info('CGB admin commands registered'))
     .catch((e) => logger.warn(`CGB admin setMyCommands: ${e.message}`));
