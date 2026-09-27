@@ -96,8 +96,43 @@ async function openManualDelivery(bot, order, paymentMethod) {
       } else {
         logger.warn(`[canva] auto-invite failed for #${order.id}: ${r.reason}` +
           (r.needLogin ? ' (needs re-login)' : '') + ' — handing to manual');
+        // Tell the owner WHY, in Telegram. This used to require('./canvaAlert'),
+        // a file that never existed — the throw was swallowed, so a failed
+        // auto-invite left no trace except the server log.
         try {
-          require('./canvaAlert') && require('../services/agentMemory')
+          await notifyAdmin(bot, {
+            type: 'manual_delivery',
+            title: '⚠️ Canva auto-invite failed → manual',
+            body: `🆔 Order #${order.id}\n📧 <code>${escapeHtml(order.email)}</code>\n` +
+                  `❌ ${escapeHtml(String(r.reason || 'unknown'))}` +
+                  (r.needLogin ? '\n🔑 Session expired — paste a fresh CANVA_SESSION.' : '') +
+                  // The invite may already be in Canva: inviting again would
+                  // send the customer a second email. Say so loudly.
+                  (r.invited ? '\n\n⚠️ <b>Already invited in Canva — do NOT invite again.</b> Open People → this email\'s pending invite → copy its link.' : '') +
+                  `\n\n<i>The manual task below is ready as usual.</i>`,
+            dedupeKey: `canva_fail:${row.id}`, refType: 'manual_delivery', refId: row.id,
+          });
+        } catch (_) {}
+        // What the bot saw (screenshot + buttons + masked links), so the next
+        // fix is based on Canva's real page, not guesses.
+        if (r.debug) {
+          const d = r.debug;
+          const cap = `🔍 <b>Canva page after the invite</b> (order #${order.id})\n` +
+            (d.url ? `🌐 <code>${escapeHtml(String(d.url).slice(0, 100))}</code>\n` : '') +
+            `🔗 team links: ${d.links?.team?.length || 0} · after invite: ${d.links?.after_invite?.length || 0}\n` +
+            (d.buttons?.length ? `🔘 ${escapeHtml(d.buttons.slice(0, 25).join(' · ')).slice(0, 700)}` : '');
+          // ADMIN_IDS plus the legacy single ADMIN_ID, deduped.
+          const admins = [...new Set([...(config.adminIds || []), Number(process.env.ADMIN_ID) || 0].filter(Boolean))];
+          for (const adminId of admins) {
+            try {
+              if (d.shot) await bot.sendPhoto(adminId, d.shot, { caption: cap.slice(0, 1020), parse_mode: 'HTML' }, { filename: 'canva.jpg', contentType: 'image/jpeg' });
+              else await bot.sendMessage(adminId, cap, { parse_mode: 'HTML' });
+            } catch (_) {}
+          }
+          try { require('../services/agentMemory').setState('canva_last_failure', JSON.stringify({ at: new Date().toISOString(), order: order.id, reason: r.reason, url: d.url, buttons: d.buttons, links: d.links })); } catch (_) {}
+        }
+        try {
+          require('../services/agentMemory')
             .logChat('event', `⚠️ Canva أوتوماتيك ما نجّمش (${r.reason}) — الطلب #${order.id} ولّى يدوي` +
               (r.needLogin ? '. لازم تسجّل الدخول من جديد.' : ''));
         } catch (_) {}

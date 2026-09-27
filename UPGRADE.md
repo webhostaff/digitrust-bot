@@ -1414,3 +1414,50 @@ was correct; Railway was still serving an older build.
 * Tested: the bot's own launch code starts a real Chromium and streams a
   screenshot; volume detection against real mounts; the whole v109 suite.
   The Docker build itself cannot run in the sandbox (no Docker).
+
+# Part 44 — "Check login did nothing" + silent invite failures (v111)
+
+* **Check login looked dead.** The main callback router (`handleCallbackQuery`)
+  also receives every button tap and answers it at once with an empty reply.
+  Telegram accepts one answer per tap, so the Canva result popup, sent 10–30 s
+  later, was rejected and swallowed. All `canva_*` buttons now reply with
+  MESSAGES: "⏳ Checking…", then the result.
+* **Check login sends a screenshot** of what the server sees (plus the URL on
+  failure), so a login wall, a security check or a changed page can be told
+  apart at a glance.
+* **Failed auto-invites were silent.** The failure path called
+  `require('./canvaAlert')`, a file that never existed; the throw was
+  swallowed, so the owner never learned why an order went manual. It now sends
+  a Telegram alert "⚠️ Canva auto-invite failed → manual" with the reason (and
+  a hint to paste a fresh CANVA_SESSION when the session expired); the manual
+  task still opens as before.
+* Tested with a mock Telegram enforcing the one-answer-per-tap rule, the real
+  failure path of `openManualDelivery`, and a real Chromium screenshot.
+
+# Part 45 — Canva: catching the invite link for real (v112)
+
+Order #17989 proved the session works (the bot reached People and invited the
+email) but ended with "invited, but no link appeared". The link hunt was
+rebuilt around three independent sources:
+
+* **Network** — every JSON/text response Canva's app receives is scanned for a
+  `canva.com/brand/join?…` URL (JSON-escaped `\/` and `\u0026` handled). The
+  invite API reply usually carries it, with no dependence on button labels.
+* **Copy hook** — an init script wraps `navigator.clipboard.writeText/write`,
+  `execCommand('copy')` and the copy event, so whatever a "Copy link" button
+  copies is recorded (headless Chromium cannot read the clipboard back).
+* **DOM + pending-invite menu** — inputs/hrefs/text, and the invited row's
+  "…" → "Copy invite link".
+
+**Public-link guard (owner's hard rule):** join links seen before the email is
+typed (page load, invite dialog) are the team's shared link and are never
+accepted; a link already delivered to a different email is rejected too. A
+doubtful case goes to manual instead of leaking.
+
+**Failure report:** the admin gets the Canva screenshot, the visible buttons
+and the (masked) links seen, plus "Already invited — do NOT invite again" so
+the customer does not get two emails. Also stored as `canva_last_failure`.
+
+Tested with real Chromium through the full `inviteEmail()` against a fake
+Canva page: link in the network reply; link only behind "…" → Copy invite
+link; only the team link available (refused, no leak); reused-link rejection.

@@ -291,9 +291,14 @@ async function checkLogin() {
       await page.goto(PEOPLE_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
       const loggedIn = await isOnPeoplePage(page);
       if (loggedIn) await saveSession(ctx);
-      return { ok: loggedIn, reason: loggedIn ? 'ok' : 'not logged in' };
+      // A picture of what the server actually sees: "not logged in" alone
+      // cannot tell a login wall from a security check or a changed page.
+      const shot = await page.screenshot({ type: 'jpeg', quality: 60 }).catch(() => null);
+      return { ok: loggedIn, reason: loggedIn ? 'ok' : 'not logged in', url: page.url(), shot };
     } catch (e) {
-      return { ok: false, reason: e.message };
+      let shot = null;
+      try { const pg = ctx && ctx.pages()[0]; if (pg) shot = await pg.screenshot({ type: 'jpeg', quality: 60 }); } catch (_) {}
+      return { ok: false, reason: e.message, shot };
     } finally {
       if (ctx) await ctx.close().catch(() => {});
     }
@@ -396,10 +401,24 @@ async function inviteEmail(email) {
     const gap = Date.now() - lastInviteAt;
     if (gap < MIN_GAP_MS) await sleep(MIN_GAP_MS - gap + rand(200, 1200));
 
-    let ctx;
+    let ctx, page;
+    // What we saw, for the link hunt and for the owner's report on failure.
+    const trace = { phase: 'load', baseline: new Set(), net: new Set(), copied: new Set(), dom: new Set(), sent: false };
     try {
       ctx = await newContext(true);
-      const page = await ctx.newPage();
+      await ctx.addInitScript(COPY_HOOK);
+      await ctx.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: 'https://www.canva.com' }).catch(() => {});
+      page = await ctx.newPage();
+      // Listen BEFORE navigating: links in the page-load responses are the
+      // team's own (baseline); links arriving after "send" are the customer's.
+      page.on('response', async (resp) => {
+        try {
+          const ct = (resp.headers()['content-type'] || '').toLowerCase();
+          if (!/json|text|javascript/.test(ct)) return;
+          const found = findJoinLinks(await resp.text());
+          for (const l of found) (trace.phase === 'load' ? trace.baseline : trace.net).add(l);
+        } catch (_) {}
+      });
       await page.goto(PEOPLE_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
 
       if (!(await isOnPeoplePage(page))) {
@@ -407,13 +426,13 @@ async function inviteEmail(email) {
         return { ok: false, reason: 'session expired', needLogin: true };
       }
 
-      const link = await doInvite(page, clean);
+      const link = await doInvite(page, clean, trace);
       lastInviteAt = Date.now();
       await saveSession(ctx); // keep the session warm
-      if (link) return { ok: true, link };
-      return { ok: false, reason: 'invited, but no link appeared' };
+      if (link) { rememberLink(link, clean); return { ok: true, link }; }
+      return { ok: false, reason: 'invited, but no link appeared', invited: true, debug: await failureDebug(page, trace) };
     } catch (e) {
-      return { ok: false, reason: e.message };
+      return { ok: false, reason: e.message, invited: trace.sent, debug: page ? await failureDebug(page, trace) : null };
     } finally {
       if (ctx) await ctx.close().catch(() => {});
     }
@@ -421,65 +440,203 @@ async function inviteEmail(email) {
 }
 
 /**
- * Drive the invite UI. Kept tolerant: Canva changes labels, so several
- * selectors are tried for each step and the copied link is read from whichever
- * surface shows it (a readonly input, or the clipboard).
+ * Drive the invite UI and come back with THIS email's personal join link.
+ *
+ * v1 found the invite part fine but lost the link ("invited, but no link
+ * appeared" — order #17989). The link is now caught three independent ways,
+ * because Canva's page cannot be seen from the dev sandbox and its UI shifts:
+ *   1. NETWORK — every JSON/text response Canva's own app receives is scanned
+ *      for a brand/join URL. The invite API usually returns it; no UI needed.
+ *   2. COPY HOOK — an init script wraps navigator.clipboard.writeText/write,
+ *      execCommand('copy') and the copy event, so whatever a "Copy link"
+ *      button copies is recorded even though headless Chromium cannot read
+ *      the clipboard back.
+ *   3. DOM — inputs, hrefs and page text, after also trying the pending
+ *      invite's "…" menu → "Copy invite link".
+ *
+ * SAFETY — never hand out the team's PUBLIC link (the owner's hard rule):
+ *   - every join link seen BEFORE the email is typed is baseline (the
+ *     team-wide "invite via link") and is never accepted;
+ *   - a link already delivered to a DIFFERENT email is rejected too (a
+ *     personal link is unique; a repeat means it is shared);
+ * so a doubtful case fails to the manual lane instead of leaking.
  */
-async function doInvite(page, email) {
-  // Open the invite dialog if the email box is not already visible.
+async function doInvite(page, email, trace) {
   const emailSel = 'input[type="email"], input[placeholder*="email" i]';
+
+  // Baseline: links that exist before this invite belong to the team, not the customer.
+  await sleep(1500);
+  for (const l of await domLinks(page)) trace.baseline.add(l);
+  for (const l of trace.net) trace.baseline.add(l);
+  trace.net.clear();
+
   if (!(await visible(page, emailSel))) {
     await clickAny(page, [
-      () => page.getByRole('button', { name: /invite (people|members)/i }).first(),
+      () => page.getByRole('button', { name: /invite (people|members|to team)/i }).first(),
       () => page.getByRole('button', { name: /^invite/i }).first(),
     ]);
     await page.waitForSelector(emailSel, { timeout: 10000 });
+    await sleep(800);
+    for (const l of await domLinks(page)) trace.baseline.add(l); // the dialog's own team link
   }
+  trace.phase = 'invite'; // from here on, network links count as the customer's
 
   const box = page.locator(emailSel).first();
   await box.click();
   await box.fill(email);
   await page.keyboard.press('Enter').catch(() => {});
-  await sleep(rand(500, 1200));
+  await sleep(rand(600, 1200));
 
-  // Confirm / send.
   await clickAny(page, [
+    () => page.getByRole('button', { name: /send invit/i }).first(),
     () => page.getByRole('button', { name: /confirm and invite/i }).first(),
-    () => page.getByRole('button', { name: /send invite/i }).first(),
     () => page.getByRole('button', { name: /^invite$/i }).first(),
+    () => page.getByRole('button', { name: /^send$/i }).first(),
     () => page.getByRole('button', { name: /confirm/i }).first(),
   ]);
-
-  // The personal link appears on a "copy link" step. Grant clipboard and read.
-  await page.context().grantPermissions(['clipboard-read', 'clipboard-write']).catch(() => {});
-  const link = await readInviteLink(page);
-  return link;
+  trace.sent = true;
+  return readInviteLink(page, email, trace);
 }
 
-async function readInviteLink(page) {
-  const deadline = Date.now() + 15000;
+async function readInviteLink(page, email, trace) {
+  const pick = () => {
+    const all = [...trace.net, ...trace.copied, ...trace.dom];
+    return all.find((l) => !trace.baseline.has(l) && !deliveredElsewhere(l, email)) || null;
+  };
+  const collect = async () => {
+    for (const l of await domLinks(page)) trace.dom.add(l);
+    for (const l of await copiedLinks(page)) trace.copied.add(l);
+  };
+  const deadline = Date.now() + 20000;
+  let triedMenu = false;
   while (Date.now() < deadline) {
-    // 1) a readonly input holding the link
-    const val = await page.evaluate(() => {
-      const ins = [...document.querySelectorAll('input')];
-      const hit = ins.map((i) => i.value || '').find((v) => /canva\.com\/(brand\/join|.*invite)/i.test(v));
-      return hit || null;
-    }).catch(() => null);
-    if (val) return val.trim();
+    await collect();
+    const hit = pick(); if (hit) return hit;
 
-    // 2) click a "Copy link" control, then read the clipboard
-    const copied = await clickAny(page, [
-      () => page.getByRole('button', { name: /copy link/i }).first(),
-      () => page.getByRole('button', { name: /copy/i }).first(),
-    ]).catch(() => false);
-    if (copied) {
-      await sleep(400);
-      const clip = await page.evaluate(() => navigator.clipboard.readText().catch(() => '')).catch(() => '');
-      if (clip && /canva\.com\/(brand\/join|.*invite)/i.test(clip)) return clip.trim();
+    // After a few seconds with nothing: the pending invite row for this email,
+    // "…" / More → "Copy invite link".
+    if (!triedMenu && Date.now() > deadline - 15000) {
+      triedMenu = true;
+      await page.keyboard.press('Escape').catch(() => {}); // close the invite dialog
+      await sleep(700);
+      try {
+        const row = page.getByText(email, { exact: false }).first();
+        if (await row.isVisible({ timeout: 2500 })) {
+          const box = row.locator('xpath=ancestor::*[.//button][1]');
+          await clickAny(page, [
+            () => box.getByRole('button', { name: /more|options|actions|…|\.\.\./i }).first(),
+            () => box.locator('button').last(),
+          ]);
+          await sleep(500);
+          await clickAny(page, [
+            () => page.getByRole('menuitem', { name: /copy (invite )?link/i }).first(),
+            () => page.getByRole('button', { name: /copy (invite )?link/i }).first(),
+            () => page.getByText(/copy (invite )?link/i).first(),
+          ]);
+          await sleep(600);
+        }
+      } catch (_) {}
+      continue;
     }
-    await sleep(700);
+    await sleep(800);
   }
-  return null;
+  await collect();
+  return pick();
+}
+
+// ── Link finding ──────────────────────────────────────────────────────────────
+
+const JOIN_RE = /https?:\/\/(?:www\.)?canva\.com\/brand\/join\?[^\s"'<>\\)]+/gi;
+
+/** All brand/join links in a blob of text (JSON-escaped or HTML-escaped). */
+function findJoinLinks(text) {
+  const t = String(text || '')
+    .replace(/\\u002[fF]/g, '/').replace(/\\u0026/g, '&').replace(/\\\//g, '/')
+    .replace(/&amp;/g, '&');
+  return [...new Set((t.match(JOIN_RE) || []).map((l) => l.replace(/[.,;]+$/, '')))];
+}
+
+async function domLinks(page) {
+  const blob = await page.evaluate(() => {
+    const parts = [];
+    document.querySelectorAll('input,textarea').forEach((i) => parts.push(i.value || ''));
+    document.querySelectorAll('a[href]').forEach((a) => parts.push(a.href));
+    parts.push(document.body ? document.body.innerText : '');
+    return parts.join('\n');
+  }).catch(() => '');
+  return findJoinLinks(blob);
+}
+
+async function copiedLinks(page) {
+  const list = await page.evaluate(() => (window.__dtCopied || []).slice()).catch(() => []);
+  return findJoinLinks(list.join('\n'));
+}
+
+/** Installed before any Canva script runs: records what "Copy" buttons copy. */
+const COPY_HOOK = `(() => {
+  window.__dtCopied = [];
+  const rec = (t) => { try { if (t) window.__dtCopied.push(String(t)); } catch (_) {} };
+  try {
+    if (navigator.clipboard) {
+      const w = navigator.clipboard.writeText && navigator.clipboard.writeText.bind(navigator.clipboard);
+      navigator.clipboard.writeText = (t) => { rec(t); return w ? w(t).catch(() => {}) : Promise.resolve(); };
+      const wr = navigator.clipboard.write && navigator.clipboard.write.bind(navigator.clipboard);
+      navigator.clipboard.write = async (items) => {
+        try { for (const it of items || []) for (const ty of it.types || []) if (/text/.test(ty)) rec(await (await it.getType(ty)).text()); } catch (_) {}
+        return wr ? wr(items).catch(() => {}) : undefined;
+      };
+    }
+    const ex = document.execCommand.bind(document);
+    document.execCommand = (cmd, ...a) => {
+      if (String(cmd).toLowerCase() === 'copy') {
+        const sel = document.getSelection && String(document.getSelection());
+        const el = document.activeElement;
+        rec(sel || (el && el.value));
+      }
+      return ex(cmd, ...a);
+    };
+    document.addEventListener('copy', (e) => { try { rec(String(document.getSelection())); } catch (_) {} }, true);
+  } catch (_) {}
+})();`;
+
+/** Remember which email got which link, to spot a shared (public) link. */
+function linkKey(l) { return require('crypto').createHash('sha256').update(l).digest('hex').slice(0, 20); }
+function deliveredElsewhere(link, email) {
+  const map = mem.getState('canva_links', null) || {};
+  const who = map[linkKey(link)];
+  return !!(who && who !== String(email).toLowerCase());
+}
+function rememberLink(link, email) {
+  const map = mem.getState('canva_links', null) || {};
+  map[linkKey(link)] = String(email).toLowerCase();
+  const keys = Object.keys(map); // keep the last 2000
+  if (keys.length > 2000) for (const k of keys.slice(0, keys.length - 2000)) delete map[k];
+  mem.setState('canva_links', map);
+}
+
+/** Screenshot + what the page offers + which links were seen, for the owner. */
+async function failureDebug(page, trace) {
+  const shot = await page.screenshot({ type: 'jpeg', quality: 60 }).catch(() => null);
+  const buttons = await describePage(page);
+  // Masked, never raw: a team link must not end up pasted anywhere.
+  const mask = (l) => l.replace(/(token=)([^&]{4})[^&]*/i, '$1$2…');
+  return {
+    shot, url: page.url(), buttons,
+    links: { team: [...trace.baseline].map(mask), after_invite: [...new Set([...trace.net, ...trace.copied, ...trace.dom])].map(mask) },
+  };
+}
+
+/** Visible buttons / menu items / links, for the owner's failure report. */
+async function describePage(page) {
+  return page.evaluate(() => {
+    const txt = (el) => (el.innerText || el.getAttribute('aria-label') || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+    const seen = new Set(); const out = [];
+    document.querySelectorAll('button,[role="button"],[role="menuitem"],a').forEach((el) => {
+      const r = el.getBoundingClientRect(); if (!r.width || !r.height) return;
+      const t = txt(el); if (t && !seen.has(t)) { seen.add(t); out.push(t); }
+    });
+    return out.slice(0, 40);
+  }).catch(() => []);
 }
 
 // ── Small helpers ─────────────────────────────────────────────────────────────
@@ -519,5 +676,5 @@ module.exports = {
   available, status, checkLogin, inviteEmail, selfTest,
   startLogin, loginShot, loginClick, loginType, loginKey, finishLogin, endLogin,
   forgetSession, importEnvSession,
-  _test: { parseSessionText, resolveDataDir, volumeCheck, DATA_DIR, STORAGE },
+  _test: { parseSessionText, resolveDataDir, volumeCheck, findJoinLinks, doInvite, COPY_HOOK, rememberLink, deliveredElsewhere, DATA_DIR, STORAGE },
 };

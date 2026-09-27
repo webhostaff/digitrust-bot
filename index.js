@@ -708,20 +708,39 @@ bot.onText(/^\/canva$/i, async (msg) => {
 
 bot.on('callback_query', async (q) => {
   if (!adminHandler.isAdmin(q.from.id)) return;
+  if (!/^canva_/.test(q.data || '')) return;
   const canva = require('./services/canvaBot');
+  const chatId = q.message.chat.id;
+  // WHY results go in MESSAGES, never in the tap popup: the main callback
+  // router (handleCallbackQuery) also receives this tap and answers it with an
+  // empty reply straight away. Telegram accepts ONE answer per tap, so a popup
+  // sent after a 10–20 s Canva check was silently dropped — the button "did
+  // nothing". A message always arrives, however long the check takes.
   if (q.data === 'canva_check') {
+    const wait = await bot.sendMessage(chatId, '⏳ Checking Canva from the server… (10–30 s)').catch(() => null);
     const st = await canva.checkLogin();
-    await bot.answerCallbackQuery(q.id, { text: st.ok ? '✅ Logged in and reachable' : `🔴 ${st.reason}`, show_alert: true }).catch(() => {});
+    const txt = st.ok
+      ? '✅ <b>Canva accepted the session.</b> Invites will run automatically.\n\nNext: place one test order with a second email of yours.'
+      : `🔴 <b>Canva check failed:</b> ${escapeHtml(String(st.reason || '?'))}` +
+        (st.url ? `\n🌐 <code>${escapeHtml(String(st.url).slice(0, 120))}</code>` : '') +
+        '\n\n<i>The picture shows what the server sees.</i>';
+    if (wait) bot.deleteMessage(chatId, wait.message_id).catch(() => {});
+    if (st.shot) {
+      await bot.sendPhoto(chatId, st.shot, { caption: txt, parse_mode: 'HTML' },
+        { filename: 'canva.jpg', contentType: 'image/jpeg' })
+        .catch(() => bot.sendMessage(chatId, txt, { parse_mode: 'HTML' }).catch(() => {}));
+    } else {
+      await bot.sendMessage(chatId, txt, { parse_mode: 'HTML' }).catch(() => {});
+    }
   } else if (q.data === 'canva_test') {
-    await bot.answerCallbackQuery(q.id, { text: '⏳ Testing the browser…' }).catch(() => {});
     const r = await canva.selfTest();
-    await bot.sendMessage(q.message.chat.id, r.ok
+    await bot.sendMessage(chatId, r.ok
       ? `✅ <b>Browser works.</b>\n🌐 Chromium: <code>${escapeHtml(String(r.chromium))}</code>\nLoaded a test page fine. You can log in now.`
       : `🔴 <b>Browser test failed</b>\n\n<code>${escapeHtml(String(r.error))}</code>\n\n<i>Usually means Railway did not build with the Dockerfile. Check Settings → Build → Builder = Dockerfile, then redeploy.</i>`,
       { parse_mode: 'HTML' }).catch(() => {});
   } else if (q.data === 'canva_forget') {
     canva.forgetSession();
-    await bot.answerCallbackQuery(q.id, { text: '🗑 Session cleared. Run /canva to log in again.', show_alert: true }).catch(() => {});
+    await bot.sendMessage(chatId, '🗑 Session cleared. Paste a fresh CANVA_SESSION (or log in) to turn invites back on.').catch(() => {});
   }
 });
 
