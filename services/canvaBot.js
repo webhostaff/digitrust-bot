@@ -405,7 +405,7 @@ async function inviteEmail(email) {
 
     let ctx, page;
     // What we saw, for the link hunt and for the owner's report on failure.
-    const trace = { baseline: new Set(), net: new Set(), copied: new Set(), dom: new Set(), sent: false, clickAt: 0, reqAfter: new WeakSet() };
+    const trace = { baseline: new Set(), net: new Set(), copied: new Set(), dom: new Set(), postConfirm: new Set(), sent: false, clickAt: 0, confirmAt: 0, reqAfter: new WeakSet(), reqPostConfirm: new WeakSet() };
     try {
       ctx = await newContext(true);
       await ctx.addInitScript(COPY_HOOK);
@@ -417,14 +417,29 @@ async function inviteEmail(email) {
       // start, not by when the reply is read, closes a race the tests caught:
       // a team link in the "Confirm and invite" reply, read a moment late,
       // looked "new" after the click and was delivered.
-      page.on('request', (req) => { if (trace.clickAt) trace.reqAfter.add(req); });
+      page.on('request', (req) => {
+        if (trace.confirmAt) trace.reqPostConfirm.add(req);
+        if (trace.clickAt) trace.reqAfter.add(req);
+      });
       page.on('response', async (resp) => {
         try {
           const ct = (resp.headers()['content-type'] || '').toLowerCase();
           if (!/json|text|javascript/.test(ct)) return;
           const after = trace.reqAfter.has(resp.request());
           for (const l of findJoinLinks(await resp.text())) {
-            if (after) trace.net.add(l); else addBaseline(trace, l);
+            // Three kinds of link, by WHEN their request started:
+            //  - after a "Copy link" click  → a candidate (net);
+            //  - after "Confirm and invite" → most likely THIS customer's own
+            //    link (Canva's invite reply carries it — that's how the
+            //    "Invite sent!" window knows it). Kept aside, NOT banned.
+            //    The V114 rule baselined and permanently banned these, so the
+            //    customer's link was then rejected when "Copy link" produced
+            //    it: "invited, but the link could not be copied";
+            //  - before Confirm (page load, invite window) → team/other,
+            //    baseline + permanent ban, as before.
+            if (after) trace.net.add(l);
+            else if (trace.reqPostConfirm.has(resp.request())) trace.postConfirm.add(l);
+            else addBaseline(trace, l);
           }
         } catch (_) {}
       });
@@ -527,6 +542,7 @@ async function doInvite(page, email, trace) {
     if (await confirm.isVisible({ timeout: 3000 })) {
       const label = (await confirm.innerText().catch(() => '')) || '';
       if (/get invite link/i.test(label)) throw new Error('refusing the team-link button');
+      trace.confirmAt = Date.now();
       await confirm.click(); sent = true;
     }
   } catch (_) {}
@@ -598,12 +614,20 @@ async function findFollowUp(page, email) {
  * baseline (team link, other rows), so it can never be handed out.
  */
 async function clickAndCatch(page, locator, email, trace) {
-  for (const l of trace.net) addBaseline(trace, l);
-  for (const l of await copiedLinks(page)) addBaseline(trace, l);
+  // Only what THIS click produces counts. Earlier copies/network links are
+  // set aside for this click (not banned: they may be this customer's own
+  // link, e.g. from the invite reply — permanently banning those is exactly
+  // what made the V114 flow reject the right link).
+  for (const l of trace.net) trace.baseline.add(l);
+  for (const l of await copiedLinks(page)) trace.baseline.add(l);
   trace.net.clear(); trace.copied.clear();
   // What the click itself COPIED is the strongest evidence; network second.
-  const pick = () => [...trace.copied, ...trace.net]
-    .find((l) => !trace.baseline.has(l) && !isBanned(l, email)) || null;
+  // A link the click COPIED is accepted even if the invite reply already
+  // showed it (that's the normal case); a network-only link still has to
+  // come from a request made after the click.
+  const pick = () =>
+    [...trace.copied].find((l) => (!trace.baseline.has(l) || trace.postConfirm.has(l)) && !isBanned(l, email)) ||
+    [...trace.net].find((l) => !trace.baseline.has(l) && !isBanned(l, email)) || null;
   for (let attempt = 0; attempt < 2; attempt++) {
     trace.clickAt = Date.now();
     try { await locator.click({ timeout: 5000 }); } catch (_) { return null; }
@@ -766,14 +790,16 @@ const COPY_HOOK = `(() => {
 function addBaseline(trace, l) {
   trace.baseline.add(l);
   try {
-    const ban = mem.getState('canva_team_links', null) || {};
+    const ban = mem.getState('canva_team_links_v2', null) || {};
     const k = linkKey(l);
-    if (!ban[k]) { ban[k] = Date.now(); mem.setState('canva_team_links', ban); }
+    if (!ban[k]) { ban[k] = Date.now(); mem.setState('canva_team_links_v2', ban); }
   } catch (_) {}
   return false;
 }
 function isBanned(link, email) {
-  const ban = mem.getState('canva_team_links', null) || {};
+  // v2: the V114 list ('canva_team_links') also holds customers' OWN links
+  // banned by the rule fixed above, so it is no longer read.
+  const ban = mem.getState('canva_team_links_v2', null) || {};
   return !!ban[linkKey(link)] || deliveredElsewhere(link, email);
 }
 

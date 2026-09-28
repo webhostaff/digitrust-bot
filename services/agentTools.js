@@ -912,6 +912,143 @@ TOOLS.cgb_renewals = {
   },
 };
 
+// ── ChatGPT Business: workspace ⟷ subscriptions, already joined ──────────────
+//
+// Why this exists: asked "who expired but is still inside?" or "when does X
+// end?", the assistant used to stitch raw lists from several tools, which is
+// exactly where a fast model slips. This does the joining in code and hands
+// over finished facts per email plus ready-made problem lists, so the model
+// only has to read and explain.
+function cgbLocalDate(d = new Date()) {
+  const p2 = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`;
+}
+function cgbDaysBetween(fromYmd, toYmd) {
+  return Math.round((new Date(`${toYmd}T00:00:00`) - new Date(`${fromYmd}T00:00:00`)) / 86400000);
+}
+
+async function cgbWorkspaceReport({ email, days } = {}) {
+  const window = Math.max(1, Math.min(30, parseInt(days, 10) || 3));
+  const today = cgbLocalDate();
+  const guard = await require('./cgbGuard').fetchGuardReport();
+  const g = guard.ok ? guard.data : null;
+
+  // Latest subscription per email (orders counted), refunded/unpaid shells left out.
+  const subRows = raw.prepare(`
+    SELECT cs.order_id, cs.user_id, cs.email, cs.start_date, cs.end_date, cs.status, cs.final_price, cs.id,
+           u.username, u.first_name
+    FROM chatgpt_subscriptions cs LEFT JOIN users u ON u.telegram_id = cs.user_id
+    WHERE COALESCE(cs.status, '') NOT IN ('awaiting_payment')
+    ORDER BY cs.end_date ASC, cs.id ASC
+  `).all();
+  const subs = new Map();
+  for (const r of subRows) {
+    const k = String(r.email || '').trim().toLowerCase();
+    if (!k) continue;
+    const prev = subs.get(k);
+    const orders = (prev?.orders || 0) + 1;
+    const keep = !prev || String(r.end_date || '') >= String(prev.end_date || '') ? r : prev.row;
+    subs.set(k, { row: keep, orders });
+  }
+
+  const members = new Map((g?.members || []).map((m) => [String(m.email).toLowerCase(), m.role || null]));
+  const pending = new Set((g?.pending || []).map((e) => String(e).toLowerCase()));
+  const wl = new Map((g?.whitelist || []).map((w) => [String(w.email).toLowerCase(), w]));
+  const queued = new Map((g?.queue || []).map((q) => [String(q.email).toLowerCase(), q]));
+  const all = new Set([...members.keys(), ...pending, ...wl.keys(), ...subs.keys(), ...queued.keys()]);
+
+  const records = [];
+  for (const e of all) {
+    const s = subs.get(e);
+    const r = s?.row;
+    const daysLeft = r?.end_date ? cgbDaysBetween(today, r.end_date) : null;
+    const role = members.get(e) || null;
+    const rec = {
+      email: e,
+      in_workspace: g ? members.has(e) : null,
+      role,
+      pending_invite: g ? pending.has(e) : null,
+      whitelisted: g ? wl.has(e) : null,
+      whitelisted_by: wl.get(e)?.added_by || null,
+      queue: queued.get(e) ? { status: queued.get(e).status, error: queued.get(e).last_error || null } : null,
+      subscription: r ? {
+        order_id: r.order_id, status: r.status, start: r.start_date, end: r.end_date, days_left: daysLeft,
+        customer: r.username ? '@' + r.username : (r.first_name || String(r.user_id)), orders: s.orders,
+      } : null,
+      flags: [],
+    };
+    const owner = /owner|admin/i.test(role || '');
+    const active = r && r.status !== 'cancelled' && daysLeft !== null && daysLeft >= 0;
+    if (g) {
+      if (rec.in_workspace && r && (daysLeft < 0 || r.status === 'expired')) rec.flags.push('expired_still_inside');
+      if (rec.in_workspace && r && r.status === 'cancelled') rec.flags.push('cancelled_still_inside');
+      if (active && !rec.in_workspace && !rec.pending_invite) rec.flags.push('paid_not_inside');
+      if (rec.pending_invite) rec.flags.push('invited_not_accepted');
+      if (rec.in_workspace && !rec.whitelisted && !owner) rec.flags.push('inside_not_whitelisted');
+      if (rec.in_workspace && !r && !owner) rec.flags.push('inside_no_subscription');
+      if (rec.queue && rec.queue.status === 'failed') rec.flags.push('invite_failed');
+    }
+    if (active && daysLeft <= window) rec.flags.push('ending_soon');
+    records.push(rec);
+  }
+
+  if (email) {
+    const want = String(email).trim().toLowerCase();
+    const rec = records.find((x) => x.email === want) || null;
+    const history = subRows.filter((x) => String(x.email || '').toLowerCase() === want)
+      .map((x) => ({ order_id: x.order_id, start: x.start_date, end: x.end_date, status: x.status, paid: x.final_price }));
+    return {
+      today, found: !!rec, record: rec, order_history: history,
+      workspace_data: g ? { read_at: g.members_read_at, incomplete: g.last_read_incomplete } : { error: guard.error },
+    };
+  }
+
+  const pick = (flag, sortBy) => {
+    const list = records.filter((x) => x.flags.includes(flag));
+    if (sortBy) list.sort(sortBy);
+    return { count: list.length, emails: list.slice(0, 40).map((x) => ({
+      email: x.email, end: x.subscription?.end || null, days_left: x.subscription?.days_left ?? null,
+      customer: x.subscription?.customer || null, order_id: x.subscription?.order_id || null,
+      error: x.queue?.error || undefined,
+    })) };
+  };
+  const byDays = (a, b) => (a.subscription?.days_left ?? 1e9) - (b.subscription?.days_left ?? 1e9);
+  return {
+    today,
+    workspace_data: g
+      ? { ok: true, read_at: g.members_read_at, incomplete: g.last_read_incomplete, invite_bot_version: g.version,
+          members: members.size, pending: pending.size, whitelist: wl.size, queue_waiting: (g.queue || []).filter((q) => q.status === 'waiting').length }
+      : { ok: false, error: guard.error, note: 'Only DIGITRUST subscription data is available; workspace columns are unknown.' },
+    subscriptions: { emails_with_a_seat: subs.size, active: records.filter((x) => x.subscription && x.subscription.status !== 'cancelled' && x.subscription.days_left >= 0).length },
+    problems: {
+      expired_still_inside: pick('expired_still_inside', byDays),
+      cancelled_still_inside: pick('cancelled_still_inside'),
+      paid_not_inside: pick('paid_not_inside', byDays),
+      invite_failed: pick('invite_failed'),
+      inside_not_whitelisted: pick('inside_not_whitelisted'),
+    },
+    watch: {
+      ending_soon: { window_days: window, ...pick('ending_soon', byDays) },
+      invited_not_accepted: pick('invited_not_accepted'),
+      inside_no_subscription: pick('inside_no_subscription'),
+    },
+  };
+}
+
+TOOLS.cgb_workspace_report = {
+  description:
+    'ChatGPT Business — the workspace (from the invite bot: members, pending invites, whitelist, invite queue) ' +
+    'already JOINED with DIGITRUST subscriptions (order, start, end, days left, customer). Use it for ANY question ' +
+    'about who is in the workspace, when an email started or ends, who expired but is still inside, who paid but ' +
+    'is not inside, failed invites, whitelist gaps, or a full report. Pass email to get one person in detail with ' +
+    'their order history. Read-only.',
+  input: {
+    email: 'optional — one email to look up in detail',
+    days: 'optional — "ending soon" window in days (default 3)',
+  },
+  run: (args) => cgbWorkspaceReport(args || {}),
+};
+
 TOOLS.cgb_find_seat = {
   description: 'Find ChatGPT Business seats by email (or part of it) — who owns it, dates, status, paid.',
   input: { email: 'email or part of it' },

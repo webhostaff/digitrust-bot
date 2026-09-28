@@ -1661,3 +1661,48 @@ bot … Invalid URL` — the variable was set, but not a valid address.
   is not a valid address: "…"`, each order logs the same instead of a bare
   "Invalid URL", and /guardtest shows the exact value and what it must look
   like.
+
+# Part 53 — Canva: the customer's own link was being thrown away (v120)
+
+"The invite goes out but the bot finds no link to send": caused by the V114
+protection against leaking the team's public link. That rule treated EVERY
+join link seen before the "Copy link" click as a team link and banned it
+forever. Canva's reply to "Confirm and invite" carries the customer's own
+link (that's how the "Invite sent!" window knows it), so the bot banned the
+customer's link a second early, then rejected it when "Copy link" produced
+exactly that link → "invited, but the link could not be copied".
+
+* Links are now judged by WHEN their request started: before Confirm (page
+  load, invite window) → team link, banned as before; after Confirm → kept
+  aside, not banned; after the Copy click → candidate.
+* A link is still only delivered if this customer's own "Copy link" copied
+  it (or a request made after that click returned it), so a team link that
+  shows up in the Confirm reply still never reaches a customer.
+* The old ban list (`canva_team_links`) is no longer read — it holds
+  customers' own links banned by the old rule. New list: `canva_team_links_v2`.
+* Tested on the fake Canva page, which now sends the customer's link in the
+  Confirm reply like the real site: the V119 code fails exactly like
+  production ("invited, but the link could not be copied"), the new code
+  delivers it; the team-link-in-reply scenarios were rerun with properly
+  escaped JSON (the old fake's escaping had hidden those links from the bot
+  entirely) and the team link is still never delivered. All 13 scenarios pass.
+
+# Part 54 — Yamen reads the ChatGPT Business workspace (v121)
+
+* **cgb_workspace_report** (new Yamen tool): the invite bot's workspace
+  (members, pending invites, whitelist, invite queue — via its new read-only
+  `/api/report`) already JOINED in code with every DIGITRUST seat (order,
+  start, end, days left, customer, number of orders). Returns ready-made
+  lists: expired but still inside, cancelled but still inside, paid but not
+  inside, failed invites, inside but not whitelisted, ending soon, invited not
+  accepted, inside with no subscription. With `email`: one person in detail
+  plus their order history. If the invite bot can't be reached it says so and
+  answers from DIGITRUST data only.
+* Why: "Yamen seems dumb" came mostly from the cheap model stitching raw lists
+  from several tools. The joining is now done in code; the model only reads
+  and explains. Questions about subscriptions, emails, dates and "why" now get
+  more thinking on the cheap model; "تقارير" joins the report words that use
+  the strong model.
+* Tested on realistic mixes (all flag types, the owner never flagged, any-case
+  email lookup, latest seat of a repeat customer, invite bot unreachable), the
+  SQL on real SQLite, and against the real invite-bot /api/report endpoint.

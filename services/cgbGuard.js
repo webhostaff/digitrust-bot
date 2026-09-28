@@ -264,4 +264,24 @@ async function diagnose() {
   return { ok: true, lines };
 }
 
-module.exports = { notifyGuardOfNewInvite, makeGuardWebhookHandler, cancelGuardInvite, diagnose, _normalizeGuardUrl: normalizeGuardUrl };
+/**
+ * The invite bot's read-only snapshot (members, pending, whitelist, queue) for
+ * Yamen's workspace reports. Served from the invite bot's last complete read —
+ * it never opens ChatGPT, so asking can't disturb invites. Never throws.
+ */
+async function fetchGuardReport() {
+  if (!GUARD_URL || !SHARED_SECRET) return { ok: false, error: 'the invite-bot link is not configured (GUARD_AUTO_INVITE_URL / GUARD_SECRET)' };
+  if (!guardUrlValid()) return { ok: false, error: `GUARD_AUTO_INVITE_URL is not a valid address ("${GUARD_URL_RAW}")` };
+  try {
+    const u = new URL(GUARD_URL);
+    const url = `${u.origin}/api/report${GUARD_PANEL ? `?panel=${encodeURIComponent(GUARD_PANEL)}` : ''}`;
+    const r = await fetchWithTimeout(url, { method: 'GET', headers: { 'X-Invite-Secret': SHARED_SECRET } });
+    if (r.status === 404) return { ok: false, error: 'the invite bot is an older build without /api/report — update it' };
+    if (!r.ok) return { ok: false, error: `the invite bot answered HTTP ${r.status}` };
+    return { ok: true, data: await r.json() };
+  } catch (e) {
+    return { ok: false, error: `could not reach the invite bot: ${e.message}` };
+  }
+}
+
+module.exports = { notifyGuardOfNewInvite, makeGuardWebhookHandler, cancelGuardInvite, diagnose, fetchGuardReport, _normalizeGuardUrl: normalizeGuardUrl };

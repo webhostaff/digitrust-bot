@@ -170,7 +170,7 @@ function refuse(m, p) {
 // Deep only when the message clearly asks for reading a lot or reasoning —
 // everything else (greetings, look-ups, "who is waiting") goes to the cheap tier.
 const DEEP_HINTS = new RegExp([
-  'حوصل', 'لخص', 'ملخص', 'حلل', 'تحليل', 'قارن', 'تقرير', 'خطة', 'استراتيج', 'فكر بالعمق',
+  'حوصل', 'لخص', 'ملخص', 'حلل', 'تحليل', 'قارن', 'تقرير', 'تقارير', 'خطة', 'استراتيج', 'فكر بالعمق',
   'summar', 'analy', 'report', 'compare', 'strategy', 'résum', 'analys',
 ].join('|'), 'i');
 
@@ -290,6 +290,8 @@ WHAT YOU CAN SEE (read-only)
 - The store bot: orders, products, stock, wallets, refunds, deposits, suppliers, API sales.
 - The support bot: every conversation.
 - The ChatGPT Business bot: seats, cycles and the price right now (cgb_cycle_now), the renewal round — paid / said yes unpaid / no answer / declined / to activate (cgb_renewals), seats by email (cgb_find_seat).
+- The ChatGPT Business WORKSPACE (cgb_workspace_report): members, pending invites, whitelist and invite queue from the invite bot, already joined with every seat's order, start, end and days left. For "when does X end", "who expired but is still inside", "who paid but isn't in", "failed invites", "who isn't whitelisted", or a report: call it and answer from its facts — exact dates and counts, never guesses. If workspace_data.ok is false, say the workspace side couldn't be read and why, and answer only from the subscription side. If workspace_data.incomplete is true, say the last workspace read was incomplete.
+- A good ChatGPT Business report is short and ordered: first the problems that need action (expired still inside, paid not inside, failed invites, not whitelisted), each with emails and dates; then what to watch (ending soon, invited not accepted); then the totals. End with the one or two actions you'd take first.
 - Binance, LIVE: txid_check verifies any TxID or Binance Pay id on Binance AND in the shop (already used? by whom? credited?); recent_deposits lists what arrived. For "check this txid" always use txid_check and give a clear verdict first.
 - You write only in this app. You never message customers or post in the bots; drafts go out only when the owner taps Send.
 
@@ -457,7 +459,7 @@ const TOOL_LABEL = {
   propose_stock_count: '📦 يحضّر التعبئة', propose_post: '🎨 يصمّم المنشور',
   propose_product: '🆕 يحضّر المنتج', propose_product_update: '✏️ يحضّر التعديل', list_categories: '📁 الأقسام',
   scheduled_posts: '⏰ المنشورات المبرمجة', propose_stock: '📦 يحضّر المخزون', view_customer_media: '🖼 يشوف الصور',
-  propose_debit: '➖ يحضّر نقص رصيد', cgb_new_seats_since: '🤖 مقاعد جديدة', auto_credit_verified_deposit: '⚡️ إيداع متحقق منو',
+  cgb_workspace_report: '🧾 تقرير الووركسبيس', propose_debit: '➖ يحضّر نقص رصيد', cgb_new_seats_since: '🤖 مقاعد جديدة', auto_credit_verified_deposit: '⚡️ إيداع متحقق منو',
 };
 
 /**
@@ -712,7 +714,9 @@ async function turnAnthropic(ctx) {
 
 // Actions and pictures need a moment more thought than a look-up, even on
 // the fast tier — still far cheaper than the deep one.
-const CAREFUL = /(مخزون|ستوك|stock|زيد|زيدل|اضف|أضف|ضيف|حسابات|accounts|txid|تيكس|ثبّت|ثبت|صورة|image|photo)/i;
+// More thinking (still the cheap model) for questions whose answer depends on
+// getting data right: stock, money, subscriptions, emails, dates, "why".
+const CAREFUL = /(مخزون|ستوك|stock|زيد|زيدل|اضف|أضف|ضيف|حسابات|accounts|txid|تيكس|ثبّت|ثبت|صورة|image|photo|اشتراك|subscription|ينتهي|يوفى|يوفا|expire|ووركسبيس|workspace|ايميل|إيميل|email|@|وقتاش|علاش|why|شنوة صار)/i;
 
 /** One owner message, end to end. */
 async function runTurn({ text, mode, emit, signal, proactive = null, images = [] }) {
