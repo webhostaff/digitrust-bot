@@ -1813,3 +1813,81 @@ and a `note`, and Yamen is told to explain an empty inbox with those facts.
   learned `vocab` words. Text-to-speech was ~20% too fast (speed 1.1 +
   "quick, lively" + the app speeding playback up again): now speed 0.95,
   "calm, clear, unhurried", normal playback.
+
+# Part 61 — Yamen becomes an app: side navigation and a Private chats section (v128)
+
+* **App shell** (right-to-left): a side navigation — يمان (the assistant
+  chat), المحادثات الخاصة, تفعيلات ChatGPT, التنبيهات, الذاكرة والإعدادات —
+  with live badges. Persistent on desktop (≥900px); on a phone it slides in
+  from ☰ over a dimmed background. Sections cross-fade; reduced motion is
+  respected; the last section is remembered.
+* **Private chats** (Telegram Business) as a real messaging view: chat list
+  with avatars, "customer" tag, last message and a jasmine "waiting 35 m"
+  pill; the open chat shows who they are (balance, last order, ChatGPT days
+  left), the conversation, and a composer with **✨ suggest** (Yamen writes a
+  reply in your style, with the shop-bot link when it fits, flags scams — the
+  text only fills the box) and **➤ send** (goes out as you). Two panes on
+  desktop, list → chat on a phone. Telegram's 24h rule is shown before you try.
+* **ChatGPT activations** section: each waiting customer with a ticking timer
+  and an "ask Yamen" button; **Alerts** section with unread badge.
+* API: `GET /agent/business/chats`, `GET /agent/business/thread`,
+  `POST /agent/business/suggest` (one tool-free model call, counts toward the
+  daily budget, writes nothing to Yamen's chat), `POST /agent/business/send`.
+* Reviewed from real renders (desktop 1280 and phone 390): no page errors.
+  Tested the endpoints through the real router (token, list, thread, 404,
+  suggest sends nothing, send only on ➤).
+
+# Part 62 — Token diet + professional UI pass (v129)
+
+## Tokens: 56–73% less per everyday call
+Measured: every call used to send all 56 tool descriptions (~6,900 tokens)
+plus every topic's rules (~6,000), ~13,000 tokens before the question itself.
+* **Tool groups** (sales, stock, products, posts, support, money, cgb,
+  private, web, system). A message gets a small core (lookups, memory) plus
+  the groups its words point to, plus the groups of the last 15 minutes (so
+  "إيه ابعثو" still works). Yamen loads any other group himself with
+  `use_tools`. Anything not in a group stays core, so a new tool is never lost.
+* **Instructions split the same way**: a 7.4k-char core (was 19.3k) + topic
+  guides sent only with their group. A test checks every line of the old
+  instructions still exists somewhere.
+* Measured after: greeting ~3,400 (was ~13,000), sales ~3,700, stock ~5,200,
+  private ~5,000, TxID ~5,000, daily summary ~9,000.
+* Undid the expensive routing added in v124/v127: private-chat words no
+  longer force the strong model; the "careful thinking" trigger no longer
+  fires on "@", "email", "why"…; ✨ suggestions use the fast model.
+* The Responses conversation chain resets at 12k input tokens (was 25k) —
+  past that every message re-bills the whole history.
+* `prompt_cache_key` on every call so OpenAI reuses its cache for the
+  unchanging start (dropped automatically if a model rejects it).
+* Nightly learning gets the core only (its transcript no longer drags in
+  every tool group).
+
+## UI
+* One consistent line-icon set replaces every emoji icon (menu, call, sound,
+  new chat, attach, mic, send/stop, refresh, back, suggest, nav).
+* Yamen's replies are written straight on the page, full width of a centred
+  760px reading column, aligned by their own language; only the owner's
+  messages are bubbles.
+* One unified composer bar (attach · text · mic · send) in both chats.
+* Budget meter in the sidebar (spent / daily cap, model, memory count).
+* "@name" keeps the @ in front inside Arabic sentences (alerts and replies).
+* Reviewed from real renders, desktop and phone; no page errors.
+
+# Part 63 — Yamen's app, premium layer: depth, light and motion (v130)
+
+"Not professional — make it fluid and beautiful." v129 fixed the structure;
+this pass changes the feel. CSS only; no behaviour changed.
+* Depth instead of borders: frosted-glass sidebar, headers, cards and
+  composer floating over a deep night-sea background with a soft cobalt and
+  turquoise glow.
+* One signature gradient (cobalt → sea turquoise) used only for the owner's
+  messages, the send button, the active section and Yamen's mark/label.
+* The waiting counter is now a capsule with a pulsing amber halo instead of
+  a solid bar; waiting private chats get an amber ring on the avatar.
+* Motion that answers: messages and cards float in with a light spring,
+  sections glide, the settings sheet rises, buttons give way when pressed;
+  all off under "reduce motion".
+* Suggestion chips appear only on an empty chat.
+* Fixed during review: the capsule's styles leaked onto waiting chat rows
+  (shared class name) — now scoped to the capsule.
+* Reviewed from real renders on desktop and phone; no page errors.

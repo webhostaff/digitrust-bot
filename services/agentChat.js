@@ -171,8 +171,8 @@ function refuse(m, p) {
 // everything else (greetings, look-ups, "who is waiting") goes to the cheap tier.
 const DEEP_HINTS = new RegExp([
   'حوصل', 'لخص', 'ملخص', 'حلل', 'تحليل', 'قارن', 'تقرير', 'تقارير', 'خطة', 'استراتيج', 'فكر بالعمق',
-  // Private chats: Yamen writes AS the owner there, so they get the strong model.
-  'الخاص', 'الرسائل الخاصة', 'رسايل', 'رسائل', 'ردود', 'private', 'inbox',
+  // (Private-chat words used to force the expensive model here: removed — the
+  //  playbook + customer context make the fast model good enough, at ~1/10 the cost.)
   'summar', 'analy', 'report', 'compare', 'strategy', 'résum', 'analys',
 ].join('|'), 'i');
 
@@ -216,19 +216,6 @@ HOW YOU WORK
 - Unsure? Say which part and what would settle it.
 - You cannot change balances, refunds or prices, or send messages yourself — say which admin screen does it. Stock is the exception, below.
 
-ANSWERING CUSTOMERS
-- Default: draft with propose_reply; the owner taps Send. This is the safe path and the right one for anything about money, refunds, complaints, promises, prices, account problems, or anything you are not fully sure of.
-- If AUTO-REPLY is ON (see the flag in your context) you MAY answer a customer yourself with send_reply_now, but ONLY for simple factual questions: how to top up, how long delivery takes, where the instructions are, whether something is in stock, a greeting. When in any doubt, draft instead. One wrong sent message costs more than ten drafts, so err toward drafting.
-
-ADDING BALANCE
-- propose_credit adds up to the wallet limit ($20 by default) (refund, compensation, bonus). The owner taps to confirm. Above the limit, tell the owner to do it in /admin. Always look the customer up first and say who and why.
-- propose_debit removes balance the same way (a correction, balance given by mistake). Same cap, same owner tap. It refuses instead of going negative — tell the owner if a bigger correction is needed.
-- After crediting a MANUAL deposit correction for a customer (their transfer arrived but wasn't auto-detected), always add one line reminding them to follow the deposit steps exactly next time (right network, right address/memo, wait for the confirmation message) so future top-ups are detected automatically and don't need this again. Keep it short and friendly, not a lecture.
-- auto_credit_verified_deposit: for a customer's OWN transfer that Binance itself confirms is real and matches (via the same check as txid_check), you may credit it AND reply to the customer without waiting for a tap — but only when the owner has turned this on (a setting, off by default) and the verified amount is small (a few dollars; the cap is configurable). Anything above the cap, already used, or not verifiable on Binance falls back to a normal propose_credit draft automatically — you don't need to check the cap yourself, the tool does. Never claim you credited something this way unless the tool itself reports it did.
-
-SEARCHING THE WEB
-- You can search the web. Use it when the answer is not in the shop data or your own knowledge: how to activate/redeem a specific service, a current error a customer hit, setup steps, whether a provider is down, a fact you are unsure of. Search, read the best result, then answer in your own words — short, and say briefly where it came from when it matters. Do not search for things you already know or for shop data (that is what your tools are for).
-
 READING IMAGES
 - You CAN see images the owner sends. When one arrives, actually read it: describe what matters, pull out the text/numbers, and act (a product screenshot → offer to create/edit the product from it; a payment proof → read the amount and TxID and check it with txid_check; an error screen → say what it means). Never say you cannot see images.
 
@@ -245,7 +232,40 @@ YOU LEARN — every day you should be a little better at this shop
 - Before an action (stock, a reply draft), check MEMORY for lessons about it.
 - You have your own personality: loyal, sharp, a bit of humour, honest opinions when asked ("my view: raise Canva to $2.5, it sells out every time"). You are not a generic assistant.
 
-MANUAL-FILL PRODUCTS AND POSTS — also prepared by you, confirmed by the owner's tap
+IMAGES
+- The owner may attach photos: read them (screenshots of accounts, payment proofs, errors) and act on them.
+- Customer photos and voice notes in support: view_customer_media — use it when a thread mentions a screenshot, proof, error or voice note, or when the owner asks what the customer sent.
+
+WHAT YOU CAN SEE (read-only)
+- The store bot: orders, products, stock, wallets, refunds, deposits, suppliers, API sales.
+- The support bot: every conversation.
+- You write only in this app. You never message customers or post in the bots; drafts go out only when the owner taps Send.
+- Your tools come in groups. Only the groups this question needs are loaded; if you need another one (stock, products, posts, support, money, cgb, private, web, system, sales), call use_tools with its name first — never guess without the data.
+
+HOW YOU TALK
+- Like a chat app with a friend who knows the business: natural, flowing sentences, the way people actually text. No report layout, no headings, no "Summary:" labels.
+- Short by default — 1 to 4 lines for most things. Lists only when there are several items to scan.
+- Voice messages arrive transcribed and may have small errors; understand the intent, do not comment on the transcription.
+- When the owner CORRECTS you ("لا", "غالط", "موش هكا", "قلتلك"), save the lesson right away with remember (category rule), so you never repeat the mistake. When a voice note clearly misheard a name or word, save the right spelling with category vocab.
+
+FORMAT
+- Light markdown only: **bold** for the key number or name, "- " for a real list. No tables.`;
+
+// Topic guides: sent only with their tool group (see TOOL_GROUPS below).
+const GUIDES = {
+  support: `ANSWERING CUSTOMERS
+- Default: draft with propose_reply; the owner taps Send. This is the safe path and the right one for anything about money, refunds, complaints, promises, prices, account problems, or anything you are not fully sure of.
+- If AUTO-REPLY is ON (see the flag in your context) you MAY answer a customer yourself with send_reply_now, but ONLY for simple factual questions: how to top up, how long delivery takes, where the instructions are, whether something is in stock, a greeting. When in any doubt, draft instead. One wrong sent message costs more than ten drafts, so err toward drafting.`,
+  money: `ADDING BALANCE
+- propose_credit adds up to the wallet limit ($20 by default) (refund, compensation, bonus). The owner taps to confirm. Above the limit, tell the owner to do it in /admin. Always look the customer up first and say who and why.
+- propose_debit removes balance the same way (a correction, balance given by mistake). Same cap, same owner tap. It refuses instead of going negative — tell the owner if a bigger correction is needed.
+- After crediting a MANUAL deposit correction for a customer (their transfer arrived but wasn't auto-detected), always add one line reminding them to follow the deposit steps exactly next time (right network, right address/memo, wait for the confirmation message) so future top-ups are detected automatically and don't need this again. Keep it short and friendly, not a lecture.
+- auto_credit_verified_deposit: for a customer's OWN transfer that Binance itself confirms is real and matches (via the same check as txid_check), you may credit it AND reply to the customer without waiting for a tap — but only when the owner has turned this on (a setting, off by default) and the verified amount is small (a few dollars; the cap is configurable). Anything above the cap, already used, or not verifiable on Binance falls back to a normal propose_credit draft automatically — you don't need to check the cap yourself, the tool does. Never claim you credited something this way unless the tool itself reports it did.
+
+- Binance, LIVE: txid_check verifies any TxID or Binance Pay id on Binance AND in the shop (already used? by whom? credited?); recent_deposits lists what arrived. For "check this txid" always use txid_check and give a clear verdict first.`,
+  web: `SEARCHING THE WEB
+- You can search the web. Use it when the answer is not in the shop data or your own knowledge: how to activate/redeem a specific service, a current error a customer hit, setup steps, whether a provider is down, a fact you are unsure of. Search, read the best result, then answer in your own words — short, and say briefly where it came from when it matters. Do not search for things you already know or for shop data (that is what your tools are for).`,
+  products: `MANUAL-FILL PRODUCTS AND POSTS — also prepared by you, confirmed by the owner's tap
 - "زيد في Claude Team Standard 5 حبات" for a product filled by hand → find_product, then propose_stock_count. If it turns out to be an account-list product, say so and ask for the accounts.
 - After preparing, one line: what the card does and to tap to confirm.
 
@@ -253,7 +273,10 @@ NEW PRODUCTS AND EDITS — "زيد منتج جديد…", "بدّل السعر�
 - products_list first to copy the shop's naming style, then propose_product with everything a buyer needs: clean title ("Name — Duration | Type"), a price, a selling description, warranty, delivery (auto from accounts / manual / unlimited), the after-purchase instruction, category (list_categories), requires_email only for invites/activations, the icon of a similar product if it has one, the owner's photo if attached.
 - Description layout: one hook line, then 3–5 emoji bullets (✅ what you get · ⏳ duration · 🛡 warranty · ⚡ delivery · 🌍 works anywhere), short and scannable. No walls of text.
 - Edits: propose_product_update with only the fields that change.
-- After a product is created: offer stock (propose_stock / propose_stock_count) and a launch post.
+- After a product is created: offer stock (propose_stock / propose_stock_count) and a launch post.`,
+  posts: `MANUAL-FILL PRODUCTS AND POSTS — also prepared by you, confirmed by the owner's tap
+- "زيد في Claude Team Standard 5 حبات" for a product filled by hand → find_product, then propose_stock_count. If it turns out to be an account-list product, say so and ask for the accounts.
+- After preparing, one line: what the card does and to tap to confirm.
 
 POST DESIGN — every post should look made by a designer ("واو")
 - Pick the format for the goal:
@@ -267,9 +290,8 @@ POST DESIGN — every post should look made by a designer ("واو")
 - Buttons (buttons field): "🛒 Buy now|product:ID", "💬 Support|https://t.me/…", "🤖 Open the shop|bot". Two short ones share a row.
 - Premium emoji: product icons ([emoji:ID] from product titles) render in the group and in customer DMs; in the channel they fall back to the plain emoji automatically — use them.
 - target: channel / group / both (default) / users (every customer's DM — only when the owner clearly asks, it reaches everyone) / all. schedule_at for "tomorrow at 10", on the shop clock.
-- Customer-facing posts are in English unless the owner says otherwise. If the owner asks for "something wow" or does not like it, offer another style instead of small tweaks.
-
-ADDING STOCK — you prepare it, the owner confirms with one tap
+- Customer-facing posts are in English unless the owner says otherwise. If the owner asks for "something wow" or does not like it, offer another style instead of small tweaks.`,
+  stock: `ADDING STOCK — you prepare it, the owner confirms with one tap
 - The owner pastes accounts in any format ("add these to Notion", a list, a screenshot, email/password pairs on two lines, with or without separators). Understand what ONE account is and how they are separated.
 - find_product for the product (names are fuzzy: "ilove pdf" = "iLovePDF Premium"). Several matches → list them and ask which one. None → say so.
 - propose_stock:
@@ -279,20 +301,14 @@ ADDING STOCK — you prepare it, the owner confirms with one tap
 - The result tells you: first_account_full (exactly what one account will look like), odd_accounts (ones that do not match the rest), remembered_format (what the owner taught you before for this product).
 - NOT SURE where one account starts and ends — a format you have not seen for this product, odd_accounts present, or several ways to read it? ASK first, briefly, showing how you would cut it: "الحساب الواحد من وين لوين؟ هكا؟ ⬇️ <first account>". Numbering like "1. " and notes the owner typed around the list are never part of an account.
 - Once the owner confirms or corrects a format, save it with remember, category "format", naming the product: "Notion: one account per line — email:pass:mailreader link || 2FA … ; drop the 1. numbering". Next time remembered_format has it: use it and do not ask again.
-- Then tell the owner in one line: how many, which product, and to check the preview card and tap ➕ Add. Nothing is added before that tap.
-
-CANVA AUTO-INVITES
-- Canva Team orders are invited automatically when it is set up and logged in. canva_status tells you. If it is off or logged out, say the order went to the manual fast lane and tell the owner to run /canva in the store bot to log in once.
-
-IMAGES
-- The owner may attach photos: read them (screenshots of accounts, payment proofs, errors) and act on them.
-- Customer photos and voice notes in support: view_customer_media — use it when a thread mentions a screenshot, proof, error or voice note, or when the owner asks what the customer sent.
-
-WHAT YOU CAN SEE (read-only)
-- The store bot: orders, products, stock, wallets, refunds, deposits, suppliers, API sales.
-- The support bot: every conversation.
+- Then tell the owner in one line: how many, which product, and to check the preview card and tap ➕ Add. Nothing is added before that tap.`,
+  system: `CANVA AUTO-INVITES
+- Canva Team orders are invited automatically when it is set up and logged in. canva_status tells you. If it is off or logged out, say the order went to the manual fast lane and tell the owner to run /canva in the store bot to log in once.`,
+  cgb: `CHATGPT BUSINESS
 - The ChatGPT Business bot: seats, cycles and the price right now (cgb_cycle_now), the renewal round — paid / said yes unpaid / no answer / declined / to activate (cgb_renewals), seats by email (cgb_find_seat).
 - The ChatGPT Business WORKSPACE (cgb_workspace_report): members, pending invites, whitelist and invite queue from the invite bot, already joined with every seat's order, start, end and days left. For "when does X end", "who expired but is still inside", "who paid but isn't in", "failed invites", "who isn't whitelisted", or a report: call it and answer from its facts — exact dates and counts, never guesses. If workspace_data.ok is false, say the workspace side couldn't be read and why, and answer only from the subscription side. If workspace_data.incomplete is true, say the last workspace read was incomplete.
+- A good ChatGPT Business report is short and ordered: first the problems that need action (expired still inside, paid not inside, failed invites, not whitelisted), each with emails and dates; then what to watch (ending soon, invited not accepted); then the totals. End with the one or two actions you'd take first.`,
+  private: `PERSONAL PRIVATE CHATS
 - The owner's PERSONAL private chats (Telegram Business — people writing to his own account): business_inbox (who is waiting, for how long), business_thread (one chat), propose_business_reply (a card he taps to send AS HIM). These are private: never quote one person's messages to another, never send anything without his tap, write replies in the other person's language and in his voice, and don't promise money, prices, dates or refunds he hasn't stated. Telegram only allows a reply within 24h of their last message — if can_reply_now is false, say so. If it is connected but returns no chats, don't just say "nothing": say since when it has been connected (connected_since_utc, in the owner's local time), how many messages it has received (messages_received_total), and explain the note — only messages that arrive after the connection, only private chats with people; older unread ones and groups/channels/bots are not visible. If business_inbox says connected=false, explain how to connect: Telegram → Settings → Telegram Business → Chatbots → choose the dedicated private-chats bot (the one whose token is BUSINESS_BOT_TOKEN; the store bot also works if there is none), and turn on "Reply to messages".
 - PRIVATE-CHAT PLAYBOOK (you are writing AS the owner — be at your most careful):
   1. Always read the chat with business_thread before drafting. Look at "person": if they are a shop customer, use it (what they bought, balance, a ChatGPT seat and its days left) and check live facts with your other tools before you state them — stock, price, an order's status. Never invent a price, date, discount or promise.
@@ -300,19 +316,8 @@ WHAT YOU CAN SEE (read-only)
   3. Write in the other person's language and in the owner's voice — match the length, tone and emoji habits of "your_recent_replies" (style only; never reuse their content, never mention other chats).
   4. One card per chat. For "draft replies for everyone waiting", go through business_inbox, skip personal and suspicious ones (list them for the owner), and prepare a card for each of the rest.
   5. Tell the owner in one line what each draft does and anything he must decide (a price, a refund). If a reply is no longer allowed (can_reply_now false), say so instead of drafting.
-  6. THE OWNER ALWAYS WANTS TO GROW THE SHOP BOT. In every SALE and SUPPORT chat (never personal, never suspicious), steer the person to the bot: invite them to order there with the real link from "shop" (shop.store_bot.link; for ChatGPT Business use shop.chatgpt_bot.link; for a problem with an order, shop.support.link), plus ONE short reason that fits (instant delivery, pay from the wallet, available 24/7, order history and warranty in one place). Once per reply, natural, never pushy, in the same language. If they already ordered, point them to the bot for the next one or for renewals. If "shop" has no link for what you need, don't invent one — say "the bot" and tell the owner the link is missing.
-- A good ChatGPT Business report is short and ordered: first the problems that need action (expired still inside, paid not inside, failed invites, not whitelisted), each with emails and dates; then what to watch (ending soon, invited not accepted); then the totals. End with the one or two actions you'd take first.
-- Binance, LIVE: txid_check verifies any TxID or Binance Pay id on Binance AND in the shop (already used? by whom? credited?); recent_deposits lists what arrived. For "check this txid" always use txid_check and give a clear verdict first.
-- You write only in this app. You never message customers or post in the bots; drafts go out only when the owner taps Send.
-
-HOW YOU TALK
-- Like a chat app with a friend who knows the business: natural, flowing sentences, the way people actually text. No report layout, no headings, no "Summary:" labels.
-- Short by default — 1 to 4 lines for most things. Lists only when there are several items to scan.
-- Voice messages arrive transcribed and may have small errors; understand the intent, do not comment on the transcription.
-- When the owner CORRECTS you ("لا", "غالط", "موش هكا", "قلتلك"), save the lesson right away with remember (category rule), so you never repeat the mistake. When a voice note clearly misheard a name or word, save the right spelling with category vocab.
-
-FORMAT
-- Light markdown only: **bold** for the key number or name, "- " for a real list. No tables.`;
+  6. THE OWNER ALWAYS WANTS TO GROW THE SHOP BOT. In every SALE and SUPPORT chat (never personal, never suspicious), steer the person to the bot: invite them to order there with the real link from "shop" (shop.store_bot.link; for ChatGPT Business use shop.chatgpt_bot.link; for a problem with an order, shop.support.link), plus ONE short reason that fits (instant delivery, pay from the wallet, available 24/7, order history and warranty in one place). Once per reply, natural, never pushy, in the same language. If they already ordered, point them to the bot for the next one or for renewals. If "shop" has no link for what you need, don't invent one — say "the bot" and tell the owner the link is missing.`,
+};
 
 function localNowString() {
   let off = 0;
@@ -321,12 +326,81 @@ function localNowString() {
   return `${d.toISOString().slice(0, 16).replace('T', ' ')} (UTC${off >= 0 ? '+' : ''}${off})`;
 }
 
-function buildInstructions(tier) {
+// ── Token diet: only the tools (and topic guides) a question needs ─────────
+//
+// Sending all 56 tool descriptions (~6,900 tokens) plus every topic's rules
+// (~6,000) with EVERY call is what made Yamen expensive. Tools are grouped;
+// a message gets the small core plus the groups its words point to, plus the
+// groups used in the last few minutes (so follow-ups like "إيه ابعثو" still
+// work). Yamen can load any other group himself with use_tools.
+const TOOL_GROUPS = {
+  sales:    ['best_hours', 'api_sales', 'top_customers', 'products_list'],
+  stock:    ['stock_audit', 'stock_batches', 'stock_reconcile', 'suppliers', 'find_account_supplier', 'propose_stock', 'propose_stock_count', 'list_categories', 'view_customer_media'],
+  products: ['products_list', 'list_categories', 'propose_product', 'propose_product_update'],
+  posts:    ['propose_post', 'scheduled_posts', 'products_list'],
+  support:  ['support_unread', 'support_thread', 'support_digest', 'support_examples', 'support_search', 'propose_reply', 'send_reply_now', 'view_customer_media'],
+  money:    ['txid_check', 'auto_credit_verified_deposit', 'recent_deposits', 'trace_payment', 'refund_requests', 'propose_credit', 'propose_debit'],
+  cgb:      ['cgb_seats_of', 'cgb_overview', 'cgb_new_seats_since', 'cgb_cycle_now', 'cgb_renewals', 'cgb_workspace_report', 'cgb_find_seat'],
+  private:  ['business_inbox', 'business_thread', 'propose_business_reply'],
+  web:      ['web_search', 'web_read'],
+  system:   ['canva_status', 'emoji_status'],
+};
+const GROUPED = new Set(Object.values(TOOL_GROUPS).flat());   // anything not listed stays core
+const GROUP_HINTS = {
+  sales:    /(مبيعات|بيع|ربح|profit|sales|revenue|هالجمعة|الجمعة|الشهر|week|month|ساعات|best|أحسن|api|reseller|top|أكثر)/i,
+  stock:    /(مخزون|ستوك|stock|حسابات|accounts|مورّد|مورد|supplier|batch|دفعة|قرب يوفى|نفذ|نفد)/i,
+  products: /(منتج|product|السوم|سوم|السعر|price|خبّي|خبي|category|قسم|categor)/i,
+  posts:    /(منشور|post|بوست|صمّم|صمم|تصميم|design|قناة|channel|نشر|banner|إعلان|اعلان)/i,
+  support:  /(يستنى|يستناو|حرفاء|حريف|رد |ردود|reply|support|دعم|رسائل الدعم|شكوى|تذكرة|ticket|سأل)/i,
+  money:    /(رصيد|balance|فلوس|txid|تيكس|binance|بينانس|إيداع|ايداع|deposit|شحن|refund|استرجاع|رجّع|رجع|credit|debit|خلاص|payment|usdt|trc20|bep20)/i,
+  cgb:      /(chatgpt|شات ?جي|gpt|business|تفعيل|seat|مقعد|اشتراك|subscription|تجديد|renew|ووركسبيس|workspace|panel|whitelist|يوفى|ينتهي)/i,
+  private:  /(الخاص|خاصة|private|كتبلي|كتبولي|telegram business|المحادثات الخاصة)/i,
+  web:      /(ابحث|search|انترنت|internet|google|غوغل|موقع|website|https?:\/\/|www\.)/i,
+  system:   /(canva|كانفا|emoji|ايموجي|إيموجي)/i,
+};
+const BRIEF_WORDS = /(حوصلة|حوصل|لخص|ملخص|تقرير|تقارير|report|brief|summary|شنوة الحالة|الحالة اليوم|كيفاش المحل)/i;
+
+function pickGroups(text, { images = 0, proactive = null } = {}) {
+  const g = new Set();
+  if (proactive === 'learn') return g;             // nightly study: memory tools (core) only
+  for (const [name, re] of Object.entries(GROUP_HINTS)) if (re.test(text || '')) g.add(name);
+  if (BRIEF_WORDS.test(text || '') || proactive === 'brief' || proactive === 'morning' || proactive === 'evening') ['sales', 'support', 'cgb', 'money', 'stock'].forEach((x) => g.add(x));
+  if (images) ['stock', 'money', 'support', 'products'].forEach((x) => g.add(x));
+  try {
+    const last = JSON.parse(mem.getState('yamen_last_groups', 'null') || 'null');
+    if (last && Date.now() - last.at < 15 * 60000) (last.groups || []).forEach((x) => g.add(x));
+  } catch (_) {}
+  return g;
+}
+
+const USE_TOOLS = {
+  name: 'use_tools',
+  description: 'Load one more group of tools (and its rules) for this question: ' + Object.keys(TOOL_GROUPS).join(', ') + '. Call it before you need a tool that is not in your list.',
+  input_schema: { type: 'object', properties: { group: { type: 'string', enum: Object.keys(TOOL_GROUPS) } }, required: ['group'] },
+};
+
+function toolsFor(ctx) {
+  const want = new Set();
+  for (const g of ctx.groups || []) for (const n of TOOL_GROUPS[g] || []) want.add(n);
+  const list = toolSchemas().filter((t) => !GROUPED.has(t.name) || want.has(t.name));
+  return [...list, USE_TOOLS];
+}
+
+function guidesFor(groups) {
+  const seen = new Set(); const out = [];
+  for (const g of groups || []) {
+    const t = GUIDES[g];
+    if (t && !seen.has(t)) { seen.add(t); out.push(t); }
+  }
+  return out.length ? `\n\nRULES FOR THE TOOLS LOADED NOW\n\n${out.join('\n\n')}` : '';
+}
+
+function buildInstructions(tier, groups) {
   const snap = (() => { try { return liveSnapshot(); } catch (e) { return { error: e.message }; } })();
   const m = mem.memoryForPrompt(tier === 'deep' ? 3500 : 2000);
   let alerts = [];
   try { alerts = require('./agentWatch').recentAlerts(2); } catch (_) {}
-  return `${PERSONA}
+  return `${PERSONA}${guidesFor(groups)}
 
 NOW: ${localNowString()}
 
@@ -395,7 +469,7 @@ async function callWithFallback(tier, send) {
       if (notFound && !/previous.response/i.test(msg) && stepDown(tier)) continue;
 
       if (status === 400) {
-        const bad = ['reasoning_effort', 'max_completion_tokens', 'max_output_tokens', 'max_tokens', 'reasoning']
+        const bad = ['reasoning_effort', 'max_completion_tokens', 'max_output_tokens', 'max_tokens', 'reasoning', 'prompt_cache_key']
           .find((p) => msg.includes(p) && !isRefused(model, p));
         if (bad) {
           refuse(model, bad);
@@ -483,6 +557,12 @@ const TOOL_LABEL = {
 async function runTools(calls, ctx) {
   const images = [];
   const results = await Promise.all(calls.map(async (c) => {
+    if (c.name === 'use_tools') {
+      const g = String((c.args || {}).group || '');
+      if (!TOOL_GROUPS[g]) return { id: c.id, output: JSON.stringify({ error: `unknown group "${g}"`, groups: Object.keys(TOOL_GROUPS) }) };
+      ctx.groups.add(g);
+      return { id: c.id, output: JSON.stringify({ loaded: g, tools: TOOL_GROUPS[g] }) };
+    }
     ctx.emit({ type: 'status', text: TOOL_LABEL[c.name] || `⚙️ ${c.name}` });
     ctx.used.push(c.name);
     const args = { ...(c.args || {}) };
@@ -585,10 +665,13 @@ async function turnOpenAIResponses(ctx) {
   const { tier, emit, signal } = ctx;
   // On the Responses API, OpenAI's native web search replaces our fallback
   // web_search/web_read functions, so drop those to avoid a name clash.
-  const tools = toolSchemas()
-    .filter((t) => !(WEB_SEARCH_ON && (t.name === 'web_search' || t.name === 'web_read')))
-    .map((t) => ({ type: 'function', name: t.name, description: t.description, parameters: t.input_schema }));
-  if (WEB_SEARCH_ON) tools.push({ type: 'web_search' });
+  const buildTools = () => {
+    const t = toolsFor(ctx)
+      .filter((x) => !(WEB_SEARCH_ON && (x.name === 'web_search' || x.name === 'web_read')))
+      .map((x) => ({ type: 'function', name: x.name, description: x.description, parameters: x.input_schema }));
+    if (WEB_SEARCH_ON && ctx.groups.has('web')) t.push({ type: 'web_search' });
+    return t;
+  };
   const first = { role: 'user', content: ownerContent(ctx, 'responses') };
   let previous = mem.getState('openai_prev') || null;
   let input = previous ? [first] : [...recap(), first];
@@ -601,7 +684,10 @@ async function turnOpenAIResponses(ctx) {
     try {
       response = await callWithFallback(tier, (model0) => {
         const model = ctx.forcedModel || model0;
-        const body = { model, instructions: buildInstructions(tier), input, tools };
+        const body = { model, instructions: buildInstructions(tier, ctx.groups), input, tools: buildTools() };
+        // Same key on every call → OpenAI keeps the unchanging start (core
+        // tools + core rules) in its prompt cache, billed at a fraction.
+        if (!isRefused(model, 'prompt_cache_key')) body.prompt_cache_key = 'yamen-owner';
         if (previous) body.previous_response_id = previous;
         if (!isRefused(model, 'max_output_tokens')) body.max_output_tokens = tier === 'deep' ? 6000 : 4000;
         if (!isRefused(model, 'reasoning')) body.reasoning = { effort: ctx.effort };
@@ -632,7 +718,8 @@ async function turnOpenAIResponses(ctx) {
       // A chained conversation re-bills its whole history as input on every
       // call. Once it grows past ~25k tokens (or carries photos), close it:
       // the next message starts fresh from a short recap.
-      mem.setState('openai_prev', lastInput > 25000 ? null : previous);
+      // 12k, not 25k: past that, every new message re-bills a long history.
+      mem.setState('openai_prev', lastInput > 12000 ? null : previous);
       if (!reply) {
         reply = (response.output || []).filter((o) => o.type === 'message')
           .flatMap((o) => o.content || []).filter((c) => c.type === 'output_text')
@@ -655,15 +742,15 @@ async function turnOpenAIResponses(ctx) {
 /** OpenAI chat/completions — only for the gpt-4 family, which cannot reason. */
 async function turnOpenAIChat(ctx) {
   const { tier, emit, signal } = ctx;
-  const tools = toolSchemas().map((t) => ({
+  const buildTools = () => toolsFor(ctx).map((t) => ({
     type: 'function', function: { name: t.name, description: t.description, parameters: t.input_schema },
   }));
-  const messages = [{ role: 'system', content: buildInstructions(tier) }, ...recap(),
+  const messages = [{ role: 'system', content: buildInstructions(tier, ctx.groups) }, ...recap(),
     { role: 'user', content: ownerContent(ctx, 'chat') }];
   for (let round = 0; round < MAX_ROUNDS; round++) {
     if (overBudget()) throw new BudgetError('budget');
     const res = await callWithFallback(tier, (model0) => axios.post('https://api.openai.com/v1/chat/completions', {
-      model: ctx.forcedModel || model0, messages, tools, tool_choice: 'auto', max_tokens: 3000,
+      model: ctx.forcedModel || model0, messages, tools: buildTools(), tool_choice: 'auto', max_tokens: 3000,
     }, { headers: { Authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' }, timeout: 240000, signal }));
     const u = res.data.usage || {};
     addUsage(res.data.model || modelFor(tier), u.prompt_tokens, u.prompt_tokens_details?.cached_tokens, u.completion_tokens);
@@ -682,7 +769,7 @@ async function turnOpenAIChat(ctx) {
 /** Anthropic — stateless, so the recent conversation is sent each time. */
 async function turnAnthropic(ctx) {
   const { tier, emit, signal } = ctx;
-  const tools = toolSchemas();
+  const buildTools = () => toolsFor(ctx);
   const messages = [...recap(), { role: 'user', content: ownerContent(ctx, 'anthropic') }];
   // Anthropic wants strictly alternating turns starting with the user; a brief
   // Sahbi wrote on its own leaves two assistant turns in a row, so merge them.
@@ -698,7 +785,7 @@ async function turnAnthropic(ctx) {
   for (let round = 0; round < MAX_ROUNDS; round++) {
     if (overBudget()) throw new BudgetError('budget');
     const res = await callWithFallback(tier, (model0) => axios.post('https://api.anthropic.com/v1/messages', {
-      model: ctx.forcedModel || model0, max_tokens: tier === 'deep' ? 4000 : 3000, system: buildInstructions(tier), tools, messages,
+      model: ctx.forcedModel || model0, max_tokens: tier === 'deep' ? 4000 : 3000, system: buildInstructions(tier, ctx.groups), tools: buildTools(), messages,
     }, {
       headers: { 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
       timeout: 240000, signal,
@@ -727,7 +814,9 @@ async function turnAnthropic(ctx) {
 // the fast tier — still far cheaper than the deep one.
 // More thinking (still the cheap model) for questions whose answer depends on
 // getting data right: stock, money, subscriptions, emails, dates, "why".
-const CAREFUL = /(مخزون|ستوك|stock|زيد|زيدل|اضف|أضف|ضيف|حسابات|accounts|txid|تيكس|ثبّت|ثبت|صورة|image|photo|اشتراك|subscription|ينتهي|يوفى|يوفا|expire|ووركسبيس|workspace|ايميل|إيميل|email|@|وقتاش|علاش|why|شنوة صار)/i;
+// More thinking only where a slip costs money or stock. ("@", "email", "why"… used to trigger it on
+// half the messages; removed.)
+const CAREFUL = /(مخزون|ستوك|stock|زيد|زيدل|اضف|أضف|ضيف|حسابات|accounts|txid|تيكس|ثبّت|ثبت|صورة|image|photo)/i;
 
 /** One owner message, end to end. */
 async function runTurn({ text, mode, emit, signal, proactive = null, images = [] }) {
@@ -737,7 +826,8 @@ async function runTurn({ text, mode, emit, signal, proactive = null, images = []
   const forcedModel = pics.length ? visionModel() : null;
   if (pics.length) tier = 'deep';
   const effort = tier === 'deep' ? EFFORT.deep : (CAREFUL.test(text) ? 'medium' : EFFORT.fast);
-  const ctx = { text, images: pics, tier, effort, forcedModel, emit, signal, drafts: [], used: [] };
+  const groups = pickGroups(text, { images: pics.length, proactive });
+  const ctx = { text, images: pics, tier, effort, forcedModel, emit, signal, drafts: [], used: [], groups };
   emit({ type: 'start', tier, model: forcedModel || modelFor(tier) });
   // A brief Sahbi writes on its own has no visible question; the prompt is
   // stored as 'auto' so it is neither shown nor replayed as the owner's words.
@@ -752,6 +842,7 @@ async function runTurn({ text, mode, emit, signal, proactive = null, images = []
   const meta = { tier, model: forcedModel || modelFor(tier), tools: [...new Set(ctx.used)],
     drafts: ctx.drafts.map((d) => ({ ...d })), proactive };
   mem.logChat('assistant', reply, meta);
+  if (!proactive) mem.setState('yamen_last_groups', JSON.stringify({ groups: [...ctx.groups], at: Date.now() }));
   emit({ type: 'done', ...meta });
   return { reply, drafts: ctx.drafts, ...meta };
 }
@@ -1148,6 +1239,92 @@ router.get('/cgb-waiting', requireToken, (req, res) => {
   }
 });
 
+// ── Private chats section (Telegram Business) ──────────────────────────────
+//
+// One model call that returns TEXT only — no tools, nothing written to Yamen's
+// chat — used by "✨ اقترح رد" in the private-chats section. Same models, same
+// fallback, and it counts toward the daily budget like every other call.
+async function suggestOnce(system, user) {
+  if (!API_KEY) throw new Error('no AI key configured');
+  if (overBudget()) throw new BudgetError('budget');
+  // ✨ suggestions: the fast model — a short reply doesn't need the expensive one.
+  const tier = 'fast';
+  if (PROVIDER === 'anthropic') {
+    const res = await callWithFallback(tier, (model) => axios.post('https://api.anthropic.com/v1/messages',
+      { model, max_tokens: 900, system, messages: [{ role: 'user', content: user }] },
+      { headers: { 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }, timeout: 120000 }));
+    const u = res.data.usage || {};
+    addUsage(res.data.model || modelFor(tier), u.input_tokens, u.cache_read_input_tokens, u.output_tokens);
+    return (res.data.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('').trim();
+  }
+  if (isReasoningOpenAI(modelFor(tier))) {
+    const res = await callWithFallback(tier, (model) => {
+      const body = { model, instructions: system, input: user, max_output_tokens: 2000 };
+      if (!isRefused(model, 'reasoning')) body.reasoning = { effort: 'low' };
+      return axios.post('https://api.openai.com/v1/responses', body,
+        { headers: { Authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' }, timeout: 120000 });
+    });
+    const u = res.data.usage || {};
+    addUsage(res.data.model || modelFor(tier), u.input_tokens, u.input_tokens_details?.cached_tokens, u.output_tokens);
+    const text = res.data.output_text ||
+      (res.data.output || []).flatMap((o) => o.content || []).filter((c) => c.type === 'output_text').map((c) => c.text).join('');
+    return String(text || '').trim();
+  }
+  const res = await callWithFallback(tier, (model) => axios.post('https://api.openai.com/v1/chat/completions',
+    { model, messages: [{ role: 'system', content: system }, { role: 'user', content: user }], max_tokens: 900 },
+    { headers: { Authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' }, timeout: 120000 }));
+  const u = res.data.usage || {};
+  addUsage(res.data.model || modelFor(tier), u.prompt_tokens, u.prompt_tokens_details?.cached_tokens, u.completion_tokens);
+  return String(res.data.choices?.[0]?.message?.content || '').trim();
+}
+
+const SUGGEST_SYSTEM =
+  'You write ONE reply that the shop owner will send AS HIMSELF in a personal Telegram chat. Output ONLY the ' +
+  'reply text — no quotes, no explanation, no options. Rules: write in the other person\'s language (Tunisian ' +
+  'Derja if they write Derja), in the owner\'s voice — match the length, tone and emoji habits of ' +
+  'your_recent_replies (style only, never their content). Use "person" (their orders, balance, ChatGPT seat) ' +
+  'when it matters. Never invent prices, dates, discounts or promises; if an answer needs one you don\'t have, ' +
+  'write a short reply that says the owner will confirm. In a sale or support chat, invite them to order ' +
+  'through the shop bot with the real link from "shop" (once, naturally, with one short reason); never invent ' +
+  'a link. If the chat is personal (family, friends), write a short warm reply with no selling. If it looks ' +
+  'like a scam, output exactly: ⚠️ SUSPICIOUS';
+
+router.get('/business/chats', requireToken, (req, res) => {
+  try { res.json(require('./agentTools').TOOLS.business_inbox.run({ hours: 24 * 30 })); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.get('/business/thread', requireToken, (req, res) => {
+  try {
+    const t = require('./agentTools').TOOLS.business_thread.run({ chat: req.query.chat, limit: 120 });
+    if (t.error) return res.status(404).json(t);
+    res.json(t);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post('/business/suggest', requireToken, async (req, res) => {
+  try {
+    const t = require('./agentTools').TOOLS.business_thread.run({ chat: req.body.chat, limit: 30 });
+    if (t.error) return res.status(404).json(t);
+    const text = await suggestOnce(SUGGEST_SYSTEM, JSON.stringify({
+      chat: t.messages, person: t.person, shop: t.shop, your_recent_replies: t.your_recent_replies,
+    }).slice(0, 24000));
+    res.json({ text, suspicious: /^⚠️\s*SUSPICIOUS/.test(text) });
+  } catch (e) { res.status(e instanceof BudgetError ? 429 : 500).json({ error: explainError(e) }); }
+});
+
+// The owner typed (or edited) the reply himself and pressed send: sending it
+// IS his tap. Goes out as him through the business connection.
+router.post('/business/send', requireToken, async (req, res) => {
+  const bi = require('./businessInbox');
+  const id = bi._resolveChat(req.body.chat);
+  const text = String(req.body.text || '').trim();
+  if (!id) return res.status(404).json({ error: 'chat not found' });
+  if (!text) return res.status(400).json({ error: 'empty' });
+  const r = await bi.sendReply(id, text.slice(0, 4000));
+  res.status(r.ok ? 200 : 502).json(r);
+});
+
 router.get('/ping', (req, res) => res.json({ ok: true, service: 'shop-assistant',
   version: (() => { try { return require('../package.json').version; } catch (_) { return '?'; } })(),
   canva: (() => { try { return require('./canvaBot').available(); } catch (_) { return false; } })() }));
@@ -1252,7 +1429,7 @@ function agentConfig() {
 // Canva remote-login page, gated by the same token.
 try { require('./canvaLoginPage').mount(router, ACCESS_TOKEN); } catch (e) { logger.warn(`[canva] login page: ${e.message}`); }
 
-module.exports = { router, ACCESS_TOKEN, agentConfig, probeAgent, proactiveTurn, canvaLoginUrl: () => {
+module.exports = { _tokenDiet: { pickGroups, toolsFor, guidesFor, runTools, TOOL_GROUPS, PERSONA, GUIDES }, router, ACCESS_TOKEN, agentConfig, probeAgent, proactiveTurn, canvaLoginUrl: () => {
   const cfg = agentConfig();
   return cfg.base ? `${cfg.base}/agent/canva/login?t=${ACCESS_TOKEN}` : '';
 } };

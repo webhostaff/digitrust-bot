@@ -5,7 +5,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Yamen">
-<meta name="theme-color" content="#0A1626">
+<meta name="theme-color" content="#060D1A">
 <link rel="manifest" href="manifest.json?t=__TOKEN__">
 <link rel="apple-touch-icon" href="icon.svg?t=__TOKEN__">
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -59,14 +59,14 @@ header .sub{font-size:12px;color:var(--dim);white-space:nowrap;overflow:hidden;t
 /* ── Waiting strip: the one loud thing on screen ──────────────────── */
 #pulse{display:none;padding:8px 12px;border-bottom:1px solid var(--line)}
 #pulse.on{display:block}
-.wait{display:flex;align-items:center;gap:10px;width:100%;border:none;border-radius:var(--r-m);
+#pulse .wait{display:flex;align-items:center;gap:10px;width:100%;border:none;border-radius:var(--r-m);
   padding:9px 12px;background:var(--jasmine);color:var(--jasmine-ink);text-align:start}
-.wait[hidden]{display:none}
-.wait .n{font-size:22px;font-weight:700;line-height:1;min-width:1.2em;text-align:center}
-.wait .l{flex:1;font-size:14px;font-weight:600}
-.wait .t{font-variant-numeric:tabular-nums;font-size:14px;font-weight:700;padding:2px 9px;border-radius:999px;
+#pulse .wait[hidden]{display:none}
+#pulse .wait .n{font-size:22px;font-weight:700;line-height:1;min-width:1.2em;text-align:center}
+#pulse .wait .l{flex:1;font-size:14px;font-weight:600}
+#pulse .wait .t{font-variant-numeric:tabular-nums;font-size:14px;font-weight:700;padding:2px 9px;border-radius:999px;
   background:#00000014}
-.wait:active{transform:scale(.99)}
+#pulse .wait:active{transform:scale(.99)}
 
 /* ── Morning brief pills ──────────────────────────────────────────── */
 #brief{display:flex;gap:7px;overflow-x:auto;padding:9px 12px;border-bottom:1px solid var(--line)}
@@ -227,21 +227,405 @@ header .sub{font-size:12px;color:var(--dim);white-space:nowrap;overflow:hidden;t
 #how div{background:var(--card);border:1px solid var(--line);border-radius:var(--r-l);padding:20px;max-width:340px}
 #how ol{margin:0;padding-inline-start:20px;color:var(--dim);font-size:14px;line-height:2}
 #how button{margin-top:16px;width:100%;border:none;color:#fff;border-radius:var(--r-m);padding:11px;background:var(--accent)}
+
+/* ═════ App shell: side navigation + sections ═════════════════════════ */
+body{display:block}
+#app{display:flex;height:100%;min-height:0}
+#side{width:268px;flex:none;display:flex;flex-direction:column;gap:18px;padding:16px 12px;
+  background:var(--card2);border-inline-end:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:12px;padding:4px 6px}
+.brand img{width:40px;height:40px;border-radius:12px}
+.brand b{display:block;font-size:18px;line-height:1.2}
+.brand small{color:var(--dim);font-size:12.5px}
+#side nav{display:flex;flex-direction:column;gap:4px}
+.nav{display:flex;align-items:center;gap:12px;width:100%;padding:10px 12px;border:none;border-radius:var(--r-m);
+  background:transparent;color:var(--dim);text-align:start;font-size:15px;position:relative;transition:background .15s,color .15s}
+.nav:hover{background:var(--card);color:var(--fg)}
+.nav.on{background:var(--raise);color:var(--fg);font-weight:600}
+.nav.on::before{content:"";position:absolute;inset-inline-start:0;top:9px;bottom:9px;width:3px;border-radius:3px;background:var(--accent)}
+.nav .ic{width:24px;text-align:center;font-size:17px}
+.nav .lb{flex:1}
+.bdg{min-width:22px;height:22px;padding:0 7px;border-radius:999px;display:inline-grid;place-items:center;
+  font-size:12px;font-weight:700;background:var(--accent);color:#fff;font-variant-numeric:tabular-nums}
+.bdg.hot{background:var(--jasmine);color:var(--jasmine-ink)}
+.bdg[hidden]{display:none}
+#side .sep{height:1px;background:var(--line);margin:8px 6px}
+#side .foot{margin-top:auto;font-size:12.5px;color:var(--mute);padding:0 8px;line-height:1.7}
+#scrim{display:none}
+#main{flex:1;min-width:0;position:relative}
+.view{position:absolute;inset:0;display:flex;flex-direction:column;min-height:0;
+  opacity:0;visibility:hidden;transform:translateY(6px);transition:opacity .2s ease,transform .2s ease,visibility 0s .2s}
+.view.on{opacity:1;visibility:visible;transform:none;transition:opacity .2s ease,transform .2s ease}
+.menu{display:none}
+@media (max-width:899px){
+  #side{position:fixed;inset-block:0;inset-inline-start:0;z-index:20;width:min(82vw,300px);
+    transform:translateX(105%);transition:transform .25s cubic-bezier(.2,.8,.2,1);box-shadow:0 0 0 1px var(--line)}
+  #side.open{transform:none}
+  #scrim{display:block;position:fixed;inset:0;z-index:19;background:#050B14B3;opacity:0;pointer-events:none;transition:opacity .2s}
+  #scrim.on{opacity:1;pointer-events:auto}
+  .menu{display:inline-grid;place-items:center}
+}
+
+/* ═════ Lists (activations, alerts) ═══════════════════════════════════ */
+.list{flex:1;overflow-y:auto;padding:14px 12px;display:flex;flex-direction:column;gap:10px}
+.item{display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:var(--r-m);
+  background:var(--card);border:1px solid var(--line)}
+.item.hot{border-inline-start:4px solid var(--jasmine)}
+.item .m{flex:1;min-width:0}
+.item .m b{display:block;font-size:15px}
+.item .m small{display:block;color:var(--dim);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:ltr;text-align:end}
+.item .tm{font-variant-numeric:tabular-nums;font-weight:700;color:var(--jasmine);direction:ltr}
+.item.al{align-items:flex-start;white-space:pre-wrap;font-size:14.5px;border-inline-start:4px solid var(--jasmine)}
+.item.al .when{color:var(--mute);font-size:12px;flex:none}
+.cta{margin:4px 0 0;padding:12px;border:none;border-radius:var(--r-m);background:var(--accent);color:#fff;font-weight:600}
+.empty{margin:auto;text-align:center;color:var(--dim);max-width:360px;padding:28px 16px}
+.empty b{display:block;color:var(--fg);font-size:16px;margin-bottom:6px}
+.empty p{margin:0;font-size:14px;line-height:1.8}
+
+/* ═════ Private chats ═════════════════════════════════════════════════ */
+.split{flex:1;display:flex;min-height:0}
+.plist{width:360px;flex:none;overflow-y:auto;padding:8px;border-inline-end:1px solid var(--line);display:flex;flex-direction:column;gap:2px}
+.prow{display:flex;align-items:center;gap:12px;width:100%;padding:10px;border:none;border-radius:var(--r-m);
+  background:transparent;text-align:start;transition:background .15s}
+.prow:hover{background:var(--card)}
+.prow.sel{background:var(--raise)}
+.av{width:44px;height:44px;border-radius:50%;flex:none;display:grid;place-items:center;font-weight:700;font-size:17px;color:#fff;background:var(--raise)}
+.pm{flex:1;min-width:0;display:flex;flex-direction:column}
+.pn{display:flex;align-items:center;gap:6px;font-size:15px}
+.pn b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* Names like "@karim" must keep the @ in front inside the right-to-left layout. */
+.pn b,#pName,.item .m b,.pp{unicode-bidi:plaintext}
+.tag{font-style:normal;font-size:11px;padding:0 7px;border-radius:999px;border:1px solid var(--ok);color:var(--ok);flex:none}
+.pp{color:var(--dim);font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pt{flex:none;font-size:12px;color:var(--mute)}
+.pt em{font-style:normal;background:var(--jasmine);color:var(--jasmine-ink);border-radius:999px;padding:1px 8px;font-weight:700}
+.prow.wait .pn b{color:#fff}
+.pthread,.pempty{flex:1;min-width:0;display:none;flex-direction:column;min-height:0}
+.pempty{display:flex}
+.split.open .pthread{display:flex}
+.split.open .pempty{display:none}
+.ptop{display:flex;align-items:center;gap:12px;padding:10px 14px;border-bottom:1px solid var(--line)}
+.ptop .av{width:40px;height:40px;font-size:15px}
+.ptop b{font-size:16px}
+#pBack{display:none}
+.pcard{margin:12px 14px 0;padding:10px 12px;border-radius:var(--r-m);background:var(--card);border:1px solid var(--line);
+  display:flex;flex-wrap:wrap;gap:6px 14px;font-size:13.5px;color:var(--dim)}
+.pcard[hidden]{display:none}
+.pcard b{color:var(--fg);font-weight:600}
+.pmsgs{flex:1;overflow-y:auto;padding:16px 14px;display:flex;flex-direction:column;gap:8px}
+.bub{max-width:80%;padding:8px 13px;border-radius:17px;white-space:pre-wrap;overflow-wrap:anywhere;font-size:15px;line-height:1.65}
+.bub.them{align-self:flex-start;background:var(--card);border:1px solid var(--line);border-end-start-radius:6px}
+.bub.you{align-self:flex-end;background:var(--accent);color:#fff;border-end-end-radius:6px}
+.bub small{display:block;font-size:11px;opacity:.65;margin-top:2px}
+.pnote{padding:0 14px;font-size:13px;color:var(--dim);min-height:0}
+.pnote:not(:empty){padding:6px 14px}
+.pnote.bad{color:var(--bad)}
+.pcomp{display:flex;gap:8px;align-items:flex-end;padding:8px 12px 12px;border-top:1px solid var(--line)}
+#pi{flex:1;background:var(--card);border:1px solid var(--line);color:var(--fg);resize:none;border-radius:var(--r-l);
+  padding:11px 15px;font:inherit;font-size:16px;line-height:1.5;min-width:0;min-height:46px;max-height:40vh;overflow-y:auto}
+#pi:focus{outline:none;border-color:var(--accent)}
+.cbtn.sug{background:transparent;border:1px solid var(--line);color:var(--jasmine)}
+.cbtn.sug.busy{animation:pulse 1s infinite}
+.cbtn.go{background:var(--accent);color:#fff}
+@media (max-width:899px){
+  .plist{width:100%;border:none}
+  .split.open .plist{display:none}
+  .pempty{display:none}
+  #pBack{display:inline-grid;place-items:center}
+}
+
+/* ═════ Professional pass ═════════════════════════════════════════════
+   One line-icon set instead of emoji; the assistant writes straight on the
+   page in a centred reading column (only the owner gets bubbles); one
+   unified composer bar; a budget meter in the sidebar. */
+.i{width:20px;height:20px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;display:block}
+.hbtn.ico{width:38px;height:38px;min-width:38px;padding:0;display:inline-grid;place-items:center;border-color:transparent;color:var(--dim)}
+.hbtn.ico:hover{background:var(--card);color:var(--fg)}
+.hbtn.ico.lit{color:var(--accent);background:#2F6BFF1A}
+#mode{height:32px;border-radius:999px;padding:0 12px;border-color:var(--line)}
+#v-yamen header,#v-private header,#v-cgb header,#v-alerts header{min-height:60px;gap:8px}
+.nav .ic .i{width:20px;height:20px}
+.nav .ic{display:grid;place-items:center}
+
+/* reading column */
+#log,.chips,#thumbs,#brief{padding-inline:max(14px, calc((100% - 760px) / 2))}
+#log{gap:18px;padding-top:22px;scroll-behavior:smooth}
+.row{max-width:100%}
+.row.me{max-width:82%}
+.bot .msg{background:none;border:none;padding:2px 0;border-radius:0;font-size:16px;line-height:1.85}
+.me .msg{border-radius:20px;border-end-end-radius:6px;padding:10px 15px}
+.row.bot .meta{margin-inline-start:0}
+.alert,.err,.draft,.stock{max-width:100%}
+
+/* unified composer */
+#composer{margin:6px auto 12px;width:min(100% - 24px, 760px);padding:6px;gap:2px;border:1px solid var(--line);
+  border-radius:26px;background:var(--card);align-items:flex-end;transition:border-color .15s}
+#composer:focus-within{border-color:var(--accent)}
+#composer #i{background:transparent;border:none;min-height:40px;padding:9px 8px;border-radius:0}
+#composer .cbtn{width:40px;height:40px;border-radius:50%;background:transparent;border:none;color:var(--dim)}
+#composer .cbtn:hover{color:var(--fg);background:var(--raise)}
+#composer #send{background:var(--accent);color:#fff}
+#composer #send:hover{background:#4A7EFF}
+#composer #send.stop{background:var(--raise);color:var(--bad)}
+#composer #mic.on{background:var(--bad);color:#fff}
+#rec{border-radius:20px;min-height:40px}
+.chips{padding-top:4px;padding-bottom:2px}
+.chips button{font-size:13px;padding:5px 12px}
+
+/* private chats composer, same language */
+.pcomp{margin:6px 12px 12px;padding:6px;gap:2px;border:1px solid var(--line);border-radius:26px;background:var(--card);border-top:1px solid var(--line)}
+.pcomp:focus-within{border-color:var(--accent)}
+.pcomp #pi{background:transparent;border:none;min-height:40px;padding:9px 8px;border-radius:0}
+.pcomp .cbtn{width:40px;height:40px;border-radius:50%}
+.pcomp .cbtn.sug{border:none;background:#F4B8601A;color:var(--jasmine)}
+.pcomp .cbtn.go{background:var(--accent)}
+
+/* sidebar polish + budget meter */
+#side{gap:22px}
+.nav{padding:10px 12px;font-size:14.5px}
+.meter{display:flex;flex-direction:column;gap:7px;padding:12px;border:1px solid var(--line);border-radius:var(--r-m);background:var(--card)}
+.meter .mt{display:flex;justify-content:space-between;align-items:baseline;font-size:12.5px;color:var(--dim)}
+.meter .mt b{color:var(--fg);font-weight:600;font-variant-numeric:tabular-nums}
+.meter .bar{height:6px;border-radius:99px;background:var(--line);overflow:hidden}
+.meter .bar i{display:block;height:100%;border-radius:99px;background:var(--ok);transition:width .4s ease}
+.meter .bar i.hi{background:var(--jasmine)}
+.meter small{color:var(--mute);font-size:11.5px}
+
+/* lists: calmer, denser */
+.item{padding:12px 14px}
+.prow{padding:10px 12px}
+.av{font-size:16px}
+
+/* refinements after review */
+.row.bot{align-self:stretch;align-items:stretch;max-width:100%}
+.row.bot .msg{width:100%}
+.row.bot .meta{justify-content:flex-end}
+@media (min-width:900px){.hbtn.menu{display:none}}
+#pulse,#install{padding-inline:max(14px, calc((100% - 760px) / 2))}
+
+/* ═════════════════════════════════════════════════════════════════════
+   PREMIUM LAYER — "Sidi Bou Said, after dark"
+   Depth instead of borders: frosted panels floating over a deep night-sea
+   with a soft glow. One signature gradient (cobalt → sea turquoise) used
+   only for the owner's messages, the send button and Yamen's mark. Motion
+   that answers: messages float in, sections glide, buttons give way.
+   ═════════════════════════════════════════════════════════════════════ */
+:root{
+  --sea:#060D1A; --glass:rgba(20,36,62,.55); --glass-2:rgba(26,46,78,.72); --glass-hi:rgba(38,62,102,.6);
+  --hair:rgba(255,255,255,.07); --hair-2:rgba(255,255,255,.12);
+  --grad:linear-gradient(135deg,#2F6BFF 0%,#1FA6E0 100%);
+  --grad-soft:linear-gradient(135deg,rgba(47,107,255,.18),rgba(31,166,224,.14));
+  --glow:0 10px 30px -8px rgba(47,107,255,.55);
+  --lift:0 18px 44px -18px rgba(0,0,0,.7);
+  --spring:cubic-bezier(.2,.9,.25,1.15);
+  --ease:cubic-bezier(.22,.8,.3,1);
+}
+html{background:var(--sea)}
+body{
+  background:
+    radial-gradient(900px 620px at 88% -10%, rgba(47,107,255,.20), transparent 62%),
+    radial-gradient(800px 600px at -10% 110%, rgba(31,166,224,.14), transparent 60%),
+    var(--sea);
+  background-attachment:fixed;
+  -webkit-font-smoothing:antialiased;
+}
+::selection{background:rgba(47,107,255,.45)}
+*::-webkit-scrollbar{width:8px;height:8px}
+*::-webkit-scrollbar-thumb{background:rgba(255,255,255,.08);border-radius:99px}
+*::-webkit-scrollbar-track{background:transparent}
+
+/* ── Sidebar: a frosted column ─────────────────────────────────────── */
+#side{background:rgba(10,20,38,.62);backdrop-filter:blur(22px) saturate(140%);-webkit-backdrop-filter:blur(22px) saturate(140%);
+  border-inline-end:1px solid var(--hair);padding:20px 14px}
+.brand{padding:4px 8px 10px}
+.brand img{width:44px;height:44px;border-radius:14px;box-shadow:var(--glow)}
+.brand b{font-size:19px;letter-spacing:.1px}
+.nav{border-radius:14px;padding:11px 12px;color:#9FB4CC;transition:background .25s var(--ease),color .2s,transform .15s}
+.nav .ic{width:34px;height:34px;border-radius:11px;display:grid;place-items:center;background:rgba(255,255,255,.04);transition:background .25s,color .25s}
+.nav:hover{background:rgba(255,255,255,.04);color:#fff}
+.nav:active{transform:scale(.98)}
+.nav.on{background:var(--grad-soft);color:#fff}
+.nav.on::before{display:none}
+.nav.on .ic{background:var(--grad);color:#fff;box-shadow:var(--glow)}
+.bdg{background:rgba(255,255,255,.12);color:#fff;min-width:24px;height:24px}
+.bdg.hot{background:#F4B860;color:#2A1B05;box-shadow:0 6px 18px -6px rgba(244,184,96,.8)}
+#side .sep{background:var(--hair)}
+.meter{background:rgba(255,255,255,.035);border:1px solid var(--hair);border-radius:16px}
+.meter .bar{background:rgba(255,255,255,.07)}
+.meter .bar i{background:var(--grad)}
+
+/* ── Headers: glass bars ───────────────────────────────────────────── */
+#v-yamen header,#v-private header,#v-cgb header,#v-alerts header{
+  background:rgba(8,16,30,.55);backdrop-filter:blur(20px) saturate(140%);-webkit-backdrop-filter:blur(20px) saturate(140%);
+  border-bottom:1px solid var(--hair);min-height:64px}
+header h1{font-size:18px;font-weight:700}
+.orb{background:var(--grad);border:none;box-shadow:var(--glow)}
+.orb img{opacity:.96}
+.hbtn.ico{border-radius:12px;color:#9FB4CC;transition:background .2s,color .2s,transform .12s}
+.hbtn.ico:hover{background:rgba(255,255,255,.06);color:#fff}
+.hbtn.ico:active{transform:scale(.92)}
+.hbtn.ico.lit{background:var(--grad-soft);color:#7FB3FF}
+#mode{background:rgba(255,255,255,.05);border:1px solid var(--hair);color:#DCE6FF}
+
+/* ── Waiting capsule (was a shouting bar) ──────────────────────────── */
+#pulse{border:none;padding-top:10px;padding-bottom:2px}
+#pulse .wait{background:rgba(244,184,96,.10);color:#FFE3B3;border:1px solid rgba(244,184,96,.28);border-radius:999px;
+  padding:8px 10px 8px 14px;box-shadow:0 10px 26px -14px rgba(244,184,96,.55);transition:transform .15s,background .2s}
+#pulse .wait:hover{background:rgba(244,184,96,.16)}
+#pulse .wait:active{transform:scale(.985)}
+#pulse .wait .n{font-size:15px;min-width:28px;height:28px;border-radius:50%;display:grid;place-items:center;background:#F4B860;color:#2A1B05;position:relative}
+#pulse .wait .n::after{content:"";position:absolute;inset:-4px;border-radius:50%;border:2px solid rgba(244,184,96,.55);animation:halo 1.8s var(--ease) infinite}
+@keyframes halo{0%{transform:scale(.85);opacity:.9}100%{transform:scale(1.35);opacity:0}}
+#pulse .wait .l{font-weight:600;font-size:14px}
+#pulse .wait .t{background:rgba(244,184,96,.16);color:#FFD28A}
+
+/* ── Install hint & brief pills: quiet ─────────────────────────────── */
+#install{background:transparent;border-bottom:1px solid var(--hair);color:#C9D6E6}
+#brief{border-bottom:none;padding-top:10px;padding-bottom:2px}
+.pill{background:rgba(255,255,255,.045);border:1px solid var(--hair);color:#C9D6E6;padding:6px 13px}
+.pill.hot{background:rgba(244,184,96,.10);border-color:rgba(244,184,96,.28);color:#FFD28A}
+.pill.good{background:rgba(60,203,139,.10);border-color:rgba(60,203,139,.26);color:#8FE6BD}
+.pill.bad{background:rgba(242,104,92,.10);border-color:rgba(242,104,92,.28);color:#FFB3AA}
+
+/* ── Conversation ──────────────────────────────────────────────────── */
+#log{gap:22px}
+.msg{animation:float-in .38s var(--spring) both}
+@keyframes float-in{from{opacity:0;transform:translateY(10px) scale(.985)}to{opacity:1;transform:none}}
+.me .msg{background:var(--grad);box-shadow:var(--glow);border-radius:22px;border-end-end-radius:8px;padding:11px 16px}
+.row.bot{position:relative;padding-inline-start:0}
+.row.bot .msg{position:relative;padding-top:34px}
+.row.bot .msg::before{content:"يمان";position:absolute;top:0;inset-inline-start:0;display:flex;align-items:center;gap:8px;
+  font-size:13px;font-weight:600;color:#9FC2FF;letter-spacing:.2px}
+.row.bot .msg::after{content:"";position:absolute;top:3px;inset-inline-start:40px;width:7px;height:7px;border-radius:50%;background:var(--grad)}
+.bot .msg strong{color:#fff}
+.bot .msg code{background:rgba(255,255,255,.06);border:none}
+.bot .msg pre{background:rgba(0,0,0,.28);border:1px solid var(--hair)}
+.meta{color:#6F88A6}
+.status{color:#9FC2FF}
+.status i{background:var(--grad)}
+.divider{border:none;background:rgba(255,255,255,.05);color:#8FA7C0}
+.event{color:#8FE6BD;background:rgba(60,203,139,.08);border-radius:999px;padding:5px 14px}
+
+/* cards: glass, soft edge glow instead of hard stripes */
+.alert,.draft,.stock,.err{background:var(--glass);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
+  border:1px solid var(--hair);border-radius:20px;box-shadow:var(--lift);animation:float-in .4s var(--spring) both}
+.alert{border-inline-start:1px solid var(--hair);background:linear-gradient(180deg,rgba(244,184,96,.10),rgba(20,36,62,.55) 60%)}
+.alert .h{color:#FFD28A}
+.draft{border-inline-start:1px solid var(--hair);background:linear-gradient(180deg,rgba(47,107,255,.14),rgba(20,36,62,.55) 55%)}
+.stock{border-inline-start:1px solid var(--hair);background:linear-gradient(180deg,rgba(60,203,139,.12),rgba(20,36,62,.55) 55%)}
+.err{border-inline-start:1px solid var(--hair);background:linear-gradient(180deg,rgba(242,104,92,.14),rgba(20,36,62,.55) 55%)}
+.draft .body,.stock .pv{background:rgba(0,0,0,.22);border:1px solid var(--hair);border-radius:14px}
+.draft .yes,.stock .yes{background:var(--grad);box-shadow:var(--glow)}
+.draft .acts button,.stock .acts button{border-radius:14px;transition:transform .12s,filter .2s}
+.draft .acts button:active,.stock .acts button:active{transform:scale(.97)}
+.draft .no,.stock .no{background:rgba(255,255,255,.04)}
+.draft .copy{background:rgba(255,255,255,.06)}
+
+/* suggestions only on an empty chat — they were noise mid-conversation */
+#log:has(.row) + .chips{display:none}
+.chips{justify-content:center;flex-wrap:wrap;overflow:visible;gap:8px;padding-top:6px;padding-bottom:10px}
+.chips button{background:rgba(255,255,255,.045);border:1px solid var(--hair);color:#C9D6E6;padding:8px 14px;border-radius:14px;
+  transition:background .2s,transform .12s,border-color .2s}
+.chips button:hover{background:rgba(47,107,255,.14);border-color:rgba(47,107,255,.4);color:#fff}
+.tip{padding-top:12vh}
+.tip .big img{box-shadow:var(--glow)}
+
+/* ── Composer: a floating glass capsule ────────────────────────────── */
+#composer,.pcomp{background:rgba(20,36,62,.62);backdrop-filter:blur(20px) saturate(140%);-webkit-backdrop-filter:blur(20px) saturate(140%);
+  border:1px solid var(--hair-2);border-radius:28px;box-shadow:0 18px 40px -20px rgba(0,0,0,.8);
+  transition:border-color .2s,box-shadow .25s}
+#composer:focus-within,.pcomp:focus-within{border-color:rgba(47,107,255,.6);box-shadow:0 0 0 4px rgba(47,107,255,.12),0 18px 40px -20px rgba(0,0,0,.8)}
+#composer #send,.pcomp .cbtn.go{background:var(--grad);box-shadow:var(--glow);transition:transform .15s var(--spring),filter .2s}
+#composer #send:active,.pcomp .cbtn.go:active{transform:scale(.9)}
+#composer #i:placeholder-shown ~ #send{filter:saturate(.6) brightness(.85);box-shadow:none}
+#composer .cbtn,.pcomp .cbtn{transition:background .2s,color .2s,transform .12s}
+#composer .cbtn:active{transform:scale(.9)}
+.pcomp .cbtn.sug{background:rgba(244,184,96,.12)}
+
+/* ── Views glide ───────────────────────────────────────────────────── */
+.view{transform:translateY(8px) scale(.995);transition:opacity .3s var(--ease),transform .35s var(--ease),visibility 0s .3s}
+.view.on{transition:opacity .3s var(--ease),transform .35s var(--ease)}
+
+/* ── Private chats ─────────────────────────────────────────────────── */
+.plist{border-inline-end:1px solid var(--hair);padding:10px}
+.prow{border-radius:16px;transition:background .2s,transform .12s}
+.prow:hover{background:rgba(255,255,255,.04)}
+.prow:active{transform:scale(.99)}
+.prow.sel{background:var(--grad-soft)}
+.prow.wait .av{box-shadow:0 0 0 2px var(--sea),0 0 0 4px #F4B860}
+.av{box-shadow:0 6px 16px -8px rgba(0,0,0,.8)}
+.pt em{background:#F4B860;box-shadow:0 6px 14px -6px rgba(244,184,96,.8)}
+.ptop{background:rgba(8,16,30,.4);border-bottom:1px solid var(--hair)}
+.pcard{background:var(--glass);border:1px solid var(--hair);border-radius:16px}
+.bub{animation:float-in .32s var(--spring) both;border-radius:20px}
+.bub.them{background:var(--glass-2);border:1px solid var(--hair)}
+.bub.you{background:var(--grad);box-shadow:var(--glow)}
+
+/* ── Lists (activations, alerts) ───────────────────────────────────── */
+.item{background:var(--glass);border:1px solid var(--hair);border-radius:18px;box-shadow:var(--lift);animation:float-in .35s var(--spring) both}
+.item.hot{border-inline-start:1px solid var(--hair);background:linear-gradient(90deg,rgba(20,36,62,.55),rgba(244,184,96,.10))}
+.item.al{border-inline-start:1px solid var(--hair);background:linear-gradient(180deg,rgba(244,184,96,.08),rgba(20,36,62,.55))}
+.cta{background:var(--grad);box-shadow:var(--glow);border-radius:16px;transition:transform .12s}
+.cta:active{transform:scale(.98)}
+
+/* ── Sheet (memory & settings) ─────────────────────────────────────── */
+#drawer{background:rgba(3,8,16,.6);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+#drawer .panel{background:rgba(14,26,46,.9);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);border-top:1px solid var(--hair-2);
+  border-radius:26px 26px 0 0;box-shadow:0 -20px 50px -20px rgba(0,0,0,.8);animation:sheet-up .38s var(--spring)}
+@keyframes sheet-up{from{transform:translateY(40px);opacity:.4}to{transform:none;opacity:1}}
+.set,.note{background:rgba(255,255,255,.035);border:1px solid var(--hair);border-radius:16px}
+.tabs{border:1px solid var(--hair);background:rgba(255,255,255,.03)}
+.tabs button.on{background:var(--grad-soft)}
+.sw:checked{background:var(--grad)}
+.addrow button{background:var(--grad)}
+.addrow input,.addrow select{background:rgba(255,255,255,.04);border:1px solid var(--hair)}
+
+/* ── Call screen ───────────────────────────────────────────────────── */
+#call{background:radial-gradient(600px 420px at 50% 40%,rgba(47,107,255,.35),transparent 70%),var(--sea)}
+#call .ring{background:var(--grad);border:none;box-shadow:0 0 60px -10px rgba(47,107,255,.8)}
+
+@media (max-width:899px){
+  #side{background:rgba(10,20,38,.9)}
+  .chips{justify-content:flex-start;flex-wrap:nowrap;overflow-x:auto}
+}
+@media (prefers-reduced-motion:reduce){#pulse .wait .n::after{display:none}}
+
+/* label above Yamen's replies: the signature gradient, no stray dot */
+.row.bot .msg::after{display:none}
+.row.bot .msg::before{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent;font-weight:700;font-size:13px}
+.row.bot .msg{padding-top:28px}
 </style></head>
 <body>
+<div id="app" dir="rtl">
+<aside id="side" aria-label="الأقسام">
+  <div class="brand"><img src="icon.svg?t=__TOKEN__" alt=""><div><b>يمان</b><small>مساعد المتجر</small></div></div>
+  <nav>
+    <button class="nav on" data-view="yamen"><span class="ic"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l1.8 4.7 4.7 1.8-4.7 1.8L12 16l-1.8-4.7L5.5 9.5l4.7-1.8z"/><path d="M18.5 15l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"/></svg></span><span class="lb">يمان</span></button>
+    <button class="nav" data-view="private"><span class="ic"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19V6.5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H8.5z"/></svg></span><span class="lb">المحادثات الخاصة</span><b class="bdg" id="bPriv" hidden></b></button>
+    <button class="nav" data-view="cgb"><span class="ic"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M13 3L5 13.5h6L10 21l8-10.5h-6z"/></svg></span><span class="lb">تفعيلات ChatGPT</span><b class="bdg hot" id="bCgb" hidden></b></button>
+    <button class="nav" data-view="alerts"><span class="ic"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 16.5V11a6 6 0 0 1 12 0v5.5l1.5 1.5h-15z"/><path d="M10 20.5a2 2 0 0 0 4 0"/></svg></span><span class="lb">التنبيهات</span><b class="bdg" id="bAl" hidden></b></button>
+    <div class="sep"></div>
+    <button class="nav" id="navMem"><span class="ic"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4l8 4-8 4-8-4z"/><path d="M4 12l8 4 8-4M4 16l8 4 8-4"/></svg></span><span class="lb">الذاكرة والإعدادات</span></button>
+  </nav>
+  <div class="foot" id="sideFoot"></div>
+</aside>
+<div id="scrim"></div>
+<main id="main">
+<section class="view on" id="v-yamen">
 <header>
+  <button class="hbtn ico menu" aria-label="القائمة"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
   <div class="orb" id="orb"><img src="icon.svg?t=__TOKEN__" alt="" style="width:100%;height:100%;border-radius:12px"></div>
   <div class="who"><h1>يمان</h1><div class="sub" id="sub">…</div></div>
   <button class="hbtn" id="mode" title="Mode">Auto</button>
-  <button class="hbtn" id="callb" title="Talk directly">📞</button>
-  <button class="hbtn" id="spk" title="Read replies aloud">🔇</button>
-  <button class="hbtn" id="memb" title="Memory">🧠</button>
-  <button class="hbtn" id="newc" title="New chat">＋</button>
+  <button class="hbtn ico" id="callb" title="مكالمة صوتية" aria-label="مكالمة صوتية"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M6.6 3.5h2.3l1.4 4-2 1.3a12 12 0 0 0 6.9 6.9l1.3-2 4 1.4v2.3a2 2 0 0 1-2.2 2A17.5 17.5 0 0 1 4.6 5.7a2 2 0 0 1 2-2.2z"/></svg></button>
+  <button class="hbtn ico" id="spk" title="يقرا الردود بالصوت" aria-label="الصوت"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M16 9.5l5 5M21 9.5l-5 5"/></svg></button>
+  <button class="hbtn" id="memb" title="Memory" hidden>🧠</button>
+  <button class="hbtn ico" id="newc" title="محادثة جديدة" aria-label="محادثة جديدة"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L18.5 9.5a2.8 2.8 0 0 0-4-4L4 16z"/><path d="M13.5 6.5l4 4"/></svg></button>
 </header>
 <div id="pulse" dir="rtl"><button id="cgbw" class="wait" hidden></button></div>
 <div id="install">📲 <span>زيدو للشاشة الرئيسية وحلّو كيف تطبيق</span><button id="ok">كيفاش</button><button id="no">✕</button></div>
 <div id="brief"></div>
-<div id="log"></div>
+<div id="log" dir="ltr"></div>
 <div class="chips" id="chips">
   <button>📨 هل في رسائل؟</button>
   <button>📋 عطيني حوصلة اليوم</button>
@@ -258,12 +642,40 @@ header .sub{font-size:12px;color:var(--dim);white-space:nowrap;overflow:hidden;t
 </div>
 <div class="thumbs" id="thumbs"></div>
 <div id="composer">
-  <button class="cbtn" id="att" title="Attach photo or file">📎</button>
+  <button class="cbtn" id="att" title="زيد صورة ولا ملف" aria-label="زيد صورة ولا ملف"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 11.5l-8.2 8.2a5 5 0 0 1-7.1-7.1l8.5-8.5a3.3 3.3 0 0 1 4.7 4.7l-8.5 8.5a1.7 1.7 0 0 1-2.4-2.4l7.8-7.8"/></svg></button>
   <input type="file" id="file" accept="image/*,.txt,.csv,.json,text/plain" multiple style="display:none">
-  <button class="cbtn" id="mic" title="Voice">🎙</button>
-  <textarea id="i" rows="1" dir="auto" placeholder="اكتب ولا احكي 🎙…" enterkeyhint="send"></textarea>
+  <button class="cbtn" id="mic" title="رسالة صوتية" aria-label="رسالة صوتية"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></svg></button>
+  <textarea id="i" rows="1" dir="auto" placeholder="اسأل يمان أي حاجة…" enterkeyhint="send"></textarea>
   <div id="rec"><i></i><span id="rect">0:00</span><span style="flex:1;opacity:.8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">يسمع فيك… 🎙 باش تكمّل</span></div>
-  <button class="cbtn" id="send" title="Send">➤</button>
+  <button class="cbtn" id="send" title="ابعث" aria-label="ابعث"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M5.5 11.5L12 5l6.5 6.5"/></svg></button>
+</div>
+</section>
+
+<section class="view" id="v-private">
+  <header><button class="hbtn ico menu" aria-label="القائمة"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button><div class="who"><h1>المحادثات الخاصة</h1><div class="sub" id="pState">…</div></div><button class="hbtn ico" id="pRefresh" title="حدّث" aria-label="حدّث"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6"/></svg></button></header>
+  <div class="split" id="pSplit">
+    <div class="plist" id="plist"><div class="empty"><b>…</b></div></div>
+    <div class="pthread" id="pthread">
+      <div class="ptop"><button class="hbtn ico" id="pBack" aria-label="رجوع"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg></button><span class="av" id="pAv"></span><div class="who"><b id="pName"></b><div class="sub" id="pMeta"></div></div></div>
+      <div class="pcard" id="pCard" hidden></div>
+      <div class="pmsgs" id="pmsgs" dir="ltr"></div>
+      <div class="pnote" id="pNote"></div>
+      <div class="pcomp"><button class="cbtn sug" id="pSug" title="يمان يقترح رد" aria-label="يمان يقترح رد"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l1.8 4.7 4.7 1.8-4.7 1.8L12 16l-1.8-4.7L5.5 9.5l4.7-1.8z"/><path d="M18.5 15l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"/></svg></button><textarea id="pi" rows="1" dir="auto" placeholder="اكتب ردّك، ولا خلّي يمان يقترح ✨"></textarea><button class="cbtn go" id="pSend" title="ابعث باسمك" aria-label="ابعث باسمك"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M5.5 11.5L12 5l6.5 6.5"/></svg></button></div>
+    </div>
+    <div class="pempty" id="pEmpty"><div class="empty"><b>اختار محادثة</b><p>يمان يعرفلك شكون الشخص، ويقترح رد بأسلوبك.</p></div></div>
+  </div>
+</section>
+
+<section class="view" id="v-cgb">
+  <header><button class="hbtn ico menu" aria-label="القائمة"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button><div class="who"><h1>تفعيلات ChatGPT</h1><div class="sub" id="cgbSub">…</div></div></header>
+  <div class="list" id="cgbList"></div>
+</section>
+
+<section class="view" id="v-alerts">
+  <header><button class="hbtn ico menu" aria-label="القائمة"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button><div class="who"><h1>التنبيهات</h1><div class="sub">الي يلقاه يمان وهو يراقب المحل</div></div></header>
+  <div class="list" id="alList"></div>
+</section>
+</main>
 </div>
 
 <div id="drawer"><div class="panel" dir="rtl">
@@ -315,6 +727,7 @@ header .sub{font-size:12px;color:var(--dim);white-space:nowrap;overflow:hidden;t
 <div id="how"><div><h3 style="margin:0 0 10px">📲 زيدو للشاشة الرئيسية</h3><ol id="steps"></ol><button id="close">فهمت</button></div></div>
 
 <script>
+const ICON={up:'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M5.5 11.5L12 5l6.5 6.5"/></svg>',stop:'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="2.5" fill="currentColor" stroke="none"/></svg>',vol:'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/></svg>',mute:'<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M16 9.5l5 5M21 9.5l-5 5"/></svg>'};
 const T=(new URLSearchParams(location.search).get('t'))||'__TOKEN__';
 const $=id=>document.getElementById(id);
 const log=$('log'), inp=$('i'), sendB=$('send'), sub=$('sub'), orb=$('orb');
@@ -331,7 +744,9 @@ function inline(s){
     .replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>')
     .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
 }
-function md(src){
+// Keep "@name" readable inside Arabic sentences (the @ used to jump to the end).
+const isoAt=t=>String(t==null?'':t).replace(/(^|[\s(«"'\u200f])@([A-Za-z0-9_]{3,})/g,'$1\u2066@$2\u2069');
+function md(src){src=isoAt(src);
   const parts=String(src||'').split(/```/);
   let html='';
   parts.forEach((part,i)=>{
@@ -369,7 +784,7 @@ function addMe(text,at,pics){
   log.appendChild(r); toBottom(true);
 }
 const PRO={morning:'☀️ حوصلة الصباح',evening:'🌙 حوصلة النهار'};
-function addAlert(text,at){
+function addAlert(text,at){text=isoAt(text);
   clearTip();
   const d=document.createElement('div'); d.className='alert'; d.dir='auto';
   d.innerHTML='<div class="h"><span>🤝 يمان نبّهك</span><span></span></div><div class="b"></div>';
@@ -467,6 +882,8 @@ async function loadBrief(){
     const j=await (await fetch(api('brief'))).json(); const s=j.snapshot||{}; models=j.models||{};
     const u=j.usage||{};
     sub.textContent=`💸 $${(u.cost||0).toFixed(2)} من $${Number(j.budget||0).toFixed(2)} اليوم`;
+    { const spent=Number(u.cost||0), cap=Number(j.budget||0), pct=cap?Math.min(100,Math.round(spent*100/cap)):0;
+      $('sideFoot').innerHTML='<div class="meter"><div class="mt"><span>صرف اليوم</span><b dir="ltr">$'+spent.toFixed(2)+' / $'+cap.toFixed(2)+'</b></div><div class="bar"><i style="width:'+pct+'%"'+(pct>=80?' class="hi"':'')+'></i></div><small>'+String(models.fast||'').replace(/[<>&"]/g,'')+' · '+(j.memory||0)+' ذكرى</small></div>'; }
     sub.title=`⚡ ${models.fast||'?'} · 🧠 ${j.memory||0}`;
     const pills=[];
     const P=(n,cls,label,q)=>{ if(n>0) pills.push([cls,label,q]); };
@@ -518,7 +935,7 @@ async function pollNew(){
 }
 
 // ── Sending (streamed) ───────────────────────────────────────
-function setBusy(b){busy=b; orb.classList.toggle('busy',b); sendB.classList.toggle('stop',b); sendB.textContent=b?'■':'➤';}
+function setBusy(b){busy=b; orb.classList.toggle('busy',b); sendB.classList.toggle('stop',b); sendB.innerHTML=b?ICON.stop:ICON.up;}
 
 let pending=[], lastReply=''; // {kind:'img',url} | {kind:'txt',name,text}
 async function send(text){
@@ -609,7 +1026,8 @@ document.querySelectorAll('#chips button').forEach(b=>b.onclick=()=>send(b.textC
 let cgbState={count:0,oldestAt:0};
 async function pollCgb(){
   try{ const r=await fetch(api('cgb-waiting')); if(!r.ok) return; const j=await r.json();
-    cgbState={count:j.count||0, oldestAt:j.count?Date.now()-(j.oldest_minutes||0)*60000:0}; renderCgb(); }catch(_){}
+    cgbState={count:j.count||0, oldestAt:j.count?Date.now()-(j.oldest_minutes||0)*60000:0, scheduled:j.scheduled||0,
+      items:(j.items||[]).map(x=>({...x, at:Date.now()-(x.minutes||0)*60000}))}; renderCgb(); }catch(_){}
 }
 function renderCgb(){
   const b=$('cgbw'), bar=$('pulse'); if(!b) return;
@@ -621,6 +1039,127 @@ function renderCgb(){
 }
 $('cgbw').onclick=()=>send('شكون يستنى تفعيل ChatGPT Business؟ ورّيني الطلبات من الأقدم للأحدث.');
 pollCgb(); setInterval(pollCgb,30000); setInterval(renderCgb,1000);
+
+// ═════ App shell ══════════════════════════════════════════════════════
+const side=$('side'), scrim=$('scrim');
+const escH=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function openSide(o){ side.classList.toggle('open',o); scrim.classList.toggle('on',o); }
+document.querySelectorAll('.menu').forEach(b=>b.onclick=()=>openSide(true));
+scrim.onclick=()=>openSide(false);
+function showView(v){
+  document.querySelectorAll('.view').forEach(x=>x.classList.toggle('on',x.id==='v-'+v));
+  document.querySelectorAll('.nav[data-view]').forEach(n=>n.classList.toggle('on',n.dataset.view===v));
+  openSide(false); try{localStorage.setItem('view',v);}catch(_){}
+  if(v==='private') loadChats(); if(v==='cgb') renderCgbList(); if(v==='alerts') loadAlerts(true);
+}
+document.querySelectorAll('.nav[data-view]').forEach(n=>n.onclick=()=>showView(n.dataset.view));
+$('navMem').onclick=()=>{ openSide(false); $('memb').click(); };
+const fmtClock=ms=>{ const s=Math.max(0,Math.floor(ms/1000)), h=Math.floor(s/3600), m=Math.floor(s%3600/60), x=s%60;
+  return (h?h+':'+String(m).padStart(2,'0'):String(m))+':'+String(x).padStart(2,'0'); };
+const ago=m=>m==null?'':(m<1?'توا':m<60?m+' د':m<1440?Math.floor(m/60)+' س':Math.floor(m/1440)+' ي');
+function hue(t){ let h=0; for(const c of String(t)) h=(h*31+c.charCodeAt(0))%360; return h; }
+function paintAv(el,name){ const t=String(name||'?').replace(/^@/,''); el.textContent=(t.trim()[0]||'?').toUpperCase(); el.style.background='hsl('+hue(t)+' 42% 34%)'; }
+
+// ── ChatGPT activations section ──────────────────────────────────────
+function renderCgbList(){
+  const b=$('bCgb'); b.textContent=cgbState.count||''; b.hidden=!cgbState.count;
+  if(!$('v-cgb').classList.contains('on')) return;
+  $('cgbSub').textContent=cgbState.count?(cgbState.count+' يستناو التفعيل'+(cgbState.scheduled?' · '+cgbState.scheduled+' يبداو بعد':'')):'حتى حد ما يستنى';
+  const L=$('cgbList');
+  if(!cgbState.count){ L.innerHTML='<div class="empty"><b>حتى تفعيل ما يستنى</b><p>كي حريف يخلّص ChatGPT Business يبان هوني، والوقت من قداش يستنى يدور.</p></div>'; return; }
+  L.innerHTML=(cgbState.items||[]).map(x=>'<div class="item hot"><span class="av" data-n="'+escH(x.who)+'"></span><div class="m"><b>'+escH(x.who)+' · #'+escH(x.order_id)+'</b><small>'+escH(x.email)+'</small></div><span class="tm" data-at="'+x.at+'">'+fmtClock(Date.now()-x.at)+'</span></div>').join('')+
+    '<div class="small" style="text-align:center;margin-top:6px">فعّلهم من البطاقة الحمراء في تيليجرام ولا من بوت الدعوات.</div><button class="cta" id="cgbAsk">اسأل يمان شكون الأولى</button>';
+  L.querySelectorAll('.av').forEach(a=>paintAv(a,a.dataset.n));
+  $('cgbAsk').onclick=()=>{ showView('yamen'); send('شكون يستنى تفعيل ChatGPT Business؟ ورّيني الطلبات من الأقدم للأحدث.'); };
+}
+setInterval(()=>{ document.querySelectorAll('#cgbList .tm').forEach(t=>t.textContent=fmtClock(Date.now()-Number(t.dataset.at))); renderCgbBadge(); },1000);
+function renderCgbBadge(){ const b=$('bCgb'); b.textContent=cgbState.count||''; b.hidden=!cgbState.count; }
+
+// ── Alerts section ───────────────────────────────────────────────────
+let alSeen=Number(localStorage.getItem('alSeen')||0);
+async function loadAlerts(mark){
+  try{ const j=await (await fetch(api('history?limit=80'))).json(); const al=(j.items||[]).filter(x=>x.role==='alert').reverse();
+    const fresh=al.filter(x=>(x.id||0)>alSeen).length; const b=$('bAl'); b.textContent=fresh||''; b.hidden=!fresh||mark;
+    if(mark&&al.length){ alSeen=Math.max(...al.map(x=>x.id||0)); localStorage.setItem('alSeen',alSeen); }
+    if(!$('v-alerts').classList.contains('on')) return;
+    const L=$('alList');
+    L.innerHTML=al.length?al.map(x=>'<div class="item al" dir="auto"><div class="m">'+escH(x.content)+'</div><span class="when">'+escH(String(x.created_at||'').slice(5,16))+'</span></div>').join('')
+      :'<div class="empty"><b>حتى تنبيه لتوا</b><p>يمان يراقب المحل كل 5 دقايق، وكي يلقى حاجة تستناك تبان هوني.</p></div>';
+  }catch(_){}
+}
+
+// ── Private chats section ────────────────────────────────────────────
+let curChat=null, curCan=true;
+function pNote(t,bad){ const n=$('pNote'); n.textContent=t||''; n.classList.toggle('bad',!!bad); }
+async function loadChats(){
+  try{
+    const j=await (await fetch(api('business/chats'))).json(); const chats=j.chats||[];
+    const b=$('bPriv'); b.textContent=j.waiting||''; b.hidden=!j.waiting;
+    $('pState').textContent=!j.connected?'موش مربوط':(j.waiting?j.waiting+' يستناو ردّك':'كل شي مجاوب');
+    if(!$('v-private').classList.contains('on')) return;
+    const L=$('plist');
+    if(!j.connected){ L.innerHTML='<div class="empty"><b>المحادثات الخاصة موش مربوطة</b><p>Telegram ← Settings ← Telegram Business ← Chatbots: اختار بوت يمان الخاص وفعّل Reply to messages.</p></div>'; return; }
+    if(!chats.length){ L.innerHTML='<div class="empty"><b>ما وصلت حتى رسالة لتوا</b><p>يمان يشوف كان الرسائل الي تجي من بعد الربط، ومن الناس برك (موش القروبات ولا البوتات).</p></div>'; return; }
+    L.innerHTML='';
+    for(const c of chats){
+      const r=document.createElement('button'); r.className='prow'+(c.waiting?' wait':'')+(String(curChat)===String(c.chat_id)?' sel':'');
+      r.innerHTML='<span class="av"></span><span class="pm"><span class="pn"><b></b>'+(c.known_customer?'<i class="tag">حريف</i>':'')+'</span><span class="pp" dir="auto"></span></span><span class="pt">'+(c.waiting?'<em>'+ago(c.waiting_minutes)+'</em>':'')+'</span>';
+      paintAv(r.querySelector('.av'),c.who); r.querySelector('b').textContent=c.who; r.querySelector('.pp').textContent=c.last_message||'';
+      r.onclick=()=>openChat(c); L.appendChild(r);
+    }
+  }catch(e){ $('plist').innerHTML='<div class="empty"><b>ما نجّمتش نجيب المحادثات</b><p>'+escH(e.message)+'</p></div>'; }
+}
+async function openChat(c){
+  curChat=c.chat_id; curCan=c.can_reply_now!==false;
+  $('pSplit').classList.add('open'); paintAv($('pAv'),c.who); $('pName').textContent=c.who;
+  $('pMeta').textContent=c.waiting?('يستنى ردّك من '+ago(c.waiting_minutes)):'مجاوب';
+  pNote(curCan?'':'⏳ آخر رسالة منو قبل أكثر من 24 ساعة: تيليجرام ما يخلّيش البوت يجاوب.', !curCan);
+  document.querySelectorAll('.prow').forEach(x=>x.classList.remove('sel'));
+  await refreshThread(true);
+}
+async function refreshThread(scroll){
+  if(curChat==null) return;
+  try{
+    const j=await (await fetch(api('business/thread?chat='+encodeURIComponent(curChat)))).json();
+    const M=$('pmsgs'); const atBottom=M.scrollHeight-M.scrollTop-M.clientHeight<40;
+    M.innerHTML=(j.messages||[]).map(m=>'<div class="bub '+(m.from==='you'?'you':'them')+'" dir="auto">'+escH(m.text)+'<small>'+escH(String(m.at||'').slice(11,16))+'</small></div>').join('');
+    if(scroll||atBottom) M.scrollTop=M.scrollHeight;
+    const p=j.person||{}; const C=$('pCard');
+    if(p.known_customer){
+      const seat=(p.chatgpt_seats||[])[0];
+      C.innerHTML='<span>🛒 <b>حريف في المتجر</b></span>'+(p.balance!=null?'<span>💰 الرصيد <b>$'+Number(p.balance).toFixed(2)+'</b></span>':'')+
+        ((p.recent_orders||[]).length?'<span>🧾 آخر طلب <b>#'+escH(p.recent_orders[0].id)+'</b></span>':'')+
+        (seat?'<span>⚡ ChatGPT '+(seat.days_left>=0?'يوفى بعد <b>'+seat.days_left+' يوم</b>':'<b>وفى</b>')+'</span>':'');
+      C.hidden=false;
+    } else C.hidden=true;
+  }catch(_){}
+}
+$('pBack').onclick=()=>{ $('pSplit').classList.remove('open'); curChat=null; loadChats(); };
+$('pRefresh').onclick=()=>{ loadChats(); refreshThread(); };
+const pi=$('pi'); pi.addEventListener('input',()=>{ pi.style.height='auto'; pi.style.height=Math.min(pi.scrollHeight,window.innerHeight*0.4)+'px'; });
+$('pSug').onclick=async()=>{
+  if(curChat==null) return; const b=$('pSug'); b.classList.add('busy'); pNote('✨ يمان يقرا المحادثة ويكتب…');
+  try{ const r=await post('business/suggest',{chat:curChat}); const j=await r.json();
+    if(!r.ok) pNote('❌ '+(j.error||('HTTP '+r.status)),true);
+    else if(j.suspicious) pNote('⚠️ يمان يشك إنها محاولة تحيّل: ما كتبش رد. اقرا المحادثة بالشوية.',true);
+    else { pi.value=j.text||''; pi.dispatchEvent(new Event('input')); pi.focus(); pNote('راجع الرد وبدّل فيه كان تحب، ومبعد ➤ باش يتبعث باسمك.'); }
+  }catch(e){ pNote('❌ '+e.message,true); } finally{ b.classList.remove('busy'); }
+};
+$('pSend').onclick=async()=>{
+  const t=pi.value.trim(); if(!t||curChat==null) return;
+  if(!curCan){ pNote('⏳ تيليجرام ما يخلّيش البوت يجاوب: آخر رسالة منو قبل أكثر من 24 ساعة.',true); return; }
+  const b=$('pSend'); b.disabled=true; pNote('⏳ يتبعث…');
+  try{ const r=await post('business/send',{chat:curChat,text:t}); const j=await r.json();
+    if(j.ok){ pi.value=''; pi.dispatchEvent(new Event('input')); pNote('✅ تبعث باسمك'); await refreshThread(true); loadChats(); }
+    else pNote('❌ '+(j.error||'ما تبعثش'),true);
+  }catch(e){ pNote('❌ '+e.message,true); } finally{ b.disabled=false; }
+};
+pi.addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey&&window.innerWidth>899){ e.preventDefault(); $('pSend').click(); } });
+
+// Badges stay fresh whatever section is open.
+function tickSections(){ loadChats(); loadAlerts(false); if(curChat!=null&&$('v-private').classList.contains('on')) refreshThread(); }
+tickSections(); setInterval(tickSections,20000);
+try{ const v=localStorage.getItem('view'); if(v&&v!=='yamen'&&$('v-'+v)) showView(v); }catch(_){}
 
 // Grows with the text up to ~45% of the screen, then scrolls inside.
 function grow(){ inp.style.height='auto'; inp.style.height=Math.min(inp.scrollHeight, window.innerHeight*0.45)+'px'; }
@@ -691,7 +1230,7 @@ mic.onclick=()=>{
 };
 
 let speakOn=localStorage.getItem('speak')==='1', audioEl=null;
-const spk=$('spk'); const paintSpk=()=>{spk.textContent=speakOn?'🔊':'🔇';}; paintSpk();
+const spk=$('spk'); const paintSpk=()=>{spk.innerHTML=speakOn?ICON.vol:ICON.mute; spk.classList.toggle('lit',!!speakOn);}; paintSpk();
 spk.onclick=()=>{ speakOn=!speakOn; localStorage.setItem('speak',speakOn?'1':'0'); paintSpk(); if(!speakOn) stopSpeaking(); };
 function stopSpeaking(){ try{speechSynthesis.cancel();}catch(_){} if(audioEl){audioEl.pause(); audioEl=null;} sq.length=0; sqSpoken=0; sqBusy=false; }
 
