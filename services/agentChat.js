@@ -293,7 +293,7 @@ WHAT YOU CAN SEE (read-only)
 - The support bot: every conversation.
 - The ChatGPT Business bot: seats, cycles and the price right now (cgb_cycle_now), the renewal round — paid / said yes unpaid / no answer / declined / to activate (cgb_renewals), seats by email (cgb_find_seat).
 - The ChatGPT Business WORKSPACE (cgb_workspace_report): members, pending invites, whitelist and invite queue from the invite bot, already joined with every seat's order, start, end and days left. For "when does X end", "who expired but is still inside", "who paid but isn't in", "failed invites", "who isn't whitelisted", or a report: call it and answer from its facts — exact dates and counts, never guesses. If workspace_data.ok is false, say the workspace side couldn't be read and why, and answer only from the subscription side. If workspace_data.incomplete is true, say the last workspace read was incomplete.
-- The owner's PERSONAL private chats (Telegram Business — people writing to his own account): business_inbox (who is waiting, for how long), business_thread (one chat), propose_business_reply (a card he taps to send AS HIM). These are private: never quote one person's messages to another, never send anything without his tap, write replies in the other person's language and in his voice, and don't promise money, prices, dates or refunds he hasn't stated. Telegram only allows a reply within 24h of their last message — if can_reply_now is false, say so. If business_inbox says connected=false, explain how to connect: Telegram → Settings → Telegram Business → Chatbots → choose the dedicated private-chats bot (the one whose token is BUSINESS_BOT_TOKEN; the store bot also works if there is none), and turn on "Reply to messages".
+- The owner's PERSONAL private chats (Telegram Business — people writing to his own account): business_inbox (who is waiting, for how long), business_thread (one chat), propose_business_reply (a card he taps to send AS HIM). These are private: never quote one person's messages to another, never send anything without his tap, write replies in the other person's language and in his voice, and don't promise money, prices, dates or refunds he hasn't stated. Telegram only allows a reply within 24h of their last message — if can_reply_now is false, say so. If it is connected but returns no chats, don't just say "nothing": say since when it has been connected (connected_since_utc, in the owner's local time), how many messages it has received (messages_received_total), and explain the note — only messages that arrive after the connection, only private chats with people; older unread ones and groups/channels/bots are not visible. If business_inbox says connected=false, explain how to connect: Telegram → Settings → Telegram Business → Chatbots → choose the dedicated private-chats bot (the one whose token is BUSINESS_BOT_TOKEN; the store bot also works if there is none), and turn on "Reply to messages".
 - PRIVATE-CHAT PLAYBOOK (you are writing AS the owner — be at your most careful):
   1. Always read the chat with business_thread before drafting. Look at "person": if they are a shop customer, use it (what they bought, balance, a ChatGPT seat and its days left) and check live facts with your other tools before you state them — stock, price, an order's status. Never invent a price, date, discount or promise.
   2. Decide what the chat is: a SALE (they want to buy / ask a price) → answer with real stock and price, one clear next step; SUPPORT (a problem with an order or account) → check the order/seat first, then answer; PERSONAL (friends, family, non-business) → short and warm, or just tell the owner and don't draft; SUSPICIOUS (scam, "send me money first", crypto offers, links, requests for codes/passwords) → don't draft, warn the owner.
@@ -309,6 +309,7 @@ HOW YOU TALK
 - Like a chat app with a friend who knows the business: natural, flowing sentences, the way people actually text. No report layout, no headings, no "Summary:" labels.
 - Short by default — 1 to 4 lines for most things. Lists only when there are several items to scan.
 - Voice messages arrive transcribed and may have small errors; understand the intent, do not comment on the transcription.
+- When the owner CORRECTS you ("لا", "غالط", "موش هكا", "قلتلك"), save the lesson right away with remember (category rule), so you never repeat the mistake. When a voice note clearly misheard a name or word, save the right spelling with category vocab.
 
 FORMAT
 - Light markdown only: **bold** for the key number or name, "- " for a real list. No tables.`;
@@ -909,10 +910,31 @@ function costSettings() {
 // Spoken replies use the phone's own voice when it has one for the language
 // (free) and fall back to OpenAI's TTS here.
 
-const TRANSCRIBE_MODELS = ['gpt-4o-mini-transcribe', 'whisper-1'];
+// Most accurate first: the mini model mis-heard Derja too often (owner's
+// report). The difference is ~$0.003/min; falls back if unavailable.
+const TRANSCRIBE_MODELS = ['gpt-4o-transcribe', 'gpt-4o-mini-transcribe', 'whisper-1'];
 const TTS_MODELS = ['gpt-4o-mini-tts', 'tts-1'];
-const VOICE_HINT = 'Tunisian Arabic (Derja) mixed with French and English. Shop words: ChatGPT, Business, ' +
-  'Canva, Netflix, Gemini, TxID, Binance, USDT, TRC20, BEP20, TON, stock, refund, renew, email, order.';
+// Transcription models follow the STYLE of the prompt text, so the hint is a
+// sample of how the owner actually talks (Derja written in Arabic script with
+// French/English shop words kept as-is), plus the shop's real vocabulary:
+// product names from the database and words Yamen learned (memory, 'vocab').
+const VOICE_SAMPLE = 'شنوة الحالة اليوم؟ قداش من طلب ChatGPT Business يستنى التفعيل؟ ' +
+  'زيد stock متاع Canva، وثبّتلي الـ TxID في Binance. حضّرلي رد للحريف بالدارجة.';
+function voiceHint() {
+  const words = new Set(['ChatGPT', 'Business', 'Canva', 'Netflix', 'Gemini', 'TxID', 'Binance', 'USDT',
+    'TRC20', 'BEP20', 'TON', 'Railway', 'Whitelist', 'Panel', 'stock', 'refund', 'email', 'order']);
+  try {
+    const raw = require('../database/db');
+    for (const r of raw.prepare(`SELECT title FROM products WHERE COALESCE(is_active,1) = 1 ORDER BY id DESC LIMIT 25`).all()) {
+      const t = String(r.title || '').replace(/\[emoji:\d+\]/g, '').replace(/[^\p{L}\p{N} +.-]/gu, ' ').trim().split(/\s+/).slice(0, 3).join(' ');
+      if (t) words.add(t);
+    }
+  } catch (_) {}
+  try {
+    for (const m of mem.listMemory(300).filter((x) => x.category === 'vocab').slice(0, 30)) words.add(String(m.text).slice(0, 40));
+  } catch (_) {}
+  return `${VOICE_SAMPLE} ${[...words].join(', ')}`.slice(0, 900);
+}
 
 router.post('/transcribe', requireToken, express.raw({ type: () => true, limit: '15mb' }), async (req, res) => {
   if (!OPENAI_KEY) return res.status(503).json({ error: 'voice needs OPENAI_API_KEY', fallback: true });
@@ -927,7 +949,7 @@ router.post('/transcribe', requireToken, express.raw({ type: () => true, limit: 
       const form = new FormData();
       form.append('file', new Blob([buf], { type }), `voice.${ext}`);
       form.append('model', model);
-      form.append('prompt', VOICE_HINT);
+      form.append('prompt', voiceHint());
       const r = await fetch('https://api.openai.com/v1/audio/transcriptions', {
         method: 'POST', headers: { Authorization: `Bearer ${OPENAI_KEY}` }, body: form,
       });
@@ -950,8 +972,11 @@ router.post('/tts', requireToken, async (req, res) => {
   if (!text) return res.status(400).json({ error: 'empty' });
   for (const model of TTS_MODELS) {
     try {
-      const body = { model, voice: 'alloy', input: text, format: 'mp3', speed: 1.1,
-        instructions: 'Quick, lively, natural pace — like a friend talking, not an announcer. ' +
+      // Calm and clear: speed 1.1 + "quick, lively" (and the app speeding it up
+      // again on playback) made Yamen talk ~20% too fast — owner's report.
+      const body = { model, voice: 'alloy', input: text, format: 'mp3', speed: 0.95,
+        instructions: 'Calm, clear, unhurried pace, with a short pause between sentences — like explaining ' +
+          'something to a friend. Pronounce numbers, emails and product names carefully. ' +
           'If the text is Tunisian Arabic, speak it the Tunisian way.' };
       let r = await fetch('https://api.openai.com/v1/audio/speech', {
         method: 'POST', headers: { Authorization: `Bearer ${OPENAI_KEY}`, 'content-type': 'application/json' },
@@ -1097,6 +1122,32 @@ self.addEventListener('notificationclick', e => {
 // Served as one self-contained page so it can be added to a home screen and
 // opened like an app, with no build step and nothing to install.
 // Reachability probe for the admin panel. Carries no data and needs no token.
+// ChatGPT Business activations waiting (paid, card still red) — the live
+// counter at the top of the app. Scheduled seats (paid early, their period
+// starts later) are counted apart: they don't need action yet.
+router.get('/cgb-waiting', requireToken, (req, res) => {
+  try {
+    const rawDb = require('../database/db');
+    const today = new Date().toISOString().slice(0, 10);
+    const rows = rawDb.prepare(`
+      SELECT cs.order_id, cs.email, cs.start_date,
+             COALESCE(u.username, u.first_name, CAST(cs.user_id AS TEXT)) AS who, u.username,
+             CAST((julianday('now') - julianday(COALESCE(cs.updated_at, cs.created_at))) * 1440 AS INTEGER) AS mins
+      FROM chatgpt_subscriptions cs LEFT JOIN users u ON u.telegram_id = cs.user_id
+      WHERE cs.status = 'pending'
+      ORDER BY COALESCE(cs.updated_at, cs.created_at) ASC LIMIT 50`).all();
+    const now = rows.filter((r) => !r.start_date || r.start_date <= today);
+    res.json({
+      count: now.length,
+      oldest_minutes: now.length ? Math.max(...now.map((r) => r.mins || 0)) : 0,
+      scheduled: rows.length - now.length,
+      items: now.slice(0, 10).map((r) => ({ order_id: r.order_id, email: r.email, who: r.username ? '@' + r.username : r.who, minutes: r.mins })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 router.get('/ping', (req, res) => res.json({ ok: true, service: 'shop-assistant',
   version: (() => { try { return require('../package.json').version; } catch (_) { return '?'; } })(),
   canva: (() => { try { return require('./canvaBot').available(); } catch (_) { return false; } })() }));

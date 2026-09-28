@@ -52,6 +52,7 @@ async function onConnection(bot, name, c) {
   const record = {
     id: c.id, owner_id: Number(c.user.id), user_chat_id: c.user_chat_id, bot: name,
     enabled: c.is_enabled !== false, can_reply: c.can_reply, rights: c.rights || null, date: c.date,
+    connected_at: new Date().toISOString().replace('T', ' ').slice(0, 19),   // UTC, same format as SQLite datetime('now')
   };
   mem.setState('business_connection', JSON.stringify(record));
   logger.info(`[business] connection ${record.enabled ? 'ON' : 'OFF'} (reply ${canReply(record) ? 'allowed' : 'NOT allowed'})`);
@@ -117,12 +118,27 @@ function inbox({ hours = 48 } = {}) {
     // Telegram lets a business bot answer only chats active in the last 24h.
     can_reply_now: canReply(conn) && !!r.last_in_at && (Date.now() - new Date(r.last_in_at.replace(' ', 'T') + 'Z').getTime()) < 24 * 3600 * 1000,
   }));
+  // Facts for an honest answer when the list is empty: "nothing here" with
+  // twelve unread badges on the owner's screen looks like a bug unless we say
+  // WHY — Telegram only forwards messages sent AFTER the connection, and only
+  // 1-to-1 chats with people (not groups, channels or other bots).
+  let received = 0, lastAt = null;
+  try {
+    const r = raw.prepare(`SELECT COUNT(*) AS n, MAX(created_at) AS last FROM business_messages WHERE is_owner = 0`).get();
+    received = Number(r?.n || 0); lastAt = r?.last || null;
+  } catch (_) {}
   return {
     connected: !!(conn && conn.enabled),
     reply_allowed: canReply(conn),
+    connected_since_utc: conn?.connected_at || null,
+    messages_received_total: received,
+    last_message_received_utc: lastAt,
     window_hours: h,
     waiting: chats.filter((c) => c.waiting).length,
     chats,
+    note: chats.length ? undefined :
+      'Telegram only delivers messages that arrive AFTER the connection, and only private chats with people ' +
+      '(not groups, channels or other bots). Unread messages from before the connection are not visible to the bot.',
   };
 }
 

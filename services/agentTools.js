@@ -537,7 +537,7 @@ TOOLS.remember = {
     'whenever you learn something worth knowing next week. One fact per call, short and specific.',
   input: {
     text: 'the fact, self-contained (include names/ids/emails so it makes sense later)',
-    category: 'owner | customer | supplier | product | rule | issue | note',
+    category: 'owner | customer | supplier | product | rule | issue | note | vocab (a word/name to hear correctly in voice notes)',
   },
   run: ({ text, category }) => {
     const id = mem.addMemory(text, category || 'note', 'assistant');

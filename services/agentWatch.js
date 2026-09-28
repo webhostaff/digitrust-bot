@@ -41,6 +41,8 @@ const DEFAULTS = {
   quiet_start: '01:00',
   quiet_end: '08:30',
   wait_minutes: '30',      // support reply follow-up
+  learn_enabled: '1',      // nightly: re-read the day's chat with the owner and save lessons
+  learn_at: '23:30',
 };
 
 function setting(k) { return mem.getState(`watch_${k}`, DEFAULTS[k]); }
@@ -150,6 +152,25 @@ const RULES = [
         key: `wait_${r.user_id}_${r.last_id}`,
         weight: 3,
         line: `💬 <b>${esc(who(r))}</b> يستنى رد من <b>${fmtAge(r.mins)}</b>: «${esc(String(r.content || '[media]').slice(0, 90))}»`,
+      }));
+  },
+
+  // A paid ChatGPT Business seat still not activated (red card) for too long.
+  function waitingCgbActivations() {
+    const mins = parseInt(setting('wait_minutes'), 10) || 30;
+    return q(`
+      SELECT cs.order_id, cs.email, u.username, u.first_name, cs.user_id,
+             CAST((julianday('now') - julianday(COALESCE(cs.updated_at, cs.created_at))) * 1440 AS INTEGER) AS mins
+      FROM chatgpt_subscriptions cs LEFT JOIN users u ON u.telegram_id = cs.user_id
+      WHERE cs.status = 'pending'
+        AND (cs.start_date IS NULL OR cs.start_date <= date('now'))
+        AND COALESCE(cs.updated_at, cs.created_at) <= datetime('now', ?)
+        AND COALESCE(cs.updated_at, cs.created_at) >= datetime('now', '-3 days')
+      ORDER BY cs.updated_at ASC LIMIT 10`, `-${mins} minutes`)
+      .map((r) => ({
+        key: `cgbwait_${r.order_id}`,
+        weight: 3,
+        line: `🤖 <b>${esc(who(r))}</b> خلّص ChatGPT Business (#${r.order_id}) ويستنى التفعيل من <b>${fmtAge(r.mins)}</b> — <code>${esc(r.email || '')}</code>`,
       }));
   },
 
@@ -381,10 +402,55 @@ async function runBriefsIfDue() {
   }
 }
 
+// ── Nightly learning ──────────────────────────────────────────────────────────
+//
+// "Yamen should get smarter day by day": once a night he re-reads the day's
+// conversation with the owner and saves what he should know tomorrow, with the
+// same remember tool he uses in chat (so the owner sees and can delete every
+// lesson in the app's memory screen). Words he misheard or the owner uses a lot
+// are saved as 'vocab' and feed the voice transcriber's hint.
+const LEARN_PROMPT =
+  'DAILY LEARNING (the owner did not ask — this is your own study time). Below is today\'s conversation between ' +
+  'you and the owner. Find what will make you work better tomorrow, and save each item with the remember tool ' +
+  '(one call per item, at most 6, short and self-contained):\n' +
+  '- his CORRECTIONS of you (he said no / wrong / not like that) → category "rule": what to do instead;\n' +
+  '- his preferences and standing rules → "owner" or "rule";\n' +
+  '- how his business works: products, suppliers, processes, recurring customer problems → "product" / "supplier" / "issue";\n' +
+  '- words, names or product names you misheard or that he uses often → "vocab" (just the word or name).\n' +
+  'Do NOT save: anything already in your memory, one-off facts (today\'s balance, a single order), secrets ' +
+  '(passwords, keys, codes, card numbers), or other people\'s private messages. If nothing is worth saving, save nothing.\n' +
+  'Then answer with ONE short line in Tunisian Derja: what you learned today (or that there was nothing new).\n\n' +
+  'TODAY\'S CONVERSATION:\n';
+
+function todaysTranscript() {
+  const rows = q(`SELECT role, content FROM agent_chat
+                  WHERE role IN ('user','assistant') AND created_at >= datetime('now','-24 hours')
+                  ORDER BY id ASC LIMIT 120`);
+  const owner = rows.filter((r) => r.role === 'user').length;
+  const text = rows.map((r) => `${r.role === 'user' ? 'OWNER' : 'YAMEN'}: ${String(r.content || '').replace(/\s+/g, ' ').slice(0, 400)}`).join('\n');
+  return { owner, text: text.slice(-14000) };
+}
+
+async function runLearnIfDue() {
+  if (setting('learn_enabled') !== '1') return;
+  const now = local(); const today = ymd(now);
+  const at = toMin(setting('learn_at') || '23:30');
+  const t = hm(now);
+  if (!(t >= at && t < at + 60)) return;
+  if (!firstTime(`learn_${today}`)) return;
+  const tr = todaysTranscript();
+  if (tr.owner < 3) return;                         // too little said today to learn from
+  const chat = require('./agentChat');
+  if (!chat.proactiveTurn) return;
+  const reply = await chat.proactiveTurn(LEARN_PROMPT + tr.text, 'learn');
+  if (reply) mem.logChat('event', `🧠 ${String(reply).slice(0, 300)}`, { kind: 'learn' });
+}
+
 async function tick() {
   try { await require('./agentStudio').runScheduled(BOT); } catch (e) { logger.warn(`[yamen] scheduled posts: ${e.message}`); }
   try { await runRules(); } catch (e) { logger.warn(`[sahbi] rules: ${e.message}`); }
   try { await runBriefsIfDue(); } catch (e) { logger.warn(`[sahbi] briefs: ${e.message}`); }
+  try { await runLearnIfDue(); } catch (e) { logger.warn(`[sahbi] learn: ${e.message}`); }
 }
 
 function start(bot) {
@@ -401,4 +467,4 @@ function recentAlerts(limit = 6) {
   return q(`SELECT content, created_at FROM agent_chat WHERE role = 'alert' ORDER BY id DESC LIMIT ?`, limit);
 }
 
-module.exports = { start, tick, runBrief, runRules, allSettings, saveSettings, recentAlerts, RULES };
+module.exports = { _runLearnIfDue: runLearnIfDue, _todaysTranscript: todaysTranscript, start, tick, runBrief, runRules, allSettings, saveSettings, recentAlerts, RULES };

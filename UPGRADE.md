@@ -1777,3 +1777,39 @@ In private chats Yamen writes AS the owner, so mistakes cost the most there.
 * business_thread returns `shop`: the store bot's real @username (read with
   getMe at startup), CHATGPT_BOT_USERNAME and SUPPORT_BOT_USERNAME. A link that
   isn't configured stays empty; Yamen is told never to invent one.
+
+# Part 59 — an empty private inbox is explained, not just "nothing" (v126)
+
+The owner saw unread badges (12, 4, 1) while Yamen said there were no chats.
+Telegram only forwards messages that arrive AFTER the business connection, and
+only 1-to-1 chats with people (not groups, channels or other bots) — so older
+unread messages are invisible to the bot. business_inbox now returns
+`connected_since_utc`, `messages_received_total`, `last_message_received_utc`
+and a `note`, and Yamen is told to explain an empty inbox with those facts.
+
+# Part 60 — Yamen: new look, activation counter, learns nightly, better voice (v127)
+
+* **New design** ("Sidi Bou Said at night"): deep sea-blue base, cobalt for the
+  owner's messages and main actions, jasmine amber only for things waiting on
+  him; IBM Plex Sans Arabic; no gradient washes — cards are told apart by a
+  coloured edge (cobalt = a reply to approve, green = stock/action, amber =
+  alert). Cards and notes follow their text's own direction, so Arabic lines
+  no longer come out in scrambled word order. Every id/class is unchanged,
+  so all features keep working. Reviewed from real renders at phone size.
+* **Live ChatGPT activation counter** under the header: how many paid seats
+  are waiting to be activated and a ticking timer for the oldest; tap it to
+  ask Yamen for the list. Paid-early seats (period starts later) are counted
+  apart. Endpoint `/agent/cgb-waiting`. Plus an alert when one waits longer
+  than the "wait minutes" setting. Replaces the old count pill.
+* **Learns every night** (23:30 by default): re-reads the day's conversation
+  with the owner and saves up to 6 lessons with the normal memory tool — his
+  corrections, rules, how the business works, and misheard words (category
+  `vocab`). Skips quiet days; once per night; never saves secrets or other
+  people's messages; every lesson is visible/deletable in the memory screen.
+  He also saves a lesson immediately whenever the owner corrects him.
+* **Voice**: speech-to-text now uses the most accurate model first
+  (gpt-4o-transcribe) with a hint written the way the owner talks (Derja in
+  Arabic script + French/English shop words) plus real product names and the
+  learned `vocab` words. Text-to-speech was ~20% too fast (speed 1.1 +
+  "quick, lively" + the app speeding playback up again): now speed 0.95,
+  "calm, clear, unhurried", normal playback.
