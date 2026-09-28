@@ -153,6 +153,25 @@ const RULES = [
       }));
   },
 
+  // People waiting in the owner's PERSONAL private chats (Telegram Business).
+  function waitingPrivateChats() {
+    const mins = parseInt(setting('wait_minutes'), 10) || 30;
+    return q(`
+      SELECT b.id AS last_id, b.chat_id, b.text, b.username, b.from_name,
+             CAST((julianday('now') - julianday(b.created_at)) * 1440 AS INTEGER) AS mins
+      FROM business_messages b
+      WHERE b.id IN (SELECT MAX(id) FROM business_messages GROUP BY chat_id)
+        AND b.is_owner = 0
+        AND b.created_at <= datetime('now', ?)
+        AND b.created_at >= datetime('now', '-1 day')
+      ORDER BY b.created_at ASC LIMIT 10`, `-${mins} minutes`)
+      .map((r) => ({
+        key: `bwait_${r.chat_id}_${r.last_id}`,
+        weight: 3,
+        line: `📥 <b>${esc(r.username ? '@' + r.username : (r.from_name || String(r.chat_id)))}</b> كتبلك في الخاص من <b>${fmtAge(r.mins)}</b>: «${esc(String(r.text || '').slice(0, 90))}»`,
+      }));
+  },
+
   function stuckManualDeliveries() {
     return q(`
       SELECT md.id, md.order_id, md.user_id, md.email, md.created_at, p.title, u.username, u.first_name,

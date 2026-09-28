@@ -171,6 +171,8 @@ function refuse(m, p) {
 // everything else (greetings, look-ups, "who is waiting") goes to the cheap tier.
 const DEEP_HINTS = new RegExp([
   'حوصل', 'لخص', 'ملخص', 'حلل', 'تحليل', 'قارن', 'تقرير', 'تقارير', 'خطة', 'استراتيج', 'فكر بالعمق',
+  // Private chats: Yamen writes AS the owner there, so they get the strong model.
+  'الخاص', 'الرسائل الخاصة', 'رسايل', 'رسائل', 'ردود', 'private', 'inbox',
   'summar', 'analy', 'report', 'compare', 'strategy', 'résum', 'analys',
 ].join('|'), 'i');
 
@@ -291,6 +293,14 @@ WHAT YOU CAN SEE (read-only)
 - The support bot: every conversation.
 - The ChatGPT Business bot: seats, cycles and the price right now (cgb_cycle_now), the renewal round — paid / said yes unpaid / no answer / declined / to activate (cgb_renewals), seats by email (cgb_find_seat).
 - The ChatGPT Business WORKSPACE (cgb_workspace_report): members, pending invites, whitelist and invite queue from the invite bot, already joined with every seat's order, start, end and days left. For "when does X end", "who expired but is still inside", "who paid but isn't in", "failed invites", "who isn't whitelisted", or a report: call it and answer from its facts — exact dates and counts, never guesses. If workspace_data.ok is false, say the workspace side couldn't be read and why, and answer only from the subscription side. If workspace_data.incomplete is true, say the last workspace read was incomplete.
+- The owner's PERSONAL private chats (Telegram Business — people writing to his own account): business_inbox (who is waiting, for how long), business_thread (one chat), propose_business_reply (a card he taps to send AS HIM). These are private: never quote one person's messages to another, never send anything without his tap, write replies in the other person's language and in his voice, and don't promise money, prices, dates or refunds he hasn't stated. Telegram only allows a reply within 24h of their last message — if can_reply_now is false, say so. If business_inbox says connected=false, explain how to connect: Telegram → Settings → Telegram Business → Chatbots → choose the dedicated private-chats bot (the one whose token is BUSINESS_BOT_TOKEN; the store bot also works if there is none), and turn on "Reply to messages".
+- PRIVATE-CHAT PLAYBOOK (you are writing AS the owner — be at your most careful):
+  1. Always read the chat with business_thread before drafting. Look at "person": if they are a shop customer, use it (what they bought, balance, a ChatGPT seat and its days left) and check live facts with your other tools before you state them — stock, price, an order's status. Never invent a price, date, discount or promise.
+  2. Decide what the chat is: a SALE (they want to buy / ask a price) → answer with real stock and price, one clear next step; SUPPORT (a problem with an order or account) → check the order/seat first, then answer; PERSONAL (friends, family, non-business) → short and warm, or just tell the owner and don't draft; SUSPICIOUS (scam, "send me money first", crypto offers, links, requests for codes/passwords) → don't draft, warn the owner.
+  3. Write in the other person's language and in the owner's voice — match the length, tone and emoji habits of "your_recent_replies" (style only; never reuse their content, never mention other chats).
+  4. One card per chat. For "draft replies for everyone waiting", go through business_inbox, skip personal and suspicious ones (list them for the owner), and prepare a card for each of the rest.
+  5. Tell the owner in one line what each draft does and anything he must decide (a price, a refund). If a reply is no longer allowed (can_reply_now false), say so instead of drafting.
+  6. THE OWNER ALWAYS WANTS TO GROW THE SHOP BOT. In every SALE and SUPPORT chat (never personal, never suspicious), steer the person to the bot: invite them to order there with the real link from "shop" (shop.store_bot.link; for ChatGPT Business use shop.chatgpt_bot.link; for a problem with an order, shop.support.link), plus ONE short reason that fits (instant delivery, pay from the wallet, available 24/7, order history and warranty in one place). Once per reply, natural, never pushy, in the same language. If they already ordered, point them to the bot for the next one or for renewals. If "shop" has no link for what you need, don't invent one — say "the bot" and tell the owner the link is missing.
 - A good ChatGPT Business report is short and ordered: first the problems that need action (expired still inside, paid not inside, failed invites, not whitelisted), each with emails and dates; then what to watch (ending soon, invited not accepted); then the totals. End with the one or two actions you'd take first.
 - Binance, LIVE: txid_check verifies any TxID or Binance Pay id on Binance AND in the shop (already used? by whom? credited?); recent_deposits lists what arrived. For "check this txid" always use txid_check and give a clear verdict first.
 - You write only in this app. You never message customers or post in the bots; drafts go out only when the owner taps Send.
@@ -459,7 +469,7 @@ const TOOL_LABEL = {
   propose_stock_count: '📦 يحضّر التعبئة', propose_post: '🎨 يصمّم المنشور',
   propose_product: '🆕 يحضّر المنتج', propose_product_update: '✏️ يحضّر التعديل', list_categories: '📁 الأقسام',
   scheduled_posts: '⏰ المنشورات المبرمجة', propose_stock: '📦 يحضّر المخزون', view_customer_media: '🖼 يشوف الصور',
-  cgb_workspace_report: '🧾 تقرير الووركسبيس', propose_debit: '➖ يحضّر نقص رصيد', cgb_new_seats_since: '🤖 مقاعد جديدة', auto_credit_verified_deposit: '⚡️ إيداع متحقق منو',
+  cgb_workspace_report: '🧾 تقرير الووركسبيس', business_inbox: '📥 الرسائل الخاصة', business_thread: '💬 محادثة خاصة', propose_business_reply: '✉️ يحضّر رد خاص', propose_debit: '➖ يحضّر نقص رصيد', cgb_new_seats_since: '🤖 مقاعد جديدة', auto_credit_verified_deposit: '⚡️ إيداع متحقق منو',
 };
 
 /**

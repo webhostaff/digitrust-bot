@@ -2222,6 +2222,16 @@ try {
 
 // ── Start Support Bot ─────────────────────────────────────────────────
 require('./support-bot');
+// Telegram Business: the owner's personal private chats, when he connects
+// this bot (Settings → Telegram Business → Chatbots). See services/businessInbox.js.
+try {
+  const bi = require('./services/businessInbox');
+  bi.attach(bot, 'store');                                      // works if the owner picks the store bot…
+  // Remember the store bot's real @username so Yamen can link to it in
+  // private chats (he always promotes the shop bot — never an invented link).
+  bot.getMe().then((me) => { if (me && me.username) require('./services/agentMemory').setState('store_bot_username', me.username); }).catch(() => {});
+  bi.startDedicated(TelegramBot, process.env.BUSINESS_BOT_TOKEN); // …or, better, a separate bot just for this
+} catch (e) { logger.warn('businessInbox: ' + e.message); }
 let chatgptBotModule = null;
 try { chatgptBotModule = require('./chatgpt-bot'); } catch (e) { logger.warn('chatgpt-bot load: ' + e.message); }
 

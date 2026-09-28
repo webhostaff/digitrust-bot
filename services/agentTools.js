@@ -1049,6 +1049,107 @@ TOOLS.cgb_workspace_report = {
   run: (args) => cgbWorkspaceReport(args || {}),
 };
 
+// ── The owner's PERSONAL private chats (Telegram Business) ──────────────────
+TOOLS.business_inbox = {
+  description:
+    "The owner's PERSONAL Telegram private chats (people writing to his own account), available once he connects " +
+    'the bot in Telegram Business → Chatbots. Lists chats active in the last N hours, who is WAITING for his answer ' +
+    'and for how long, the last message, and whether a reply can be sent now (Telegram allows it only within 24h of ' +
+    'their last message). Read-only.',
+  input: { hours: 'look back this many hours (default 48)' },
+  run: ({ hours } = {}) => {
+    const r = require('./businessInbox').inbox({ hours });
+    for (const c of r.chats || []) {
+      try {
+        const u = raw.prepare('SELECT username, balance FROM users WHERE telegram_id = ?').get(Number(c.chat_id));
+        c.known_customer = !!u;
+      } catch (_) { c.known_customer = false; }
+    }
+    return r;
+  },
+};
+// Who is on the other side of a private chat. In a 1-to-1 chat the chat id IS
+// the person's Telegram id, so if they ever used the shop we know them — and a
+// reply that ignores "he paid yesterday and his seat isn't active" is the kind
+// of mistake that makes an assistant look dumb in front of a customer.
+function businessPerson(chatId) {
+  try {
+    const card = TOOLS.customer_lookup.run({ user_id: String(chatId) });
+    if (!card || !card.found) return { known_customer: false };
+    const today = new Date().toISOString().slice(0, 10);
+    let seats = [];
+    try {
+      seats = raw.prepare(`SELECT order_id, email, start_date, end_date, status FROM chatgpt_subscriptions
+                           WHERE user_id = ? AND COALESCE(status,'') NOT IN ('awaiting_payment','cancelled')
+                           ORDER BY end_date DESC LIMIT 3`).all(Number(chatId))
+        .map((x) => ({ ...x, days_left: x.end_date ? Math.round((new Date(x.end_date) - new Date(today)) / 86400000) : null }));
+    } catch (_) {}
+    return { known_customer: true, ...card, recent_orders: (card.recent_orders || []).slice(0, 5), chatgpt_seats: seats };
+  } catch (_) {
+    return { known_customer: false };
+  }
+}
+
+// The shop's REAL bot links, so drafts can send people to the shop bot
+// without Yamen ever inventing a username.
+function shopLinks() {
+  const at = (u) => { const v = String(u || '').trim().replace(/^@/, ''); return v ? { username: '@' + v, link: `https://t.me/${v}` } : null; };
+  let store = null;
+  try { store = at(mem.getState('store_bot_username', '')); } catch (_) {}
+  return {
+    store_bot: store,
+    chatgpt_bot: at(process.env.CHATGPT_BOT_USERNAME),
+    support: at(process.env.SUPPORT_BOT_USERNAME),
+    store_name: process.env.STORE_NAME || 'DIGITRUST',
+  };
+}
+
+// A few of the owner's OWN recent private replies, as a style guide only.
+function businessStyleSample() {
+  try {
+    return raw.prepare(`SELECT text FROM business_messages
+                        WHERE is_owner = 1 AND length(text) BETWEEN 4 AND 300 AND text NOT LIKE '[%'
+                        ORDER BY id DESC LIMIT 12`).all().map((r) => r.text);
+  } catch (_) { return []; }
+}
+
+TOOLS.business_thread = {
+  description:
+    'One personal private chat in full (oldest first): "you" = the owner, "them" = the other person. Also returns ' +
+    '`person` (if they are a shop customer: balance, rank, recent orders, ChatGPT seats with days left) and ' +
+    '`your_recent_replies` (the owner’s own recent private messages — a STYLE guide only, never content to reuse). Read-only.',
+  input: { chat: 'chat id or @username from business_inbox', limit: 'max messages (default 40)' },
+  run: ({ chat, limit } = {}) => {
+    const t = require('./businessInbox').thread({ chat, limit });
+    if (t.error) return t;
+    return { ...t, person: businessPerson(t.chat_id), your_recent_replies: businessStyleSample(), shop: shopLinks() };
+  },
+};
+TOOLS.propose_business_reply = {
+  description:
+    'Prepare a reply to send AS THE OWNER in one of his personal private chats. Nothing is sent until he taps ' +
+    'the card. Read the thread first; write in the other person\'s language and in the owner\'s voice; never promise ' +
+    'money, prices, dates or refunds he has not stated.',
+  input: { chat: 'chat id or @username', text: 'the reply', why: 'one short line for the owner: what this answers' },
+  run: ({ chat, text, why } = {}) => {
+    const bi = require('./businessInbox');
+    const id = bi._resolveChat(chat);
+    if (!id) return { error: `no private chat found for "${chat}" — use business_inbox first` };
+    const body = String(text || '').trim();
+    if (!body) return { error: 'empty reply' };
+    const conn = bi.connection();
+    if (!conn || !conn.enabled) return { error: 'Telegram Business is not connected' };
+    const whoLabel = String(chat).startsWith('@') ? chat : `chat ${id}`;
+    const action_id = newAction('business_reply', { chatId: id, text: body.slice(0, 4000) });
+    return {
+      action_id, kind: 'business_reply',
+      title: `✉️ رد خاص لـ ${whoLabel}`,
+      summary: `${body.slice(0, 600)}${why ? `\n\n📝 ${String(why).slice(0, 160)}` : ''}`,
+      confirm: '📨 ابعث باسمي',
+    };
+  },
+};
+
 TOOLS.cgb_find_seat = {
   description: 'Find ChatGPT Business seats by email (or part of it) — who owns it, dates, status, paid.',
   input: { email: 'email or part of it' },
@@ -1363,6 +1464,10 @@ async function performAction(a, bot) {
 ${reason ? '📝 ' + reason : ''}`, { parse_mode: 'HTML' }); } catch (_) {}
     }
     return { ok: true, message: `✅ تزادو $${amount.toFixed(2)} لرصيد الحريف — من ${before.toFixed(2)} لـ ${(before + amount).toFixed(2)}` };
+  }
+  if (a.kind === 'business_reply') {
+    const r = await require('./businessInbox').sendReply(a.payload.chatId, a.payload.text);
+    return r.ok ? { ok: true, message: '✅ تبعث الرد باسمك.' } : { ok: false, error: r.error };
   }
   if (a.kind === 'debit') {
     const { userId, amount, reason } = a.payload;

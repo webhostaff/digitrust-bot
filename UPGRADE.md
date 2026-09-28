@@ -1706,3 +1706,74 @@ exactly that link → "invited, but the link could not be copied".
 * Tested on realistic mixes (all flag types, the owner never flagged, any-case
   email lookup, latest seat of a repeat customer, invite bot unreachable), the
   SQL on real SQLite, and against the real invite-bot /api/report endpoint.
+
+# Part 55 — Yamen reads the owner's personal private chats (v122)
+
+With Telegram Premium, the owner connects the store bot to his own account
+(Telegram → Settings → Telegram Business → Chatbots). Telegram's official
+mechanism: no password, disconnect any time from the same screen. (BotFather
+→ the store bot → Bot Settings → Business Mode must be ON for it to appear.)
+
+* services/businessInbox.js receives `business_connection` / `business_message`.
+  Only a connection made by the OWNER's account is accepted; anyone else who
+  connects this bot is ignored. Text only is stored (media as [photo] etc.),
+  30 days, in `business_messages`.
+* Yamen tools: business_inbox (who is waiting in your private chats and for
+  how long, and whether a reply is allowed now — Telegram only allows one
+  within 24h of their last message), business_thread (one chat),
+  propose_business_reply (a card; sent AS THE OWNER only when he taps).
+  No auto-reply in personal chats.
+* agentWatch: "📥 X wrote to you privately N minutes ago" alerts, same
+  wait-minutes setting as the support inbox.
+* These messages never reach the shop's normal command handlers (the Telegram
+  library routes them to a separate event).
+* Tested on a real SQLite engine (sql.js): stranger connection ignored, owner
+  connection saved and confirmed, inbox/waiting logic, @username lookup,
+  prepare → tap → sent as the owner, no-permission and 24h refusals, and the
+  alert query.
+
+# Part 56 — a separate bot for the owner's private chats (v123)
+
+* `BUSINESS_BOT_TOKEN` (optional): a dedicated bot used ONLY for Telegram
+  Business (the owner's personal private chats), so the store bot stays for
+  customers and the two never mix. It answers nobody but the owner: /start
+  from him explains how to connect it (or says it is connected); anyone
+  else gets no reply. Replies Yamen prepares go out through this bot, as the
+  owner, only when he taps.
+* The store bot still works as before if no dedicated bot is set.
+* Tested: no token → nothing starts; stranger /start → silence; owner /start
+  → instructions / "connected"; connection saved on the dedicated bot; a
+  reply is sent through it and the store bot sends nothing.
+
+# Part 57 — Yamen in private chats: knows who he's talking to, writes like the owner (v124)
+
+In private chats Yamen writes AS the owner, so mistakes cost the most there.
+
+* business_thread now also returns `person`: in a 1-to-1 chat the chat id IS
+  the person's Telegram id, so a shop customer is recognised automatically —
+  balance, rank, recent orders, ChatGPT seats with days left. business_inbox
+  marks which waiting chats are customers.
+* `your_recent_replies`: a sample of the owner's OWN recent private messages
+  (never anyone else's) as a style guide, so drafts match his length, tone
+  and emoji habits.
+* A private-chat playbook in Yamen's instructions: read the thread first; sort
+  the chat into sale / support / personal / suspicious; check live facts
+  (stock, price, order, seat) before stating them; never invent prices, dates
+  or promises; don't draft for personal or suspicious chats (warn instead);
+  one card per chat; batch "draft replies for everyone waiting".
+* Private-chat requests now use the strong model (they are rarer and matter
+  more). Keep an eye on the daily budget in the app (🧠 → 🔔 → 💸).
+* Tested on real SQLite: customer context, stranger → "not a customer",
+  style sample = owner only, inbox customer flags, and the model routing.
+
+# Part 58 — private chats always promote the shop bot (v125)
+
+* Standing rule in Yamen's private-chat playbook: the owner always wants to
+  grow the shop bot. In every sale and support chat (never personal or
+  suspicious ones) a draft invites the person to order through the bot with
+  the REAL link and one short reason that fits (instant delivery, wallet,
+  24/7, history and warranty in one place) — once per reply, natural, never
+  pushy. ChatGPT Business questions → the ChatGPT bot; order problems → support.
+* business_thread returns `shop`: the store bot's real @username (read with
+  getMe at startup), CHATGPT_BOT_USERNAME and SUPPORT_BOT_USERNAME. A link that
+  isn't configured stays empty; Yamen is told never to invent one.

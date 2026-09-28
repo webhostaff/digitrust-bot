@@ -724,6 +724,24 @@ db.exec(`
   -- button) can repaint THAT SAME message green instead of only sending a
   -- separate confirmation. One row per order; overwritten if a card is ever
   -- resent for the same order.
+  -- Telegram Business: the owner's PERSONAL private chats, delivered to the
+  -- store bot once the owner connects it (Settings → Telegram Business →
+  -- Chatbots). Text only, kept 30 days, so Yamen can show who is waiting
+  -- and draft replies. is_owner = 1 for the owner's own messages.
+  CREATE TABLE IF NOT EXISTS business_messages (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    connection_id TEXT    NOT NULL,
+    chat_id       INTEGER NOT NULL,
+    from_id       INTEGER,
+    from_name     TEXT,
+    username      TEXT,
+    is_owner      INTEGER NOT NULL DEFAULT 0,
+    message_id    INTEGER,
+    text          TEXT,
+    created_at    TEXT    DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_business_chat ON business_messages(chat_id, id);
+
   CREATE TABLE IF NOT EXISTS cgb_admin_cards (
     order_id   INTEGER PRIMARY KEY,
     chat_id    INTEGER NOT NULL,
