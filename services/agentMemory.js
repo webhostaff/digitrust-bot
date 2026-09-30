@@ -139,6 +139,21 @@ function turnsForRecap(limit = 10) {
   return out.reverse();
 }
 
+/**
+ * Events logged since the owner's last message (V132): button taps
+ * (✅ a credit confirmed, a reply sent), auto credits, replies sent from the
+ * app. They happen OUTSIDE the conversation thread, so the model never saw
+ * them — on 30-09 Yamen drafted "your credits are pending approval" for two
+ * credits the owner had already confirmed a minute earlier.
+ */
+function eventsSinceLastTurn(limit = 12) {
+  return raw.prepare(`
+    SELECT content FROM agent_chat
+    WHERE role = 'event'
+      AND id > COALESCE((SELECT MAX(id) FROM agent_chat WHERE role IN ('user','auto')), 0)
+    ORDER BY id ASC LIMIT ?`).all(limit).map((r) => String(r.content || '').slice(0, 240));
+}
+
 function searchChat(q, limit = 20) {
   const term = `%${String(q || '').trim()}%`;
   return raw.prepare(`SELECT id, role, substr(content, 1, 500) AS content, created_at FROM agent_chat
@@ -166,6 +181,6 @@ function safeJson(s) { try { return JSON.parse(s); } catch (_) { return null; } 
 
 module.exports = {
   addMemory, updateMemory, deleteMemory, listMemory, searchMemory, memoryForPrompt,
-  logChat, recentChat, turnsSinceDivider, turnsForRecap, searchChat,
+  logChat, recentChat, turnsSinceDivider, turnsForRecap, eventsSinceLastTurn, searchChat,
   getState, setState,
 };

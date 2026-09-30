@@ -1414,6 +1414,56 @@ function takeAction(id) {
   return a;
 }
 
+
+// ── system_guide (V132) ─────────────────────────────────────────────────────
+// How the owner's whole system works, end to end, so Yamen reasons about the
+// real flow instead of guessing. Read on demand (not sent with every message).
+const SYSTEM_GUIDE = {
+  overview:
+    'DIGITRUST = one Node.js service (Railway) running several Telegram bots on one SQLite DB: ' +
+    '(1) the STORE bot — products, wallet, orders, deliveries, referral, /admin panel; ' +
+    '(2) the SUPPORT bot — customers write here; staff replies go out with a "📩 Support" header; ✓/✓✓ read receipts; ' +
+    '(3) the CHATGPT BUSINESS bot — sells ChatGPT Business seats; (4) the CANVA bot; ' +
+    '(5) Yamen\'s own private bot, connected to the owner\'s personal Telegram through Telegram Business (private chats with people only; no groups/channels/bots; can reply only within 24h of their last message). ' +
+    'A SEPARATE service, "Business Guard" (Python + Playwright, Postgres, its own Telegram bot), drives the ChatGPT Business admin page: it buys seats, sends invites and removes strangers. Resellers use a REST API (api-reseller / api-public).',
+  deposits:
+    'Wallet top-ups (USDT on BEP20, TRC20, TON; also Binance Pay and CryptoBot). The customer picks a network and an amount; the bot RESERVES a unique amount: the base plus cents (e.g. 29 → 29.37; rarely 3 decimals like 29.137). The reservation lives ~30–60 min. ' +
+    'TON needs the MEMO too (shared Binance address). ' +
+    'REAL-TIME SYNC: every ~40 s, while reservations are open, Binance deposit history is read and a transfer matching a reserved amount is credited to that reservation\'s owner automatically — no TxID needed. This covers TON (the wallet shows a different hash than Binance records, by design) and OFF-CHAIN / internal Binance transfers ("Off-chain transfer …" ids, no blockchain hash). ' +
+    'The TxID path still exists: the customer pastes a TxID → verified on Binance → must match an open reservation that is HIS, and must not predate it (else → manual review queue, never auto-credit). A deposit older than deposit_max_age_minutes (15) with no reservation is refused (harvested TxIDs). Every credited Binance id is stored in used_txids: nothing is credited twice. ' +
+    'The extra cents are credited in full. Unmatched deposits land in the Deposit Review queue for the owner.',
+  money_rules:
+    'Yamen never moves money silently. propose_credit / propose_debit make a card the owner taps (✅). Without a TxID the limit is $20; with a TxID Binance confirms (and unused) the amount comes from Binance and the limit is AGENT_VERIFIED_CREDIT_CAP ($500). A confirmed TxID is stored as used. ' +
+    'auto_credit_verified_deposit may credit small verified deposits alone ONLY if the owner turned auto_credit on. ' +
+    'Identical credits are refused while one waits for a tap, or if the same amount was added to that customer in the last hour (again:true only when the owner says it is separate). ' +
+    'After the owner taps ✅ you receive "[happened since your last reply …]": those are DONE — messages must say the balance WAS added.',
+  chatgpt:
+    'ChatGPT Business seat flow: customer buys in the ChatGPT bot/store → gives an email → the order is PENDING (red card, "needs activation") → DIGITRUST sends the email to Business Guard (GUARD_AUTO_INVITE_URL) → the Guard queues it; every 7 minutes (a batch) it buys ONE NEW Standard seat per email on chatgpt.com/admin (card charged, ~$10/mo prorated), sends the invites, verifies, whitelists → it calls back DIGITRUST (/webhook/cgb-guard-status) → the seat is activated and the customer notified. ' +
+    'Billing cycles (cgbCycles): seats belong to monthly cycles; renewals and "new seats since" are computed per cycle; the owner can set a manual cycle end. ' +
+    'Seats with a future start_date wait for that date.',
+  guard:
+    'Business Guard details: one browser per panel (Panel 26 today). DRY_RUN=true means it reports strangers but removes nobody. A paid seat is recorded per email and NEVER bought twice (retries reuse it). If an invite "fails" but the email shows up in Users/Pending, it is whitelisted and DIGITRUST told success. Unknown members get an alert with Allow / Delete / Ignore. A frozen browser is killed and relaunched after 20 min. After every restart the queue waits 3 min (time for 🧹 Clear old). Its /start is a dashboard: queue, today\'s invites/seats/failures, last batch.',
+  support:
+    'Support bot: every customer message is stored (support_messages). Staff replies from the bot or from Yamen\'s app (💬 رسائل الدعم) go out identically. Yamen can suggest (✨) or take a case ("يمان يتكفّل"): read the thread, check orders/TxIDs/photos, then prepare the reply and any credit as cards. Customer-facing text is ENGLISH unless the owner says otherwise.',
+  private_chats:
+    'The owner\'s personal chats reach Yamen through Telegram Business. Order in the app: 🔴 unread → 🟢 answered → 🟡 read but not answered. Opening a chat in the app marks it read (app only — the other person sees no ✓✓). Yamen never sends there without the owner pressing send.',
+  alerts:
+    'Watch rules run in the background (waiting customers, pending seats, stock running out, refunds abuse, no sales for hours…). Alerts are short: similar items collapse into one line. Morning brief ~09:00, evening wrap, and a nightly learning pass (23:30) that reads the day and saves rules.',
+};
+
+TOOLS.system_guide = {
+  description:
+    'How the owner\'s whole system works end to end (store, deposits & real-time sync, TON/off-chain, money rules, ' +
+    'ChatGPT Business flow & cycles, Business Guard, support, private chats, alerts). Read the relevant topic before ' +
+    'answering or acting on anything about how the system behaves — never guess the flow.',
+  input: { topic: 'one of: overview, deposits, money_rules, chatgpt, guard, support, private_chats, alerts, all' },
+  run: ({ topic }) => {
+    const t = String(topic || 'overview').toLowerCase().trim();
+    if (t === 'all') return { guide: SYSTEM_GUIDE };
+    return SYSTEM_GUIDE[t] ? { topic: t, guide: SYSTEM_GUIDE[t] } : { topics: Object.keys(SYSTEM_GUIDE), guide: SYSTEM_GUIDE.overview };
+  },
+};
+
 TOOLS.propose_stock_count = {
   description:
     'For products filled BY HAND (manual delivery / counter stock, e.g. "Claude Team Standard"): prepare adding N ' +
@@ -1522,6 +1572,24 @@ function proposeVerifiedCredit(u, amount, txid, network) {
   };
 }
 
+function duplicateCredit(userId, amount, txid) {
+  const amt = Number(String(amount || '').replace(/[$,\s]/g, ''));
+  const tx = String(txid || '').trim();
+  for (const [, a] of ACTIONS) {
+    if (a.kind !== 'credit' || Number(a.payload.userId) !== Number(userId)) continue;
+    if ((tx && a.payload.txid === tx) || (!tx && Number.isFinite(amt) && Math.abs(Number(a.payload.amount) - amt) < 0.005)) {
+      return `a credit draft for this customer${tx ? ' and TxID' : ` and $${amt.toFixed(2)}`} is ALREADY waiting for the owner's tap — do not make another; point him to it.`;
+    }
+  }
+  if (!tx && Number.isFinite(amt) && amt > 0) {
+    const r = raw.prepare(`SELECT created_at FROM transactions WHERE user_id = ? AND type IN ('admin_credit','deposit')
+                           AND ABS(amount - ?) < 0.005 AND created_at >= datetime('now','-60 minutes')
+                           ORDER BY id DESC LIMIT 1`).get(Number(userId), amt);
+    if (r) return `$${amt.toFixed(2)} was ALREADY added to this customer at ${r.created_at} UTC (confirmed). Do not add it again; if a message is needed, say it was added.`;
+  }
+  return null;
+}
+
 TOOLS.propose_credit = {
   description:
     `Prepare adding balance to a customer's wallet — a refund, compensation, a bonus. Yamen may propose up to ` +
@@ -1534,12 +1602,21 @@ TOOLS.propose_credit = {
     txid: 'optional — the TxID when this credits a deposit. With a TxID Binance confirms (and not used yet), the ' +
           'amount is taken from Binance and the cap is $' + VERIFIED_CREDIT_CAP + ' instead of $' + CREDIT_CAP + '. ' +
           'Use this whenever the owner tells you to add a deposit you found — never split it.',
+    again: 'optional true — ONLY when the owner explicitly says this is an additional, separate credit ' +
+           '(the tool refuses a credit identical to one waiting for his tap or added in the last hour)',
   },
-  run: async ({ user, amount, reason, txid }) => {
+  run: async ({ user, amount, reason, txid, again }) => {
     const key = String(user || '').trim().replace(/^@/, '');
     let u = /^\d+$/.test(key) ? raw.prepare('SELECT * FROM users WHERE telegram_id = ?').get(Number(key))
       : raw.prepare('SELECT * FROM users WHERE lower(username) = lower(?)').get(key);
     if (!u) return { error: `customer "${user}" not found` };
+    // Never the same credit twice (V132, @alex109990 on 30-09: two credits
+    // confirmed, then drafted again). Blocked when an identical draft is
+    // already waiting for the owner's tap, or the same amount was credited
+    // to this customer in the last hour — unless the owner explicitly says
+    // it's an additional, separate credit (again: true).
+    const dup = duplicateCredit(u.telegram_id, amount, txid);
+    if (dup && !again) return { error: dup };
     const tx = String(txid || '').trim();
     if (tx) {
       if (db.isTxidUsed(tx)) return { error: `${tx} was already used/credited in the shop — not proposing it again.` };

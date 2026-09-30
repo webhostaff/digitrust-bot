@@ -2202,6 +2202,11 @@ async function runStaleProductCheck() {
   }
 }
 setInterval(runStaleProductCheck, STALE_CHECK_INTERVAL_MS);
+
+// V132 — real-time deposit sync: credits a reserved amount as soon as Binance
+// has it, without the customer sending a TxID (TON, off-chain transfers).
+try { require('./handlers/wallet').startDepositWatcher(bot); }
+catch (e) { logger.warn(`Deposit watcher not started: ${e.message}`); }
 // Run once shortly after boot too, so a freshly-enabled setting doesn't wait 6 hours
 setTimeout(runStaleProductCheck, 60 * 1000);
 

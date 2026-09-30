@@ -150,7 +150,7 @@ const RULES = [
       ORDER BY m.created_at ASC LIMIT 15`, `-${mins} minutes`)
       .map((r) => ({
         key: `wait_${r.user_id}_${r.last_id}`,
-        weight: 3,
+        weight: 3, group: 'support', who: who(r), mins: r.mins,
         line: `💬 <b>${esc(who(r))}</b> يستنى رد من <b>${fmtAge(r.mins)}</b>: «${esc(String(r.content || '[media]').slice(0, 90))}»`,
       }));
   },
@@ -169,7 +169,7 @@ const RULES = [
       ORDER BY cs.updated_at ASC LIMIT 10`, `-${mins} minutes`)
       .map((r) => ({
         key: `cgbwait_${r.order_id}`,
-        weight: 3,
+        weight: 3, group: 'cgb_paid', who: who(r), mins: r.mins,
         line: `🤖 <b>${esc(who(r))}</b> خلّص ChatGPT Business (#${r.order_id}) ويستنى التفعيل من <b>${fmtAge(r.mins)}</b> — <code>${esc(r.email || '')}</code>`,
       }));
   },
@@ -189,7 +189,7 @@ const RULES = [
       ORDER BY b.created_at ASC LIMIT 10`, `-${mins} minutes`)
       .map((r) => ({
         key: `bwait_${r.chat_id}_${r.last_id}`,
-        weight: 3,
+        weight: 3, group: 'private', who: r.username ? '@' + r.username : (r.from_name || String(r.chat_id)), mins: r.mins,
         line: `📥 <b>${esc(r.username ? '@' + r.username : (r.from_name || String(r.chat_id)))}</b> كتبلك في الخاص من <b>${fmtAge(r.mins)}</b>: «${esc(String(r.text || '').slice(0, 90))}»`,
       }));
   },
@@ -206,7 +206,7 @@ const RULES = [
       ORDER BY md.created_at ASC LIMIT 10`)
       .map((r) => ({
         key: `md_${r.id}`,
-        weight: 3,
+        weight: 3, group: 'manual', who: who(r), mins: r.mins,
         line: `📦 تسليم يدوي #${r.order_id} (${esc(clean(r.title))}) لـ <b>${esc(who(r))}</b> يستنى من <b>${fmtAge(r.mins)}</b>`,
       }));
   },
@@ -219,7 +219,7 @@ const RULES = [
       LIMIT 10`)
       .map((r) => ({
         key: `seat_${r.id}_${ymd(new Date())}`,
-        weight: 3,
+        weight: 3, group: 'seat', who: who(r),
         line: `🤖 مقعد ChatGPT لازمو تفعيل: <b>${esc(who(r))}</b> — <code>${esc(r.email)}</code> (يبدا ${esc(r.start_date)})`,
       }));
   },
@@ -334,6 +334,38 @@ function fmtAge(mins) {
   return h < 24 ? `${h} ساعة` : `${Math.floor(h / 24)} يوم`;
 }
 
+const GROUP_LINE = {
+  support:  (n) => `💬 <b>${n}</b> حرفاء يستناو رد في الدعم`,
+  private:  (n) => `📥 <b>${n}</b> رسائل خاصة جديدة`,
+  cgb_paid: (n) => `🤖 <b>${n}</b> خلّصو ChatGPT ويستناو التفعيل`,
+  seat:     (n) => `🤖 <b>${n}</b> مقاعد ChatGPT لازمها تفعيل`,
+  manual:   (n) => `📦 <b>${n}</b> تسليمات يدوية تستنى`,
+};
+
+function compactLines(findings) {
+  const out = [];
+  const groups = new Map();
+  for (const f of findings) {
+    if (f.group && GROUP_LINE[f.group]) {
+      if (!groups.has(f.group)) { groups.set(f.group, []); out.push({ group: f.group }); }
+      groups.get(f.group).push(f);
+    } else out.push({ line: f.line });
+  }
+  return out.map((o) => {
+    if (o.line) return o.line;
+    const xs = groups.get(o.group);
+    if (xs.length === 1) return xs[0].line;          // a single item keeps its detailed line
+    const counts = new Map();
+    for (const x of xs) if (x.who) counts.set(x.who, (counts.get(x.who) || 0) + 1);
+    const top = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+    const names = top.slice(0, 3).map(([n, c]) => esc(n) + (c > 1 ? ` ×${c}` : '')).join('، ');
+    const rest = top.slice(3).reduce((a, [, c]) => a + c, 0);
+    const oldest = Math.max(0, ...xs.map((x) => x.mins || 0));
+    return `${GROUP_LINE[o.group](xs.length)}: ${names}${rest ? ` +${rest}` : ''}` +
+      (oldest ? ` · الأقدم ${fmtAge(oldest)}` : '');
+  });
+}
+
 async function runRules() {
   if (setting('watch_enabled') !== '1') return;
   if (inQuiet()) return; // unsent findings stay unsent, and go out after quiet hours
@@ -347,15 +379,13 @@ async function runRules() {
   fresh.forEach((f) => firstTime(f.key));
   fresh.sort((a, b) => b.weight - a.weight);
 
-  const urgent = fresh.filter((f) => !f.idea);
-  const ideas = fresh.filter((f) => f.idea);
-  const html =
-    `🤝 <b>يمان ينبّهك</b>\n\n` +
-    urgent.map((f) => f.line).join('\n') +
-    (ideas.length ? `${urgent.length ? '\n\n' : ''}${ideas.map((f) => f.line).join('\n')}` : '') +
-    `\n\n<i>قلّي ونحضّرلك الردود ولا نفسّرلك أكثر.</i>`;
+  // Short and calm (V132): similar findings collapse into ONE line
+  // ("🤖 10 ChatGPT seats need activation: @a، @b +8"), no header or footer
+  // (the app's card has its own), at most 5 lines per alert.
+  const lines = compactLines(fresh.filter((f) => !f.idea)).concat(fresh.filter((f) => f.idea).slice(0, 1).map((f) => f.line));
+  const html = lines.slice(0, 5).join('\n') + (lines.length > 5 ? `\n<i>+${lines.length - 5} أخرين في 🔔 التنبيهات</i>` : '');
 
-  await push(html);
+  await push('🤝 ' + html);
   const plain = html.replace(/<[^>]+>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
   mem.logChat('alert', plain, { kind: 'rules', count: fresh.length });
 }
@@ -480,4 +510,4 @@ function recentAlerts(limit = 6) {
   return q(`SELECT content, created_at FROM agent_chat WHERE role = 'alert' ORDER BY id DESC LIMIT ?`, limit);
 }
 
-module.exports = { _runLearnIfDue: runLearnIfDue, _todaysTranscript: todaysTranscript, start, tick, runBrief, runRules, allSettings, saveSettings, recentAlerts, RULES };
+module.exports = { _compactLines: compactLines, _runLearnIfDue: runLearnIfDue, _todaysTranscript: todaysTranscript, start, tick, runBrief, runRules, allSettings, saveSettings, recentAlerts, RULES };

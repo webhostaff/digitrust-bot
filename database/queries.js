@@ -1581,7 +1581,7 @@ const di_get = db.prepare('SELECT * FROM deposit_intents WHERE id = ?');
  * guarantees no two live reservations ever collide. On collision we simply
  * draw again.
  *
- * The suffix costs the customer at most 0.000999 USDT — a tenth of a cent.
+ * The suffix is at most $0.99 and is credited to the customer's wallet in full.
  *
  * @returns {object|null} the created intent row
  */
@@ -1592,28 +1592,36 @@ function createDepositIntent(userId, network, baseAmount, ttlMinutes) {
   const ttl = (Number(ttlMinutes) > 0 ? Number(ttlMinutes) : 60) * 60 * 1000;
   const base = Number(Number(baseAmount).toFixed(2));
 
-  for (let attempt = 0; attempt < 80; attempt++) {
-    // 0.000100 .. 0.009999 — about one cent at most, and USDT keeps 6 decimals
-    // on both TRC20 and BEP20, so the exact figure survives the transfer.
-    // 0.000101 .. 0.000999 — at most a TENTH of a cent on top of what the
-    // customer asked to deposit, so the identifier is effectively free.
-    //
-    // Note this is not a fee and nothing is lost to the network: BEP20 gas is
-    // paid in BNB and TRC20 in TRX/Energy, never in USDT, so the exact figure
-    // sent is the exact figure Binance receives.
-    //
-    // 899 possible values per base amount. A collision only matters between
-    // two reservations that are open at the same time for the same base, and
-    // the loop simply redraws; the partial UNIQUE index is what guarantees
-    // correctness, not the size of the range.
-    const suffix = (101 + nodeCrypto.randomInt(0, 899)) / 1e6;
-    const unique = Number((base + suffix).toFixed(6));
+  // Build V132 — CENTS, not millionths. "29.000350" confused customers (three
+  // zeros, then digits nobody reads correctly). The identifier is now the
+  // cents: 29.37. The extra cents are credited to the customer's wallet in
+  // full, so it costs them nothing, and 2-decimal amounts are what every
+  // wallet and exchange lets them type without trouble.
+  //
+  // 99 values per base amount (.01–.99) are drawn first. Only if all of them
+  // are reserved at the same moment does it fall back to 3 decimals without
+  // a leading zero (.101–.999, never a multiple of 10 so it can't read as a
+  // cents value). The partial UNIQUE index still guarantees no collision.
+  const cents = nodeCrypto.randomInt(0, 99);
+  for (let i = 0; i < 99; i++) {
+    const k = ((cents + i) % 99) + 1;                // 1..99, starting at a random point
+    const unique = Number((base + k / 100).toFixed(2));
     try {
       const res = di_insert.run(userId, network, base, unique, now, now + ttl);
       return di_get.get(res.lastInsertRowid);
     } catch (e) {
-      if (String(e.message).includes('UNIQUE')) continue; // collision, redraw
-      throw e;
+      if (!String(e.message).includes('UNIQUE')) throw e;
+    }
+  }
+  for (let attempt = 0; attempt < 120; attempt++) {
+    let k = 101 + nodeCrypto.randomInt(0, 899);      // 101..999
+    if (k % 10 === 0) k += 1;
+    const unique = Number((base + k / 1000).toFixed(3));
+    try {
+      const res = di_insert.run(userId, network, base, unique, now, now + ttl);
+      return di_get.get(res.lastInsertRowid);
+    } catch (e) {
+      if (!String(e.message).includes('UNIQUE')) throw e;
     }
   }
   return null; // astronomically unlikely
@@ -1633,7 +1641,43 @@ function findIntentForDeposit(network, amount) {
   return di_findOpenByAmount.get(network, now, Number(amount));
 }
 
+const di_allOpen = db.prepare(`SELECT * FROM deposit_intents WHERE status = 'open' AND expires_ms >= ? ORDER BY id`);
+const di_findRecentByAmount = db.prepare(`
+  SELECT * FROM deposit_intents
+  WHERE status IN ('open','expired') AND network = ? AND expires_ms >= ?
+    AND ABS(unique_amount - ?) < 0.0000021
+  ORDER BY (status = 'open') DESC, id DESC LIMIT 1
+`);
+const di_claimRecent = db.prepare(`
+  UPDATE deposit_intents SET status = 'claimed', claimed_txid = ?, claimed_at = datetime('now')
+  WHERE id = ? AND status IN ('open','expired')
+`);
+const di_recentClaimedForUser = db.prepare(`
+  SELECT * FROM deposit_intents WHERE user_id = ? AND status = 'claimed'
+    AND claimed_at >= datetime('now', '-3 hours') ORDER BY id DESC LIMIT 1
+`);
+
+/** Every live reservation — the deposit watcher scans only while there are some. */
+function listOpenIntents() {
+  const now = Date.now();
+  di_expireStale.run(now);
+  return di_allOpen.all(now);
+}
+
+/**
+ * For the automatic watcher: a live reservation, or one that expired less
+ * than `graceMs` ago (a customer who paid at minute 29 and whose transfer
+ * Binance booked at minute 35 must still be credited). A live one wins.
+ */
+function findIntentForDepositRecent(network, amount, graceMs = 45 * 60 * 1000) {
+  const now = Date.now();
+  di_expireStale.run(now);
+  return di_findRecentByAmount.get(network, now - graceMs, Number(amount));
+}
+
 const claimDepositIntent  = (id, txid) => di_claim.run(txid, id).changes > 0;
+const claimDepositIntentRecent = (id, txid) => di_claimRecent.run(txid, id).changes > 0;
+const recentClaimedIntentForUser = (userId) => di_recentClaimedForUser.get(userId);
 const cancelDepositIntent = (id) => di_cancel.run(id).changes > 0;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3205,6 +3249,10 @@ module.exports = {
 
   // ═══ V3: deposit security ═══
   createDepositIntent,
+  listOpenIntents,
+  findIntentForDepositRecent,
+  claimDepositIntentRecent,
+  recentClaimedIntentForUser,
   getOpenIntents,
   findIntentForDeposit,
   claimDepositIntent,

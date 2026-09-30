@@ -242,12 +242,16 @@ WHAT YOU CAN SEE (read-only)
 - You write only in this app. You never message customers or post in the bots; drafts go out only when the owner taps Send.
 - Your tools come in groups. Only the groups this question needs are loaded; if you need another one (stock, products, posts, support, money, cgb, private, web, system, sales), call use_tools with its name first — never guess without the data.
 
+KNOW THE SYSTEM
+- system_guide(topic) explains how the owner's system really works (deposits & real-time sync, TON/off-chain, ChatGPT seat flow and cycles, Business Guard, support, private chats). Read the topic before explaining or deciding anything about how the system behaves — never guess.
+
 FOLLOW THE THREAD — the owner's biggest complaint was that you don't connect events
 - A short follow-up without a name ("ومساج", "زيدو", "ابعثلو", "هل استعمل", "شوف هذا") continues YOUR LAST ACTION: same customer, same TxID, same order — see FOCUS and "[what I did: …]". Never jump back to an older customer.
 - A message you draft must match what actually happened: if you (or auto-credit) just added balance, say it was added — never "we can't confirm the payment" right after crediting it.
 - "id + TxID + fix it and message him" is ONE job in ONE turn: check the TxID → credit (propose_credit WITH the txid) → draft the message that says exactly what was done.
 - "Add it" for a deposit you verified: propose_credit with its txid — the full Binance amount in one draft. Never split an amount, never draft a placeholder.
 - Every turn ends with at least one line saying what you did or found. Never an empty reply.
+- "[happened since your last reply …]" lists what the owner did with the buttons (✅ confirmed credits, sent replies) and what ran automatically. Those are DONE: a message to the customer says the balance WAS added — never "pending approval" — and you never prepare the same credit again.
 
 HOW YOU TALK
 - Like a chat app with a friend who knows the business: natural, flowing sentences, the way people actually text. No report layout, no headings, no "Summary:" labels.
@@ -513,6 +517,18 @@ function replyFromWork(items) {
   return lines.join('\n');
 }
 
+/** TxIDs in a message: EVM/TRON hex (with or without 0x), TON base64, Binance off-chain ids. */
+function extractTxids(text) {
+  const t = String(text || '');
+  const out = new Set();
+  for (const m of t.matchAll(/\b(0x)?[a-fA-F0-9]{64}\b/g)) out.add(m[0]);
+  for (const m of t.matchAll(/(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{43}={0,1}(?![A-Za-z0-9+/_=-])/g)) {
+    if (/[A-Z]/.test(m[0]) && /[a-z]/.test(m[0]) && /\d/.test(m[0])) out.add(m[0]);
+  }
+  for (const m of t.matchAll(/off-?chain transfer\s*\d+/gi)) out.add(m[0]);
+  return [...out];
+}
+
 // A correction from the owner. "شبيك"/"بهيم" were not in any list, so a
 // frustrated owner used to get the same mistake again.
 const CORRECTION_RE = /(شبيك|بهيم|ماكش فاهم|ما فهمتش|مافهمتش|موش هذا|موش هكا|مش هكا|غالط|غلطت|قتلك|قلتلك|لا لا|ماهوش هكا|علاش عملت|شنوة عملت|not what i|wrong|no no)/i;
@@ -636,7 +652,7 @@ const TOOL_LABEL = {
   top_customers: '👑 أحسن الحرفاء', cgb_seats_of: '🤖 مقاعد ChatGPT', trace_payment: '💳 يتبّع الدفعة',
   refund_requests: '🔄 طلبات الاسترجاع', cgb_overview: '🤖 ChatGPT Business', propose_reply: '✍️ يكتب رد',
   remember: '📝 يحفظ', update_memory: '📝 يصلّح ملاحظة', forget: '🗑 ينسى', recall_memory: '🧠 يتفكّر',
-  search_past_chats: '🧠 يلوّج في كلامنا', txid_check: '🔗 يثبّت الـ TxID في Binance',
+  search_past_chats: '🧠 يلوّج في كلامنا', txid_check: '🔗 يثبّت الـ TxID في Binance', system_guide: '📘 يراجع كيفاش يخدم السيستام',
   recent_deposits: '🏦 يشوف الإيداعات في Binance', cgb_cycle_now: '🗓 الدورة توا',
   cgb_renewals: '🔄 التجديدات', cgb_find_seat: '📧 يلوّج على الإيميل', order_lookup: '🧾 الطلب',
   emoji_status: '🎨 يثبّت الأيقونات', canva_status: '🎨 حالة Canva', find_product: '🔎 يلوّج على المنتج',
@@ -937,9 +953,32 @@ async function runTurn({ text, mode, emit, signal, proactive = null, images = []
   if (pics.length) tier = 'deep';
   const effort = tier === 'deep' ? EFFORT.deep : (CAREFUL.test(text) ? 'medium' : EFFORT.fast);
   const groups = pickGroups(text, { images: pics.length, proactive });
+  const ctx0 = { work: [] };
   const correcting = !proactive && CORRECTION_RE.test(text || '');
-  const ctx = { text, modelText: correcting ? `${text}${CORRECTION_NOTE}` : text, images: pics, tier, effort,
-    forcedModel, emit, signal, drafts: [], used: [], groups, work: [], workItems: [], proactive };
+  let outside = [];
+  try { outside = proactive ? [] : mem.eventsSinceLastTurn(); } catch (_) {}
+  let modelText = correcting ? `${text}${CORRECTION_NOTE}` : text;
+  // Fast TxID (V132): a pasted TxID is checked on Binance BEFORE the model is
+  // called, and the verdict rides along with the message — one model round
+  // trip saved (the model used to spend a whole call just deciding to check).
+  const txids = !proactive ? extractTxids(text) : [];
+  if (txids.length) {
+    const checks = await Promise.all(txids.slice(0, 3).map(async (t) => {
+      try {
+        const out = await require('./agentTools').runTool('txid_check', { id: t });
+        return `txid_check(${t.slice(0, 18)}…) → ${JSON.stringify(out).slice(0, 1800)}`;
+      } catch (e) { return `txid_check(${t.slice(0, 18)}…) → error ${e.message}`; }
+    }));
+    modelText = `${modelText}\n\n[already checked for you — use these results, do not call txid_check again for them:\n${checks.join('\n')}]`;
+    ctx0.work.push(...checks.map((c) => c.slice(0, 220)));
+    if (groups instanceof Set) groups.add('money'); else if (!groups.includes('money')) groups.push('money');
+  }
+  if (outside.length) {
+    modelText = `[happened since your last reply, outside this chat — these are DONE facts, never describe them as pending:\n` +
+      outside.map((e) => `• ${e}`).join('\n') + `]\n\n${modelText}`;
+  }
+  const ctx = { text, modelText, images: pics, tier, effort,
+    forcedModel, emit, signal, drafts: [], used: [], groups, work: [...ctx0.work], workItems: [], proactive };
   emit({ type: 'start', tier, model: forcedModel || modelFor(tier) });
   // A brief Sahbi writes on its own has no visible question; the prompt is
   // stored as 'auto' so it is neither shown nor replayed as the owner's words.
@@ -1081,7 +1120,10 @@ router.post('/action/approve', requireToken, async (req, res) => {
   try {
     const bot = req.app && (req.app.get('storeBot') || req.app.get('bot'));
     const r = await tools.performAction(a, bot);
-    if (r.ok) mem.logChat('event', r.message);
+    if (r.ok) {
+      const who = a.payload && (a.payload.userId || a.payload.user || a.payload.chat) ? ` (customer ${a.payload.userId || a.payload.user || a.payload.chat})` : '';
+      mem.logChat('event', `✅ OWNER CONFIRMED ${a.kind}${who}: ${r.message}`);
+    }
     res.status(r.ok ? 200 : 400).json(r);
   } catch (e) {
     logger.error(`[agent] action: ${e.message}`);

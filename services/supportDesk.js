@@ -19,7 +19,8 @@ function supportBot() {
   } catch (_) { return null; }
 }
 
-const RANK = { new: 0, waiting: 1, replied: 2 };
+// Owner's order (V132): 🔴 unread → 🟢 answered → 🟡 read but not answered.
+const RANK = { new: 0, replied: 1, waiting: 2 };
 
 /**
  * Conversations of the last `days`. Order: NEW (unread) first, then read but

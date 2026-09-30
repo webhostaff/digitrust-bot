@@ -39,6 +39,83 @@ function minDepositLabel() {
 // Track TXIDs currently being verified to prevent rapid duplicate submissions
 const PROCESSING_TXIDS = new Set();
 
+/** 29.37 → "29.37"; 29.137 → "29.137" (never trailing zeros beyond 2). */
+function fmtReserved(v) {
+  const n = Number(v);
+  const two = n.toFixed(2);
+  return Math.abs(Number(two) - n) < 1e-9 ? two : String(Number(n.toFixed(6)));
+}
+
+// ── Real-time deposit sync (V132) ───────────────────────────────────────────
+//
+// Every DEPOSIT_SCAN_SECONDS, while at least one reservation is open, Binance's
+// deposit history is read and any transfer whose amount matches a
+// reservation is credited to that reservation's owner — no TxID needed.
+//
+//   • TON: the wallet shows a different hash than Binance records, so hash
+//     matching can never work there; the reserved amount always does.
+//   • Off-chain / internal transfers between Binance accounts (transferType 1,
+//     "Off-chain transfer …" ids) carry no blockchain hash at all; they are
+//     matched by amount the same way, on whatever network the customer chose.
+//
+// Same guarantees as the TxID path: the reservation must exist, the transfer
+// must not predate it, the Binance id is stored as used (never credited
+// twice), and the reservation is consumed atomically.
+const NET_FROM_BINANCE = { BSC: 'BEP20', BEP20: 'BEP20', TRX: 'TRC20', TRC20: 'TRC20', TRON: 'TRC20', TON: 'TON' };
+let depositScanRunning = false;
+
+async function scanDepositsOnce(bot) {
+  if (depositScanRunning) return 0;
+  const open = db.listOpenIntents ? db.listOpenIntents() : [];
+  if (!open.length) return 0;
+  depositScanRunning = true;
+  let credited = 0;
+  try {
+    const since = Math.min(...open.map((i) => Number(i.created_ms))) - 10 * 60 * 1000;
+    const history = await require('../services/binance').fetchDepositHistory({ coin: 'USDT', startTime: since, endTime: Date.now() });
+    for (const d of history || []) {
+      if (![1, 6].includes(Number(d.status))) continue;          // 1 = success, 6 = credited (locked)
+      const id = String(d.txId || '').trim() || `binance-deposit-${d.id}`;
+      if (db.isTxidUsed(id) || PROCESSING_TXIDS.has(id)) continue;
+      const offchain = Number(d.transferType) === 1 || /off-?chain|internal/i.test(id);
+      const mapped = NET_FROM_BINANCE[String(d.network || '').toUpperCase()];
+      const nets = offchain || !mapped ? ['BEP20', 'TRC20', 'TON'] : [mapped];
+      let intent = null;
+      for (const n of nets) { intent = db.findIntentForDepositRecent(n, Number(d.amount)); if (intent) break; }
+      if (!intent) continue;
+      if (d.insertTime && Number(d.insertTime) < Number(intent.created_ms) - 120000) continue;
+      PROCESSING_TXIDS.add(id);
+      try {
+        if (!db.claimDepositIntentRecent(intent.id, id)) continue;
+        try { db.clearPendingDeposit(id); } catch (_) {}
+        logger.info(`[AUTO-DEPOSIT] ${d.amount} USDT ${d.network}${offchain ? ' (off-chain)' : ''} → reservation #${intent.id} user ${intent.user_id}`);
+        await creditFromVerifiedDeposit(bot, intent.user_id, intent.user_id, {
+          identifier: id,
+          amount: Number(d.amount),
+          network: intent.network,
+          asset: 'USDT',
+          address: d.address || null,
+          method: `USDT ${intent.network}${offchain ? ' · Binance internal' : ''} · auto-detected`,
+        });
+        credited += 1;
+      } finally {
+        PROCESSING_TXIDS.delete(id);
+      }
+    }
+  } catch (e) {
+    logger.warn(`[AUTO-DEPOSIT] scan failed: ${e.message}`);
+  } finally {
+    depositScanRunning = false;
+  }
+  return credited;
+}
+
+function startDepositWatcher(bot) {
+  const secs = Math.max(20, parseInt(process.env.DEPOSIT_SCAN_SECONDS || '40', 10) || 40);
+  setInterval(() => { scanDepositsOnce(bot).catch(() => {}); }, secs * 1000);
+  logger.info(`[AUTO-DEPOSIT] real-time deposit sync every ${secs}s (while reservations are open)`);
+}
+
 // ── Wallet home ───────────────────────────────────────────────────────────────
 
 async function showWallet(bot, chatId, userId, messageId = null) {
@@ -179,17 +256,19 @@ async function handleUsdtAmount(bot, msg) {
     chatId,
     `💎 <b>Send exactly this amount</b>\n\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
-    `💵 <b>Amount:</b>\n<code>${intent.unique_amount.toFixed(6)}</code>\n\n` +
+    `💵 <b>Amount:</b>\n<code>${fmtReserved(intent.unique_amount)}</code> USDT\n\n` +
     `📥 <b>${net} address:</b>\n<code>${address}</code>\n` +
     memoBlock +
     `━━━━━━━━━━━━━━━━━━━━\n\n` +
     `⚠️ <b>The amount must match to the last decimal.</b>\n` +
     `That exact figure is reserved for you — it is how we know the deposit is yours. ` +
     `A different amount cannot be credited automatically.\n\n` +
-    `<i>The few extra decimals cost you less than a tenth of a cent, and they are ` +
-    `credited to your wallet in full.</i>\n\n` +
+    `<i>The extra cents are credited to your wallet in full.</i>\n\n` +
     `⏰ Reserved for <b>${ttl} minutes</b>.\n\n` +
-    `After sending, paste the <b>TxID</b> (transaction hash) here.`,
+    `✨ <b>Nothing else to do:</b> we detect your transfer automatically and credit it ` +
+    `within about a minute of Binance receiving it — from any wallet, or from your own ` +
+    `Binance account (internal transfer).\n` +
+    `<i>You can still paste the TxID here if you like.</i>`,
     {
       parse_mode: 'HTML',
       reply_markup: { inline_keyboard: [
@@ -303,7 +382,7 @@ async function handleUsdtTxId(bot, msg) {
     let result;
     try {
       result = await Promise.race([
-        verifyDepositByTxId(txid, { maxAgeMinutes: maxAge }),
+        verifyDepositByTxId(txid, { maxAgeMinutes: maxAge, userId }),
         new Promise((_, rej) => setTimeout(() => rej(new Error('TIMEOUT')), VERIFY_TIMEOUT))
       ]);
     } catch (err) {
@@ -318,6 +397,20 @@ async function handleUsdtTxId(bot, msg) {
     if (db.isTxidUsed(txid)) {
       await bot.sendMessage(chatId, t(lang, 'wallet_already_used'), { parse_mode: 'HTML' });
       return;
+    }
+
+    // The automatic watcher may already have credited this transfer (TON
+    // wallets show a different hash than Binance, so the customer's hash
+    // itself was never stored). Say so instead of "not found".
+    if (!result.found || (result.txid && db.isTxidUsed(result.txid))) {
+      const done = db.recentClaimedIntentForUser && db.recentClaimedIntentForUser(userId);
+      if (done && (result.reason === 'not_found' || (result.txid && db.isTxidUsed(result.txid)))) {
+        await bot.sendMessage(chatId,
+          `✅ <b>Already credited</b>\n\nYour deposit of <b>${fmtReserved(done.unique_amount)} USDT</b> was detected ` +
+          `automatically and added to your wallet.`,
+          { parse_mode: 'HTML', reply_markup: backKb('menu_wallet') });
+        return;
+      }
     }
 
     if (!result.found) {
@@ -849,6 +942,9 @@ async function showTransactions(bot, chatId, userId, messageId) {
 }
 
 module.exports = {
+  startDepositWatcher,
+  scanDepositsOnce,
+  fmtReserved,
   startUsdtAmount,
   handleUsdtAmount,
 

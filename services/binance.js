@@ -228,6 +228,11 @@ async function verifyDepositByTxId(rawTxid, opts = {}) {
         const intent = dbq.findIntentForDeposit
           ? dbq.findIntentForDeposit('TON', Number(d.amount))
           : null;
+        // Only the SUBMITTER's own reservation (V132). Without this, a TON
+        // hash that matched nothing picked the first TON deposit belonging to
+        // ANY open reservation — often another customer's — and the honest
+        // submitter was then told "this deposit is not yours … ban".
+        if (intent && opts.userId && Number(intent.user_id) !== Number(opts.userId)) continue;
         if (intent) {
           logger.info(
             `[VERIFY] TON matched by reserved amount ${d.amount} ` +
@@ -795,6 +800,7 @@ async function listRecentDeposits({ days = 7, limit = 15, network = null, amount
 }
 
 module.exports = {
+  fetchDepositHistory,
   listRecentDeposits,
   verifyDepositByTxId,
   verifyBinancePayOrder,
