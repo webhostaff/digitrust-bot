@@ -788,31 +788,35 @@ TOOLS.auto_credit_verified_deposit = {
       : raw.prepare('SELECT * FROM users WHERE lower(username) = lower(?)').get(key);
     if (!u) return { error: `customer "${user}" not found` };
 
-    const draftFallback = (reason) => {
-      const d = TOOLS.propose_credit.run({ user, amount: 0.01, reason: `Verified deposit ${id}` });
-      return { ...d, auto: false, held_reason: reason, note: 'Prepared as a normal draft instead — set the right amount before sending if it changed.' };
-    };
-
-    const on = (() => { try { return mem.getState('auto_credit', '0') === '1'; } catch (_) { return false; } })();
-    if (!on) return draftFallback('auto_credit_off');
-
     if (db.isTxidUsed(id)) return { error: `${id} was already used/credited in the shop — check txid_check before crediting again.` };
+    if (!binance) return { error: 'Binance is not configured — cannot verify this TxID. Ask the owner to credit it from /admin if he checked it himself.' };
 
-    if (!binance) return draftFallback('binance_not_configured');
+    // Binance FIRST, always — the old order drafted a placeholder $0.01 credit
+    // whenever auto-credit was off (owner's 30-09 transcript: "💰 زيد $0.01"
+    // for a verified 30 USDT deposit). A draft now always carries the amount
+    // Binance itself reports, and nothing at all is drafted for a TxID
+    // Binance doesn't know.
     const [dep, pay] = await Promise.all([
       binance.findDepositRaw(id).catch(() => ({ ok: false })),
       binance.findPayTransactionRaw(id).catch(() => ({ ok: false })),
     ]);
     const depositMatch = (dep.matches || [])[0];
     const payMatch = (pay.matches || [])[0];
-    if (!depositMatch && !payMatch) return draftFallback('not_found_on_binance');
-
-    // The amount is Binance's own reported figure — never the model's or the
-    // customer's claim. Rounded like every other wallet figure in this shop.
+    if (!depositMatch && !payMatch) {
+      return { error: `${id} is NOT found on Binance (deposits or Binance Pay). Do not credit — ask the customer for the right TxID, network, or a screenshot.` };
+    }
     const rawAmount = Number(depositMatch ? depositMatch.amount : payMatch.amount);
-    if (!Number.isFinite(rawAmount) || rawAmount <= 0) return draftFallback('unreadable_amount');
+    if (!Number.isFinite(rawAmount) || rawAmount <= 0) return { error: 'Binance returned an unreadable amount for this TxID.' };
     const amount = Math.round(rawAmount * 100) / 100;
+    const network = depositMatch ? depositMatch.network : 'Binance Pay';
 
+    const draftFallback = (reason) => {
+      const d = proposeVerifiedCredit(u, amount, id, network);
+      return { ...d, auto: false, held_reason: reason, verified_on_binance: { amount, network } };
+    };
+
+    const on = (() => { try { return mem.getState('auto_credit', '0') === '1'; } catch (_) { return false; } })();
+    if (!on) return draftFallback('auto_credit_off');
     if (amount > AUTO_CREDIT_CAP) return draftFallback(`over_auto_cap_$${AUTO_CREDIT_CAP}`);
     const todayTotal = todayAutoCreditedTotal();
     if (todayTotal + amount > AUTO_CREDIT_DAILY_CAP) return draftFallback(`daily_auto_cap_reached_$${AUTO_CREDIT_DAILY_CAP}`);
@@ -1055,7 +1059,8 @@ TOOLS.business_inbox = {
     "The owner's PERSONAL Telegram private chats (people writing to his own account), available once he connects " +
     'the bot in Telegram Business → Chatbots. Lists chats active in the last N hours, who is WAITING for his answer ' +
     'and for how long, the last message, and whether a reply can be sent now (Telegram allows it only within 24h of ' +
-    'their last message). Read-only.',
+    'their last message). Read-only. state: "new" = waiting for him; "replied"; "seen" = he looked and chose not ' +
+    'to answer — never report a seen chat as waiting or nag him about it.',
   input: { hours: 'look back this many hours (default 48)' },
   run: ({ hours } = {}) => {
     const r = require('./businessInbox').inbox({ hours });
@@ -1454,9 +1459,15 @@ async function performAction(a, bot) {
     return out;
   }
   if (a.kind === 'credit') {
-    const { userId, amount, reason } = a.payload;
+    const { userId, amount, reason, txid, network } = a.payload;
+    // Two drafts for the same deposit (it happened on 30-09: a $0.01 and a
+    // $20 one) must never both go through.
+    if (txid && db.isTxidUsed(txid)) return { ok: false, error: `هذا الـTxID تزاد قبل — ما زدتش مرة ثانية.` };
     const before = Number((raw.prepare('SELECT balance FROM users WHERE telegram_id = ?').get(userId) || {}).balance || 0);
     db.updateBalance(userId, amount);
+    if (txid) {
+      try { db.saveUsedTxid({ txid, userId, amount, network: network || '', asset: 'USDT' }); } catch (_) {}
+    }
     try { db.addTransaction({ userId, type: 'admin_credit', amount, description: reason, refId: `yamen_${Date.now()}`, orderId: null }); } catch (_) {}
     // Let the customer know, quietly.
     if (bot) {
@@ -1491,6 +1502,26 @@ ${reason ? '📝 ' + reason : ''}`, { parse_mode: 'HTML' }); } catch (_) {}
 
 const CREDIT_CAP = Number(process.env.AGENT_CREDIT_CAP || 20); // max Yamen may propose at once
 
+// A credit backed by a deposit Binance itself confirmed may go above the
+// normal cap (the owner still taps to confirm): the 30-09 transcript had Yamen
+// split a verified 30 USDT deposit into "$20 now, the other $10 from /admin".
+const VERIFIED_CREDIT_CAP = Number(process.env.AGENT_VERIFIED_CREDIT_CAP || 500);
+
+function proposeVerifiedCredit(u, amount, txid, network) {
+  if (amount > VERIFIED_CREDIT_CAP) {
+    return { error: `verified deposit of $${amount.toFixed(2)} is above $${VERIFIED_CREDIT_CAP} — the owner must add it from /admin` };
+  }
+  const reason = `Verified deposit ${String(txid).slice(0, 24)} · ${network}`;
+  const id = newAction('credit', { userId: u.telegram_id, amount: Number(amount.toFixed(2)), reason, txid: String(txid), network });
+  const bal = Number(u.balance || 0);
+  return {
+    action_id: id, kind: 'credit',
+    title: `💰 ${u.username ? '@' + u.username : u.telegram_id}`,
+    summary: `➕ $${amount.toFixed(2)} → balance ${bal.toFixed(2)} → ${(bal + amount).toFixed(2)}\n✅ Binance: ${amount.toFixed(2)} USDT · ${network}\n🔗 ${String(txid).slice(0, 30)}`,
+    confirm: `💰 زيد $${amount.toFixed(2)}`,
+  };
+}
+
 TOOLS.propose_credit = {
   description:
     `Prepare adding balance to a customer's wallet — a refund, compensation, a bonus. Yamen may propose up to ` +
@@ -1500,15 +1531,31 @@ TOOLS.propose_credit = {
     user: 'customer @username or telegram id',
     amount: 'dollars to add (positive), max ' + CREDIT_CAP,
     reason: 'short reason shown in the wallet history and to the owner',
+    txid: 'optional — the TxID when this credits a deposit. With a TxID Binance confirms (and not used yet), the ' +
+          'amount is taken from Binance and the cap is $' + VERIFIED_CREDIT_CAP + ' instead of $' + CREDIT_CAP + '. ' +
+          'Use this whenever the owner tells you to add a deposit you found — never split it.',
   },
-  run: ({ user, amount, reason }) => {
-    const amt = Number(String(amount).replace(/[$,\s]/g, ''));
-    if (!Number.isFinite(amt) || amt <= 0) return { error: 'amount must be a positive number' };
-    if (amt > CREDIT_CAP) return { error: `over the $${CREDIT_CAP} limit — amounts above $${CREDIT_CAP} must be added by the owner in /admin` };
+  run: async ({ user, amount, reason, txid }) => {
     const key = String(user || '').trim().replace(/^@/, '');
     let u = /^\d+$/.test(key) ? raw.prepare('SELECT * FROM users WHERE telegram_id = ?').get(Number(key))
       : raw.prepare('SELECT * FROM users WHERE lower(username) = lower(?)').get(key);
     if (!u) return { error: `customer "${user}" not found` };
+    const tx = String(txid || '').trim();
+    if (tx) {
+      if (db.isTxidUsed(tx)) return { error: `${tx} was already used/credited in the shop — not proposing it again.` };
+      if (!binance) return { error: 'Binance is not configured — cannot verify this TxID.' };
+      const [dep, pay] = await Promise.all([
+        binance.findDepositRaw(tx).catch(() => ({ ok: false })),
+        binance.findPayTransactionRaw(tx).catch(() => ({ ok: false })),
+      ]);
+      const m = (dep.matches || [])[0] || (pay.matches || [])[0];
+      if (!m) return { error: `${tx} is not found on Binance — not proposing a credit for it.` };
+      const binAmt = Math.round(Number(m.amount) * 100) / 100;
+      return proposeVerifiedCredit(u, binAmt, tx, (dep.matches || [])[0] ? m.network : 'Binance Pay');
+    }
+    const amt = Number(String(amount).replace(/[$,\s]/g, ''));
+    if (!Number.isFinite(amt) || amt <= 0) return { error: 'amount must be a positive number' };
+    if (amt > CREDIT_CAP) return { error: `over the $${CREDIT_CAP} limit without a TxID — if this is a deposit, call again with its txid; otherwise the owner adds it from /admin. Never split an amount.` };
     const id = newAction('credit', { userId: u.telegram_id, amount: Number(amt.toFixed(2)), reason: String(reason || 'Added by Yamen').slice(0, 120) });
     return {
       action_id: id, kind: 'credit',
@@ -1774,4 +1821,4 @@ async function sendApprovedReply(draftId, bot) {
   }
 }
 
-module.exports = { TOOLS, toolSchemas, runTool, sendApprovedReply, liveSnapshot, takeStockDraft, splitAccounts, takeAction, performAction };
+module.exports = { TOOLS, toolSchemas, runTool, sendApprovedReply, liveSnapshot, takeStockDraft, splitAccounts, takeAction, performAction, businessPerson, shopLinks };

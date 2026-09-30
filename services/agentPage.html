@@ -294,7 +294,7 @@ body{display:block}
 .pn{display:flex;align-items:center;gap:6px;font-size:15px}
 .pn b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 /* Names like "@karim" must keep the @ in front inside the right-to-left layout. */
-.pn b,#pName,.item .m b,.pp{unicode-bidi:plaintext}
+.pn b,#pName,#sName,.item .m b,.pp{unicode-bidi:plaintext}
 .tag{font-style:normal;font-size:11px;padding:0 7px;border-radius:999px;border:1px solid var(--ok);color:var(--ok);flex:none}
 .pp{color:var(--dim);font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .pt{flex:none;font-size:12px;color:var(--mute)}
@@ -594,6 +594,31 @@ header h1{font-size:18px;font-weight:700}
 .row.bot .msg::after{display:none}
 .row.bot .msg::before{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent;font-weight:700;font-size:13px}
 .row.bot .msg{padding-top:28px}
+
+/* ── V131: seen chats, support section, send button on the right ─── */
+#si{flex:1;background:transparent;border:none;color:var(--fg);resize:none;min-height:40px;padding:9px 8px;
+  font:inherit;font-size:16px;line-height:1.5;min-width:0;max-height:40vh;overflow-y:auto}
+#si:focus{outline:none}
+.pgrp{font-size:12px;color:var(--mute);padding:12px 12px 4px;display:flex;align-items:center;gap:6px;letter-spacing:.2px}
+.pgrp:first-child{padding-top:4px}
+.pgrp svg{width:14px;height:14px;flex:none}
+.prow.seen{opacity:.6}
+.prow.seen:hover{opacity:.9}
+.prow.seen .pn b{font-weight:500}
+.pt .eye{display:inline-flex;align-items:center;gap:3px;color:var(--mute)}
+.pt .eye svg{width:15px;height:15px}
+.pt .cnt{font-style:normal;background:var(--grad);color:#fff;border-radius:999px;padding:1px 7px;font-weight:700;box-shadow:var(--glow)}
+.pt .mine{color:var(--mute)}
+.prow.new .pp{color:var(--fg)}
+.hbtn.yh{display:inline-flex;align-items:center;gap:6px;margin-inline-start:auto;padding:7px 12px;border-radius:999px;
+  background:var(--grad-soft);border:1px solid rgba(47,107,255,.35);color:var(--fg);font-size:13px;white-space:nowrap}
+.hbtn.yh svg{width:16px;height:16px;color:var(--jasmine)}
+.hbtn.yh:active{transform:scale(.96)}
+/* The send button sits on the RIGHT (owner's request). In this right-to-left
+   layout the first item is the rightmost, so the button goes first, the text
+   right after it, and the extra buttons (📎 🎙 ✨) stay on the left. */
+#composer #send,.pcomp .cbtn.go{order:-2}
+#composer #i,#composer #rec,.pcomp textarea{order:-1}
 </style></head>
 <body>
 <div id="app" dir="rtl">
@@ -602,6 +627,7 @@ header h1{font-size:18px;font-weight:700}
   <nav>
     <button class="nav on" data-view="yamen"><span class="ic"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l1.8 4.7 4.7 1.8-4.7 1.8L12 16l-1.8-4.7L5.5 9.5l4.7-1.8z"/><path d="M18.5 15l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"/></svg></span><span class="lb">يمان</span></button>
     <button class="nav" data-view="private"><span class="ic"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19V6.5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H8.5z"/></svg></span><span class="lb">المحادثات الخاصة</span><b class="bdg" id="bPriv" hidden></b></button>
+    <button class="nav" data-view="support"><span class="ic"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 13v-1.5a7.5 7.5 0 0 1 15 0V13"/><rect x="3.5" y="12.5" width="4" height="6" rx="1.6"/><rect x="16.5" y="12.5" width="4" height="6" rx="1.6"/><path d="M18.5 18.5c0 1.4-1.6 2.5-4.5 2.5h-1.5"/></svg></span><span class="lb">رسائل الدعم</span><b class="bdg" id="bSup" hidden></b></button>
     <button class="nav" data-view="cgb"><span class="ic"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M13 3L5 13.5h6L10 21l8-10.5h-6z"/></svg></span><span class="lb">تفعيلات ChatGPT</span><b class="bdg hot" id="bCgb" hidden></b></button>
     <button class="nav" data-view="alerts"><span class="ic"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 16.5V11a6 6 0 0 1 12 0v5.5l1.5 1.5h-15z"/><path d="M10 20.5a2 2 0 0 0 4 0"/></svg></span><span class="lb">التنبيهات</span><b class="bdg" id="bAl" hidden></b></button>
     <div class="sep"></div>
@@ -663,6 +689,21 @@ header h1{font-size:18px;font-weight:700}
       <div class="pcomp"><button class="cbtn sug" id="pSug" title="يمان يقترح رد" aria-label="يمان يقترح رد"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l1.8 4.7 4.7 1.8-4.7 1.8L12 16l-1.8-4.7L5.5 9.5l4.7-1.8z"/><path d="M18.5 15l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"/></svg></button><textarea id="pi" rows="1" dir="auto" placeholder="اكتب ردّك، ولا خلّي يمان يقترح ✨"></textarea><button class="cbtn go" id="pSend" title="ابعث باسمك" aria-label="ابعث باسمك"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M5.5 11.5L12 5l6.5 6.5"/></svg></button></div>
     </div>
     <div class="pempty" id="pEmpty"><div class="empty"><b>اختار محادثة</b><p>يمان يعرفلك شكون الشخص، ويقترح رد بأسلوبك.</p></div></div>
+  </div>
+</section>
+
+<section class="view" id="v-support">
+  <header><button class="hbtn ico menu" aria-label="القائمة"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button><div class="who"><h1>رسائل الدعم</h1><div class="sub" id="sState">…</div></div><button class="hbtn ico" id="sRefresh" title="حدّث" aria-label="حدّث"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6"/></svg></button></header>
+  <div class="split" id="sSplit">
+    <div class="plist" id="slist"><div class="empty"><b>…</b></div></div>
+    <div class="pthread" id="sthread">
+      <div class="ptop"><button class="hbtn ico" id="sBack" aria-label="رجوع"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg></button><span class="av" id="sAv"></span><div class="who"><b id="sName"></b><div class="sub" id="sMeta"></div></div><button class="hbtn yh" id="sYamen" title="يمان يثبّت ويحضّر الرد"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l1.8 4.7 4.7 1.8-4.7 1.8L12 16l-1.8-4.7L5.5 9.5l4.7-1.8z"/></svg><span>يمان يتكفّل</span></button></div>
+      <div class="pcard" id="sCard" hidden></div>
+      <div class="pmsgs" id="smsgs" dir="ltr"></div>
+      <div class="pnote" id="sNote"></div>
+      <div class="pcomp"><button class="cbtn sug" id="sSug" title="يمان يقترح رد" aria-label="يمان يقترح رد"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l1.8 4.7 4.7 1.8-4.7 1.8L12 16l-1.8-4.7L5.5 9.5l4.7-1.8z"/><path d="M18.5 15l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"/></svg></button><textarea id="si" rows="1" dir="auto" placeholder="اكتب الرد، ولا ✨ يمان يقترح"></textarea><button class="cbtn go" id="sSend" title="ابعث من بوت الدعم" aria-label="ابعث من بوت الدعم"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M5.5 11.5L12 5l6.5 6.5"/></svg></button></div>
+    </div>
+    <div class="pempty" id="sEmpty"><div class="empty"><b>اختار حريف</b><p>جاوبو انت، ولا ✨ يمان يقترح، ولا «يمان يتكفّل» يثبّت الطلب والدفع ويحضّرلك الرد.</p></div></div>
   </div>
 </section>
 
@@ -1050,7 +1091,7 @@ function showView(v){
   document.querySelectorAll('.view').forEach(x=>x.classList.toggle('on',x.id==='v-'+v));
   document.querySelectorAll('.nav[data-view]').forEach(n=>n.classList.toggle('on',n.dataset.view===v));
   openSide(false); try{localStorage.setItem('view',v);}catch(_){}
-  if(v==='private') loadChats(); if(v==='cgb') renderCgbList(); if(v==='alerts') loadAlerts(true);
+  if(v==='private') loadChats(); if(v==='support') loadSupport(); if(v==='cgb') renderCgbList(); if(v==='alerts') loadAlerts(true);
 }
 document.querySelectorAll('.nav[data-view]').forEach(n=>n.onclick=()=>showView(n.dataset.view));
 $('navMem').onclick=()=>{ openSide(false); $('memb').click(); };
@@ -1091,19 +1132,28 @@ async function loadAlerts(mark){
 // ── Private chats section ────────────────────────────────────────────
 let curChat=null, curCan=true;
 function pNote(t,bad){ const n=$('pNote'); n.textContent=t||''; n.classList.toggle('bad',!!bad); }
+const EYE='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="2.8"/></svg>';
+// Private chats: NEW on top (newest first) → answered → seen at the bottom,
+// with only a 👁 (owner's request: a chat he looked at is not "waiting").
 async function loadChats(){
   try{
     const j=await (await fetch(api('business/chats'))).json(); const chats=j.chats||[];
     const b=$('bPriv'); b.textContent=j.waiting||''; b.hidden=!j.waiting;
-    $('pState').textContent=!j.connected?'موش مربوط':(j.waiting?j.waiting+' يستناو ردّك':'كل شي مجاوب');
+    $('pState').textContent=!j.connected?'موش مربوط':(j.waiting?(j.waiting===1?'رسالة جديدة':j.waiting+' محادثات جديدة'):'حتى رسالة جديدة');
     if(!$('v-private').classList.contains('on')) return;
     const L=$('plist');
     if(!j.connected){ L.innerHTML='<div class="empty"><b>المحادثات الخاصة موش مربوطة</b><p>Telegram ← Settings ← Telegram Business ← Chatbots: اختار بوت يمان الخاص وفعّل Reply to messages.</p></div>'; return; }
     if(!chats.length){ L.innerHTML='<div class="empty"><b>ما وصلت حتى رسالة لتوا</b><p>يمان يشوف كان الرسائل الي تجي من بعد الربط، ومن الناس برك (موش القروبات ولا البوتات).</p></div>'; return; }
     L.innerHTML='';
+    const GRP={new:'جديدة',replied:'جاوبت',seen:'شفتهم'}; let last=null;
+    const hasNew=chats.some(c=>c.state==='new');
     for(const c of chats){
-      const r=document.createElement('button'); r.className='prow'+(c.waiting?' wait':'')+(String(curChat)===String(c.chat_id)?' sel':'');
-      r.innerHTML='<span class="av"></span><span class="pm"><span class="pn"><b></b>'+(c.known_customer?'<i class="tag">حريف</i>':'')+'</span><span class="pp" dir="auto"></span></span><span class="pt">'+(c.waiting?'<em>'+ago(c.waiting_minutes)+'</em>':'')+'</span>';
+      const st=c.state||(c.waiting?'new':'replied');
+      if(st!==last && (hasNew||st==='seen')){ const g=document.createElement('div'); g.className='pgrp'; g.innerHTML=(st==='seen'?EYE:'')+GRP[st]; L.appendChild(g); last=st; }
+      const r=document.createElement('button'); r.className='prow '+st+(st==='new'?' wait':'')+(String(curChat)===String(c.chat_id)?' sel':'');
+      const right=st==='new'?'<i class="cnt">'+(c.unread>1?c.unread:'•')+'</i> <em>'+ago(c.waiting_minutes)+'</em>'
+        :st==='seen'?'<span class="eye">'+EYE+'</span>':'<span class="mine">↩</span>';
+      r.innerHTML='<span class="av"></span><span class="pm"><span class="pn"><b></b>'+(c.known_customer?'<i class="tag">حريف</i>':'')+'</span><span class="pp" dir="auto"></span></span><span class="pt">'+right+'</span>';
       paintAv(r.querySelector('.av'),c.who); r.querySelector('b').textContent=c.who; r.querySelector('.pp').textContent=c.last_message||'';
       r.onclick=()=>openChat(c); L.appendChild(r);
     }
@@ -1112,10 +1162,11 @@ async function loadChats(){
 async function openChat(c){
   curChat=c.chat_id; curCan=c.can_reply_now!==false;
   $('pSplit').classList.add('open'); paintAv($('pAv'),c.who); $('pName').textContent=c.who;
-  $('pMeta').textContent=c.waiting?('يستنى ردّك من '+ago(c.waiting_minutes)):'مجاوب';
+  $('pMeta').textContent=c.state==='new'?('جديدة · من '+ago(c.waiting_minutes)+' · تولّي 👁 كي تحلّها'):c.state==='seen'?'👁 شفتها':'↩ جاوبت';
   pNote(curCan?'':'⏳ آخر رسالة منو قبل أكثر من 24 ساعة: تيليجرام ما يخلّيش البوت يجاوب.', !curCan);
-  document.querySelectorAll('.prow').forEach(x=>x.classList.remove('sel'));
+  document.querySelectorAll('#plist .prow').forEach(x=>x.classList.remove('sel'));
   await refreshThread(true);
+  loadChats();   // opening it marked it seen: move it down and update the badge
 }
 async function refreshThread(scroll){
   if(curChat==null) return;
@@ -1156,8 +1207,87 @@ $('pSend').onclick=async()=>{
 };
 pi.addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey&&window.innerWidth>899){ e.preventDefault(); $('pSend').click(); } });
 
+// ── Support section (support bot conversations) ──────────────────────
+let curSup=null, curSupWho='';
+function sNote(t,bad){ const n=$('sNote'); n.textContent=t||''; n.classList.toggle('bad',!!bad); }
+async function loadSupport(){
+  try{
+    const j=await (await fetch(api('support/chats'))).json(); const chats=j.chats||[];
+    const b=$('bSup'); b.textContent=j.new||''; b.hidden=!j.new;
+    $('sState').textContent=j.available===false?'بوت الدعم موش خدّام':(j.new?(j.new+' جديدة · '):'')+(j.waiting?j.waiting+' يستناو رد':'الكل مجاوب');
+    if(!$('v-support').classList.contains('on')) return;
+    const L=$('slist');
+    if(!chats.length){ L.innerHTML='<div class="empty"><b>حتى رسالة دعم</b><p>كي حريف يكتب لبوت الدعم يبان هوني.</p></div>'; return; }
+    L.innerHTML='';
+    const GRP={new:'جديدة',waiting:'يستناو رد',replied:'مجاوبين'}; let last=null;
+    for(const c of chats){
+      if(c.state!==last){ const g=document.createElement('div'); g.className='pgrp'; g.textContent=GRP[c.state]; L.appendChild(g); last=c.state; }
+      const r=document.createElement('button'); r.className='prow '+c.state+(c.state!=='replied'?' wait':'')+(String(curSup)===String(c.user_id)?' sel':'');
+      const right=c.state==='new'?'<i class="cnt">'+(c.unread>1?c.unread:'•')+'</i> <em>'+ago(c.waiting_minutes)+'</em>'
+        :c.state==='waiting'?'<em>'+ago(c.waiting_minutes)+'</em>':'<span class="mine">↩</span>';
+      r.innerHTML='<span class="av"></span><span class="pm"><span class="pn"><b></b>'+(c.known_customer?'<i class="tag">حريف</i>':'')+'</span><span class="pp" dir="auto"></span></span><span class="pt">'+right+'</span>';
+      paintAv(r.querySelector('.av'),c.who); r.querySelector('b').textContent=c.who;
+      r.querySelector('.pp').textContent=c.last_message||'';
+      r.onclick=()=>openSup(c); L.appendChild(r);
+    }
+  }catch(e){ $('slist').innerHTML='<div class="empty"><b>ما نجّمتش نجيب رسائل الدعم</b><p>'+escH(e.message)+'</p></div>'; }
+}
+async function openSup(c){
+  curSup=c.user_id; curSupWho=c.who;
+  $('sSplit').classList.add('open'); paintAv($('sAv'),c.who); $('sName').textContent=c.who;
+  $('sMeta').textContent=c.state==='replied'?'↩ مجاوب':('يستنى من '+ago(c.waiting_minutes));
+  sNote(''); $('si').value=''; $('si').dispatchEvent(new Event('input'));
+  await refreshSup(true); loadSupport();
+}
+async function refreshSup(scroll){
+  if(curSup==null) return;
+  try{
+    const j=await (await fetch(api('support/thread?user='+encodeURIComponent(curSup)))).json();
+    const M=$('smsgs'); const atBottom=M.scrollHeight-M.scrollTop-M.clientHeight<40;
+    M.innerHTML=(j.messages||[]).map(m=>'<div class="bub '+(m.from==='support'?'you':'them')+'" dir="auto">'+escH(m.text)+'<small>'+escH(String(m.at||'').slice(5,16))+'</small></div>').join('');
+    if(scroll||atBottom) M.scrollTop=M.scrollHeight;
+    const p=j.person||{}; const C=$('sCard');
+    if(p.known_customer){
+      const seat=(p.chatgpt_seats||[])[0]; const o=(p.recent_orders||[])[0];
+      C.innerHTML=(p.balance!=null?'<span>💰 الرصيد <b>$'+Number(p.balance).toFixed(2)+'</b></span>':'')+
+        (o?'<span>🧾 آخر طلب <b>#'+escH(o.id)+'</b> '+escH(o.status||'')+'</span>':'')+
+        (seat?'<span>⚡ ChatGPT '+(seat.days_left>=0?'يوفى بعد <b>'+seat.days_left+' يوم</b>':'<b>وفى</b>')+'</span>':'');
+      C.hidden=!C.innerHTML;
+    } else C.hidden=true;
+  }catch(_){}
+}
+$('sBack').onclick=()=>{ $('sSplit').classList.remove('open'); curSup=null; loadSupport(); };
+$('sRefresh').onclick=()=>{ loadSupport(); refreshSup(); };
+const si=$('si'); si.addEventListener('input',()=>{ si.style.height='auto'; si.style.height=Math.min(si.scrollHeight,window.innerHeight*0.4)+'px'; });
+$('sSug').onclick=async()=>{
+  if(curSup==null) return; const b=$('sSug'); b.classList.add('busy'); sNote('✨ يمان يقرا المحادثة ومعلومات الحريف ويكتب…');
+  try{ const r=await post('support/suggest',{user:curSup}); const j=await r.json();
+    if(!r.ok) sNote('❌ '+(j.error||('HTTP '+r.status)),true);
+    else { si.value=j.text||''; si.dispatchEvent(new Event('input')); si.focus(); sNote('راجع الرد وبدّل فيه كان تحب، ومبعد ➤ يتبعث من بوت الدعم.'); }
+  }catch(e){ sNote('❌ '+e.message,true); } finally{ b.classList.remove('busy'); }
+};
+$('sSend').onclick=async()=>{
+  const t=si.value.trim(); if(!t||curSup==null) return;
+  const b=$('sSend'); b.disabled=true; sNote('⏳ يتبعث…');
+  try{ const r=await post('support/send',{user:curSup,text:t}); const j=await r.json();
+    if(j.ok){ si.value=''; si.dispatchEvent(new Event('input')); sNote('✅ تبعث من بوت الدعم'); await refreshSup(true); loadSupport(); }
+    else sNote('❌ '+(j.error||'ما تبعثش'),true);
+  }catch(e){ sNote('❌ '+e.message,true); } finally{ b.disabled=false; }
+};
+si.addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey&&window.innerWidth>899){ e.preventDefault(); $('sSend').click(); } });
+// Hand the whole case to Yamen: he reads the thread with his tools (orders,
+// TxID, photos), prepares credits/replies as cards, and waits for your tap.
+$('sYamen').onclick=()=>{
+  if(curSup==null) return;
+  showView('yamen');
+  send('تكفّل بحريف الدعم '+curSupWho+' ('+curSup+'): اقرا المحادثة متاعو كاملة، ثبّت الي يلزم (الطلب، الدفع والـTxID، الصور الي بعثهم)، '+
+       'قلّي في سطرين شنوة المشكل، وحضّرلي الرد (ولا الإضافة للرصيد كان يلزم). ما تبعث حتى شي قبل موافقتي.');
+};
+
 // Badges stay fresh whatever section is open.
-function tickSections(){ loadChats(); loadAlerts(false); if(curChat!=null&&$('v-private').classList.contains('on')) refreshThread(); }
+function tickSections(){ loadChats(); loadSupport(); loadAlerts(false);
+  if(curChat!=null&&$('v-private').classList.contains('on')) refreshThread();
+  if(curSup!=null&&$('v-support').classList.contains('on')) refreshSup(); }
 tickSections(); setInterval(tickSections,20000);
 try{ const v=localStorage.getItem('view'); if(v&&v!=='yamen'&&$('v-'+v)) showView(v); }catch(_){}
 

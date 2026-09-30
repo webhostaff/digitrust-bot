@@ -183,6 +183,7 @@ const RULES = [
       FROM business_messages b
       WHERE b.id IN (SELECT MAX(id) FROM business_messages GROUP BY chat_id)
         AND b.is_owner = 0
+        AND NOT EXISTS (SELECT 1 FROM business_seen s WHERE s.chat_id = b.chat_id AND s.seen_id >= b.id)
         AND b.created_at <= datetime('now', ?)
         AND b.created_at >= datetime('now', '-1 day')
       ORDER BY b.created_at ASC LIMIT 10`, `-${mins} minutes`)
@@ -413,7 +414,9 @@ const LEARN_PROMPT =
   'DAILY LEARNING (the owner did not ask — this is your own study time). Below is today\'s conversation between ' +
   'you and the owner. Find what will make you work better tomorrow, and save each item with the remember tool ' +
   '(one call per item, at most 6, short and self-contained):\n' +
-  '- his CORRECTIONS of you (he said no / wrong / not like that) → category "rule": what to do instead;\n' +
+  '- his CORRECTIONS of you (lines marked CORRECTING YOU, or he said no / wrong / شبيك / not like that): look at what ' +
+  'you DID just before (the [did: …] lines), find the real mistake (wrong customer, wrong amount, a message that ' +
+  'contradicts what you did, an empty answer…) → category "rule": a concrete rule for next time;\n' +
   '- his preferences and standing rules → "owner" or "rule";\n' +
   '- how his business works: products, suppliers, processes, recurring customer problems → "product" / "supplier" / "issue";\n' +
   '- words, names or product names you misheard or that he uses often → "vocab" (just the word or name).\n' +
@@ -423,12 +426,22 @@ const LEARN_PROMPT =
   'TODAY\'S CONVERSATION:\n';
 
 function todaysTranscript() {
-  const rows = q(`SELECT role, content FROM agent_chat
-                  WHERE role IN ('user','assistant') AND created_at >= datetime('now','-24 hours')
-                  ORDER BY id ASC LIMIT 120`);
+  const rows = q(`SELECT role, content, meta FROM agent_chat
+                  WHERE role IN ('user','assistant','event') AND created_at >= datetime('now','-24 hours')
+                  ORDER BY id ASC LIMIT 160`);
   const owner = rows.filter((r) => r.role === 'user').length;
-  const text = rows.map((r) => `${r.role === 'user' ? 'OWNER' : 'YAMEN'}: ${String(r.content || '').replace(/\s+/g, ' ').slice(0, 400)}`).join('\n');
-  return { owner, text: text.slice(-14000) };
+  // With what Yamen DID (the work log) and every correction flagged: the old
+  // text-only transcript let him conclude "nothing new today" on a day the
+  // owner called him "بهيم" for losing the thread (30-09).
+  const text = rows.map((r) => {
+    let meta = null; try { meta = r.meta ? JSON.parse(r.meta) : null; } catch (_) {}
+    const body = String(r.content || '').replace(/\s+/g, ' ').slice(0, 600);
+    if (r.role === 'event') return `EVENT: ${body.slice(0, 200)}`;
+    if (r.role === 'user') return `OWNER${meta && meta.correcting ? ' (CORRECTING YOU)' : ''}: ${body}`;
+    const work = meta && Array.isArray(meta.work) && meta.work.length ? `\n  [did: ${meta.work.slice(0, 5).join(' | ').slice(0, 500)}]` : '';
+    return `YAMEN: ${body}${work}`;
+  }).join('\n');
+  return { owner, text: text.slice(-20000) };
 }
 
 async function runLearnIfDue() {

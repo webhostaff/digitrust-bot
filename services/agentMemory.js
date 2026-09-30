@@ -117,6 +117,28 @@ function turnsSinceDivider(limit = 16) {
   return out.reverse();
 }
 
+/**
+ * Like turnsSinceDivider, but with each turn's meta (what Yamen DID: the
+ * work log) and the events in between (auto credits, replies Yamen sent on
+ * his own). A text-only recap lost all of that: on 30-09, after a photo turn
+ * reset the chain, "ومساج" went to the customer from two turns earlier,
+ * because the recap didn't say Yamen had just credited someone else.
+ */
+function turnsForRecap(limit = 10) {
+  const rows = raw.prepare(`SELECT role, content, meta FROM agent_chat ORDER BY id DESC LIMIT 200`).all();
+  const out = [];
+  let turns = 0;
+  for (const r of rows) {
+    if (r.role === 'divider') break;
+    if (r.role === 'user' || r.role === 'assistant' || r.role === 'event') {
+      out.push({ role: r.role, content: r.content, meta: r.meta ? safeJson(r.meta) : null });
+      if (r.role !== 'event') turns += 1;
+    }
+    if (turns >= limit) break;
+  }
+  return out.reverse();
+}
+
 function searchChat(q, limit = 20) {
   const term = `%${String(q || '').trim()}%`;
   return raw.prepare(`SELECT id, role, substr(content, 1, 500) AS content, created_at FROM agent_chat
@@ -144,6 +166,6 @@ function safeJson(s) { try { return JSON.parse(s); } catch (_) { return null; } 
 
 module.exports = {
   addMemory, updateMemory, deleteMemory, listMemory, searchMemory, memoryForPrompt,
-  logChat, recentChat, turnsSinceDivider, searchChat,
+  logChat, recentChat, turnsSinceDivider, turnsForRecap, searchChat,
   getState, setState,
 };

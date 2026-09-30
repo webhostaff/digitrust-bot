@@ -742,6 +742,16 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_business_chat ON business_messages(chat_id, id);
 
+  -- "Seen" in Yamen's app (the owner opened the chat, or tapped 👁). A chat is
+  -- seen while seen_id >= its newest incoming message; a new message from
+  -- them makes it new again. Nothing is sent to Telegram: the other person
+  -- never gets ✓✓ from this.
+  CREATE TABLE IF NOT EXISTS business_seen (
+    chat_id  INTEGER PRIMARY KEY,
+    seen_id  INTEGER NOT NULL,
+    seen_at  TEXT    DEFAULT (datetime('now'))
+  );
+
   CREATE TABLE IF NOT EXISTS cgb_admin_cards (
     order_id   INTEGER PRIMARY KEY,
     chat_id    INTEGER NOT NULL,

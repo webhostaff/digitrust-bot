@@ -94,30 +94,50 @@ function attach(bot, name = 'store') {
   bot.on('business_message', (m) => onMessage(name, m));
 }
 
-/** Private chats with activity in the last `hours`, most-waiting first. */
+/**
+ * Private chats with activity in the last `hours`.
+ *
+ * Order (owner's request, 30-09): NEW messages on top, newest first; chats he
+ * already answered next; chats he only looked at ("seen") at the bottom —
+ * with just a 👁, not as "waiting for your reply". A new message from them
+ * brings the chat back to the top as new.
+ */
 function inbox({ hours = 48 } = {}) {
   const conn = connection();
   const h = Math.max(1, Math.min(24 * 30, parseInt(hours, 10) || 48));
   const rows = raw.prepare(`
-    SELECT b.chat_id, b.text, b.is_owner, b.created_at,
+    SELECT b.id AS last_id, b.chat_id, b.text, b.is_owner, b.created_at,
            (SELECT username  FROM business_messages x WHERE x.chat_id = b.chat_id AND x.is_owner = 0 AND x.username  IS NOT NULL ORDER BY x.id DESC LIMIT 1) AS username,
            (SELECT from_name FROM business_messages x WHERE x.chat_id = b.chat_id AND x.is_owner = 0 AND x.from_name IS NOT NULL ORDER BY x.id DESC LIMIT 1) AS from_name,
            (SELECT MAX(created_at) FROM business_messages x WHERE x.chat_id = b.chat_id AND x.is_owner = 0) AS last_in_at,
+           (SELECT MAX(id) FROM business_messages x WHERE x.chat_id = b.chat_id AND x.is_owner = 0) AS last_in_id,
+           (SELECT COUNT(*) FROM business_messages x WHERE x.chat_id = b.chat_id AND x.is_owner = 0
+              AND x.id > COALESCE((SELECT seen_id FROM business_seen s WHERE s.chat_id = b.chat_id), 0)
+              AND x.id > COALESCE((SELECT MAX(id) FROM business_messages y WHERE y.chat_id = b.chat_id AND y.is_owner = 1), 0)) AS unread,
+           (SELECT seen_id FROM business_seen s WHERE s.chat_id = b.chat_id) AS seen_id,
            CAST((julianday('now') - julianday(b.created_at)) * 1440 AS INTEGER) AS mins
     FROM business_messages b
     WHERE b.id IN (SELECT MAX(id) FROM business_messages GROUP BY chat_id)
       AND b.created_at >= datetime('now', ?)
-    ORDER BY b.is_owner ASC, b.created_at ASC
+    ORDER BY b.id DESC
   `).all(`-${h} hours`);
-  const chats = rows.map((r) => ({
-    chat_id: r.chat_id,
-    who: r.username ? '@' + r.username : (r.from_name || String(r.chat_id)),
-    waiting: !r.is_owner,
-    waiting_minutes: !r.is_owner ? r.mins : 0,
-    last_message: String(r.text || '').slice(0, 200),
-    // Telegram lets a business bot answer only chats active in the last 24h.
-    can_reply_now: canReply(conn) && !!r.last_in_at && (Date.now() - new Date(r.last_in_at.replace(' ', 'T') + 'Z').getTime()) < 24 * 3600 * 1000,
-  }));
+  const RANK = { new: 0, replied: 1, seen: 2 };
+  const chats = rows.map((r) => {
+    const state = r.is_owner ? 'replied' : (r.seen_id && r.seen_id >= r.last_id ? 'seen' : 'new');
+    return {
+      chat_id: r.chat_id,
+      who: r.username ? '@' + r.username : (r.from_name || String(r.chat_id)),
+      state,
+      seen: state === 'seen',
+      waiting: state === 'new',
+      unread: state === 'new' ? Math.max(1, r.unread || 0) : 0,
+      waiting_minutes: state === 'new' ? r.mins : 0,
+      last_message: String(r.text || '').slice(0, 200),
+      last_at: r.created_at,
+      // Telegram lets a business bot answer only chats active in the last 24h.
+      can_reply_now: canReply(conn) && !!r.last_in_at && (Date.now() - new Date(r.last_in_at.replace(' ', 'T') + 'Z').getTime()) < 24 * 3600 * 1000,
+    };
+  }).sort((a, b) => (RANK[a.state] - RANK[b.state]) || 0);   // stable: newest first inside each group
   // Facts for an honest answer when the list is empty: "nothing here" with
   // twelve unread badges on the owner's screen looks like a bug unless we say
   // WHY — Telegram only forwards messages sent AFTER the connection, and only
@@ -140,6 +160,17 @@ function inbox({ hours = 48 } = {}) {
       'Telegram only delivers messages that arrive AFTER the connection, and only private chats with people ' +
       '(not groups, channels or other bots). Unread messages from before the connection are not visible to the bot.',
   };
+}
+
+/** Mark a chat seen in the app (never on Telegram — no ✓✓ for them). */
+function markSeen(chat) {
+  const id = resolveChat(chat);
+  if (!id) return { ok: false, error: 'chat not found' };
+  const r = raw.prepare(`SELECT MAX(id) AS m FROM business_messages WHERE chat_id = ?`).get(id);
+  raw.prepare(`INSERT INTO business_seen (chat_id, seen_id, seen_at) VALUES (?, ?, datetime('now'))
+               ON CONFLICT(chat_id) DO UPDATE SET seen_id = MAX(seen_id, excluded.seen_id), seen_at = datetime('now')`)
+    .run(id, Number(r?.m || 0));
+  return { ok: true, chat_id: id };
 }
 
 /** One private chat, oldest first. `who` = chat id or @username. */
@@ -212,4 +243,4 @@ function startDedicated(TelegramBotClass, token) {
   return bot;
 }
 
-module.exports = { attach, startDedicated, inbox, thread, sendReply, connection, _resolveChat: resolveChat };
+module.exports = { attach, startDedicated, inbox, thread, sendReply, connection, markSeen, _resolveChat: resolveChat };

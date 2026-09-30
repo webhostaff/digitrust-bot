@@ -1962,4 +1962,27 @@ bot.on('polling_error', (err) => {
   logger.warn(`Support bot polling error: ${err.message}`);
 });
 
+// ── Used by Yamen's app ("💬 الدعم" section) ────────────────────────────────
+// The SAME path as a staff reply typed in this bot: same "📩 Support" header,
+// stored as 'out' with its Telegram id (so recall/delete keep working), and
+// the thread marked read — the customer sees exactly what they always see.
+bot.deskMarkRead = (userId) => markThreadRead(Number(userId));
+bot.deskReply = async (userId, text) => {
+  const uid = Number(userId);
+  const body = String(text || '').trim();
+  if (!uid || !body) return { ok: false, error: 'user and text are required' };
+  try {
+    const sent = await bot.sendMessage(uid, `📩 <b>Support</b>\n\n${escapeHtml(body)}`, { parse_mode: 'HTML' });
+    const ins = insertMsg.run(uid, null, null, 'out', body, null, null);
+    if (sent && sent.message_id) {
+      rawDb.prepare('UPDATE support_messages SET tg_msg_id = ? WHERE id = ?').run(sent.message_id, ins.lastInsertRowid);
+    }
+    try { await markThreadRead(uid); } catch (_) {}
+    return { ok: true };
+  } catch (e) {
+    logger.error(`Support reply (app) to ${uid} failed: ${e.message}`);
+    return { ok: false, error: e.message };
+  }
+};
+
 module.exports = bot;

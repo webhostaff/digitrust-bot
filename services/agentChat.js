@@ -242,6 +242,13 @@ WHAT YOU CAN SEE (read-only)
 - You write only in this app. You never message customers or post in the bots; drafts go out only when the owner taps Send.
 - Your tools come in groups. Only the groups this question needs are loaded; if you need another one (stock, products, posts, support, money, cgb, private, web, system, sales), call use_tools with its name first — never guess without the data.
 
+FOLLOW THE THREAD — the owner's biggest complaint was that you don't connect events
+- A short follow-up without a name ("ومساج", "زيدو", "ابعثلو", "هل استعمل", "شوف هذا") continues YOUR LAST ACTION: same customer, same TxID, same order — see FOCUS and "[what I did: …]". Never jump back to an older customer.
+- A message you draft must match what actually happened: if you (or auto-credit) just added balance, say it was added — never "we can't confirm the payment" right after crediting it.
+- "id + TxID + fix it and message him" is ONE job in ONE turn: check the TxID → credit (propose_credit WITH the txid) → draft the message that says exactly what was done.
+- "Add it" for a deposit you verified: propose_credit with its txid — the full Binance amount in one draft. Never split an amount, never draft a placeholder.
+- Every turn ends with at least one line saying what you did or found. Never an empty reply.
+
 HOW YOU TALK
 - Like a chat app with a friend who knows the business: natural, flowing sentences, the way people actually text. No report layout, no headings, no "Summary:" labels.
 - Short by default — 1 to 4 lines for most things. Lists only when there are several items to scan.
@@ -257,7 +264,9 @@ const GUIDES = {
 - Default: draft with propose_reply; the owner taps Send. This is the safe path and the right one for anything about money, refunds, complaints, promises, prices, account problems, or anything you are not fully sure of.
 - If AUTO-REPLY is ON (see the flag in your context) you MAY answer a customer yourself with send_reply_now, but ONLY for simple factual questions: how to top up, how long delivery takes, where the instructions are, whether something is in stock, a greeting. When in any doubt, draft instead. One wrong sent message costs more than ten drafts, so err toward drafting.`,
   money: `ADDING BALANCE
-- propose_credit adds up to the wallet limit ($20 by default) (refund, compensation, bonus). The owner taps to confirm. Above the limit, tell the owner to do it in /admin. Always look the customer up first and say who and why.
+- propose_credit adds balance (refund, compensation, bonus); the owner taps to confirm. Without a TxID the limit is $20 by default.
+- For a DEPOSIT: pass its txid. The amount then comes from Binance itself, the limit is much higher, and the TxID is marked used when the owner confirms (so it can't be added twice). Never split a deposit into "part now, rest from /admin".
+- Always look the customer up first and say who and why.
 - propose_debit removes balance the same way (a correction, balance given by mistake). Same cap, same owner tap. It refuses instead of going negative — tell the owner if a bigger correction is needed.
 - After crediting a MANUAL deposit correction for a customer (their transfer arrived but wasn't auto-detected), always add one line reminding them to follow the deposit steps exactly next time (right network, right address/memo, wait for the confirmation message) so future top-ups are detected automatically and don't need this again. Keep it short and friendly, not a lecture.
 - auto_credit_verified_deposit: for a customer's OWN transfer that Binance itself confirms is real and matches (via the same check as txid_check), you may credit it AND reply to the customer without waiting for a tap — but only when the owner has turned this on (a setting, off by default) and the verified amount is small (a few dollars; the cap is configurable). Anything above the cap, already used, or not verifiable on Binance falls back to a normal propose_credit draft automatically — you don't need to check the cap yourself, the tool does. Never claim you credited something this way unless the tool itself reports it did.
@@ -404,6 +413,9 @@ function buildInstructions(tier, groups) {
 
 NOW: ${localNowString()}
 
+FOCUS (the customer you were just working on — short follow-ups like "ومساج", "زيدو", "ابعثلو", "هل استعمل" are about THIS one unless the owner names someone else)
+${focusLine()}
+
 RECENT ALERTS YOU SENT
 ${alerts.length ? alerts.map((a) => `[${a.created_at}] ${String(a.content).slice(0, 400)}`).join('\n') : '(none)'}
 
@@ -414,12 +426,99 @@ MEMORY (${m.total} note${m.total === 1 ? '' : 's'}${m.lines.length < m.total ? `
 ${m.lines.length ? m.lines.join('\n') : '(empty — start filling it)'}`;
 }
 
-/** The last turns as plain messages — for a fresh chain or a stateless provider. */
+/**
+ * The last turns — for a fresh chain or a stateless provider. Each of
+ * Yamen's replies carries its work log ("what I did": the tools, for whom,
+ * with what result), and events in between (an auto credit, an auto reply)
+ * are included, so a follow-up like "ومساج" after a reset still knows which
+ * customer and which operation it is about.
+ */
 function recap(excludeLastUser = true) {
-  const turns = mem.turnsSinceDivider(6);
+  const turns = mem.turnsForRecap(10);
   if (excludeLastUser && turns.length && turns[turns.length - 1].role === 'user') turns.pop();
-  return turns.map((t) => ({ role: t.role, content: String(t.content || '').slice(0, 1200) }));
+  return turns.map((t) => {
+    if (t.role === 'event') return { role: 'assistant', content: `[event] ${String(t.content || '').slice(0, 300)}` };
+    let content = String(t.content || '').slice(0, 1500);
+    const work = (t.meta && Array.isArray(t.meta.work)) ? t.meta.work : [];
+    if (t.role === 'assistant' && work.length) content += `\n[what I did: ${work.slice(0, 8).join(' | ')}]`;
+    return { role: t.role, content: content || '(no text)' };
+  });
 }
+
+// ── Work log & focus ─────────────────────────────────────────────────────────
+
+const WHO_KEYS = ['user', 'user_id', 'userId', 'telegram_id', 'customer', 'username', 'chat_id', 'chatId', 'email'];
+
+function compactArgs(args) {
+  return Object.entries(args || {}).filter(([k, v]) => !k.startsWith('__') && v !== undefined && v !== null && v !== '')
+    .map(([k, v]) => `${k}=${String(typeof v === 'object' ? JSON.stringify(v) : v).slice(0, 48)}`).join(', ');
+}
+
+/** One short line per tool call: kept with the reply and replayed in the recap. */
+function workLine(call, output) {
+  let res = String(output || '');
+  try {
+    const o = JSON.parse(res);
+    if (o && typeof o === 'object') {
+      if (o.error) res = `ERROR ${o.error}`;
+      else if (o.summary) res = `${o.title || ''} ${o.summary}`;
+      else res = JSON.stringify(o);
+    }
+  } catch (_) {}
+  return `${call.name}(${compactArgs(call.args)}) → ${res.replace(/\s+/g, ' ').slice(0, 200)}`;
+}
+
+/** The customer Yamen is working on right now, remembered for 45 minutes. */
+function noteFocus(call, output) {
+  let who = null;
+  for (const k of WHO_KEYS) if (call.args && call.args[k]) { who = String(call.args[k]); break; }
+  if (!who) {
+    try {
+      const o = JSON.parse(output || 'null');
+      if (o && typeof o === 'object') who = o.user || o.username || o.telegram_id || o.customer || null;
+      if (who && typeof who === 'object') who = who.username || who.telegram_id || null;
+    } catch (_) {}
+  }
+  if (!who) return;
+  mem.setState('yamen_focus', JSON.stringify({ who: String(who).slice(0, 60), via: call.name, at: Date.now(),
+    last: workLine(call, output).slice(0, 220) }));
+}
+
+function focusLine() {
+  try {
+    const f = JSON.parse(mem.getState('yamen_focus', 'null') || 'null');
+    if (!f || Date.now() - f.at > 45 * 60000) return '(none)';
+    const mins = Math.round((Date.now() - f.at) / 60000);
+    return `${f.who} — ${mins} min ago, last: ${f.last}`;
+  } catch (_) { return '(none)'; }
+}
+
+/** Yamen used tools but wrote nothing (the "…" reply on 30-09): say what was
+ *  done, in plain Derja — one line per consequential operation. */
+function replyFromWork(items) {
+  const lines = [];
+  for (const it of items.slice(0, 8)) {
+    const o = it.out || {}; const a = it.args || {};
+    const who = a.user || a.user_id || a.chat || o.to || o.user || '';
+    if (o.credited) lines.push(`✅ زدت $${Number(o.amount || 0).toFixed(2)} لرصيد ${who} (الـTxID متحقق منو في Binance)${o.customer_notified ? '، والحريف وصلو إشعار' : ''}.`);
+    else if (o.sent === true) lines.push(`✅ جاوبت ${who} وحدي.`);
+    else if (o.draft_id) lines.push(`✉️ حضّرت رد لـ ${o.to || who} — يستنى موافقتك.`);
+    else if (o.action_id) lines.push(`📝 حضّرت: ${o.title || ''} ${String(o.summary || '').split('\n')[0]} — يستنى تأكيدك.`);
+    else if (o.error) lines.push(`⚠️ ${TOOL_LABEL[it.name] || it.name}: ${String(o.error).slice(0, 160)}`);
+  }
+  if (!lines.length) {
+    const names = [...new Set(items.map((it) => TOOL_LABEL[it.name] || it.name))].slice(0, 4);
+    return `شفت: ${names.join('، ')}. قلّي شنوة تحب نعمل بالضبط.`;
+  }
+  return lines.join('\n');
+}
+
+// A correction from the owner. "شبيك"/"بهيم" were not in any list, so a
+// frustrated owner used to get the same mistake again.
+const CORRECTION_RE = /(شبيك|بهيم|ماكش فاهم|ما فهمتش|مافهمتش|موش هذا|موش هكا|مش هكا|غالط|غلطت|قتلك|قلتلك|لا لا|ماهوش هكا|علاش عملت|شنوة عملت|not what i|wrong|no no)/i;
+const CORRECTION_NOTE = '\n\n[note to Yamen, not from the owner: the owner is CORRECTING you. Re-read FOCUS and "what I did" in ' +
+  'the recent turns, say in ONE line what you got wrong, fix it now in this same turn, then save a rule with ' +
+  'remember (category "rule") written so it never happens again.]';
 
 // ── Access ───────────────────────────────────────────────────────────────────
 
@@ -635,6 +734,13 @@ async function runTools(calls, ctx) {
     // Tool results are the biggest input cost; 12k characters is ~3k tokens.
     return { id: c.id, output: JSON.stringify(out === undefined ? null : out).slice(0, 12000) };
   }));
+  calls.forEach((c, i) => {
+    if (c.name === 'use_tools' || !results[i]) return;
+    ctx.work.push(workLine(c, results[i].output));
+    let parsed = null; try { parsed = JSON.parse(results[i].output); } catch (_) {}
+    ctx.workItems.push({ name: c.name, args: c.args || {}, out: parsed && typeof parsed === 'object' ? parsed : null });
+    try { noteFocus(c, results[i].output); } catch (_) {}
+  });
   return { results, images };
 }
 
@@ -642,8 +748,9 @@ const parseArgs = (s) => { try { return JSON.parse(s || '{}'); } catch (_) { ret
 
 /** The owner's message with any attached photos, per provider. */
 function ownerContent(ctx, provider) {
-  if (!ctx.images.length) return ctx.text;
-  const text = ctx.text || '(see the image)';
+  const base = ctx.modelText || ctx.text;
+  if (!ctx.images.length) return base;
+  const text = base || '(see the image)';
   if (provider === 'responses') {
     return [{ type: 'input_text', text }, ...ctx.images.map((u) => ({ type: 'input_image', image_url: u }))];
   }
@@ -719,7 +826,10 @@ async function turnOpenAIResponses(ctx) {
       // call. Once it grows past ~25k tokens (or carries photos), close it:
       // the next message starts fresh from a short recap.
       // 12k, not 25k: past that, every new message re-bills a long history.
-      mem.setState('openai_prev', lastInput > 12000 ? null : previous);
+      // 24k (was 12k in V129): at 12k the chain reset after almost every TxID
+      // check, and Yamen lost the thread. The recap now carries the work log
+      // too, so a reset no longer forgets what was just done.
+      mem.setState('openai_prev', lastInput > 24000 ? null : previous);
       if (!reply) {
         reply = (response.output || []).filter((o) => o.type === 'message')
           .flatMap((o) => o.content || []).filter((c) => c.type === 'output_text')
@@ -827,20 +937,26 @@ async function runTurn({ text, mode, emit, signal, proactive = null, images = []
   if (pics.length) tier = 'deep';
   const effort = tier === 'deep' ? EFFORT.deep : (CAREFUL.test(text) ? 'medium' : EFFORT.fast);
   const groups = pickGroups(text, { images: pics.length, proactive });
-  const ctx = { text, images: pics, tier, effort, forcedModel, emit, signal, drafts: [], used: [], groups };
+  const correcting = !proactive && CORRECTION_RE.test(text || '');
+  const ctx = { text, modelText: correcting ? `${text}${CORRECTION_NOTE}` : text, images: pics, tier, effort,
+    forcedModel, emit, signal, drafts: [], used: [], groups, work: [], workItems: [], proactive };
   emit({ type: 'start', tier, model: forcedModel || modelFor(tier) });
   // A brief Sahbi writes on its own has no visible question; the prompt is
   // stored as 'auto' so it is neither shown nor replayed as the owner's words.
-  mem.logChat(proactive ? 'auto' : 'user', text, { tier, proactive, images: pics.length || undefined });
+  mem.logChat(proactive ? 'auto' : 'user', text, { tier, proactive, images: pics.length || undefined, correcting: correcting || undefined });
 
   const activeModel = forcedModel || modelFor(tier);
   const fn = PROVIDER === 'anthropic' ? turnAnthropic
     : (isReasoningOpenAI(activeModel) ? turnOpenAIResponses : turnOpenAIChat);
-  const reply = await fn(ctx);
+  let reply = await fn(ctx);
+  if (String(reply || '').replace(/[\s.…]/g, '').length < 2 && ctx.work.length) {
+    reply = replyFromWork(ctx.workItems);
+    emit({ type: 'delta', text: reply });
+  }
   // Photos make the chained context heavy; start the next message fresh.
   if (pics.length) mem.setState('openai_prev', null);
   const meta = { tier, model: forcedModel || modelFor(tier), tools: [...new Set(ctx.used)],
-    drafts: ctx.drafts.map((d) => ({ ...d })), proactive };
+    drafts: ctx.drafts.map((d) => ({ ...d })), proactive, work: ctx.work.slice(0, 12), correcting: correcting || undefined };
   mem.logChat('assistant', reply, meta);
   if (!proactive) mem.setState('yamen_last_groups', JSON.stringify({ groups: [...ctx.groups], at: Date.now() }));
   emit({ type: 'done', ...meta });
@@ -1298,6 +1414,8 @@ router.get('/business/thread', requireToken, (req, res) => {
   try {
     const t = require('./agentTools').TOOLS.business_thread.run({ chat: req.query.chat, limit: 120 });
     if (t.error) return res.status(404).json(t);
+    // Opening a chat in the app = he saw it (app only, nothing sent to Telegram).
+    if (req.query.seen !== '0') { try { require('./businessInbox').markSeen(t.chat_id); } catch (_) {} }
     res.json(t);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1311,6 +1429,66 @@ router.post('/business/suggest', requireToken, async (req, res) => {
     }).slice(0, 24000));
     res.json({ text, suspicious: /^⚠️\s*SUSPICIOUS/.test(text) });
   } catch (e) { res.status(e instanceof BudgetError ? 429 : 500).json({ error: explainError(e) }); }
+});
+
+router.post('/business/seen', requireToken, (req, res) => {
+  try { res.json(require('./businessInbox').markSeen(req.body.chat)); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── 💬 Support section (support bot conversations) ──────────────────────────
+
+const SUPPORT_SUGGEST_SYSTEM =
+  'You write ONE reply that the shop\'s support will send to a customer in the support bot. Output ONLY the reply ' +
+  'text — no quotes, no explanation, no options, no greeting line like "Support:" (the bot adds its own header). ' +
+  'Language: English, unless the owner\'s rules say otherwise. Answer what the customer actually asked in the LAST ' +
+  'messages, using "person" (their balance, orders, ChatGPT seats) — if their order or payment is there, say what ' +
+  'you see. Match the tone and length of support_style (style only). Follow owner_rules. Never invent prices, ' +
+  'dates, refunds, credits or promises; never say balance was added unless "person" shows it. If the answer needs ' +
+  'a check you cannot do (a TxID, a screenshot), ask for exactly what is needed. For a problem with an order, ' +
+  'point to the order history in the bot. Keep it short and kind.';
+
+router.get('/support/chats', requireToken, (req, res) => {
+  try { res.json(require('./supportDesk').list({ days: 30 })); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.get('/support/thread', requireToken, async (req, res) => {
+  try {
+    const desk = require('./supportDesk');
+    const t = desk.thread(req.query.user);
+    if (t.error) return res.status(404).json(t);
+    let person = null;
+    try { person = require('./agentTools').businessPerson(t.user_id); } catch (_) {}
+    if (req.query.read !== '0') await desk.markRead(t.user_id);
+    res.json({ ...t, person });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post('/support/suggest', requireToken, async (req, res) => {
+  try {
+    const desk = require('./supportDesk');
+    const t = desk.thread(req.body.user, { limit: 40 });
+    if (t.error) return res.status(404).json(t);
+    const tools = require('./agentTools');
+    let rules = [];
+    try { rules = mem.memoryForPrompt(1500).lines; } catch (_) {}
+    const text = await suggestOnce(SUPPORT_SUGGEST_SYSTEM, JSON.stringify({
+      customer: t.who, chat: t.messages.map((m) => ({ from: m.from, text: m.text, at: m.at })),
+      person: tools.businessPerson(t.user_id), shop: tools.shopLinks(),
+      support_style: desk.styleSample(), owner_rules: rules,
+    }).slice(0, 24000));
+    res.json({ text });
+  } catch (e) { res.status(e instanceof BudgetError ? 429 : 500).json({ error: explainError(e) }); }
+});
+
+// The owner pressed send on text he wrote or reviewed: that IS his tap.
+router.post('/support/send', requireToken, async (req, res) => {
+  const text = String(req.body.text || '').trim();
+  if (!text) return res.status(400).json({ error: 'empty' });
+  const r = await require('./supportDesk').send(req.body.user, text);
+  if (r.ok) mem.logChat('event', `✅ Support reply sent to ${req.body.user} (from the app): "${text.slice(0, 80)}"`);
+  res.status(r.ok ? 200 : 502).json(r);
 });
 
 // The owner typed (or edited) the reply himself and pressed send: sending it
@@ -1429,7 +1607,7 @@ function agentConfig() {
 // Canva remote-login page, gated by the same token.
 try { require('./canvaLoginPage').mount(router, ACCESS_TOKEN); } catch (e) { logger.warn(`[canva] login page: ${e.message}`); }
 
-module.exports = { _tokenDiet: { pickGroups, toolsFor, guidesFor, runTools, TOOL_GROUPS, PERSONA, GUIDES }, router, ACCESS_TOKEN, agentConfig, probeAgent, proactiveTurn, canvaLoginUrl: () => {
+module.exports = { __runTurnForTest: runTurn, _tokenDiet: { pickGroups, toolsFor, guidesFor, runTools, TOOL_GROUPS, PERSONA, GUIDES }, router, ACCESS_TOKEN, agentConfig, probeAgent, proactiveTurn, canvaLoginUrl: () => {
   const cfg = agentConfig();
   return cfg.base ? `${cfg.base}/agent/canva/login?t=${ACCESS_TOKEN}` : '';
 } };
