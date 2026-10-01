@@ -1006,6 +1006,51 @@ bot.on('message', async (msg) => {
     return;
   }
 
+  // V138 — stock as a .txt FILE. Telegram Desktop turns a long paste into
+  // "message.txt" (owner, 01-10: 164 KB of Gemini links), which this handler
+  // used to ignore (no msg.text). In the stock-upload states the file is read
+  // and handled exactly like pasted text: AYMEN-separated if it contains
+  // AYMEN, otherwise ONE ITEM PER LINE.
+  if (msg.document && !msg.text && msg.from && msg.chat && msg.chat.type === 'private'
+      && adminHandler.isAdmin(msg.from.id)
+      && ['ADMIN_STOCK_BATCH', 'ADMIN_STOCK_DATA', 'ADMIN_ADD_STOCK'].includes(session.get(msg.from.id).state)) {
+    const doc = msg.document;
+    const name = String(doc.file_name || 'file');
+    try {
+      if (doc.file_size && doc.file_size > 20 * 1024 * 1024) {
+        await bot.sendMessage(msg.chat.id, '❌ File too large (Telegram lets bots read up to 20 MB). Split it into smaller files.');
+        return;
+      }
+      if (!/\.(txt|csv|text|list)$/i.test(name) && !/^text\//.test(doc.mime_type || '')) {
+        await bot.sendMessage(msg.chat.id, '❌ Send a <b>.txt</b> file (one item per line, or separated with AYMEN).', { parse_mode: 'HTML' });
+        return;
+      }
+      const link = await bot.getFileLink(doc.file_id);
+      const res = await fetch(link, { signal: AbortSignal.timeout(60000) });
+      if (!res.ok) throw new Error(`download HTTP ${res.status}`);
+      let raw = (await res.text()).replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+      const usesAymen = raw.includes('AYMEN');
+      const items = usesAymen
+        ? raw.split('AYMEN').map((x) => x.trim()).filter(Boolean)
+        : raw.split('\n').map((x) => x.trim()).filter(Boolean);
+      if (!items.length) {
+        await bot.sendMessage(msg.chat.id, '⚠️ The file is empty — no items found.');
+        return;
+      }
+      logger.info(`[STOCK FILE] ${msg.from.id} ${name}: ${items.length} item(s) (${usesAymen ? 'AYMEN' : 'one per line'})`);
+      await bot.sendMessage(msg.chat.id,
+        `📄 <b>${name.replace(/[<>&]/g, '')}</b> read: <b>${items.length}</b> item(s) ` +
+        `(${usesAymen ? 'separated by AYMEN' : 'one per line'}).\n` +
+        `First: <code>${items[0].slice(0, 80).replace(/[<>&]/g, '')}${items[0].length > 80 ? '…' : ''}</code>`,
+        { parse_mode: 'HTML' });
+      await adminHandler.handleAdminText(bot, { ...msg, text: items.join('AYMEN'), document: undefined, entities: [] });
+    } catch (e) {
+      logger.warn(`[STOCK FILE] ${name}: ${e.message}`);
+      await bot.sendMessage(msg.chat.id, `❌ Could not read the file: ${String(e.message).slice(0, 150)}`);
+    }
+    return;
+  }
+
   if (!msg.text || msg.text.startsWith('/')) return;
 
   const userId = msg.from.id;

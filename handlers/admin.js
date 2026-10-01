@@ -4134,6 +4134,8 @@ async function handleAdminCallback(bot, query) {
     await bot.editMessageText(
       `📤 <b>Large Stock Upload — ${escapeHtml(product.title)}</b>\n\n` +
       `Send your items in <b>multiple messages</b> — each message can contain as many items as you want (up to Telegram's limit of 4096 chars).\n\n` +
+      `📄 Or send a <b>.txt file</b> (up to 20 MB) — <b>one item per line</b>, or separated with AYMEN. ` +
+      `A long paste that Telegram turns into <i>message.txt</i> works too.\n\n` +
       `Separate items within each message using <b>AYMEN</b>:\n` +
       `<code>item1AYMENitem2AYMENitem3</code>\n\n` +
       `🏷 To tag this batch with a supplier, send:\n` +
