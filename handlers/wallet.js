@@ -263,7 +263,7 @@ async function handleUsdtAmount(bot, msg) {
     `⚠️ <b>The amount must match to the last decimal.</b>\n` +
     `That exact figure is reserved for you — it is how we know the deposit is yours. ` +
     `A different amount cannot be credited automatically.\n\n` +
-    `<i>The extra cents are credited to your wallet in full.</i>\n\n` +
+    `<i>The tiny extra (less than a cent) is credited to your wallet in full.</i>\n\n` +
     `⏰ Reserved for <b>${ttl} minutes</b>.\n\n` +
     `✨ <b>Nothing else to do:</b> we detect your transfer automatically and credit it ` +
     `within about a minute of Binance receiving it — from any wallet, or from your own ` +

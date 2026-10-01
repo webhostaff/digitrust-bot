@@ -1581,7 +1581,7 @@ const di_get = db.prepare('SELECT * FROM deposit_intents WHERE id = ?');
  * guarantees no two live reservations ever collide. On collision we simply
  * draw again.
  *
- * The suffix is at most $0.99 and is credited to the customer's wallet in full.
+ * The suffix is under 10 cents in practice and is credited to the customer's wallet in full.
  *
  * @returns {object|null} the created intent row
  */
@@ -1592,36 +1592,38 @@ function createDepositIntent(userId, network, baseAmount, ttlMinutes) {
   const ttl = (Number(ttlMinutes) > 0 ? Number(ttlMinutes) : 60) * 60 * 1000;
   const base = Number(Number(baseAmount).toFixed(2));
 
-  // Build V132 — CENTS, not millionths. "29.000350" confused customers (three
-  // zeros, then digits nobody reads correctly). The identifier is now the
-  // cents: 29.37. The extra cents are credited to the customer's wallet in
-  // full, so it costs them nothing, and 2-decimal amounts are what every
-  // wallet and exchange lets them type without trouble.
-  //
-  // 99 values per base amount (.01–.99) are drawn first. Only if all of them
-  // are reserved at the same moment does it fall back to 3 decimals without
-  // a leading zero (.101–.999, never a multiple of 10 so it can't read as a
-  // cents value). The partial UNIQUE index still guarantees no collision.
-  const cents = nodeCrypto.randomInt(0, 99);
-  for (let i = 0; i < 99; i++) {
-    const k = ((cents + i) % 99) + 1;                // 1..99, starting at a random point
-    const unique = Number((base + k / 100).toFixed(2));
+  // V135/V136 — SMALL suffixes first. V132 used .01–.99, and "10.27" for a $10
+  // top-up felt like a lot to customers (even though the extra is credited).
+  // The identifier now stays under 10 cents in practice:
+  //   1) 10.01 … 10.09            one cent digit           (9 values)
+  //   2) 10.011 … 10.099          under 10 cents, 3 dec.   (81 values, never a
+  //                               multiple of 10, so it can't read as tier 1)
+  //   3) 10.101 … 10.999          only if 1) and 2) are all reserved at once
+  // Never "29.000350" again (that run of zeros was the original complaint).
+  // The partial UNIQUE index on (network, unique_amount) still guarantees no
+  // two open reservations share a figure; the extra is credited in full.
+  const tryInsert = (unique) => {
     try {
       const res = di_insert.run(userId, network, base, unique, now, now + ttl);
       return di_get.get(res.lastInsertRowid);
     } catch (e) {
       if (!String(e.message).includes('UNIQUE')) throw e;
+      return null;
     }
-  }
-  for (let attempt = 0; attempt < 120; attempt++) {
-    let k = 101 + nodeCrypto.randomInt(0, 899);      // 101..999
-    if (k % 10 === 0) k += 1;
-    const unique = Number((base + k / 1000).toFixed(3));
-    try {
-      const res = di_insert.run(userId, network, base, unique, now, now + ttl);
-      return di_get.get(res.lastInsertRowid);
-    } catch (e) {
-      if (!String(e.message).includes('UNIQUE')) throw e;
+  };
+  const shuffled = (arr) => { for (let i = arr.length - 1; i > 0; i--) { const j = nodeCrypto.randomInt(0, i + 1); [arr[i], arr[j]] = [arr[j], arr[i]]; } return arr; };
+  // V136 — "two zeros" (owner's choice): 10.003. Under a cent extra.
+  const notRound = (v, scale) => Math.round(v * scale) % 10 !== 0;
+  const tiers = [
+    shuffled(Array.from({ length: 9 }, (_, i) => (i + 1) / 1000)),                                              // .001–.009
+    shuffled(Array.from({ length: 89 }, (_, i) => (i + 11) / 10000).filter((v) => notRound(v, 10000))),          // .0011–.0099
+    shuffled(Array.from({ length: 89 }, (_, i) => (i + 11) / 1000).filter((v) => notRound(v, 1000))),            // .011–.099 (rare)
+    shuffled(Array.from({ length: 899 }, (_, i) => (i + 101) / 1000).filter((v) => notRound(v, 1000))),          // .101–.999 (last resort)
+  ];
+  for (const tier of tiers) {
+    for (const suffix of tier) {
+      const row = tryInsert(Number((base + suffix).toFixed(4)));
+      if (row) return row;
     }
   }
   return null; // astronomically unlikely
