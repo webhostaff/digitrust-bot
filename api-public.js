@@ -140,7 +140,7 @@ function buildBulkLadder(userId, product) {
   const points = new Set([1]);
   for (const q of [
     product.bulk_tier1_qty, product.bulk_tier2_qty,
-    product.bulk_tier3_qty, product.bulk_min_qty,
+    product.bulk_tier3_qty, product.bulk_tier4_qty, product.bulk_min_qty,
   ]) {
     const n = Number(q) || 0;
     if (n > 1) points.add(n);

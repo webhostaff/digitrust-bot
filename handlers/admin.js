@@ -678,10 +678,10 @@ async function handleAdminText(bot, msg) {
     } else if (editField === 'wholesale_price') {
       value = parseFloat(String(text).replace('$', '').replace(',', '.'));
       if (isNaN(value) || value < 0) { await bot.sendMessage(chatId, '❌ Enter a valid price (use <code>0</code> to disable)', { parse_mode: 'HTML' }); return; }
-    } else if (['bulk_tier1_qty', 'bulk_tier2_qty', 'bulk_tier3_qty'].includes(editField)) {
+    } else if (['bulk_tier1_qty', 'bulk_tier2_qty', 'bulk_tier3_qty', 'bulk_tier4_qty'].includes(editField)) {
       value = parseInt(text, 10);
       if (isNaN(value) || value < 0) { await bot.sendMessage(chatId, '❌ Enter a valid non-negative integer. Use <code>0</code> to disable this tier.', { parse_mode: 'HTML' }); return; }
-    } else if (['bulk_tier1_price', 'bulk_tier2_price', 'bulk_tier3_price'].includes(editField)) {
+    } else if (['bulk_tier1_price', 'bulk_tier2_price', 'bulk_tier3_price', 'bulk_tier4_price'].includes(editField)) {
       value = parseFloat(String(text).replace('$', '').replace(',', '.'));
       if (isNaN(value) || value < 0) { await bot.sendMessage(chatId, '❌ Enter a valid non-negative price. Use <code>0</code> to disable.', { parse_mode: 'HTML' }); return; }
     }
@@ -790,7 +790,7 @@ async function handleAdminText(bot, msg) {
     // Sanity check against the other two tiers: tiers must make sense as
     // increasing quantity → decreasing price, so an admin can't accidentally
     // set Tier 2 cheaper-qty-but-pricier than Tier 1, etc.
-    const otherTiers = [1, 2, 3]
+    const otherTiers = [1, 2, 3, 4]
       .filter((n) => n !== bulkTierNum)
       .map((n) => ({ n, qty: product[`bulk_tier${n}_qty`] || 0, price: product[`bulk_tier${n}_price`] || 0 }))
       .filter((t) => t.qty > 0 && t.price > 0);
@@ -3299,7 +3299,7 @@ async function handleAdminCallback(bot, query) {
     const statusLine = stockQty === 0 ? '❌ <b>OUT OF STOCK</b>' : '✅ <b>IN STOCK</b>';
     // Both systems, or neither — the screens used to disagree because this one
     // only knew about the old percentage rule.
-    const tierBits = [1, 2, 3]
+    const tierBits = [1, 2, 3, 4]
       .map((n) => ({ q: product?.[`bulk_tier${n}_qty`] || 0, p: product?.[`bulk_tier${n}_price`] || 0 }))
       .filter((t) => t.q > 0 && t.p > 0)
       .map((t) => `${t.q}+ → $${Number(t.p).toFixed(2)}`);
@@ -3441,7 +3441,7 @@ async function handleAdminCallback(bot, query) {
     const product   = db.getProduct(productId);
     if (!product) { await answer('❌ Product not found.'); return; }
 
-    const tierLines = [1, 2, 3].map((n) => {
+    const tierLines = [1, 2, 3, 4].map((n) => {
       const qty   = product[`bulk_tier${n}_qty`];
       const price = product[`bulk_tier${n}_price`];
       if (qty > 0 && price > 0) {
@@ -3995,7 +3995,7 @@ async function handleAdminCallback(bot, query) {
   }
 
   // ── Bulk Pricing — edit one tier (combined qty + price prompt) ─────
-  if (/^admin_bulkprice_edit_\d+_[123]$/.test(data)) {
+  if (/^admin_bulkprice_edit_\d+_[1234]$/.test(data)) {
     const parts     = data.split('_');
     const productId = parseInt(parts[3], 10);
     const tierNum   = parseInt(parts[4], 10);
@@ -4023,7 +4023,7 @@ async function handleAdminCallback(bot, query) {
   }
 
   // ── Bulk Pricing — clear one tier ───────────────────────────────────
-  if (/^admin_bulkprice_clear_\d+_[123]$/.test(data)) {
+  if (/^admin_bulkprice_clear_\d+_[1234]$/.test(data)) {
     const parts     = data.split('_');
     const productId = parseInt(parts[3], 10);
     const tierNum   = parseInt(parts[4], 10);

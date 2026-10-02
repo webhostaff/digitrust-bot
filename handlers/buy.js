@@ -169,8 +169,8 @@ const COOLDOWN_MS = 10 * 1000; // 10 seconds between orders
  * 0 means no cap at all: real stock is the only limit.
  */
 function maxQtyPerOrder() {
-  const v = parseInt(db.getSetting('max_qty_per_order', '500'), 10);
-  return Number.isFinite(v) && v >= 0 ? v : 500;
+  const v = parseInt(db.getSetting('max_qty_per_order', '2000'), 10);
+  return Number.isFinite(v) && v >= 0 ? v : 2000;
 }
 
 async function createAndShowSummary(bot, chatId, userId, email) {

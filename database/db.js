@@ -48,6 +48,8 @@ db.exec(`
     bulk_tier2_price REAL   DEFAULT 0,
     bulk_tier3_qty  INTEGER DEFAULT 0,
     bulk_tier3_price REAL   DEFAULT 0,
+    bulk_tier4_qty  INTEGER DEFAULT 0,
+    bulk_tier4_price REAL   DEFAULT 0,
     created_at      TEXT    DEFAULT (datetime('now'))
   );
 
@@ -329,6 +331,9 @@ if (!existingProductCols.includes('bulk_tier2_qty'))   db.exec('ALTER TABLE prod
 if (!existingProductCols.includes('bulk_tier2_price')) db.exec('ALTER TABLE products ADD COLUMN bulk_tier2_price REAL DEFAULT 0');
 if (!existingProductCols.includes('bulk_tier3_qty'))   db.exec('ALTER TABLE products ADD COLUMN bulk_tier3_qty INTEGER DEFAULT 0');
 if (!existingProductCols.includes('bulk_tier3_price')) db.exec('ALTER TABLE products ADD COLUMN bulk_tier3_price REAL DEFAULT 0');
+// V140: a 4th bulk tier (e.g. 2000+). Empty = not shown, not applied.
+if (!existingProductCols.includes('bulk_tier4_qty'))   db.exec('ALTER TABLE products ADD COLUMN bulk_tier4_qty INTEGER DEFAULT 0');
+if (!existingProductCols.includes('bulk_tier4_price')) db.exec('ALTER TABLE products ADD COLUMN bulk_tier4_price REAL DEFAULT 0');
 if (!existingProductCols.includes('instruction'))   db.exec('ALTER TABLE products ADD COLUMN instruction TEXT DEFAULT NULL');
 if (!existingProductCols.includes('display_order')) db.exec('ALTER TABLE products ADD COLUMN display_order INTEGER DEFAULT 999');
 if (!existingProductCols.includes('category_id'))   db.exec('ALTER TABLE products ADD COLUMN category_id INTEGER DEFAULT 0');
@@ -1202,7 +1207,14 @@ try {
   // 23:59 includes the end day, which is what "until the 25th" means to a buyer.
   ins.run('cgb_cycle_end_time', '23:59');
   // Guard against typos, not a sales limit. Real stock is the true cap.
-  ins.run('max_qty_per_order', '500');
+  ins.run('max_qty_per_order', '2000');
+  // V140: the cap went from 500 to 2000. INSERT OR IGNORE cannot change a value
+  // that is already stored, so a database still holding the old default is
+  // moved ONCE (marker below). A value the owner set himself is left alone.
+  if (!db.prepare("SELECT 1 FROM settings WHERE key = 'max_qty_migrated_v140'").get()) {
+    db.prepare("UPDATE settings SET value = '2000' WHERE key = 'max_qty_per_order' AND value = '500'").run();
+    ins.run('max_qty_migrated_v140', '1');
+  }
 } catch (e) {
   console.error('[SEED] cgb renewal settings:', e.message);
 }

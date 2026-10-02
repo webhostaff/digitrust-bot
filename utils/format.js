@@ -63,7 +63,7 @@ function scaleTiersProportionally(product, oldPrice, newPrice) {
   const ratio = newP / oldP;
   const changes = [];
 
-  for (const n of [1, 2, 3]) {
+  for (const n of [1, 2, 3, 4]) {
     const tierPrice = Number(product[`bulk_tier${n}_price`]) || 0;
     if (tierPrice <= 0) continue; // tier not set — nothing to scale
     const scaled = Number((tierPrice * ratio).toFixed(2));
@@ -82,7 +82,7 @@ function scaleTiersProportionally(product, oldPrice, newPrice) {
 function calcOrderPrice(product, quantity) {
   const basePrice = Number(product.price) || 0;
 
-  // Two bulk systems exist on the same product: the tier table (tier1/2/3, a
+  // Two bulk systems exist on the same product: the tier table (tier1-4, a
   // price per piece) and the older single rule (bulk_min_qty + a percentage).
   // They were evaluated as "tiers first, legacy only if no tier matched", which
   // could charge MORE for a larger order — a 50%-off legacy rule at 10+ beat a
@@ -97,6 +97,7 @@ function calcOrderPrice(product, quantity) {
     [1, product.bulk_tier1_qty, product.bulk_tier1_price],
     [2, product.bulk_tier2_qty, product.bulk_tier2_price],
     [3, product.bulk_tier3_qty, product.bulk_tier3_price],
+    [4, product.bulk_tier4_qty, product.bulk_tier4_price],
   ]) {
     const minQty = Number(q) || 0;
     const price  = Number(pr) || 0;
@@ -327,7 +328,7 @@ function formatBulkTiersDisplay(product) {
   const breakpoints = [1];
   for (const q of [
     product.bulk_tier1_qty, product.bulk_tier2_qty,
-    product.bulk_tier3_qty, product.bulk_min_qty,
+    product.bulk_tier3_qty, product.bulk_tier4_qty, product.bulk_min_qty,
   ]) {
     const n = Number(q) || 0;
     if (n > 1) breakpoints.push(n);

@@ -542,12 +542,13 @@ const adminProductsKb = (products, action = 'edit') =>
     [btn('🔙 Back', 'admin_panel')],
   ]);
 
-// Bulk pricing overview — shows all 3 tiers at a glance with edit/clear per tier
+// Bulk pricing overview — shows all 4 tiers at a glance with edit/clear per tier
 const adminBulkPriceKb = (product) => {
   const tiers = [
     { n: 1, qty: product.bulk_tier1_qty, price: product.bulk_tier1_price },
     { n: 2, qty: product.bulk_tier2_qty, price: product.bulk_tier2_price },
     { n: 3, qty: product.bulk_tier3_qty, price: product.bulk_tier3_price },
+    { n: 4, qty: product.bulk_tier4_qty, price: product.bulk_tier4_price },
   ];
   const rows = tiers.map((t) => {
     const isSet = t.qty > 0 && t.price > 0;

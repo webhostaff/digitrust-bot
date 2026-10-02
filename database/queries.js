@@ -2233,6 +2233,7 @@ module.exports = {
       'bulk_tier1_qty','bulk_tier1_price',
       'bulk_tier2_qty','bulk_tier2_price',
       'bulk_tier3_qty','bulk_tier3_price',
+      'bulk_tier4_qty','bulk_tier4_price',
       'wholesale_price','category_id',
       // V2
       'refund_enabled','delivery_type','low_stock_threshold',
@@ -3115,6 +3116,7 @@ module.exports = {
       bulk_tier1_qty: 0, bulk_tier1_price: 0,
       bulk_tier2_qty: 0, bulk_tier2_price: 0,
       bulk_tier3_qty: 0, bulk_tier3_price: 0,
+      bulk_tier4_qty: 0, bulk_tier4_price: 0,
       bulk_min_qty: 0, bulk_discount: 0,
     };
   },
