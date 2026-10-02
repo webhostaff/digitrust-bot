@@ -1,5 +1,7 @@
 'use strict';
 
+const { TIER_NUMBERS, tiersOf, isSet: tierIsSet } = require('./bulkTiers');
+
 /**
  * Shared validity window for payment confirmations (TxID / Order ID).
  * Applies to: order payments (USDT, Binance Pay) and wallet top-ups
@@ -63,7 +65,7 @@ function scaleTiersProportionally(product, oldPrice, newPrice) {
   const ratio = newP / oldP;
   const changes = [];
 
-  for (const n of [1, 2, 3, 4]) {
+  for (const n of TIER_NUMBERS) {
     const tierPrice = Number(product[`bulk_tier${n}_price`]) || 0;
     if (tierPrice <= 0) continue; // tier not set — nothing to scale
     const scaled = Number((tierPrice * ratio).toFixed(2));
@@ -93,16 +95,9 @@ function calcOrderPrice(product, quantity) {
   // read as a mistake by the customer, and it is one.
   const candidates = [];
 
-  for (const [n, q, pr] of [
-    [1, product.bulk_tier1_qty, product.bulk_tier1_price],
-    [2, product.bulk_tier2_qty, product.bulk_tier2_price],
-    [3, product.bulk_tier3_qty, product.bulk_tier3_price],
-    [4, product.bulk_tier4_qty, product.bulk_tier4_price],
-  ]) {
-    const minQty = Number(q) || 0;
-    const price  = Number(pr) || 0;
-    if (minQty > 0 && price > 0 && quantity >= minQty) {
-      candidates.push({ unitPrice: price, tier: minQty, source: `tier${n}` });
+  for (const t of tiersOf(product)) {
+    if (tierIsSet(t) && quantity >= t.qty) {
+      candidates.push({ unitPrice: t.price, tier: t.qty, source: `tier${t.n}` });
     }
   }
 
@@ -327,8 +322,7 @@ function formatBulkTiersDisplay(product) {
   // Every quantity at which any rule could start applying.
   const breakpoints = [1];
   for (const q of [
-    product.bulk_tier1_qty, product.bulk_tier2_qty,
-    product.bulk_tier3_qty, product.bulk_tier4_qty, product.bulk_min_qty,
+    ...tiersOf(product).map((t) => t.qty), product.bulk_min_qty,
   ]) {
     const n = Number(q) || 0;
     if (n > 1) breakpoints.push(n);

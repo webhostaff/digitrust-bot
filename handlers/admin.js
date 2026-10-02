@@ -4,6 +4,7 @@ const db      = require('../database/queries');
 const session = require('./session');
 const { States } = require('./session');
 const config  = require('../config');
+const { TIER_NUMBERS, TIER_COLUMNS, MAX_BULK_TIERS, tiersOf, isSet: tierIsSet } = require('../utils/bulkTiers');
 const {
   adminMainKb, adminProductsKb, adminProductEditFieldsKb, adminBulkPriceKb, adminStockManageKb,
   adminUsersKb, adminUserActionsKb, adminTicketsKb, adminTicketActionsKb,
@@ -678,10 +679,10 @@ async function handleAdminText(bot, msg) {
     } else if (editField === 'wholesale_price') {
       value = parseFloat(String(text).replace('$', '').replace(',', '.'));
       if (isNaN(value) || value < 0) { await bot.sendMessage(chatId, '❌ Enter a valid price (use <code>0</code> to disable)', { parse_mode: 'HTML' }); return; }
-    } else if (['bulk_tier1_qty', 'bulk_tier2_qty', 'bulk_tier3_qty', 'bulk_tier4_qty'].includes(editField)) {
+    } else if (TIER_COLUMNS.includes(editField) && editField.endsWith('_qty')) {
       value = parseInt(text, 10);
       if (isNaN(value) || value < 0) { await bot.sendMessage(chatId, '❌ Enter a valid non-negative integer. Use <code>0</code> to disable this tier.', { parse_mode: 'HTML' }); return; }
-    } else if (['bulk_tier1_price', 'bulk_tier2_price', 'bulk_tier3_price', 'bulk_tier4_price'].includes(editField)) {
+    } else if (TIER_COLUMNS.includes(editField) && editField.endsWith('_price')) {
       value = parseFloat(String(text).replace('$', '').replace(',', '.'));
       if (isNaN(value) || value < 0) { await bot.sendMessage(chatId, '❌ Enter a valid non-negative price. Use <code>0</code> to disable.', { parse_mode: 'HTML' }); return; }
     }
@@ -787,10 +788,10 @@ async function handleAdminText(bot, msg) {
       return;
     }
 
-    // Sanity check against the other two tiers: tiers must make sense as
+    // Sanity check against the other tiers: tiers must make sense as
     // increasing quantity → decreasing price, so an admin can't accidentally
     // set Tier 2 cheaper-qty-but-pricier than Tier 1, etc.
-    const otherTiers = [1, 2, 3, 4]
+    const otherTiers = TIER_NUMBERS
       .filter((n) => n !== bulkTierNum)
       .map((n) => ({ n, qty: product[`bulk_tier${n}_qty`] || 0, price: product[`bulk_tier${n}_price`] || 0 }))
       .filter((t) => t.qty > 0 && t.price > 0);
@@ -819,7 +820,9 @@ async function handleAdminText(bot, msg) {
     const fresh = db.getProduct(bulkProductId);
     await bot.sendMessage(
       chatId,
-      `✅ <b>Tier ${bulkTierNum} saved:</b> ${qty}+ pcs → ${formatPrice(price)} each`,
+      `✅ <b>Tier ${bulkTierNum} saved:</b> ${qty}+ pcs → ${formatPrice(price)} each` +
+      (((parseInt(db.getSetting('max_qty_per_order', '2000'), 10) || 0) > 0 && qty > parseInt(db.getSetting('max_qty_per_order', '2000'), 10))
+        ? `\n⚠️ The order limit is ${db.getSetting('max_qty_per_order', '2000')} pcs, so nobody can reach this tier. Raise the limit or lower the quantity.` : ''),
       { parse_mode: 'HTML', reply_markup: adminBulkPriceKb(fresh) }
     );
     return;
@@ -3299,10 +3302,9 @@ async function handleAdminCallback(bot, query) {
     const statusLine = stockQty === 0 ? '❌ <b>OUT OF STOCK</b>' : '✅ <b>IN STOCK</b>';
     // Both systems, or neither — the screens used to disagree because this one
     // only knew about the old percentage rule.
-    const tierBits = [1, 2, 3, 4]
-      .map((n) => ({ q: product?.[`bulk_tier${n}_qty`] || 0, p: product?.[`bulk_tier${n}_price`] || 0 }))
-      .filter((t) => t.q > 0 && t.p > 0)
-      .map((t) => `${t.q}+ → $${Number(t.p).toFixed(2)}`);
+    const tierBits = tiersOf(product || {})
+      .filter(tierIsSet)
+      .map((t) => `${t.qty}+ → $${Number(t.price).toFixed(2)}`);
     if (product?.bulk_min_qty > 0 && product?.bulk_discount > 0) {
       tierBits.push(`${product.bulk_min_qty}+ → ${product.bulk_discount}% off`);
     }
@@ -3441,14 +3443,16 @@ async function handleAdminCallback(bot, query) {
     const product   = db.getProduct(productId);
     if (!product) { await answer('❌ Product not found.'); return; }
 
-    const tierLines = [1, 2, 3, 4].map((n) => {
-      const qty   = product[`bulk_tier${n}_qty`];
-      const price = product[`bulk_tier${n}_price`];
-      if (qty > 0 && price > 0) {
-        return `  • Tier ${n}: <b>${qty}+ pcs</b> → <b>$${Number(price).toFixed(2)}</b> each`;
-      }
-      return `  • Tier ${n}: <i>not set</i>`;
-    }).join('\n');
+    const allTiers = tiersOf(product);
+    const nextFree = allTiers.find((t) => !tierIsSet(t));
+    const tierLines = (allTiers.filter(tierIsSet).map((t) =>
+      `  • Tier ${t.n}: <b>${t.qty}+ pcs</b> → <b>$${Number(t.price).toFixed(2)}</b> each`)
+      .concat(nextFree ? [`  • Tier ${nextFree.n}: <i>not set</i>`] : [])).join('\n');
+    const orderCap = parseInt(db.getSetting('max_qty_per_order', '2000'), 10) || 0;
+    const aboveCap = allTiers.filter((t) => tierIsSet(t) && orderCap > 0 && t.qty > orderCap);
+    const capWarn = aboveCap.length
+      ? `\n⚠️ <b>Above the order limit (${orderCap}):</b> ${aboveCap.map((t) => `Tier ${t.n}`).join(', ')} — nobody can order that many.\n`
+      : '';
 
     // The older percentage rule lives on the same product and is applied at
     // checkout too. Showing only the tiers meant this screen and the product
@@ -3467,16 +3471,23 @@ async function handleAdminCallback(bot, query) {
 
     // A worked example beats a description: the ladder is what the admin is
     // actually trying to see, and it is computed by the same code checkout uses.
-    const sample = [1, 5, 10, 25, 50, 100]
+    // One line per step of the ladder: 1 piece, the last piece BEFORE the first
+    // tier, then the start of every tier (never cut off, however many tiers).
+    const setTiers = allTiers.filter(tierIsSet).sort((x, y) => x.qty - y.qty);
+    const sampleQtys = [...new Set([1,
+      ...(setTiers.length && setTiers[0].qty > 2 ? [setTiers[0].qty - 1] : []),
+      ...setTiers.map((t) => t.qty)])];
+    const sample = sampleQtys
       .map((q) => {
         const r = calcOrderPrice(product, q);
-        return `${String(q).padStart(3)} pcs → $${r.unitPrice.toFixed(4)} each`;
+        return `${String(q).padStart(4)} pcs → $${r.unitPrice.toFixed(4)} each`;
       }).join('\n');
 
     await bot.editMessageText(
       `📊 <b>Bulk Pricing — ${escapeHtml(product.title || '')}</b>\n\n` +
       `Base price (1 pc): <b>${formatPrice(product.price)}</b>\n\n` +
       `${tierLines}\n` +
+      capWarn +
       legacyBlock +
       `\n💵 <b>What customers actually pay</b>\n<code>${sample}</code>\n\n` +
       `Tap a tier below to set or change it. Each tier needs a <b>minimum quantity</b> and a <b>price per piece</b> — once the customer reaches that quantity, every piece in the order is charged at that tier's price.`,
@@ -3995,7 +4006,7 @@ async function handleAdminCallback(bot, query) {
   }
 
   // ── Bulk Pricing — edit one tier (combined qty + price prompt) ─────
-  if (/^admin_bulkprice_edit_\d+_[1234]$/.test(data)) {
+  if (/^admin_bulkprice_edit_\d+_\d{1,2}$/.test(data) && TIER_NUMBERS.includes(parseInt(data.split('_')[4], 10))) {
     const parts     = data.split('_');
     const productId = parseInt(parts[3], 10);
     const tierNum   = parseInt(parts[4], 10);
@@ -4023,7 +4034,7 @@ async function handleAdminCallback(bot, query) {
   }
 
   // ── Bulk Pricing — clear one tier ───────────────────────────────────
-  if (/^admin_bulkprice_clear_\d+_[1234]$/.test(data)) {
+  if (/^admin_bulkprice_clear_\d+_\d{1,2}$/.test(data) && TIER_NUMBERS.includes(parseInt(data.split('_')[4], 10))) {
     const parts     = data.split('_');
     const productId = parseInt(parts[3], 10);
     const tierNum   = parseInt(parts[4], 10);

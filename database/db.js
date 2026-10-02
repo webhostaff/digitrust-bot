@@ -4,6 +4,7 @@ const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
 const config = require('../config');
+const { TIER_NUMBERS } = require('../utils/bulkTiers');
 
 const dbDir = path.dirname(config.dbPath);
 if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
@@ -331,9 +332,12 @@ if (!existingProductCols.includes('bulk_tier2_qty'))   db.exec('ALTER TABLE prod
 if (!existingProductCols.includes('bulk_tier2_price')) db.exec('ALTER TABLE products ADD COLUMN bulk_tier2_price REAL DEFAULT 0');
 if (!existingProductCols.includes('bulk_tier3_qty'))   db.exec('ALTER TABLE products ADD COLUMN bulk_tier3_qty INTEGER DEFAULT 0');
 if (!existingProductCols.includes('bulk_tier3_price')) db.exec('ALTER TABLE products ADD COLUMN bulk_tier3_price REAL DEFAULT 0');
-// V140: a 4th bulk tier (e.g. 2000+). Empty = not shown, not applied.
-if (!existingProductCols.includes('bulk_tier4_qty'))   db.exec('ALTER TABLE products ADD COLUMN bulk_tier4_qty INTEGER DEFAULT 0');
-if (!existingProductCols.includes('bulk_tier4_price')) db.exec('ALTER TABLE products ADD COLUMN bulk_tier4_price REAL DEFAULT 0');
+// V141: bulk tiers 4..MAX_BULK_TIERS (utils/bulkTiers.js). Empty = not shown, not applied.
+for (const n of TIER_NUMBERS) {
+  for (const [col, type] of [[`bulk_tier${n}_qty`, 'INTEGER'], [`bulk_tier${n}_price`, 'REAL']]) {
+    if (!existingProductCols.includes(col)) db.exec(`ALTER TABLE products ADD COLUMN ${col} ${type} DEFAULT 0`);
+  }
+}
 if (!existingProductCols.includes('instruction'))   db.exec('ALTER TABLE products ADD COLUMN instruction TEXT DEFAULT NULL');
 if (!existingProductCols.includes('display_order')) db.exec('ALTER TABLE products ADD COLUMN display_order INTEGER DEFAULT 999');
 if (!existingProductCols.includes('category_id'))   db.exec('ALTER TABLE products ADD COLUMN category_id INTEGER DEFAULT 0');

@@ -2,6 +2,7 @@
 
 const db = require('./db');
 const subPricing = require('../utils/subscriptionPricing');
+const { TIER_COLUMNS } = require('../utils/bulkTiers');
 
 // ── USERS ─────────────────────────────────────────────────────────────────────
 
@@ -2230,10 +2231,7 @@ module.exports = {
       'bulk_min_qty','bulk_discount','instruction','display_order',
       'preorder_enabled','preorder_max','preorder_count',
       'cost_price','premium_emoji_id',
-      'bulk_tier1_qty','bulk_tier1_price',
-      'bulk_tier2_qty','bulk_tier2_price',
-      'bulk_tier3_qty','bulk_tier3_price',
-      'bulk_tier4_qty','bulk_tier4_price',
+      ...TIER_COLUMNS,
       'wholesale_price','category_id',
       // V2
       'refund_enabled','delivery_type','low_stock_threshold',
@@ -3116,7 +3114,7 @@ module.exports = {
       bulk_tier1_qty: 0, bulk_tier1_price: 0,
       bulk_tier2_qty: 0, bulk_tier2_price: 0,
       bulk_tier3_qty: 0, bulk_tier3_price: 0,
-      bulk_tier4_qty: 0, bulk_tier4_price: 0,
+      ...Object.fromEntries(TIER_COLUMNS.filter((c) => !/^bulk_tier[123]_/.test(c)).map((c) => [c, 0])),
       bulk_min_qty: 0, bulk_discount: 0,
     };
   },

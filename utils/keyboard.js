@@ -1,6 +1,7 @@
 'use strict';
 
 const { formatPrice } = require('./format');
+const { tiersOf, isSet: tierIsSet } = require('./bulkTiers');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const mk  = (rows) => ({ inline_keyboard: rows });
@@ -542,23 +543,23 @@ const adminProductsKb = (products, action = 'edit') =>
     [btn('🔙 Back', 'admin_panel')],
   ]);
 
-// Bulk pricing overview — shows all 4 tiers at a glance with edit/clear per tier
+// Bulk pricing overview — every tier that is set (edit / clear), plus ONE
+// "Add Tier N" button for the first free slot (V141: up to MAX_BULK_TIERS tiers,
+// without a wall of empty rows).
 const adminBulkPriceKb = (product) => {
-  const tiers = [
-    { n: 1, qty: product.bulk_tier1_qty, price: product.bulk_tier1_price },
-    { n: 2, qty: product.bulk_tier2_qty, price: product.bulk_tier2_price },
-    { n: 3, qty: product.bulk_tier3_qty, price: product.bulk_tier3_price },
-    { n: 4, qty: product.bulk_tier4_qty, price: product.bulk_tier4_price },
-  ];
-  const rows = tiers.map((t) => {
-    const isSet = t.qty > 0 && t.price > 0;
-    const label = isSet
-      ? `✏️ Tier ${t.n}: ${t.qty}+ → $${Number(t.price).toFixed(2)}`
-      : `➕ Add Tier ${t.n}`;
-    const row = [btn(label, `admin_bulkprice_edit_${product.id}_${t.n}`)];
-    if (isSet) row.push(btn('🗑', `admin_bulkprice_clear_${product.id}_${t.n}`));
-    return row;
-  });
+  const rows = [];
+  let addShown = false;
+  for (const t of tiersOf(product)) {
+    if (tierIsSet(t)) {
+      rows.push([
+        btn(`✏️ Tier ${t.n}: ${t.qty}+ → $${Number(t.price).toFixed(2)}`, `admin_bulkprice_edit_${product.id}_${t.n}`),
+        btn('🗑', `admin_bulkprice_clear_${product.id}_${t.n}`),
+      ]);
+    } else if (!addShown) {
+      addShown = true;
+      rows.push([btn(`➕ Add Tier ${t.n}`, `admin_bulkprice_edit_${product.id}_${t.n}`)]);
+    }
+  }
   rows.push([btn('🔙 Back to Product', `admin_edit_p_${product.id}`)]);
   return mk(rows);
 };
