@@ -323,6 +323,8 @@ if (!existingUserCols.includes('vip_unlocked_at')) db.exec('ALTER TABLE users AD
 const existingProductCols = db.prepare('PRAGMA table_info(products)').all().map((c) => c.name);
 if (!existingProductCols.includes('stock_quantity')) db.exec('ALTER TABLE products ADD COLUMN stock_quantity INTEGER DEFAULT 0');
 if (!existingProductCols.includes('sales_count'))   db.exec('ALTER TABLE products ADD COLUMN sales_count INTEGER DEFAULT 0');
+// V142: 1 = the VIP / rank discount does NOT apply to this product (the customer pays the normal price).
+if (!existingProductCols.includes('no_rank_discount')) db.exec('ALTER TABLE products ADD COLUMN no_rank_discount INTEGER DEFAULT 0');
 if (!existingProductCols.includes('item_type'))     db.exec("ALTER TABLE products ADD COLUMN item_type TEXT DEFAULT 'key'");
 if (!existingProductCols.includes('bulk_min_qty'))  db.exec('ALTER TABLE products ADD COLUMN bulk_min_qty INTEGER DEFAULT 0');
 if (!existingProductCols.includes('bulk_discount')) db.exec('ALTER TABLE products ADD COLUMN bulk_discount REAL DEFAULT 0');

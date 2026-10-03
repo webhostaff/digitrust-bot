@@ -577,6 +577,7 @@ const adminProductEditFieldsKb = (productId) =>
     [btn('🗂 Set Category',    `admin_assigncat_${productId}`)],
     // ── V2: per-product behaviour toggles ─────────────────────────────
     [btn('🔄 Refund Eligibility',  `admin_toggle_refund_${productId}`)],
+    [btn('👑 VIP Discount',        `admin_toggle_vipdisc_${productId}`)],
     [btn('🚚 Delivery Method',     `admin_toggle_delivery_${productId}`)],
     [btn('🔔 Low-Stock Threshold', `admin_lowstock_${productId}`)],
     [btn('🤖 Toggle ChatGPT Business Mode', `admin_toggle_cgb_${productId}`)],

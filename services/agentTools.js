@@ -145,6 +145,7 @@ const TOOLS = {
       id: p.id, title: clean(p.title), price: p.price,
       stock: p.stock_quantity, sold: p.sales_count,
       delivery: p.delivery_type,
+      vip_discount: Number(p.no_rank_discount) !== 1,   // false = VIPs pay the normal price: never promise them a discount
     })),
   },
 

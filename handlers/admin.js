@@ -2941,6 +2941,32 @@ async function handleAdminCallback(bot, query) {
     return;
   }
 
+  // ── Toggle the VIP / rank discount for a product (V142) ───────────
+  if (/^admin_toggle_vipdisc_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product   = db.getProduct(productId);
+    if (!product) { await answer('❌ Product not found'); return; }
+    const excluded = Number(product.no_rank_discount) === 1 ? 0 : 1;      // flip
+    db.updateProduct(productId, 'no_rank_discount', excluded);
+    logger.info(`Admin ${userId} set no_rank_discount=${excluded} on product #${productId}`);
+
+    await bot.editMessageText(
+      `👑 <b>VIP Discount</b>\n\n` +
+      `📦 ${escapeHtml(product.title || '')}\n\n` +
+      `Status: ${excluded ? '🚫 <b>NO VIP DISCOUNT</b> — VIPs and ranked customers pay the normal price'
+                         : '✅ <b>VIP DISCOUNT APPLIES</b> — VIPs and ranked customers get their discount'}\n\n` +
+      `<i>Bulk prices are not affected: they are this product's own price list, the same for everybody. ` +
+      `Special prices you set for one customer are not affected either. The customer sees a line in the ` +
+      `order summary explaining why their discount does not apply.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: excluded ? '✅ Give VIPs their discount again' : '🚫 Remove the VIP discount here', callback_data: `admin_toggle_vipdisc_${productId}` }],
+          [{ text: '🔙 Back to product', callback_data: `admin_edit_p_${productId}` }],
+        ] } }
+    ).catch(() => {});
+    return;
+  }
+
   // ── Toggle refund eligibility for a product ───────────────────────
   if (/^admin_toggle_refund_\d+$/.test(data)) {
     const productId = parseInt(data.split('_').pop(), 10);
@@ -3314,6 +3340,9 @@ async function handleAdminCallback(bot, query) {
     const refundInfo   = Number(product?.refund_enabled) === 1
       ? '🔄 <b>Refunds:</b> ✅ Allowed\n'
       : '🔄 <b>Refunds:</b> 🚫 Blocked\n';
+    const vipInfo = Number(product?.no_rank_discount) === 1
+      ? '👑 <b>VIP discount:</b> 🚫 Not applied (normal price)\n'
+      : '👑 <b>VIP discount:</b> ✅ Applies\n';
     const deliveryInfo = product?.delivery_type === 'manual'
       ? '🚚 <b>Delivery:</b> 🖐 Manual\n'
       : '🚚 <b>Delivery:</b> ⚡ Automatic\n';
@@ -3325,7 +3354,7 @@ async function handleAdminCallback(bot, query) {
       `✏️ <b>Edit Product:</b> ${product?.title}\n` +
       `🆔 <b>Product ID:</b> <code>${productId}</code>\n\n` +
       `📦 <b>Stock qty:</b> ${stockQty}   📈 <b>Sales:</b> ${product?.sales_count || 0}\n` +
-      bulkInfo + refundInfo + deliveryInfo + lowInfo +
+      bulkInfo + refundInfo + vipInfo + deliveryInfo + lowInfo +
       `${statusLine}\n\n` +
       `Select a field to edit or manage stock:`,
       { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminProductEditFieldsKb(productId) }

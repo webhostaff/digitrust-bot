@@ -110,7 +110,10 @@ async function handleQuantity(bot, msg) {
   // Rank discount on top. resolveDiscountPct returns the better of the
   // customer's earned tier and the discount a grandfathered VIP keeps for life,
   // so switching to ranks can never lower what an existing VIP already had.
-  const rankPct = db.resolveDiscountPct(userId);
+  // A product the owner excluded from the VIP discount is sold at its normal price to everybody.
+  const excluded = Number(product?.no_rank_discount) === 1;
+  const rankPct = db.rankDiscountPctForProduct(userId, product);
+  const skippedRankPct = excluded ? db.resolveDiscountPct(userId) : 0;   // what they WOULD have had
   const isVipUser = rankPct > 0;
   if (rankPct > 0) {
     const mult = 1 - rankPct / 100;
@@ -118,7 +121,7 @@ async function handleQuantity(bot, msg) {
     unitPrice = Number((unitPrice * mult).toFixed(4));
   }
   session.update(userId, {
-    quantity: qty, total, unitPrice, discount, discountApplied,
+    quantity: qty, total, unitPrice, discount, discountApplied, skippedRankPct,
     // Remembered so the allowance is consumed only for the units it actually
     // covered, and only once payment succeeds.
     allowanceUnits: pricing.specialUnits || 0,
@@ -217,6 +220,9 @@ async function createAndShowSummary(bot, chatId, userId, email) {
   if (data.discountApplied) {
     summary += `💵 <b>Unit price:</b> ${formatPrice(data.unitPrice)} <i>(was ${formatPrice(data.productPrice)})</i>\n`;
     summary += `🎁 <b>Bulk Discount:</b> ${data.discount}% off\n`;
+  }
+  if (data.skippedRankPct > 0) {
+    summary += `👑 <i>Your ${data.skippedRankPct}% VIP discount does not apply to this product — it is sold at its normal price.</i>\n`;
   }
   if (email) summary += `📧 <b>Email:</b> ${email}\n`;
   summary += `💵 <b>Total:</b> ${formatPrice(data.total)}\n\nConfirm your order:`;
@@ -1475,6 +1481,7 @@ async function initiatePreorder(bot, chatId, userId, productId, messageId) {
     preMaxQty:    remaining,
     productTitle: product.title,
     productPrice: product.price,
+    preNoRank:    Number(product.no_rank_discount) === 1,
     requiresEmail: !!product.requires_email,
   });
 
@@ -1506,7 +1513,7 @@ async function handlePreorderQty(bot, msg) {
 
   session.update(userId, { preQty: qty });
   let total = qty * sess.data.productPrice;
-  total = db.applyRankDiscount(userId, total);
+  total = db.applyRankDiscount(userId, total, { no_rank_discount: sess.data.preNoRank ? 1 : 0 });
   session.update(userId, { preTotal: total });
 
   if (sess.data.requiresEmail) {

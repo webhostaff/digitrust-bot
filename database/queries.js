@@ -682,9 +682,19 @@ function resolveDiscountPct(userId) {
   return getUserRank(userId).discountPct;
 }
 
-/** Multiply a price by the customer's discount. */
-function applyRankDiscount(userId, amount) {
-  const pct = resolveDiscountPct(userId);
+/**
+ * The discount a customer gets on THIS product: 0 when the owner excluded the product from
+ * the VIP / rank discount (products.no_rank_discount = 1), else their normal percentage.
+ * Bulk prices are not affected: they are the product's own price list, the same for everybody.
+ */
+function rankDiscountPctForProduct(userId, product) {
+  if (product && Number(product.no_rank_discount) === 1) return 0;
+  return resolveDiscountPct(userId);
+}
+
+/** Multiply a price by the customer's discount (pass `product` to honour its VIP exclusion). */
+function applyRankDiscount(userId, amount, product = null) {
+  const pct = product ? rankDiscountPctForProduct(userId, product) : resolveDiscountPct(userId);
   if (!pct) return Number(amount);
   return Number((Number(amount) * (1 - pct / 100)).toFixed(2));
 }
@@ -2230,7 +2240,7 @@ module.exports = {
       'stock_quantity','sales_count',
       'bulk_min_qty','bulk_discount','instruction','display_order',
       'preorder_enabled','preorder_max','preorder_count',
-      'cost_price','premium_emoji_id',
+      'cost_price','premium_emoji_id','no_rank_discount',
       ...TIER_COLUMNS,
       'wholesale_price','category_id',
       // V2
@@ -2587,6 +2597,7 @@ module.exports = {
   // ── Spend ranks ──
   getUserRank,
   resolveDiscountPct,
+  rankDiscountPctForProduct,
   applyRankDiscount,
   getRankTiers:   () => rankTiersAll.all(),
   getRankTier:    (id) => rankTierById.get(id),
