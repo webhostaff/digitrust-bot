@@ -9,7 +9,7 @@ const {
   orderConfirmKb, paymentMethodKb, cancelKb, backKb, mainMenuKb, walletMenuKb,
 } = require('../utils/keyboard');
 const { formatPrice, formatReward, calcOrderPrice, PAYMENT_CONFIRM_VALIDITY_MIN, checkPaymentWindow,
-        renderEmojis } = require('../utils/format');
+        renderEmojis, plainDelivery } = require('../utils/format');
 const cryptobot = require('../services/cryptobot');
 const { checkAndNotifyStockLevel } = require('../services/notifications');
 const { evaluateStock } = require('../services/stockAlerts');
@@ -1086,7 +1086,7 @@ async function sendDelivery(bot, chatId, order, content, messageId = null) {
   // Send content as file if it's large
   if (sendAsFile && deliveryDelivered) {
     try {
-      const buffer = Buffer.from(contentStr, 'utf-8');
+      const buffer = Buffer.from(plainDelivery(contentStr), 'utf-8');      // plain text: no <code> tags in the file
       const safeName = (order.product_title || 'product')
         .replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 30);
       const filename = `order_${order.id}_${safeName}.txt`;
@@ -1098,7 +1098,7 @@ async function sendDelivery(bot, chatId, order, content, messageId = null) {
       logger.error(`Failed to send order #${order.id} as file: ${e.message}`);
       // Fall back: send the content in a message (split if needed)
       try {
-        const chunks = contentStr.match(/[\s\S]{1,3500}/g) || [];
+        const chunks = plainDelivery(contentStr).match(/[\s\S]{1,3500}/g) || [];
         for (const chunk of chunks) {
           await bot.sendMessage(chatId, `<pre>${chunk.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}</pre>`, { parse_mode: 'HTML', plain_emoji: true });
         }
@@ -1136,7 +1136,7 @@ async function sendDelivery(bot, chatId, order, content, messageId = null) {
       const vipSystemOpen = db.getSetting('vip_system_enabled', '1') === '1';
       const VIP_LIMIT = parseInt(db.getSetting('vip_limit', '1000'), 10);
       const totalVips = db.countVIPs();
-      if (!isVipAlready && refCount >= 3 && vipSystemOpen && (VIP_LIMIT - totalVips) > 0) {
+      if (!isVipAlready && refCount >= 3 && vipSystemOpen && (VIP_LIMIT - totalVips) > 0 && db.referralEarningAllowed(refId)) {
         // Unlock VIP for the referrer
         db.unlockVIP(refId);
         try {
@@ -1153,7 +1153,8 @@ async function sendDelivery(bot, chatId, order, content, messageId = null) {
     }
   } catch (e) {}
 
-    if (cashbackResult) {
+    // `{ skipped }` (order under the minimum) is not a payout: it has no referrer and no amount.
+    if (cashbackResult && cashbackResult.referrerId && cashbackResult.cashback) {
       bot.sendMessage(
         cashbackResult.referrerId,
         `🎁 <b>Referral Cashback!</b>\n\n` +

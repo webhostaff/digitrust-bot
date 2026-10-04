@@ -27,7 +27,8 @@ const binance = require('../services/binance');
 const subPricing = require('../utils/subscriptionPricing');
 const cgbCycles = require('../services/cgbCycles');
 const notices   = require('../services/notices');
-const { formatPrice, formatPriceExact, escapeHtml, expandPremiumEmojis, scaleTiersProportionally, productEmojiId, calcOrderPrice } = require('../utils/format');
+const { plainDelivery, formatPrice, formatPriceExact, escapeHtml, expandPremiumEmojis, scaleTiersProportionally, productEmojiId, calcOrderPrice } = require('../utils/format');
+const referralAdmin = require('./referralAdmin');
 const {
   publishToChannel, publishToGroup, broadcastToUsers, autoPublish, autoPublishWithPhoto,
   buildNewProductText, buildStockUpdateText,
@@ -2104,8 +2105,8 @@ async function handleAdminText(bot, msg) {
     if (order.paid_at) txt += `✅ <b>Paid at:</b> ${(order.paid_at || '').slice(0, 16)}\n`;
     if (order.email) txt += `📧 <b>Email:</b> <code>${escapeHtml(order.email)}</code>\n`;
     if (order.delivered_content) {
-      const preview = order.delivered_content.slice(0, 200);
-      txt += `\n📦 <b>Delivered Content:</b>\n<code>${escapeHtml(preview)}${order.delivered_content.length > 200 ? '...' : ''}</code>`;
+      const preview = plainDelivery(order.delivered_content).slice(0, 200);
+      txt += `\n📦 <b>Delivered Content:</b>\n<code>${escapeHtml(preview)}${plainDelivery(order.delivered_content).length > 200 ? '...' : ''}</code>`;
     }
     await bot.sendMessage(chatId, txt, {
       parse_mode: 'HTML',
@@ -2668,6 +2669,9 @@ async function handleAdminCallback(bot, query) {
 
   await answer();
 
+  // 🎁 Referrals (V143): programme switch, ranking, per-person block, CSV
+  if (/^admin_ref/.test(data) && await referralAdmin.handle(bot, query)) return;
+
   /**
    * Draw the ordering screen for the list the admin picked.
    *
@@ -3229,7 +3233,7 @@ async function handleAdminCallback(bot, query) {
       (t.delivered_at ? `✅ <b>Delivered:</b> ${String(t.delivered_at).slice(0, 16)}\n` : '') +
       (t.admin_note ? `\n📝 <i>${escapeHtml(t.admin_note)}</i>\n` : '') +
       (t.delivered_content
-        ? `\n🎁 <b>Content sent:</b>\n<code>${escapeHtml(String(t.delivered_content).slice(0, 500))}</code>\n`
+        ? `\n🎁 <b>Content sent:</b>\n<code>${escapeHtml(plainDelivery(t.delivered_content).slice(0, 500))}</code>\n`
         : '');
 
     const kb = [];
@@ -5240,7 +5244,7 @@ async function handleAdminCallback(bot, query) {
 
     // Send full delivered content if exists (in chunks)
     if (order.delivered_content) {
-      const fullContent = order.delivered_content;
+      const fullContent = plainDelivery(order.delivered_content);
       const MAX_CHUNK = 3500;
 
       await bot.sendMessage(
@@ -5488,7 +5492,7 @@ async function handleAdminCallback(bot, query) {
       `💳 <b>Payment:</b> ${escapeHtml(order.payment_method || 'N/A')}\n` +
       `⚡ <b>Status:</b> ${escapeHtml(order.status)}\n` +
       `📅 <b>Date:</b> ${(order.created_at || '').slice(0, 16)}` +
-      (order.delivered_content ? `\n\n🎁 <b>Delivered:</b>\n<code>${escapeHtml(String(order.delivered_content).slice(0, 300))}</code>` : '');
+      (order.delivered_content ? `\n\n🎁 <b>Delivered:</b>\n<code>${escapeHtml(plainDelivery(order.delivered_content).slice(0, 300))}</code>` : '');
 
     const kb = { inline_keyboard: [
       [{ text: '👤 View Customer Profile', callback_data: `admin_user_${order.user_id}` }],
@@ -6152,7 +6156,7 @@ async function handleAdminCallback(bot, query) {
 
     // If delivered, send the full delivered content in separate messages (no truncation)
     if (pr.status === 'delivered' && pr.delivered_content) {
-      const fullContent = pr.delivered_content;
+      const fullContent = plainDelivery(pr.delivered_content);
       const MAX_CHUNK = 3500; // Safe Telegram chunk size
 
       // Header for delivered content

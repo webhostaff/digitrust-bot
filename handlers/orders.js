@@ -12,7 +12,7 @@
 const db = require('../database/queries');
 const logger = require('../utils/logger');
 const { orderDetailKb, backKb } = require('../utils/keyboard');
-const { formatPrice, statusEmoji } = require('../utils/format');
+const { formatPrice, statusEmoji, plainDelivery } = require('../utils/format');
 
 const PAGE_SIZE = 8;
 
@@ -210,7 +210,7 @@ async function showOrderDetail(bot, chatId, userId, orderId, messageId, callback
 
   let contentAsFile = false;
   if (order.status === 'delivered' && order.delivered_content) {
-    const c = String(order.delivered_content);
+    const c = plainDelivery(order.delivered_content);
     const lineCount = (c.match(/\n/g) || []).length;
     if (c.length > 500 || lineCount >= 5) {
       contentAsFile = true;
@@ -289,7 +289,7 @@ async function showOrderDetail(bot, chatId, userId, orderId, messageId, callback
 
   if (contentAsFile) {
     try {
-      const buffer = Buffer.from(String(order.delivered_content), 'utf-8');
+      const buffer = Buffer.from(plainDelivery(order.delivered_content), 'utf-8');
       const safeName = cleanTitle(order.product_title || 'product')
         .replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 30);
       await bot.sendDocument(chatId, buffer, {
@@ -298,7 +298,7 @@ async function showOrderDetail(bot, chatId, userId, orderId, messageId, callback
       }, { filename: `order_${order.id}_${safeName}.txt`, contentType: 'text/plain' });
     } catch (e) {
       try {
-        const chunks = String(order.delivered_content).match(/[\s\S]{1,3500}/g) || [];
+        const chunks = plainDelivery(order.delivered_content).match(/[\s\S]{1,3500}/g) || [];
         for (const chunk of chunks) {
           await bot.sendMessage(chatId, `<pre>${escapeHtml(chunk)}</pre>`, { parse_mode: 'HTML', plain_emoji: true });
         }

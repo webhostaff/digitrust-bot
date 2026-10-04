@@ -876,6 +876,7 @@ function payReferralReward(referredId, rewardAmount) {
   return db.transaction(() => {
     const referral = getReferralByReferred.get(referredId);
     if (!referral || referral.reward_paid) return null;
+    if (!referralEarningAllowed(referral.referrer_id)) return null;     // V143: program off / person blocked
 
     const referrerId = referral.referrer_id;
     updateBalance.run(rewardAmount, referrerId);
@@ -890,6 +891,24 @@ function payReferralReward(referredId, rewardAmount) {
     markReferralRewarded.run(referredId);
     return referrerId;
   })();
+}
+
+// ── Referral master switch + per-person block (V143) ─────────────────────────
+// ONE place decides whether a referrer may earn: every earning path asks it.
+function referralProgramOn() {
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'referral_program_enabled'").get();
+  return !row || row.value !== '0';              // a missing row = on (as before this version)
+}
+function isReferralBlocked(userId) {
+  const row = db.prepare('SELECT referral_blocked FROM users WHERE telegram_id = ?').get(userId);
+  return !!(row && Number(row.referral_blocked) === 1);
+}
+/** May this referrer earn anything right now? (program on AND the person not blocked) */
+function referralEarningAllowed(referrerId) {
+  return referralProgramOn() && !isReferralBlocked(referrerId);
+}
+function setReferralBlocked(userId, blocked) {
+  return db.prepare('UPDATE users SET referral_blocked = ? WHERE telegram_id = ?').run(blocked ? 1 : 0, userId).changes > 0;
 }
 
 // ── CASHBACK REFERRAL — pays % of every purchase to referrer for life ────────
@@ -916,6 +935,7 @@ function payCashbackReferral(referredUserId, orderTotal, orderId) {
     if (!referral) return null;
     const referrerId = referral.referrer_id;
     if (!referrerId || referrerId === referredUserId) return null;
+    if (!referralEarningAllowed(referrerId)) return null;               // V143: program off / person blocked
 
     // Calculate cashback amount
     const cashback = parseFloat(((orderTotal * pct) / 100).toFixed(2));
@@ -2761,6 +2781,10 @@ module.exports = {
   },
   payReferralReward,
   payCashbackReferral,
+  referralProgramOn,
+  isReferralBlocked,
+  referralEarningAllowed,
+  setReferralBlocked,
   getReferralStats: (userId) => {
     const row = getReferralStats.get(userId);
     return { totalReferred: row.total_referred || 0, rewardedCount: row.rewarded_count || 0 };

@@ -308,6 +308,127 @@ function nextCycleAfterCurrent(from = new Date()) {
 }
 
 /**
+ * Where a RENEWAL runs, and what it costs (V144).
+ *
+ * The old renewal took its end day from calculateBestCycle() — the cycle that gives a NEW buyer
+ * the most days TODAY. That answer changes whenever a cycle is added or deleted, so deleting one
+ * cycle sent EVERY renewal to the end day of whichever cycle happened to win (a seat ending on
+ * the 9th was renewed to the 30th: 25 days for a full month). A renewing customer is in a cycle
+ * already; the renewal follows the cycle's own boundaries:
+ *
+ *   own   The seat ends exactly on a cycle's end day. The renewal runs to that cycle's NEXT end:
+ *         a whole cycle, the monthly price.
+ *   stub  No cycle ends there (its cycle was deleted and the seat was moved to another cycle's
+ *         panel). The renewal first covers the few days up to the NEAREST cycle end after the
+ *         seat's end — priced for those days only, pro-rata over that cycle's real length — and
+ *         then the whole month(s) asked for: a seat ending 5 Oct, moved to the cycle that ends on
+ *         the 9th, renews 5 Oct → 9 Nov (the 4 days + one cycle). After that it is an ordinary
+ *         "own" seat and everything is normal again.
+ *   expired / manual / fallback   As before (like a new buyer today; the monthly price).
+ *
+ * @param {string} endDateStr  the seat's current end, 'YYYY-MM-DD'
+ * @param {number} months      whole cycles to buy (1..12); in a stub they come AFTER the extra days
+ * @returns {{from:Date,to:Date,days:number,cycle:?object,kind:string,stub:?{days:number,cycleLength:number}}}
+ */
+function renewalPeriod(endDateStr, months = 1, now = new Date()) {
+  const local = localNow(now);
+  const today = new Date(local); today.setHours(0, 0, 0, 0);
+  const [bh, bm] = boundaryTime();
+  const seatEnd = new Date(`${endDateStr}T00:00:00`); seatEnd.setHours(bh, bm, 0, 0);
+  const expired = !(seatEnd > today);
+
+  // The boundary `months` cycle-ends after `from`, STRICTLY later than it (a seat's own end is
+  // already paid for, so landing on it again would sell nothing).
+  const endAfter = (from, endDay) => {
+    let end = dayIn(from.getFullYear(), from.getMonth(), endDay, bh, bm);
+    while (end <= from) end = dayIn(end.getFullYear(), end.getMonth() + 1, endDay, bh, bm);
+    if (months > 1) end = dayIn(end.getFullYear(), end.getMonth() + (months - 1), endDay, bh, bm);
+    return end;
+  };
+  const done = (from, to, cycle, kind, stub = null) => ({
+    from, to, cycle, kind, stub,
+    days: Math.max(1, Math.round((to - from) / DAY_MS)),
+  });
+
+  const cycles = getCycles().filter((c) => c.start_day && c.end_day);
+
+  // No cycle of their own to follow: renewed like a new buyer today, at the monthly price.
+  if (expired || !cycles.length || manualCycleLocal(local)) {
+    const from = expired ? today : seatEnd;
+    const best = calculateBestCycle(now);
+    const endDay = best && best.cycle && best.cycle.end_day;
+    if (!endDay) {
+      const to = new Date(from);
+      to.setMonth(to.getMonth() + months);
+      to.setHours(bh, bm, 0, 0);
+      return done(from, to, best ? best.cycle : null, expired ? 'expired' : (manualCycleLocal(local) ? 'manual' : 'fallback'));
+    }
+    return done(from, endAfter(from, endDay), best.cycle, expired ? 'expired' : 'fallback');
+  }
+
+  // own: the seat ends exactly where one of the cycles ends.
+  const own = cycles.find((c) => dayIn(seatEnd.getFullYear(), seatEnd.getMonth(), c.end_day).getDate() === seatEnd.getDate());
+  if (own) return done(seatEnd, endAfter(seatEnd, own.end_day), own, 'own');
+
+  // stub: the nearest cycle end after the seat's end.
+  let near = null;
+  for (const c of cycles) {
+    const ev = evaluateCycle(c, seatEnd, bh, bm);
+    if (!near || ev.endDate < near.ev.endDate) near = { cycle: c, ev };
+  }
+  const first = near.ev.endDate;                              // the first cycle end: where the extra days stop
+  const stub = { days: Math.max(1, Math.round((first - seatEnd) / DAY_MS)), cycleLength: near.ev.cycleLength, end: first };
+  // …then `months` whole cycles of that same cycle, each ending on its own end day.
+  const to = dayIn(first.getFullYear(), first.getMonth() + months, near.cycle.end_day, bh, bm);
+  return done(seatEnd, to, near.cycle, 'stub', stub);
+}
+
+/**
+ * Bulk discount for a duration, editable from the admin panel (setting "cgb_renew_discounts").
+ *
+ * Read as THRESHOLDS, not exact matches: "3:5,6:10,12:15" means 3 months or more gets 5%, 6 or
+ * more gets 10%, 12 gets 15%. Exact matching would give 7 months a 0% discount while 6 months
+ * got 10% — making the longer commitment cost more, which no customer would accept.
+ */
+function renewDiscountFor(months) {
+  try {
+    const row = raw.prepare(`SELECT value FROM settings WHERE key='cgb_renew_discounts'`).get();
+    const tiers = [];
+    for (const pair of String(row?.value || '').split(',')) {
+      const [m, p] = pair.split(':').map((x) => parseFloat(String(x).trim()));
+      if (Number.isFinite(m) && Number.isFinite(p)) tiers.push({ m, p });
+    }
+    tiers.sort((a, b) => a.m - b.m);
+    let pct = 0;
+    for (const t of tiers) if (months >= t.m) pct = t.p;
+    return pct;
+  } catch (e) {
+    return 0;
+  }
+}
+
+/**
+ * The full quote of a renewal: dates, days and price. One function for the customer's screens
+ * and for the owner's checks, so they can never disagree.
+ *
+ * The extra days of a stub are priced for those days only (pro-rata over that cycle's real
+ * length, the same rule a new buyer mid-cycle pays); every whole cycle is the monthly price.
+ *
+ * @param {{user_id:*, end_date:string}} sub  the seat being renewed
+ */
+function quoteRenewal(sub, months, now = new Date()) {
+  const monthly = getMonthlyPrice(sub.user_id);
+  const bulk = renewDiscountFor(months);
+  const p = renewalPeriod(sub.end_date, months, now);
+  const gross = p.stub
+    ? priceFor(p.stub.days, p.stub.cycleLength, monthly) + months * monthly
+    : monthly * months;
+  const price = Number((gross * (1 - bulk / 100)).toFixed(2));
+  return { months, monthly, gross: Number(gross.toFixed(2)), bulk, price, from: p.from, to: p.to,
+           days: p.days, kind: p.kind, cycle: p.cycle, stub: p.stub };
+}
+
+/**
  * The monthly rate — for a specific customer when one is given.
  *
  * A per-customer override beats the shop rate. Resellers and long-standing
@@ -336,4 +457,4 @@ function globalMonthlyPrice() {
   }
 }
 
-module.exports = { recordStartTime, clearStartTime, startTimeOf, getCycles, calculateBestCycle, priceFor, pricePeriod, oneMoreCycle, getMonthlyPrice, manualCycle, nextCycleAfterCurrent, boundaryTime, localNow, tzOffsetMinutes };
+module.exports = { renewalPeriod, quoteRenewal, renewDiscountFor, recordStartTime, clearStartTime, startTimeOf, getCycles, calculateBestCycle, priceFor, pricePeriod, oneMoreCycle, getMonthlyPrice, manualCycle, nextCycleAfterCurrent, boundaryTime, localNow, tzOffsetMinutes };

@@ -184,6 +184,8 @@ registerCommands();
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+const { plainDelivery } = require('./utils/format');
+
 function escapeHtml(s) {
   return String(s == null ? '' : s)
     .replace(/&/g, '&amp;')
@@ -1025,7 +1027,7 @@ async function showManualDetail(chatId, messageId, taskId) {
     (t.delivered_at    ? `✅ <b>Delivered:</b> ${formatFull(t.delivered_at)}\n` : '') +
     (t.admin_note      ? `\n📝 <i>${escapeHtml(t.admin_note)}</i>\n` : '') +
     (t.delivered_content
-      ? `\n🎁 <b>Delivered content:</b>\n<code>${escapeHtml(String(t.delivered_content).slice(0, 500))}</code>\n`
+      ? `\n🎁 <b>Delivered content:</b>\n<code>${escapeHtml(plainDelivery(t.delivered_content).slice(0, 500))}</code>\n`
       : '');
 
   const kb = [];

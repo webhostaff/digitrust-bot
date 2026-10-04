@@ -164,6 +164,16 @@ async function handleStart(bot, msg, args) {
 }
 
 async function handleReferralMenu(bot, chatId, userId) {
+  // V143: program paused (or this person may not earn): say so instead of promising rewards.
+  if (!db.referralEarningAllowed(userId)) {
+    await bot.sendMessage(
+      chatId,
+      `👥 <b>Referral Program</b>\n\nThe referral program is not available right now.\n` +
+      `Your wallet balance is unchanged.`,
+      { parse_mode: 'HTML', reply_markup: backKb('back_main') }
+    );
+    return;
+  }
   const stats    = db.getReferralStats(userId);
   const botInfo  = await bot.getMe();
   const link     = `https://t.me/${botInfo.username}?start=ref_${userId}`;

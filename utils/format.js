@@ -140,6 +140,19 @@ const statusEmoji = (status) =>
   ({ pending: '⏳', delivered: '✅', cancelled: '❌' }[status] || '❓');
 
 /** Escape HTML special chars for Telegram HTML parse mode */
+/**
+ * A delivered item as PLAIN text: the HTML wrapper the shop puts around it (<code>…</code>) taken
+ * off and the entities turned back into characters. For everything that is not a Telegram HTML
+ * message — the attached .txt file, the staff previews, exports. Before V144 those showed the tags
+ * themselves: every link in the customer's file was wrapped in a literal <code>…</code>.
+ */
+function plainDelivery(s) {
+  return String(s == null ? '' : s)
+    .replace(/<\/?(code|pre|b|i|u|s|tg-spoiler)>/gi, '')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+    .trim();
+}
+
 const escapeHtml = (str) =>
   String(str)
     .replace(/&/g, '&amp;')
@@ -362,6 +375,7 @@ function formatBulkTiersDisplay(product) {
 }
 
 module.exports = {
+  plainDelivery,
   expandPremiumEmojis, premiumizeEmojis, renderEmojis, clearEmojiCache,
   stripEmojiMarkers, productEmojiId,
   formatPrice, formatPriceExact, calcOrderPrice, formatBulkTiersDisplay, formatReward, statusEmoji, escapeHtml, truncate,

@@ -319,6 +319,8 @@ const existingUserCols = db.prepare('PRAGMA table_info(users)').all().map((c) =>
 if (!existingUserCols.includes('language')) db.exec("ALTER TABLE users ADD COLUMN language TEXT DEFAULT 'en'");
 if (!existingUserCols.includes('is_vip')) db.exec('ALTER TABLE users ADD COLUMN is_vip INTEGER DEFAULT 0');
 if (!existingUserCols.includes('vip_unlocked_at')) db.exec('ALTER TABLE users ADD COLUMN vip_unlocked_at TEXT DEFAULT NULL');
+// V143: 1 = this person earns nothing from referrals (cashback, reward, VIP unlock). Their wallet is untouched.
+if (!existingUserCols.includes('referral_blocked')) db.exec('ALTER TABLE users ADD COLUMN referral_blocked INTEGER DEFAULT 0');
 
 const existingProductCols = db.prepare('PRAGMA table_info(products)').all().map((c) => c.name);
 if (!existingProductCols.includes('stock_quantity')) db.exec('ALTER TABLE products ADD COLUMN stock_quantity INTEGER DEFAULT 0');
@@ -404,6 +406,8 @@ if (!existingProductCols.includes('premium_emoji_id')) db.exec('ALTER TABLE prod
 // ── Default settings for referral cashback ─────────────────────────────
 try {
   db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('referral_cashback_enabled', '1')").run();
+  // V143 master switch: '0' stops EVERY referral earning (cashback, first-purchase reward, VIP unlock).
+  db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('referral_program_enabled', '1')").run();
   db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('referral_cashback_pct', '2')").run();
   db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('referral_min_order', '5')").run();
   db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('preorder_auto_deliver', '0')").run();

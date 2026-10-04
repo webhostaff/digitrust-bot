@@ -79,13 +79,22 @@ const getSingleItem = db.prepare(`
  * Accepts either an array of strings or a single string.
  * Returns { valid: [{ raw }], invalid: [] }
  */
+/**
+ * An item without the <code>…</code> wrapper some tools put around a link or a code when you copy
+ * it. Stored with it, the delivery wrapped it AGAIN (<code><code>…</code></code>), and the tags
+ * ended up as visible text in the customer's file.
+ */
+function cleanItemText(raw) {
+  return String(raw == null ? '' : raw).replace(/<\/?(code|pre)(\s[^>]*)?>/gi, '').trim();
+}
+
 function validateLines(input) {
   const valid = [];
   const raw = Array.isArray(input) ? input.join('AYMEN') : String(input || '');
   // Only "AYMEN" as separator (admin-requested)
   const parts = raw.split('AYMEN');
   for (const part of parts) {
-    const trimmed = part.trim();
+    const trimmed = cleanItemText(part);
     if (trimmed) valid.push({ raw: trimmed });
   }
   return { valid, invalid: [] };
@@ -228,7 +237,11 @@ function deliverItem(productId, userId, orderId) {
  * Delivers raw_content exactly as entered.
  */
 function formatItemDelivery(item) {
-  return `<code>${item.raw_content}</code>`;
+  // Wrapper tags that were stored with the item (older stock) are dropped, and & < > are escaped:
+  // a link or password containing one used to make Telegram refuse the whole message.
+  const text = cleanItemText(item.raw_content)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return `<code>${text}</code>`;
 }
 
 // ── Queries ───────────────────────────────────────────────────────────────────
@@ -299,6 +312,7 @@ module.exports = {
   deliverItem,
   deliverItemRaw,
   formatItemDelivery,
+  cleanItemText,
   getAvailableCount,
   getItemsPage,
   getAllAvailable,

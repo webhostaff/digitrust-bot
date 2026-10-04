@@ -28,6 +28,7 @@ if (!CHATGPT_BOT_TOKEN) {
 const dbPath = process.env.DB_PATH || '/app/data/store.db';
 const db = new Database(dbPath);
 const queries = require('./database/queries');
+const cgbSeatDates = require('./services/cgbSeatDates');
 const cgbCycles = require('./services/cgbCycles');
 
 const bot = new TelegramBot(CHATGPT_BOT_TOKEN, { polling: true });
@@ -190,6 +191,9 @@ function orderCardButtons(d) {
       // Opens a confirm step (refund to wallet / refunded outside) — never
       // cancels on a single tap.
       { text: '❌ Cancel order', callback_data: `cgb_ocx_ask_${d.orderId}` },
+    ], [
+      // A paid seat whose dates are wrong (e.g. a renewal quoted on the wrong cycle).
+      { text: '✏️ Change dates', callback_data: `cgb_dates_${d.orderId}` },
     ]],
   };
 }
@@ -505,57 +509,8 @@ const RENEW_MONTHS = Array.from({ length: 12 }, (_, i) => i + 1);
  * discard what was already paid for.
  */
 function priceRenewal(sub, months) {
-  const monthly = getMonthlyPrice(sub.user_id);
-  const bulk = renewDiscountFor(months);
-  const gross = monthly * months;
-  const price = Number((gross * (1 - bulk / 100)).toFixed(2));
-
-  // A renewal always buys a WHOLE cycle on top of what is already paid for.
-  //
-  // The seat's own end is the anchor, not today. Paying two days early, one day
-  // early, or on the closing day itself must all buy the same thing — the next
-  // full cycle. Anchoring on today gave whoever paid on the last day a single
-  // day, because the boundary they were standing on is one they had already
-  // bought.
-  const today = new Date(); today.setHours(0, 0, 0, 0);
-  const [bhh, bmm] = cgbCycles.boundaryTime();
-  const currentEnd = new Date(`${sub.end_date}T00:00:00`);
-  currentEnd.setHours(bhh, bmm, 0, 0);
-
-  // An expired seat resumes from today: nobody should pay for a period that has
-  // already gone by.
-  const from = currentEnd > today ? currentEnd : today;
-  const to = cycleEndAfter(from, months);
-
-  return { months, monthly, gross, bulk, price, from, to,
-           days: Math.max(1, Math.round((to - from) / 86400000)) };
-}
-
-/**
- * The cycle boundary `months` cycles after `from`.
- *
- * Falls back to a plain month-add only when no cycle day can be determined,
- * which is better than refusing to price a renewal at all.
- */
-function cycleEndAfter(from, months) {
-  const best = cgbCycles.calculateBestCycle();
-  const [bh, bm] = cgbCycles.boundaryTime();
-  const endDay = best && best.cycle && best.cycle.end_day;
-
-  if (!endDay) {
-    const d = new Date(from);
-    d.setMonth(d.getMonth() + months);
-    d.setHours(bh, bm, 0, 0);
-    return d;
-  }
-
-  // STRICTLY after `from`. `from` is usually the seat's existing end, which sits
-  // exactly on a boundary — and that boundary is already paid for, so landing on
-  // it again would sell the customer nothing.
-  let end = new Date(from.getFullYear(), from.getMonth(), endDay, bh, bm, 0, 0);
-  while (end <= from) end = new Date(end.getFullYear(), end.getMonth() + 1, endDay, bh, bm, 0, 0);
-  if (months > 1) end = new Date(end.getFullYear(), end.getMonth() + (months - 1), endDay, bh, bm, 0, 0);
-  return end;
+  // Dates and price come from ONE place (cgbCycles.quoteRenewal): in the customer's own cycle.
+  return cgbCycles.quoteRenewal(sub, months);
 }
 
 /**
@@ -567,21 +522,7 @@ function cycleEndAfter(from, months) {
  * cost more, which no customer would accept and no shop intends.
  */
 function renewDiscountFor(months) {
-  try {
-    const row = db.prepare(`SELECT value FROM settings WHERE key='cgb_renew_discounts'`).get();
-    const tiers = [];
-    for (const pair of String(row?.value || '').split(',')) {
-      const [m, p] = pair.split(':').map((x) => parseFloat(String(x).trim()));
-      if (Number.isFinite(m) && Number.isFinite(p)) tiers.push({ m, p });
-    }
-    tiers.sort((a, b) => a.m - b.m);
-
-    let pct = 0;
-    for (const t of tiers) if (months >= t.m) pct = t.p;
-    return pct;
-  } catch (e) {
-    return 0;
-  }
+  return cgbCycles.renewDiscountFor(months);
 }
 
 async function showRenewDurations(chatId, userId, subId, messageId = null) {
@@ -606,7 +547,10 @@ async function showRenewDurations(chatId, userId, subId, messageId = null) {
   const txt =
     `🔄 <b>Renew — choose duration</b>\n\n` +
     `📧 <code>${escapeHtml(sub.email)}</code>\n` +
-    `📅 Current seat ends: <b>${sub.end_date}</b>\n\n` +
+    `📅 Current seat ends: <b>${sub.end_date}</b>\n` +
+    (priceRenewal(sub, 1).kind === 'stub'
+      ? `🗓 Your previous cycle is no longer sold: your renewal starts with ${priceRenewal(sub, 1).stub.days} extra day(s) until <b>${formatDate(priceRenewal(sub, 1).stub.end)}</b> (priced for those days), then full months. After that everything is normal.\n`
+      : '') + `\n` +
     `<i>Pick any number of months. Time is added on top of what you already ` +
     `have — nothing is lost.</i>`;
 
@@ -668,6 +612,9 @@ async function showRenewPayment(chatId, userId, subId, months, messageId = null)
     `📧 <code>${escapeHtml(sub.email)}</code>\n` +
     `🏢 ${escapeHtml(workspaceName(sub))}\n\n` +
     `📅 New period: ${formatDate(q.from)} → ${formatDate(q.to)}\n` +
+    (q.kind === 'stub'
+      ? `ℹ️ <i>Your previous cycle is no longer sold. This renewal first covers the ${q.stub.days} day(s) until ${formatDate(q.stub.end)} (priced for those days only), then the full month${months === 1 ? '' : 's'} up to ${formatDate(q.to)}. After that you renew as usual.</i>\n`
+      : '') +
     `⏳ Days added: <b>${q.days}</b>\n` +
     (q.bulk
       ? `💰 <s>$${q.gross.toFixed(2)}</s> → <b>$${q.price.toFixed(2)}</b> (−${q.bulk}%)\n`
@@ -1229,6 +1176,66 @@ async function activateAndNotifySeat(orderIdRaw, { chatId = null, msgId = null }
   return { ok: true };
 }
 
+/**
+ * Redraw the owner's card of an order after its dates changed — the stored card is edited in
+ * place; if that is impossible (too old, deleted) a fresh one is sent. Never touches an
+ * activated card.
+ */
+async function repaintSeatCard(orderId) {
+  const data = seatCardData(orderId);
+  if (!data || data.sub.status !== 'pending') return false;
+  const card = data.card;
+  const scheduled = String(card.startDate) > ymdLocal(cgbCycles.localNow(new Date()));
+  const stored = queries.getCgbAdminCard ? queries.getCgbAdminCard(orderId) : null;
+  if (stored) {
+    try {
+      await bot.editMessageText(orderCard(card, false, scheduled), {
+        chat_id: stored.chat_id, message_id: stored.message_id, parse_mode: 'HTML', reply_markup: orderCardButtons(card),
+      });
+      return true;
+    } catch (e) { logger.warn(`repaintSeatCard #${orderId}: ${e.message}`); }
+  }
+  await sendSeatCard(ADMIN_ID, data.sub.id);
+  return true;
+}
+
+// ── /setdates <order> <first day> <last day> — correct a paid seat's dates (owner only) ──
+bot.onText(/^\/setdates(?:@\w+)?(?:\s+(.*))?$/i, async (msg, match) => {
+  if (String(msg.from.id) !== String(ADMIN_ID)) return;
+  const chatId = msg.chat.id;
+  const parsed = cgbSeatDates.parseSetDates(match && match[1]);
+  if (!parsed.ok) { await bot.sendMessage(chatId, `❌ ${parsed.error}`); return; }
+  const r = cgbSeatDates.applySeatDates(parsed.orderId, parsed.start, parsed.end);
+  if (!r.ok) { await bot.sendMessage(chatId, `❌ ${r.reason}`); return; }
+  await repaintSeatCard(parsed.orderId);
+  await bot.sendMessage(chatId,
+    `✅ <b>Order #${parsed.orderId}</b> dates changed\n` +
+    `before: ${r.before.start} → ${r.before.end} (${r.before.days} days)\n` +
+    `now: <b>${r.after.start} → ${r.after.end}</b> (${r.after.days} days)\n\n` +
+    `<i>The customer is told these dates when you press Activate &amp; Notify. The price paid ($${Number(r.sub.final_price).toFixed(2)}) is unchanged — if the new period costs less, credit the difference with ➕ Add User Balance.</i>`, { parse_mode: 'HTML' });
+});
+
+// ── /checkrenewals — paid renewals not yet activated whose dates disagree with the customer's cycle ──
+bot.onText(/^\/checkrenewals(?:@\w+)?$/i, async (msg) => {
+  if (String(msg.from.id) !== String(ADMIN_ID)) return;
+  const a = cgbSeatDates.auditRenewals(new Date());
+  if (!a.checked) { await bot.sendMessage(msg.chat.id, '🔎 No paid renewal is waiting for activation.'); return; }
+  let txt = `🔎 <b>Renewals check</b>\n${a.checked} paid renewal(s) waiting for activation · ✅ ${a.ok.length} right · ⚠️ ${a.bad.length} to look at\n`;
+  for (const b of a.bad) {
+    txt += `\n⚠️ <b>#${b.orderId}</b> · ${escapeHtml(b.who)} · <code>${escapeHtml(b.email || '')}</code>\n` +
+           `   has: ${b.has.start} → ${b.has.end} (${b.has.days} days) · paid <b>$${b.has.paid.toFixed(2)}</b>\n` +
+           `   own cycle: <b>${b.should.start} → ${b.should.end}</b> (${b.should.days} days, ${b.should.months} month${b.should.months > 1 ? 's' : ''}) · price <b>$${b.should.price.toFixed(2)}</b>\n` +
+           (b.has.paid - b.should.price > 0.05
+             ? `   💸 overpaid by <b>$${(b.has.paid - b.should.price).toFixed(2)}</b> — credit it with ➕ Add User Balance (<code>${b.userId}</code>) after you change the dates\n`
+             : (b.should.price - b.has.paid > 0.05 ? `   ⚠️ paid <b>$${(b.should.price - b.has.paid).toFixed(2)}</b> less than that period costs\n` : '')) +
+           `   <code>/setdates ${b.orderId} ${b.should.start} ${b.should.end}</code>\n`;
+  }
+  if (a.bad.length) txt += `\n<i>Tap a command to copy it. Check the months before using it: they are guessed from the length. /setdates changes the DATES only — the price paid stays, so settle any difference yourself.</i>`;
+  else txt += `\n✅ Every one matches its customer's own cycle.`;
+  await bot.sendMessage(msg.chat.id, txt, { parse_mode: 'HTML' });
+});
+
+
 /** The fields the order card shows, rebuilt from the database for one order. */
 function seatCardData(orderId) {
   const sub = queries.getCgbSubscriptionByOrder(orderId);
@@ -1429,6 +1436,32 @@ bot.on('callback_query', async (q) => {
     if (!result.ok) {
       await bot.sendMessage(chatId, `❌ Could not notify customer: ${result.reason}`);
     }
+    return;
+  }
+
+  // ── ✏️ Change dates: shows the command, pre-filled ──────────────────────────
+  if (/^cgb_dates_\d+$/.test(data)) {
+    if (String(userId) !== String(ADMIN_ID)) return;
+    const orderId = parseInt(data.split('_').pop(), 10);
+    const seat = seatCardData(orderId);
+    if (!seat || seat.sub.status !== 'pending') {
+      await bot.sendMessage(chatId, '❌ Only a paid seat that is not activated yet can be changed.');
+      return;
+    }
+    let hint = '';
+    if (seat.sub.renewed_from) {
+      const prev = queries.getCgbSubById(seat.sub.renewed_from);
+      if (prev) {
+        const e = cgbSeatDates.expectedRenewal(seat.sub.user_id, prev.end_date, 1, new Date());
+        hint = `\n💡 This customer's own cycle gives, for 1 month: <b>${e.start} → ${e.end}</b> (${e.days} days) · price <b>$${e.price.toFixed(2)}</b> — paid <b>$${Number(seat.sub.final_price).toFixed(2)}</b>\n` +
+               `<code>/setdates ${orderId} ${e.start} ${e.end}</code>\n`;
+      }
+    }
+    await bot.sendMessage(chatId,
+      `✏️ <b>Change dates — order #${orderId}</b>\n` +
+      `now: ${seat.sub.start_date} → ${seat.sub.end_date} (${seat.sub.days_remaining} days)\n` + hint +
+      `\nSend (first day, last day):\n<code>/setdates ${orderId} ${seat.sub.start_date} ${seat.sub.end_date}</code>\n` +
+      `<i>Change the two dates, then send it.</i>`, { parse_mode: 'HTML' });
     return;
   }
 
@@ -2457,6 +2490,8 @@ if (ADMIN_ID) {
     { command: 'start',    description: '🤖 ChatGPT Business' },
     { command: 'menu',     description: '📋 My subscriptions & renew' },
     { command: 'renewals', description: '🔄 Who renewed (admin)' },
+      { command: 'checkrenewals', description: '🔎 Check paid renewals (admin)' },
+      { command: 'setdates', description: '✏️ Change a paid seat\'s dates (admin)' },
     { command: 'addseat',  description: '➕ Add a seat manually (admin)' },
     { command: 'setprice', description: '💰 Custom price for a customer (admin)' },
     { command: 'prices',   description: '💰 List custom prices (admin)' },
