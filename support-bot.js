@@ -41,6 +41,7 @@ if (!SUPPORT_BOT_TOKEN) {
 // Shared schema + connection: db.js has already run every migration by now.
 const rawDb   = require('./database/db');
 const queries = require('./database/queries');
+const { renderCustomerOrders } = require('./utils/customerOrders');
 const config  = require('./config');
 const manualDelivery = require('./handlers/manualDelivery');
 const { notifyAdmin } = require('./services/adminNotify');
@@ -895,27 +896,13 @@ async function replayMedia(staffChatId, targetUserId, page) {
   }
 }
 
-/** Quick view of a customer's orders from inside the chat. */
-async function showCustomerOrders(staffChatId, targetUserId, messageId = null) {
+/** Quick view of a customer's orders from inside the chat (paged: 20 per page, newest first). */
+async function showCustomerOrders(staffChatId, targetUserId, messageId = null, page = 0) {
   const orders = queries.getUserOrdersAll(targetUserId);
   const user   = queries.getUser(targetUserId);
   const name   = user ? displayName(user.username, user.first_name, targetUserId) : `User ${targetUserId}`;
-
-  let txt = `📦 <b>Orders — ${escapeHtml(name)}</b>\n🆔 <code>${targetUserId}</code>\n\n`;
-  if (!orders.length) {
-    txt += '<i>No orders yet.</i>';
-  } else {
-    const icon = { delivered: '✅', pending: '⏳', cancelled: '❌', awaiting_delivery: '🕐' };
-    for (const o of orders.slice(0, 20)) {
-      txt += `${icon[o.status] || '❓'} <b>#${o.id}</b> · ${escapeHtml(String(o.product_title || '').slice(0, 28))}\n` +
-             `   $${Number(o.total_price || 0).toFixed(2)} · ${formatFull(o.created_at)}\n`;
-    }
-    if (orders.length > 20) txt += `\n<i>…and ${orders.length - 20} more</i>`;
-  }
-
-  await send(staffChatId, messageId, txt, {
-    inline_keyboard: [[{ text: '🔙 Back to chat', callback_data: `chat_${targetUserId}` }]],
-  });
+  const view = renderCustomerOrders({ orders, name, targetUserId, page, formatDate: formatFull, escapeHtml });
+  await send(staffChatId, messageId, view.text, view.keyboard);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1346,6 +1333,12 @@ bot.on('callback_query', async (q) => {
 
     if (/^cust_orders_\d+$/.test(data)) {
       await showCustomerOrders(chatId, parseInt(data.split('_').pop(), 10), msgId);
+      return;
+    }
+    // cust_orders_p_{userId}_{page}: the older / newer pages of that list
+    if (/^cust_orders_p_\d+_\d+$/.test(data)) {
+      const [, , , uid, pg] = data.split('_');
+      await showCustomerOrders(chatId, parseInt(uid, 10), msgId, parseInt(pg, 10));
       return;
     }
     if (data === 'cust_search') {
