@@ -169,7 +169,8 @@ function orderCard(d, activated = false, scheduled = false, cancelNote = null) {
     (cancelNote
       ? `${cancelNote}\n`
       : activated
-      ? `✅ <i>Activated on ${d.activatedAt || 'now'}. The customer has been told.</i>\n`
+      ? `✅ <i>Activated${d.activatedAt ? ' on ' + d.activatedAt : ''}. The customer has been told.</i>\n` +
+        (d.editedNote ? `✏️ <i>${d.editedNote}</i>\n` : '')
       : scheduled
         ? `🗓 <i>This seat starts on ${d.startDate} (a renewal, or bought between ` +
           `two cycles). Activate it when that date arrives — pressing the button ` +
@@ -1075,6 +1076,14 @@ async function showSeatCyclePicker(chatId, target, email) {
  * active), never thrown, so callers (a Telegram handler or an HTTP route)
  * can each report it their own way.
  */
+/** The buttons of a finished (green) card: the done mark, and the way to correct its dates. */
+function activeCardMarkup(orderId) {
+  return { inline_keyboard: [
+    [{ text: '✅ Done — customer notified', callback_data: 'noop' }],
+    [{ text: '✏️ Change dates', callback_data: `cgb_dates_${orderId}` }],
+  ] };
+}
+
 async function activateAndNotifySeat(orderIdRaw, { chatId = null, msgId = null } = {}) {
   const orderId = parseInt(orderIdRaw, 10);
   if (!Number.isFinite(orderId)) return { ok: false, reason: 'invalid order id' };
@@ -1149,7 +1158,7 @@ async function activateAndNotifySeat(orderIdRaw, { chatId = null, msgId = null }
     ref:       String(orderId),
     activatedAt: `${p2(now.getDate())}/${p2(now.getMonth() + 1)} ${p2(now.getHours())}:${p2(now.getMinutes())}`,
   }, true);
-  const doneMarkup = { inline_keyboard: [[{ text: '✅ Done — customer notified', callback_data: 'noop' }]] };
+  const doneMarkup = activeCardMarkup(orderId);
 
   if (targetChatId && targetMsgId) {
     try {
@@ -1181,22 +1190,61 @@ async function activateAndNotifySeat(orderIdRaw, { chatId = null, msgId = null }
  * place; if that is impossible (too old, deleted) a fresh one is sent. Never touches an
  * activated card.
  */
-async function repaintSeatCard(orderId) {
+async function repaintSeatCard(orderId, editedNote = null) {
   const data = seatCardData(orderId);
-  if (!data || data.sub.status !== 'pending') return false;
+  if (!data || (data.sub.status !== 'pending' && data.sub.status !== 'active')) return false;
   const card = data.card;
-  const scheduled = String(card.startDate) > ymdLocal(cgbCycles.localNow(new Date()));
+  const active = data.sub.status === 'active';
+  const scheduled = !active && String(card.startDate) > ymdLocal(cgbCycles.localNow(new Date()));
+  if (active) card.editedNote = editedNote;
+  const text = orderCard(card, active, scheduled);
+  const markup = active ? activeCardMarkup(orderId) : orderCardButtons(card);
   const stored = queries.getCgbAdminCard ? queries.getCgbAdminCard(orderId) : null;
   if (stored) {
     try {
-      await bot.editMessageText(orderCard(card, false, scheduled), {
-        chat_id: stored.chat_id, message_id: stored.message_id, parse_mode: 'HTML', reply_markup: orderCardButtons(card),
-      });
+      await bot.editMessageText(text, { chat_id: stored.chat_id, message_id: stored.message_id, parse_mode: 'HTML', reply_markup: markup });
       return true;
     } catch (e) { logger.warn(`repaintSeatCard #${orderId}: ${e.message}`); }
   }
+  if (active) { await bot.sendMessage(ADMIN_ID, text, { parse_mode: 'HTML', reply_markup: markup }).catch(() => {}); return true; }
   await sendSeatCard(ADMIN_ID, data.sub.id);
   return true;
+}
+
+/**
+ * Change a seat's dates; for an ACTIVE seat optionally tell the customer. Returns what happened so
+ * the caller can report it: { ok, reason?, wasActive, before, after, told: true|false|'failed' }.
+ */
+async function changeSeatDates(orderId, start, end, { notify = false, note = null, adminId = null } = {}) {
+  const r = cgbSeatDates.applySeatDates(orderId, start, end, { allowActive: true, note, adminId, notified: false });
+  if (!r.ok) return r;
+  let told = false;
+  if (r.wasActive && notify) {
+    try {
+      await bot.sendMessage(Number(r.sub.user_id), cgbSeatDates.customerDatesMessage({ orderId, before: r.before, after: r.after, note }), { parse_mode: 'HTML' });
+      told = true;
+      try { db.prepare('UPDATE cgb_date_edits SET notified = 1 WHERE id = (SELECT MAX(id) FROM cgb_date_edits WHERE order_id = ?)').run(orderId); } catch (e) { /* the log is secondary */ }
+    } catch (e) {
+      told = 'failed';
+      logger.warn(`changeSeatDates #${orderId}: could not message customer ${r.sub.user_id}: ${e.message}`);
+    }
+  }
+  const stamp = ymdLocal(cgbCycles.localNow(new Date()));
+  await repaintSeatCard(orderId, r.wasActive
+    ? `Dates changed on ${stamp}: ${r.before.end} → ${r.after.end}${told === true ? ' — customer told' : ' — customer NOT told'}.`
+    : null);
+  return { ...r, told };
+}
+
+// Dates the owner typed for an ACTIVE seat wait here for his confirmation (a wrong date would reach the customer).
+const pendingDateEdits = new Map();            // token -> { orderId, start, end, note, at }
+const PENDING_EDIT_MS = 15 * 60 * 1000;
+function stashDateEdit(edit) {
+  const now = Date.now();
+  for (const [k, v] of pendingDateEdits) if (now - v.at > PENDING_EDIT_MS) pendingDateEdits.delete(k);
+  const token = require('crypto').randomBytes(4).toString('hex');
+  pendingDateEdits.set(token, { ...edit, at: now });
+  return token;
 }
 
 // ── /setdates <order> <first day> <last day> — correct a paid seat's dates (owner only) ──
@@ -1205,15 +1253,71 @@ bot.onText(/^\/setdates(?:@\w+)?(?:\s+(.*))?$/i, async (msg, match) => {
   const chatId = msg.chat.id;
   const parsed = cgbSeatDates.parseSetDates(match && match[1]);
   if (!parsed.ok) { await bot.sendMessage(chatId, `❌ ${parsed.error}`); return; }
-  const r = cgbSeatDates.applySeatDates(parsed.orderId, parsed.start, parsed.end);
+  const seat = seatCardData(parsed.orderId);
+  if (!seat) { await bot.sendMessage(chatId, `❌ no seat found for order #${parsed.orderId}`); return; }
+
+  // ACTIVE: the customer was already told the old dates and will be told the new ones — confirm first.
+  if (seat.sub.status === 'active') {
+    const probe = cgbSeatDates.parseSetDates(`${parsed.orderId} ${parsed.start} ${parsed.end}`);
+    if (!probe.ok) { await bot.sendMessage(chatId, `❌ ${probe.error}`); return; }
+    if (seat.sub.start_date === parsed.start && seat.sub.end_date === parsed.end) {
+      await bot.sendMessage(chatId, '❌ those are already the dates of that seat — nothing to change');
+      return;
+    }
+    const days = seat.sub.renewed_from ? cgbSeatDates.daysAfter(parsed.start, parsed.end) : cgbSeatDates.daysCovered(parsed.start, parsed.end);
+    const token = stashDateEdit({ orderId: parsed.orderId, start: parsed.start, end: parsed.end, note: parsed.note });
+    const past = parsed.end < ymdLocal(cgbCycles.localNow(new Date()));
+    await bot.sendMessage(chatId,
+      `⚠️ <b>Order #${parsed.orderId} is ACTIVE</b> — the customer already knows its dates.\n\n` +
+      `now:  ${seat.sub.start_date} → <b>${seat.sub.end_date}</b> (${seat.sub.days_remaining} days)\n` +
+      `new:  ${parsed.start} → <b>${parsed.end}</b> (${days} days)\n` +
+      (past ? `\n🚨 <b>The new end date is in the PAST</b> — the seat would count as expired.\n` : '') +
+      `\n<b>The customer would receive:</b>\n━━━━━━━━━━\n` +
+      cgbSeatDates.customerDatesMessage({ orderId: parsed.orderId, before: { end: seat.sub.end_date }, after: { end: parsed.end, days }, note: parsed.note }) +
+      `\n━━━━━━━━━━\n<i>The price paid ($${Number(seat.sub.final_price).toFixed(2)}) is not changed. Valid for 15 minutes.</i>`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+        [{ text: '✅ Apply & tell the customer', callback_data: `cgb_sd_y_${token}` }],
+        [{ text: '🔕 Apply, do NOT tell the customer', callback_data: `cgb_sd_n_${token}` }],
+        [{ text: '❌ Cancel', callback_data: `cgb_sd_x_${token}` }],
+      ] } });
+    return;
+  }
+
+  const r = await changeSeatDates(parsed.orderId, parsed.start, parsed.end, { adminId: msg.from.id });
   if (!r.ok) { await bot.sendMessage(chatId, `❌ ${r.reason}`); return; }
-  await repaintSeatCard(parsed.orderId);
   await bot.sendMessage(chatId,
     `✅ <b>Order #${parsed.orderId}</b> dates changed\n` +
     `before: ${r.before.start} → ${r.before.end} (${r.before.days} days)\n` +
     `now: <b>${r.after.start} → ${r.after.end}</b> (${r.after.days} days)\n\n` +
     `<i>The customer is told these dates when you press Activate &amp; Notify. The price paid ($${Number(r.sub.final_price).toFixed(2)}) is unchanged — if the new period costs less, credit the difference with ➕ Add User Balance.</i>`, { parse_mode: 'HTML' });
 });
+
+// ── the three buttons of an ACTIVE seat's date change ──
+async function handleDateEditButton(data, userId, chatId) {
+  const m = /^cgb_sd_([ynx])_([0-9a-f]{8})$/.exec(data);
+  if (!m) return false;
+  if (String(userId) !== String(ADMIN_ID)) return true;
+  const [, choice, token] = m;
+  const edit = pendingDateEdits.get(token);
+  if (!edit || Date.now() - edit.at > PENDING_EDIT_MS) {
+    pendingDateEdits.delete(token);
+    await bot.sendMessage(chatId, '⌛ That change expired (or was already handled). Send /setdates again.');
+    return true;
+  }
+  pendingDateEdits.delete(token);          // one tap, one change: a second tap can never repeat it
+  if (choice === 'x') { await bot.sendMessage(chatId, '❌ Cancelled — nothing was changed.'); return true; }
+  const notify = choice === 'y';
+  const r = await changeSeatDates(edit.orderId, edit.start, edit.end, { notify, note: edit.note, adminId: userId });
+  if (!r.ok) { await bot.sendMessage(chatId, `❌ ${r.reason}`); return true; }
+  await bot.sendMessage(chatId,
+    `✅ <b>Order #${edit.orderId}</b> dates changed\n` +
+    `before: ${r.before.start} → ${r.before.end} (${r.before.days} days)\n` +
+    `now: <b>${r.after.start} → ${r.after.end}</b> (${r.after.days} days)\n` +
+    (r.told === true ? `\n📨 The customer was told.`
+      : r.told === 'failed' ? `\n⚠️ <b>The customer could NOT be messaged</b> (he may have blocked the bot) — tell him yourself.`
+      : `\n🔕 The customer was NOT told.`), { parse_mode: 'HTML' });
+  return true;
+}
 
 // ── /checkrenewals — paid renewals not yet activated whose dates disagree with the customer's cycle ──
 bot.onText(/^\/checkrenewals(?:@\w+)?$/i, async (msg) => {
@@ -1439,13 +1543,18 @@ bot.on('callback_query', async (q) => {
     return;
   }
 
+  // ── an ACTIVE seat's date change: apply and tell / apply silently / cancel ───
+  if (data.startsWith('cgb_sd_')) {
+    if (await handleDateEditButton(data, userId, chatId)) return;
+  }
+
   // ── ✏️ Change dates: shows the command, pre-filled ──────────────────────────
   if (/^cgb_dates_\d+$/.test(data)) {
     if (String(userId) !== String(ADMIN_ID)) return;
     const orderId = parseInt(data.split('_').pop(), 10);
     const seat = seatCardData(orderId);
-    if (!seat || seat.sub.status !== 'pending') {
-      await bot.sendMessage(chatId, '❌ Only a paid seat that is not activated yet can be changed.');
+    if (!seat || (seat.sub.status !== 'pending' && seat.sub.status !== 'active')) {
+      await bot.sendMessage(chatId, '❌ Only a paid seat — activated or not — can be changed (not a cancelled, unpaid or expired one).');
       return;
     }
     let hint = '';
@@ -1461,7 +1570,9 @@ bot.on('callback_query', async (q) => {
       `✏️ <b>Change dates — order #${orderId}</b>\n` +
       `now: ${seat.sub.start_date} → ${seat.sub.end_date} (${seat.sub.days_remaining} days)\n` + hint +
       `\nSend (first day, last day):\n<code>/setdates ${orderId} ${seat.sub.start_date} ${seat.sub.end_date}</code>\n` +
-      `<i>Change the two dates, then send it.</i>`, { parse_mode: 'HTML' });
+      (seat.sub.status === 'active'
+        ? `<i>This seat is ACTIVE: before anything changes you will see what the customer would receive and choose whether to tell him. You can add a note at the end of the command, e.g. …  your account was moved to a new panel.</i>`
+        : `<i>Change the two dates, then send it.</i>`), { parse_mode: 'HTML' });
     return;
   }
 

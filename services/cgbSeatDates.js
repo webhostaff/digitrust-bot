@@ -1,6 +1,7 @@
 'use strict';
 /**
- * Fixing the dates of a PAID seat that is not activated yet, and finding the ones that need it (V144).
+ * Fixing the dates of a PAID seat — before it is activated (V144) or after, when the customer is
+ * told about the change (V145) — and finding the ones that need it.
  *
  * Until V144 a renewal ended on the end day of whichever cycle was "best" for a new buyer that day,
  * so deleting a cycle moved every renewal's end. Those orders are already paid: the customer saw
@@ -10,6 +11,18 @@
 
 const raw = require('../database/db');
 const cycles = require('./cgbCycles');
+
+raw.exec(`CREATE TABLE IF NOT EXISTS cgb_date_edits (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_id    INTEGER NOT NULL,
+  was_active  INTEGER NOT NULL DEFAULT 0,
+  old_start   TEXT, old_end TEXT, old_days INTEGER,
+  new_start   TEXT, new_end TEXT, new_days INTEGER,
+  notified    INTEGER NOT NULL DEFAULT 0,
+  note        TEXT,
+  admin_id    TEXT,
+  created_at  TEXT DEFAULT (datetime('now'))
+)`);
 
 const DAY_MS = 86400000;
 const MAX_SPAN_DAYS = 400;
@@ -40,10 +53,18 @@ function daysAfter(start, end) {
   return Math.max(1, Math.round((b.getTime() - a.getTime()) / DAY_MS));
 }
 
-/** '/setdates 20439 2026-10-05 2026-10-09' (arguments only) → {ok, orderId, start, end} | {ok:false, error} */
+const MAX_NOTE = 300;
+
+/**
+ * '/setdates 20439 2026-10-05 2026-11-09 [a note for the customer]' (arguments only)
+ *   → {ok, orderId, start, end, note} | {ok:false, error}
+ * The note is only used when the seat is already active and the customer is told.
+ */
 function parseSetDates(text) {
-  const t = String(text || '').trim().split(/\s+/).filter(Boolean);
-  if (t.length !== 3) return { ok: false, error: 'Use: /setdates <order> <first day> <last day>   e.g. /setdates 20439 2026-10-11 2026-11-09' };
+  const all = String(text || '').trim().split(/\s+/).filter(Boolean);
+  const t = all.slice(0, 3);
+  const note = all.slice(3).join(' ').slice(0, MAX_NOTE);
+  if (t.length !== 3) return { ok: false, error: 'Use: /setdates <order> <first day> <last day> [note for the customer]   e.g. /setdates 20439 2026-10-05 2026-11-09' };
   const orderId = /^\d+$/.test(t[0]) ? parseInt(t[0], 10) : NaN;
   if (!Number.isFinite(orderId)) return { ok: false, error: `“${t[0]}” is not an order number.` };
   if (!validYmd(t[1])) return { ok: false, error: `“${t[1]}” is not a date. Write it as YYYY-MM-DD (2026-10-11).` };
@@ -51,23 +72,52 @@ function parseSetDates(text) {
   if (t[2] < t[1]) return { ok: false, error: 'The last day cannot be before the first day.' };
   const span = daysCovered(t[1], t[2]);
   if (span > MAX_SPAN_DAYS) return { ok: false, error: `That is ${span} days — more than ${MAX_SPAN_DAYS}. Check the years.` };
-  return { ok: true, orderId, start: t[1], end: t[2] };
+  return { ok: true, orderId, start: t[1], end: t[2], note };
 }
 
-/** Change the dates of a PAID, NOT YET ACTIVATED seat. Nothing else about the order changes. */
-function applySeatDates(orderId, start, end) {
+/**
+ * Change the dates of a PAID seat: not yet activated (nobody was told anything), or ACTIVE with
+ * `{ allowActive: true }` — the caller then tells the customer. Nothing else about the order
+ * changes: not the price, not the status. Expired, cancelled and unpaid seats are refused.
+ */
+function applySeatDates(orderId, start, end, { allowActive = false, note = null, adminId = null, notified = false } = {}) {
   const sub = raw.prepare('SELECT * FROM chatgpt_subscriptions WHERE order_id = ?').get(orderId);
   if (!sub) return { ok: false, reason: `no seat found for order #${orderId}` };
-  if (sub.status === 'active') return { ok: false, reason: 'that seat is already activated and the customer was told its dates' };
   if (sub.status === 'cancelled') return { ok: false, reason: 'that order was cancelled' };
-  if (sub.status !== 'pending') return { ok: false, reason: `that order is not paid yet (${sub.status})` };
+  if (sub.status === 'expired') return { ok: false, reason: 'that seat is expired — it has to be renewed, not edited' };
+  if (sub.status === 'active' && !allowActive) return { ok: false, reason: 'that seat is already activated and the customer was told its dates' };
+  if (sub.status !== 'pending' && sub.status !== 'active') return { ok: false, reason: `that order is not paid yet (${sub.status})` };
   // A renewal counts the days AFTER its start (the start is the previous seat's last day, already
   // paid); a new seat counts both ends. The same counts the customer was quoted.
   const days = sub.renewed_from ? daysAfter(start, end) : daysCovered(start, end);
   if (days == null) return { ok: false, reason: 'invalid dates' };
-  raw.prepare(`UPDATE chatgpt_subscriptions SET start_date = ?, end_date = ?, days_remaining = ?, updated_at = datetime('now')
-               WHERE order_id = ? AND status = 'pending'`).run(start, end, days, orderId);
-  return { ok: true, before: { start: sub.start_date, end: sub.end_date, days: sub.days_remaining }, after: { start, end, days }, sub };
+  if (sub.start_date === start && sub.end_date === end) return { ok: false, reason: 'those are already the dates of that seat — nothing to change' };
+  const wasActive = sub.status === 'active';
+  raw.transaction(() => {
+    // The expiry reminders look at end_date every day, so they follow the new date by themselves;
+    // the old per-seat "already told" flags (3 days / 1 day / today) are cleared so they can fire again.
+    raw.prepare(`UPDATE chatgpt_subscriptions SET start_date = ?, end_date = ?, days_remaining = ?,
+                   notified_3d = 0, notified_1d = 0, notified_0d = 0, updated_at = datetime('now')
+                 WHERE order_id = ? AND status = ?`).run(start, end, days, orderId, sub.status);
+    raw.prepare(`INSERT INTO cgb_date_edits (order_id, was_active, old_start, old_end, old_days, new_start, new_end, new_days, notified, note, admin_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(orderId, wasActive ? 1 : 0, sub.start_date, sub.end_date, sub.days_remaining, start, end, days, notified ? 1 : 0, note || null, adminId == null ? null : String(adminId));
+  })();
+  return { ok: true, wasActive, before: { start: sub.start_date, end: sub.end_date, days: sub.days_remaining }, after: { start, end, days }, sub };
+}
+
+/** The message the customer gets when the owner changes the dates of an ACTIVE seat. */
+function customerDatesMessage({ orderId, before, after, note }) {
+  const esc = (x) => String(x == null ? '' : x).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return (
+    `📅 <b>Your subscription dates were updated</b>\n\n` +
+    `🆔 Order: <b>#${orderId}</b>\n` +
+    `⏱ Duration: <b>${after.days} days</b>\n` +
+    `📅 New expiry date: <b>${esc(after.end)}</b>\n` +
+    (before && before.end && before.end !== after.end ? `<i>(previous expiry date: ${esc(before.end)})</i>\n` : '') +
+    (note ? `\n📝 ${esc(note)}\n` : '') +
+    `\nYour subscription stays active. If you have any question, please contact our support team.`
+  );
 }
 
 const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
@@ -124,4 +174,4 @@ function auditRenewals(now = new Date()) {
   return { checked: rows.length, ok, bad };
 }
 
-module.exports = { parseSetDates, applySeatDates, auditRenewals, expectedRenewal, daysCovered, daysAfter, validYmd };
+module.exports = { parseSetDates, applySeatDates, customerDatesMessage, auditRenewals, expectedRenewal, daysCovered, daysAfter, validYmd };
