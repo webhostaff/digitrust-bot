@@ -327,6 +327,8 @@ async function showProductDetail(bot, chatId, productId, messageId = null, userI
     `📝 ${product.description || 'No description.'}\n\n` +
     `🛡 <b>Warranty:</b> ${product.warranty || 'N/A'}\n` +
     `💵 <b>Price:</b> ${formatPrice(product.price)}\n` +
+    // A special price that starts from more units than one: say where, so it is not a secret.
+    (product.customFrom ? `💲 <b>Your special price:</b> ${formatPrice(product.customFrom.price)} <i>from ${product.customFrom.minQty} units</i>\n` : '') +
     `${stockLine}\n` +
     `📈 <b>Sold:</b> ${product.sales_count || product.sold_count || 0}` +
     deliveryLine +

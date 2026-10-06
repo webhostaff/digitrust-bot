@@ -117,6 +117,7 @@ function productPayload(userId, product) {
     special_price: allowance
       ? {
           price: Number(allowance.price),
+          min_quantity: allowance.minQty || 1,        // the special price applies to orders of at least this many units
           units_left: allowance.unlimited ? null : allowance.remaining,
           unlimited: allowance.unlimited,
         }

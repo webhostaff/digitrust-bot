@@ -15,7 +15,7 @@ const { checkAndNotifyStockLevel } = require('../services/notifications');
 const { evaluateStock } = require('../services/stockAlerts');
 const manualDelivery = require('./manualDelivery');
 const {
-  verifyDepositByTxId, verifyBinancePayOrder, TXID_RE,
+  verifyDepositByTxId, verifyBinancePayOrder, TXID_RE, isTxidInput,
 } = require('../services/binance');
 const logger = require('../utils/logger');
 const { t } = require('../utils/i18n');
@@ -127,6 +127,8 @@ async function handleQuantity(bot, msg) {
     allowanceUnits: pricing.specialUnits || 0,
     allowancePrice: pricing.specialPrice || 0,
     normalUnits:    pricing.normalUnits || 0,
+    specialMinQty:  pricing.minQty || 0,
+    nextTier:       pricing.nextTier || null,       // this customer's special price exists but starts from more units
   });
 
   if (sess.data.requiresEmail) {
@@ -220,6 +222,13 @@ async function createAndShowSummary(bot, chatId, userId, email) {
   if (data.discountApplied) {
     summary += `💵 <b>Unit price:</b> ${formatPrice(data.unitPrice)} <i>(was ${formatPrice(data.productPrice)})</i>\n`;
     summary += `🎁 <b>Bulk Discount:</b> ${data.discount}% off\n`;
+  }
+  if (data.allowanceUnits > 0 && data.allowancePrice > 0) {
+    summary += `💲 <b>Your special price:</b> ${formatPrice(data.allowancePrice)}` +
+      (data.specialMinQty > 1 ? ` <i>(from ${data.specialMinQty} units)</i>` : '') +
+      (data.normalUnits > 0 ? ` × ${data.allowanceUnits}, then the normal price for the other ${data.normalUnits}` : '') + `\n`;
+  } else if (data.nextTier) {
+    summary += `💡 <i>Your special price (${formatPrice(data.nextTier.price)}) applies from ${data.nextTier.minQty} units.</i>\n`;
   }
   if (data.skippedRankPct > 0) {
     summary += `👑 <i>Your ${data.skippedRankPct}% VIP discount does not apply to this product — it is sold at its normal price.</i>\n`;
@@ -339,6 +348,7 @@ async function cancelOrder(bot, chatId, orderId, userId, messageId) {
 // ── Pay with wallet ───────────────────────────────────────────────────────────
 
 // In-memory set to prevent concurrent payment processing per order
+const { normalizeTxidInput } = require('../utils/txid');
 const PROCESSING_ORDERS = new Set();
 
 async function payWithWallet(bot, chatId, userId, orderId, messageId) {
@@ -717,7 +727,7 @@ async function startUsdtPayForOrder(bot, chatId, userId, orderId, messageId) {
     `⚠️ <b>Important — the network must match the address:</b>\n` +
     `${viaBlock}\n\n` +
     `💡 If something goes wrong (wrong amount / out of stock), funds are added to your wallet automatically.\n\n` +
-    `<i>Example TxID:</i>\n<code>0x1234...abcd</code> (64 chars)\n\n` +
+    `<i>Example TxID:</i>\n<code>0x1234...abcd</code> (64 chars)\n\n🔁 <i>Paying from a Binance account (no fee, no network)? Send the number shown as “Off-chain Transfer …” instead, e.g. <code>418351948005</code>.</i>\n\n` +
     `⏰ Valid for ${PAYMENT_CONFIRM_VALIDITY_MIN} minutes. TxID can only be used once.`,
     {
       chat_id: chatId, message_id: messageId,
@@ -731,7 +741,7 @@ async function handleUsdtTxIdForOrder(bot, msg) {
   const chatId = msg.chat.id;
   // Customer's language, so the whole purchase flow speaks it.
   const lang = db.getUserLanguage ? db.getUserLanguage(userId) : 'en';
-  const txid   = (msg.text || '').trim();
+  const txid   = normalizeTxidInput((msg.text || '').trim());      // off-chain id: one canonical spelling
   const sess   = session.get(userId);
   const internalOrderId = sess.data && sess.data.orderId;
 
@@ -739,7 +749,7 @@ async function handleUsdtTxIdForOrder(bot, msg) {
     await bot.sendMessage(chatId, t(lang, 'buy_session_expired_order'));
     return;
   }
-  if (!TXID_RE.test(txid)) {
+  if (!isTxidInput(txid)) {
     await bot.sendMessage(chatId, t(lang, 'buy_txid_invalid'), { parse_mode: 'HTML' });
     return;
   }

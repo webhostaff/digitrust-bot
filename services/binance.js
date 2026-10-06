@@ -38,6 +38,11 @@ const ALLOWED_NETWORKS = {
 // TRON = 64 hex, BSC = 0x + 64 hex, TON = 64 hex or a 44-char base64 hash.
 const TXID_RE = /^((0x)?[a-fA-F0-9]{64}|[A-Za-z0-9+/_-]{43,48}={0,2})$/;
 
+// V146: a Binance-to-Binance transfer has no hash — only "Off-chain Transfer 418351948005".
+const { offchainDigits, isOffchainTxid, normalizeTxidInput } = require('../utils/txid');
+/** Does this look like a TxID the customer could really have: a blockchain hash OR an off-chain id? */
+const isTxidInput = (raw) => TXID_RE.test(String(raw || '').trim()) || isOffchainTxid(raw);
+
 /**
  * Every spelling a transaction hash can arrive in.
  *
@@ -56,6 +61,13 @@ function txidForms(raw) {
 
   const forms = new Set();
   const add = (x) => { if (x) forms.add(String(x).toLowerCase()); };
+
+  // An off-chain id: its digits are the identity, however it is spelled around them.
+  const od = offchainDigits(v);
+  if (od) {
+    add(od); add(`off-chain transfer ${od}`); add(`internal transfer ${od}`);
+    return [...forms];
+  }
 
   add(v);
   add(v.replace(/^0x/i, ''));
@@ -162,8 +174,8 @@ async function verifyDepositByTxId(rawTxid, opts = {}) {
   }
 
   // 2. Format check
-  const txid = (rawTxid || '').trim();
-  if (!TXID_RE.test(txid)) {
+  const txid = normalizeTxidInput(rawTxid);          // off-chain ids in Binance's own spelling
+  if (!isTxidInput(txid)) {
     return {
       found: false, reason: 'invalid_format',
       message: 'Invalid TxID format. Please check and resend.',
@@ -342,6 +354,22 @@ async function verifyDepositByTxId(rawTxid, opts = {}) {
     return {
       found: false, reason: 'wrong_coin',
       message: `❌ Wrong asset. Expected USDT, got ${match.coin}.`,
+    };
+  }
+
+  // An off-chain transfer is a move between two Binance accounts: no blockchain, so no network
+  // or deposit address to check. It is in OUR deposit history only because it was sent to OUR
+  // account, and the coin (above), the amount and the reservation are still checked.
+  if (Number(match.transferType) === 1 || isOffchainTxid(match.txId)) {
+    const amountOff = Number(match.amount);
+    if (!Number.isFinite(amountOff) || amountOff <= 0) {
+      return { found: false, reason: 'api_error', message: 'Unexpected amount returned by Binance. Please contact support.' };
+    }
+    return {
+      found: true, offchain: true, amount: amountOff,
+      network: ALLOWED_NETWORKS[String(match.network || '').toUpperCase()] || 'Binance internal',
+      asset: 'USDT', address: match.address || null, txid: match.txId,
+      insertTime: Number(match.insertTime) || null, tooOld, tooOldMinutes, maxAgeMinutes,
     };
   }
 
@@ -807,4 +835,5 @@ module.exports = {
   findDepositRaw,
   findPayTransactionRaw,
   TXID_RE,
+  isTxidInput,
 };

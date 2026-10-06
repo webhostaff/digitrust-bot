@@ -266,26 +266,18 @@ async function handleAdminText(bot, msg) {
   // ── Per-product low-stock threshold ──────────────────────────────
   // ── Set a negotiated price for one customer ──────────────────────
   if (s === States.ADMIN_CUST_PRICE) {
-    // The product was chosen by tapping, so the price is expected first.
-    // An optional "x20" token sets the quantity this price starts from.
-    const parts = String(text).trim().split(/\s+/);
-    const price = parseFloat(String(parts[0] || '').replace(',', '.'));
-    let qtyLimit = 0;   // 0 = no limit
-    const rest = [];
-    for (const tok of parts.slice(1)) {
-      const m = /^q(\d+)$/i.exec(tok);
-      if (m && qtyLimit === 0) qtyLimit = Math.max(0, parseInt(m[1], 10));
-      else rest.push(tok);
-    }
-    const note  = rest.join(' ') || null;
+    // The product was chosen by tapping, so the price is expected first. Optional tokens:
+    //   x20  → the price STARTS from 20 units (an order of fewer pays the normal price)
+    //   q50  → the price covers 50 units in total, then the normal price again
+    const spec = parseSpecialPriceInput(text);
     const targetId  = d.cpUserId;
     const productId = d.cpProductId;
 
-    if (!Number.isFinite(price) || price < 0) {
-      await bot.sendMessage(chatId,
-        '❌ Send just the price, e.g. <code>3.50</code>', { parse_mode: 'HTML' });
+    if (!spec.ok) {
+      await bot.sendMessage(chatId, `❌ ${spec.error}`, { parse_mode: 'HTML' });
       return;
     }
+    const { price, minQty, qtyLimit, note } = spec;
     const product = db.getProduct(productId);
     if (!product) {
       session.clear(userId);
@@ -294,35 +286,45 @@ async function handleAdminText(bot, msg) {
     }
 
     session.clear(userId);
-    db.setCustomerPrice({ userId: targetId, productId, price, note, adminId: userId, qtyLimit });
-    logger.info(`Admin ${userId} set special price ${price} for user ${targetId} on product ${productId}`);
+    db.setCustomerPrice({ userId: targetId, productId, price, note, adminId: userId, minQty, qtyLimit });
+    logger.info(`Admin ${userId} set special price ${price} (from ${minQty} units, limit ${qtyLimit}) for user ${targetId} on product ${productId}`);
 
-    const diff = Number(product.price) - price;
     await bot.sendMessage(
       chatId,
       `✅ <b>Special Price Set</b>\n\n` +
       `👤 Customer: <code>${targetId}</code>\n` +
       `📦 ${escapeHtml(String(product.title || ''))}\n` +
-      `💵 Public: ${formatPriceExact(product.price)}\n` +
-      `💲 This customer pays: <b>${formatPriceExact(price)}</b>` +
-      (qtyLimit > 0
-        ? ` <i>(for the first ${qtyLimit} units)</i>\n` +
-          `📊 After ${qtyLimit} units the normal price applies again.\n`
-        : ` <i>(no limit)</i>\n`) +
-      (diff > 0 ? `📉 Discount: ${formatPriceExact(diff)} per unit\n`
-                : diff < 0 ? `📈 Markup: ${formatPriceExact(-diff)} per unit\n` : '') +
-      // Prices are displayed to customers rounded to cents, so anything finer
-      // than that shows one figure and charges another. Say so plainly.
-      (Math.abs(price - Number(price.toFixed(2))) > 1e-9
-        ? `\n⚠️ <b>Sub-cent price.</b> The customer will see ` +
-          `<b>${formatPrice(price)}</b> but be charged <b>${formatPriceExact(price)}</b>. ` +
-          `Use 2 decimals to keep them identical.\n`
-        : '') +
-      (note ? `📝 <i>${escapeHtml(note)}</i>\n` : '') +
+      `💵 Public: ${formatPriceExact(product.price)}\n` + specialPriceLines(product, { price, minQty, qtyLimit, note }) +
       `\n<i>Applies immediately, on every screen and at checkout. Bulk tiers no ` +
-      `longer apply to this customer for this product.</i>`,
+      `longer apply to this customer for this product while the special price applies.</i>`,
       { parse_mode: 'HTML',
         reply_markup: { inline_keyboard: [[{ text: '💲 Special Prices', callback_data: `admin_cprices_${targetId}` }]] } }
+    );
+    return;
+  }
+
+  // ── Change an existing special price ────────────────────────────────────
+  if (s === States.ADMIN_CUST_PRICE_EDIT) {
+    const targetId = d.cpUserId, productId = d.cpProductId, oldMin = d.cpOldMinQty;
+    const cur = db.listCustomerPrices(targetId).find((x) => x.product_id === productId && Number(x.min_qty) === Number(oldMin));
+    if (!cur) { session.clear(userId); await bot.sendMessage(chatId, '❌ That special price no longer exists.'); return; }
+    // What you do not mention stays as it is: "x20" alone only moves the starting quantity.
+    const spec = parseSpecialPriceInput(text, { current: cur });
+    if (!spec.ok) { await bot.sendMessage(chatId, `❌ ${spec.error}`, { parse_mode: 'HTML' }); return; }
+    const r = db.updateCustomerPrice({ userId: targetId, productId, oldMinQty: oldMin, price: spec.price, minQty: spec.minQty, qtyLimit: spec.qtyLimit, note: spec.note });
+    if (!r.ok) { await bot.sendMessage(chatId, `❌ ${r.reason}`, { parse_mode: 'HTML' }); return; }
+    session.clear(userId);
+    logger.info(`Admin ${userId} edited special price: user ${targetId}, product ${productId}: ${cur.price}@${cur.min_qty}+ → ${spec.price}@${spec.minQty}+`);
+    const product = db.getProduct(productId) || {};
+    await bot.sendMessage(
+      chatId,
+      `✅ <b>Special Price Updated</b>\n\n` +
+      `👤 Customer: <code>${targetId}</code>\n📦 ${escapeHtml(String(product.title || ''))}\n` +
+      `💵 Public: ${formatPriceExact(product.price || 0)}\n\n` +
+      `<b>Before</b>\n` + specialPriceLines(product, { price: Number(cur.price), minQty: Number(cur.min_qty), qtyLimit: Number(cur.qty_limit) || 0, note: cur.note }) +
+      `\n<b>Now</b>\n` + specialPriceLines(product, spec) +
+      `\n<i>Applies immediately.</i>`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '💲 Special Prices', callback_data: `admin_cprices_${targetId}` }]] } }
     );
     return;
   }
@@ -2299,6 +2301,64 @@ async function finalizeProduct(bot, chatId, userId, stockLines) {
 }
 
 // ── Callback handler ──────────────────────────────────────────────────────────
+
+
+/**
+ * "3.50 x20 q100 wholesale" → { ok, price, minQty, qtyLimit, note }
+ *   price   the unit price (first number; with `current`, optional)
+ *   x20     the price STARTS from 20 units — an order of fewer pays the normal price (default 1 = from the first unit)
+ *   q100    the price covers 100 units in total, then the normal price (default 0 = no limit)
+ *   rest    a note ("-" clears it when editing)
+ * With `current` (editing) anything not mentioned keeps its current value.
+ */
+function parseSpecialPriceInput(text, { current = null } = {}) {
+  const parts = String(text || '').trim().split(/\s+/).filter(Boolean);
+  let price = current ? Number(current.price) : NaN;
+  let minQty = current ? Math.max(1, Number(current.min_qty) || 1) : 1;
+  let qtyLimit = current ? Math.max(0, Number(current.qty_limit) || 0) : 0;
+  let note = current ? (current.note || null) : null;
+  if (/^-\d/.test(parts[0] || '')) return { ok: false, error: 'The price cannot be negative.' };   // "-4" is not a note
+  const rest = [];
+  let seenPrice = false, seenX = false, seenQ = false;
+  parts.forEach((tok, i) => {
+    let m;
+    if (i === 0 && /^\d+(?:[.,]\d+)?$/.test(tok)) { price = parseFloat(tok.replace(',', '.')); seenPrice = true; }
+    else if ((m = /^x(\d+)$/i.exec(tok)) && !seenX) { minQty = Math.max(1, parseInt(m[1], 10)); seenX = true; }
+    else if ((m = /^q(\d+)$/i.exec(tok)) && !seenQ) { qtyLimit = Math.max(0, parseInt(m[1], 10)); seenQ = true; }
+    else rest.push(tok);
+  });
+  if (rest.length) note = rest.join(' ') === '-' ? null : rest.join(' ');
+  if (!Number.isFinite(price) || price < 0 || (!current && !seenPrice)) {
+    return { ok: false, error: 'Send the price first, e.g. <code>3.50</code> — then, if you want, <code>x20</code> (from 20 units) and/or <code>q100</code> (100 units in total).' };
+  }
+  if (qtyLimit > 0 && minQty > qtyLimit) {
+    return { ok: false, error: `The price starts from <b>${minQty}</b> units but covers only <b>${qtyLimit}</b>: no order could use it. Raise the limit or lower the start.` };
+  }
+  return { ok: true, price, minQty, qtyLimit, note };
+}
+
+/** The lines that describe one special price to the owner (creation, edit, before/after). */
+function specialPriceLines(product, { price, minQty = 1, qtyLimit = 0, note = null }) {
+  const pub = Number((product && product.price) || 0);
+  const diff = pub - price;
+  return (
+    `💲 This customer pays: <b>${formatPriceExact(price)}</b>\n` +
+    (minQty > 1
+      ? `📦 <b>From ${minQty} units</b> — an order of fewer than ${minQty} pays the normal price\n`
+      : `📦 From the first unit\n`) +
+    (qtyLimit > 0
+      ? `🔢 Covers <b>${qtyLimit}</b> units in total, then the normal price again\n`
+      : `♾ No unit limit\n`) +
+    (diff > 0 ? `📉 Discount: ${formatPriceExact(diff)} per unit\n`
+              : diff < 0 ? `📈 Markup: ${formatPriceExact(-diff)} per unit\n` : '') +
+    // Prices are displayed to customers rounded to cents, so anything finer than that shows one
+    // figure and charges another. Say so plainly.
+    (Math.abs(price - Number(price.toFixed(2))) > 1e-9
+      ? `⚠️ <b>Sub-cent price.</b> The customer will see <b>${formatPrice(price)}</b> but be charged <b>${formatPriceExact(price)}</b>. Use 2 decimals to keep them identical.\n`
+      : '') +
+    (note ? `📝 <i>${escapeHtml(note)}</i>\n` : '')
+  );
+}
 
 
 /**
@@ -4509,21 +4569,22 @@ async function handleAdminCallback(bot, query) {
       for (const cp of list) {
         const t = String(cp.title || '').replace(/\[emoji:\d+\]/g, '').trim().slice(0, 30);
         txt += `\n📦 ${escapeHtml(t)}\n` +
-               `   ${cp.min_qty > 1 ? `<b>${cp.min_qty}+</b> units` : 'any qty'}: ` +
+               `   ${cp.min_qty > 1 ? `<b>from ${cp.min_qty} units</b>` : 'from the 1st unit'}: ` +
                `${formatPriceExact(cp.public_price)} → <b>${formatPriceExact(cp.price)}</b>` +
+               (Number(cp.qty_limit) > 0 ? `  · covers ${cp.qty_limit} units` : '') +
                (cp.note ? `  <i>(${escapeHtml(cp.note)})</i>` : '') + `\n`;
       }
-      txt += `\n<i>An allowance covers the first N units the customer buys. Beyond it, the normal price applies automatically — including within the same order.</i>`;
+      txt += `\n<i>"From N units": an order of fewer than N pays the normal price. A unit limit covers the first N units the customer buys; beyond it the normal price applies automatically — including within the same order.</i>`;
     }
 
     const kb = [[{ text: '➕ Set a special price', callback_data: `admin_cprice_add_${targetId}` }]];
     for (const cp of list.slice(0, 8)) {
       const t = String(cp.title || '').replace(/\[emoji:\d+\]/g, '').trim().slice(0, 18);
       const q = cp.min_qty > 1 ? ` ${cp.min_qty}+` : '';
-      kb.push([{
-        text: `🗑 ${t}${q} — ${formatPriceExact(cp.price)}`,
-        callback_data: `admin_cprice_del_${targetId}_${cp.product_id}_${cp.min_qty}`,
-      }]);
+      kb.push([
+        { text: `✏️ ${t}${q} — ${formatPriceExact(cp.price)}`, callback_data: `admin_cprice_edit_${targetId}_${cp.product_id}_${cp.min_qty}` },
+        { text: '🗑', callback_data: `admin_cprice_del_${targetId}_${cp.product_id}_${cp.min_qty}` },
+      ]);
     }
     kb.push([{ text: '🔙 Back to user', callback_data: `admin_user_${targetId}` }]);
 
@@ -4595,7 +4656,8 @@ async function handleAdminCallback(bot, query) {
       `🆔 Product ID: <code>${product.id}</code>\n` +
       `━━━━━━━━━━━━━━━━━━━━\n` +
       `💵 Public price: <b>${formatPriceExact(product.price)}</b>\n` +
-      (existing ? `💲 Current special: <b>${formatPriceExact(existing.price)}</b>\n` : '') +
+      db.listCustomerPrices(targetId).filter((x) => x.product_id === productId)
+        .map((x) => `💲 Current special: <b>${formatPriceExact(x.price)}</b>${x.min_qty > 1 ? ` from ${x.min_qty} units` : ''}\n`).join('') +
       (() => {
         const al = db.getCustomerAllowance(targetId, productId);
         if (!al) return '';
@@ -4604,12 +4666,40 @@ async function handleAdminCallback(bot, query) {
           : `📊 Used <b>${al.used}</b> of ${al.limit} units — <b>${al.remaining}</b> left\n`;
       })() +
       `\n<b>Send the price for this customer.</b>\n` +
-      `<code>3.50</code> — this price, no limit\n` +
-      `<code>3.50 q20</code> — this price for <b>20 units total</b>, then back to normal\n` +
-      `<code>3.50 q20 wholesale</code> — with a note\n\n` +
-      `<i>With a limit, the allowance covers the first 20 units the customer ` +
-      `buys — across any number of orders. Anything beyond that is charged the ` +
-      `normal price automatically.</i>`,
+      `<code>3.50</code> — this price, from the first unit, no limit\n` +
+      `<code>3.50 x20</code> — this price <b>from 20 units</b>; an order of fewer pays the normal price\n` +
+      `<code>3.50 q100</code> — this price for <b>100 units in total</b>, then back to normal\n` +
+      `<code>3.50 x20 q100 wholesale</code> — all together, with a note\n\n` +
+      `<i>x = the quantity the price STARTS from. q = how many units it covers in total, ` +
+      `across any number of orders. To have several steps (from 10: one price, from 50: a lower one) ` +
+      `add this product again with another x.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Cancel', callback_data: `admin_cprices_${targetId}` }]] } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_cprice_edit_\d+_\d+_\d+$/.test(data)) {
+    const parts = data.split('_');
+    const oldMin    = parseInt(parts.pop(), 10);
+    const productId = parseInt(parts.pop(), 10);
+    const targetId  = parseInt(parts.pop(), 10);
+    const cur = db.listCustomerPrices(targetId).find((x) => x.product_id === productId && Number(x.min_qty) === oldMin);
+    if (!cur) { await answer('❌ That special price no longer exists'); return; }
+    const product = db.getProduct(productId) || {};
+    session.set(userId, States.ADMIN_CUST_PRICE_EDIT, { cpUserId: targetId, cpProductId: productId, cpOldMinQty: oldMin });
+    const tpl = `${Number(cur.price)}${cur.min_qty > 1 ? ` x${cur.min_qty}` : ''}${Number(cur.qty_limit) > 0 ? ` q${cur.qty_limit}` : ''}`;
+    await bot.editMessageText(
+      `✏️ <b>Edit a Special Price</b>\n\n` +
+      `👤 Customer: <code>${targetId}</code>\n📦 ${escapeHtml(String(product.title || ''))}\n` +
+      `💵 Public price: <b>${formatPriceExact(product.price || 0)}</b>\n━━━━━━━━━━━━━━━━━━━━\n` +
+      `<b>Now</b>\n` + specialPriceLines(product, { price: Number(cur.price), minQty: Number(cur.min_qty), qtyLimit: Number(cur.qty_limit) || 0, note: cur.note }) +
+      `\n<b>Send the change.</b> Whatever you do not mention stays as it is:\n` +
+      `<code>2.90</code> — only the price\n` +
+      `<code>x20</code> — only: from 20 units (<code>x1</code> = from the first unit)\n` +
+      `<code>q0</code> — only: no unit limit (<code>q50</code> = 50 units in total)\n` +
+      `<code>2.90 x20 q50 note</code> — everything (a note of <code>-</code> clears it)\n\n` +
+      `Copy and edit:\n<code>${tpl}</code>`,
       { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
         reply_markup: { inline_keyboard: [[{ text: '🔙 Cancel', callback_data: `admin_cprices_${targetId}` }]] } }
     ).catch(() => {});

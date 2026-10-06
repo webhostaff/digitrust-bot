@@ -1,6 +1,7 @@
 'use strict';
 
 const db = require('./db');
+const { normalizeTxidInput, txidAlternates } = require('../utils/txid');
 const subPricing = require('../utils/subscriptionPricing');
 const { TIER_COLUMNS } = require('../utils/bulkTiers');
 
@@ -2729,12 +2730,14 @@ module.exports = {
   },
 
   // Generic used-TxID checks (Binance verified deposits — TRC20 + BEP20 + Binance Pay)
-  isTxidUsed: (txid) => !!getUsedTxid.get(txid),
+  // V146: an off-chain id counts as used in ANY of its spellings (418351948005 · Off-chain Transfer 418351948005 …).
+  isTxidUsed: (txid) => txidAlternates(txid).some((x) => !!getUsedTxid.get(x)),
   saveUsedTxid: (data) => {
     const res = insertUsedTxid.run({
       asset:   'USDT',
       address: null,
       ...data,
+      txid:    normalizeTxidInput(data.txid),       // an off-chain id is always stored in Binance's spelling
     });
     return res.lastInsertRowid;
   },
@@ -3012,13 +3015,23 @@ module.exports = {
    *
    * @returns {null|{price, limit, used, remaining, unlimited, note}}
    */
-  getCustomerAllowance: (userId, productId) => {
-    const row = db.prepare(`
-      SELECT price, qty_limit, note FROM customer_prices
+  getCustomerAllowance: (userId, productId, quantity = null) => {
+    // A special price can START from a quantity ("from 10 units"): it applies only to an order of at
+    // least that many, and of several such steps the highest one reached wins. Until V146 the
+    // minimum was stored but never read, so every special price applied from one unit.
+    // Callers that have no quantity (a status screen, the post-purchase note) get the lowest step.
+    const rows = db.prepare(`
+      SELECT price, qty_limit, note, min_qty FROM customer_prices
       WHERE user_id = ? AND product_id = ?
-      ORDER BY min_qty ASC LIMIT 1
-    `).get(userId, productId);
-    if (!row) return null;
+      ORDER BY min_qty ASC
+    `).all(userId, productId);
+    if (!rows.length) return null;
+    let row = rows[0];
+    if (quantity != null) {
+      const q = Math.max(1, Number(quantity) || 1);
+      row = [...rows].reverse().find((r) => Number(r.min_qty) <= q);
+      if (!row) return null;                    // below every minimum: the normal price
+    }
 
     const used = db.prepare(`
       SELECT COALESCE(SUM(units), 0) AS n FROM customer_price_usage
@@ -3028,6 +3041,7 @@ module.exports = {
     const limit = Number(row.qty_limit) || 0;
     return {
       price: Number(row.price),
+      minQty: Math.max(1, Number(row.min_qty) || 1),
       limit,
       used,
       unlimited: limit === 0,
@@ -3052,7 +3066,7 @@ module.exports = {
     const qty = Math.max(1, Number(quantity) || 1);
     const normal = calcOrderPrice(product, qty);
 
-    const allowance = module.exports.getCustomerAllowance(userId, product.id);
+    const allowance = module.exports.getCustomerAllowance(userId, product.id, qty);
     if (!allowance) {
       return {
         total: normal.total, unitPrice: normal.unitPrice,
@@ -3060,6 +3074,8 @@ module.exports = {
         normalUnits: qty, normalUnitPrice: normal.unitPrice,
         hasAllowance: false, remainingAfter: 0,
         discount: normal.discount, discountApplied: normal.discountApplied,
+        // This customer HAS a special price, just not for so few units: tell them where it starts.
+        nextTier: module.exports.getNextCustomerTier(userId, product.id, qty),
       };
     }
 
@@ -3082,7 +3098,19 @@ module.exports = {
       unlimited: allowance.unlimited,
       remainingAfter: allowance.unlimited ? Infinity : allowance.remaining - specialUnits,
       discount: 0, discountApplied: false,
+      minQty: allowance.minQty,
     };
+  },
+
+  /** The smallest step of this customer's special price that a bigger order than `quantity` would reach. */
+  getNextCustomerTier: (userId, productId, quantity = 1) => {
+    const q = Math.max(1, Number(quantity) || 1);
+    const row = db.prepare(`
+      SELECT price, min_qty FROM customer_prices
+      WHERE user_id = ? AND product_id = ? AND min_qty > ?
+      ORDER BY min_qty ASC LIMIT 1
+    `).get(userId, productId, q);
+    return row ? { minQty: Number(row.min_qty), price: Number(row.price) } : null;
   },
 
   /**
@@ -3137,8 +3165,13 @@ module.exports = {
    */
   productForCustomer: (userId, product, quantity = 1) => {
     if (!product || !userId) return product;
-    const allowance = module.exports.getCustomerAllowance(userId, product.id);
-    if (!allowance || allowance.remaining <= 0) return product;
+    const allowance = module.exports.getCustomerAllowance(userId, product.id, quantity);
+    if (!allowance || allowance.remaining <= 0) {
+      // A special price that starts from more units is not shown as THE price (it would be false for
+      // one unit) but the customer is told it exists.
+      const next = allowance ? null : module.exports.getNextCustomerTier(userId, product.id, quantity);
+      return next ? { ...product, customFrom: next } : product;
+    }
     return {
       ...product,
       price: allowance.price,
@@ -3146,6 +3179,7 @@ module.exports = {
       hasCustomPrice: true,
       allowanceRemaining: allowance.remaining,
       allowanceUnlimited: allowance.unlimited,
+      customMinQty: allowance.minQty,
       bulk_tier1_qty: 0, bulk_tier1_price: 0,
       bulk_tier2_qty: 0, bulk_tier2_price: 0,
       bulk_tier3_qty: 0, bulk_tier3_price: 0,
@@ -3169,6 +3203,30 @@ module.exports = {
         updated_at = datetime('now')
     `).run(userId, productId, Number(price), note, adminId,
            Math.max(1, Number(minQty) || 1), Math.max(0, Number(qtyLimit) || 0)),
+
+  /**
+   * Change a special price in place — price, the quantity it starts from, the unit limit, the note.
+   * The starting quantity is part of the key, so moving it onto a step that already exists is refused
+   * rather than silently merging the two.
+   * @returns {{ok:boolean, reason?:string, before?:object, after?:object}}
+   */
+  updateCustomerPrice: ({ userId, productId, oldMinQty, price, minQty, qtyLimit, note }) => {
+    const before = db.prepare('SELECT * FROM customer_prices WHERE user_id = ? AND product_id = ? AND min_qty = ?')
+      .get(userId, productId, oldMinQty);
+    if (!before) return { ok: false, reason: 'that special price no longer exists' };
+    const newMin = Math.max(1, Number(minQty) || 1);
+    if (newMin !== Number(before.min_qty)
+        && db.prepare('SELECT 1 FROM customer_prices WHERE user_id = ? AND product_id = ? AND min_qty = ?').get(userId, productId, newMin)) {
+      return { ok: false, reason: `a special price from ${newMin} units already exists for this product — edit or delete that one first` };
+    }
+    const newPrice = Number(price);
+    if (!Number.isFinite(newPrice) || newPrice < 0) return { ok: false, reason: 'invalid price' };
+    db.prepare(`UPDATE customer_prices SET price = ?, min_qty = ?, qty_limit = ?, note = ?, updated_at = datetime('now')
+                WHERE user_id = ? AND product_id = ? AND min_qty = ?`)
+      .run(newPrice, newMin, Math.max(0, Number(qtyLimit) || 0), note == null ? null : String(note), userId, productId, oldMinQty);
+    const after = db.prepare('SELECT * FROM customer_prices WHERE user_id = ? AND product_id = ? AND min_qty = ?').get(userId, productId, newMin);
+    return { ok: true, before, after };
+  },
 
   // minQty null removes every tier for that product.
   removeCustomerPrice: (userId, productId, minQty = null) => (

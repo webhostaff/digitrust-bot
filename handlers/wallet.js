@@ -11,7 +11,7 @@ const {
 } = require('../utils/keyboard');
 const { formatPrice, PAYMENT_CONFIRM_VALIDITY_MIN, checkPaymentWindow } = require('../utils/format');
 const {
-  verifyDepositByTxId, verifyBinancePayOrder, TXID_RE,
+  verifyDepositByTxId, verifyBinancePayOrder, TXID_RE, isTxidInput,
 } = require('../services/binance');
 const cryptobot = require('../services/cryptobot');
 const logger = require('../utils/logger');
@@ -37,6 +37,7 @@ function minDepositLabel() {
 }
 
 // Track TXIDs currently being verified to prevent rapid duplicate submissions
+const { normalizeTxidInput } = require('../utils/txid');
 const PROCESSING_TXIDS = new Set();
 
 /** 29.37 → "29.37"; 29.137 → "29.137" (never trailing zeros beyond 2). */
@@ -75,7 +76,7 @@ async function scanDepositsOnce(bot) {
     const history = await require('../services/binance').fetchDepositHistory({ coin: 'USDT', startTime: since, endTime: Date.now() });
     for (const d of history || []) {
       if (![1, 6].includes(Number(d.status))) continue;          // 1 = success, 6 = credited (locked)
-      const id = String(d.txId || '').trim() || `binance-deposit-${d.id}`;
+      const id = normalizeTxidInput(String(d.txId || '').trim()) || `binance-deposit-${d.id}`;
       if (db.isTxidUsed(id) || PROCESSING_TXIDS.has(id)) continue;
       const offchain = Number(d.transferType) === 1 || /off-?chain|internal/i.test(id);
       const mapped = NET_FROM_BINANCE[String(d.network || '').toUpperCase()];
@@ -345,7 +346,7 @@ async function handleUsdtTxId(bot, msg) {
   const userId = msg.from.id;
   const lang   = db.getUserLanguage ? db.getUserLanguage(userId) : 'en';
   const chatId = msg.chat.id;
-  const txid   = (msg.text || '').trim();
+  const txid   = normalizeTxidInput((msg.text || '').trim());      // an off-chain id in ANY spelling becomes one
 
   // ── PAYMENT WINDOW EXPIRY CHECK (shared 20-minute window) ──
   const sess = session.get(userId);
@@ -358,7 +359,7 @@ async function handleUsdtTxId(bot, msg) {
     return;
   }
 
-  if (!TXID_RE.test(txid)) {
+  if (!isTxidInput(txid)) {
     await bot.sendMessage(chatId, t(lang, 'wallet_invalid_txid'), { parse_mode: 'HTML' });
     return;
   }
@@ -445,6 +446,7 @@ async function handleUsdtTxId(bot, msg) {
     // belongs to this user.
     // ══════════════════════════════════════════════════════════════════
     const strict = db.getSetting('deposit_strict_mode', '1') === '1';
+    let strictIntent = null;
 
     // A stale transfer with no reservation behind it is the harvesting attack:
     // refuse it outright and never write it to the review queue, so it cannot
@@ -459,7 +461,11 @@ async function handleUsdtTxId(bot, msg) {
     }
 
     if (strict) {
-      const intent = db.findIntentForDeposit(result.network, result.amount);
+      // An off-chain transfer has no network (it never touched a blockchain): the reservation can be
+      // on any of them. The automatic scan does the same.
+      const intent = result.offchain
+        ? ['BEP20', 'TRC20', 'TON'].map((n) => db.findIntentForDeposit(n, result.amount)).find(Boolean)
+        : db.findIntentForDeposit(result.network, result.amount);
 
       // (a) No reservation at all → never auto-credit. Park it for the admin.
       if (!intent) {
@@ -543,6 +549,7 @@ async function handleUsdtTxId(bot, msg) {
         return;
       }
 
+      strictIntent = intent;
       // (d) Consume the reservation atomically — it can never be reused.
       if (!db.claimDepositIntent(intent.id, txid)) {
         await bot.sendMessage(chatId, '⚠️ This reservation was already used. Please start a new top-up.',
@@ -555,13 +562,15 @@ async function handleUsdtTxId(bot, msg) {
     // It cleared — remove it from the "waiting" list support is watching.
     db.clearPendingDeposit(txid);
 
+    // For an off-chain transfer the wallet is credited under the reservation's network.
+    const creditNet = result.offchain && strictIntent ? strictIntent.network : result.network;
     await creditFromVerifiedDeposit(bot, chatId, userId, {
       identifier: txid,
       amount: result.amount,
-      network: result.network,
+      network: creditNet,
       asset:   result.asset,
       address: result.address,
-      method:  `USDT ${result.network}`,
+      method:  result.offchain ? `USDT ${creditNet} · Binance internal` : `USDT ${result.network}`,
     });
   } finally {
     PROCESSING_TXIDS.delete(txid);
