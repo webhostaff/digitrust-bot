@@ -54,6 +54,8 @@ function normalizeGuardUrl(raw) {
     return String(raw).trim();
   }
 }
+const cgbRouting = require('./cgbRouting');
+const cgbBots = require('./cgbBots');
 const GUARD_URL_RAW = process.env.GUARD_AUTO_INVITE_URL || '';
 const GUARD_URL    = normalizeGuardUrl(GUARD_URL_RAW);
 function guardUrlValid() { try { new URL(GUARD_URL); return true; } catch (_) { return false; } }      // e.g. https://chatgpt-business-guard-production.up.railway.app/auto-invite
@@ -78,17 +80,28 @@ async function fetchWithTimeout(url, opts) {
  * temporarily unreachable. The guard's own queue/batch/seat-purchase logic
  * takes over from here; results come back later via handleGuardCallback.
  */
-async function notifyGuardOfNewInvite(email, { orderId = null } = {}) {
-  if (!GUARD_URL || !SHARED_SECRET) return; // integration not configured (the startup log says so)
+async function notifyGuardOfNewInvite(email, { orderId = null, endDate = null } = {}) {
+  if (!GUARD_URL || !SHARED_SECRET) return null; // integration not configured (the startup log says so)
   if (!guardUrlValid()) {
     logger.warn(`[cgbGuard] order #${orderId} NOT sent to the invite bot: GUARD_AUTO_INVITE_URL is not a valid address ("${GUARD_URL_RAW}")`);
-    return;
+    return { ok: false, reason: 'the invite-bot address is not valid' };
   }
   const clean = String(email || '').trim().toLowerCase();
-  if (!clean || !clean.includes('@')) return;
+  if (!clean || !clean.includes('@')) return null;
+  // V147: a cycle LINKED to a panel of the main bot goes there, strictly (each cycle is its own workspace).
+  // V148: otherwise the ACTIVE bot (one bot per panel, one working at a time) gets it; with none, the main bot as before.
+  let target = cgbRouting.resolveTarget(endDate, GUARD_PANEL);
+  const active = target.source === 'cycle' ? null : cgbBots.activeBot();
+  let botId = cgbBots.DEFAULT_ID, base = GUARD_URL;
+  if (active && !active.isDefault) {
+    base = `${active.origin}/auto-invite`;
+    botId = active.id;
+    target = { panel: active.panel || '', strict: false, source: 'bot', endDay: target.endDay };
+  }
   try {
-    const url = new URL(GUARD_URL);
-    if (GUARD_PANEL) url.searchParams.set('panel', GUARD_PANEL);
+    const url = new URL(base);
+    if (target.panel) url.searchParams.set('panel', target.panel);
+    if (target.strict) url.searchParams.set('strict', '1');          // exactly that panel, never another
     const resp = await fetchWithTimeout(url.toString(), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Invite-Secret': SHARED_SECRET },
@@ -97,11 +110,22 @@ async function notifyGuardOfNewInvite(email, { orderId = null } = {}) {
     const text = await resp.text().catch(() => '');
     if (!resp.ok) {
       logger.warn(`[cgbGuard] auto-invite POST for ${clean} (order #${orderId}) → HTTP ${resp.status}: ${text.slice(0, 300)}`);
-      return;
+      let reason = `HTTP ${resp.status}`;
+      try {
+        const j = JSON.parse(text);
+        if (j.error === 'unknown_panel') reason = `the invite bot has no panel called "${target.panel}"`;
+        else if (j.error) reason = j.error;
+      } catch (_) { /* not JSON: keep the status */ }
+      return { ok: false, status: resp.status, panel: target.panel, source: target.source, bot: botId, reason };
     }
-    logger.info(`[cgbGuard] queued ${clean} (order #${orderId}) with the guard bot: ${text.slice(0, 200)}`);
+    logger.info(`[cgbGuard] queued ${clean} (order #${orderId}) with the guard bot${botId !== cgbBots.DEFAULT_ID ? ` "${active.name}"` : ''}` +
+      `${target.panel ? ` → panel ${target.panel}${target.source === 'cycle' ? ` (cycle ending on the ${target.endDay}th)` : ''}` : ''}: ${text.slice(0, 200)}`);
+    let panelState = null;
+    try { panelState = JSON.parse(text).panel_state || null; } catch (_) { /* old invite bot */ }
+    return { ok: true, status: resp.status, panel: target.panel, source: target.source, bot: botId, panelState };
   } catch (e) {
     logger.warn(`[cgbGuard] could not reach the guard bot for ${clean} (order #${orderId}): ${e.message}`);
+    return { ok: false, panel: target.panel, source: target.source, bot: botId, reason: `could not reach the invite bot (${e.message})` };
   }
 }
 
@@ -174,29 +198,45 @@ function makeGuardWebhookHandler({ queries, logger: log, activateAndNotifySeat, 
  * 'not_found', or 'unreachable' if the call failed, or null when the
  * integration isn't configured.
  */
-async function cancelGuardInvite(email, { orderId = null } = {}) {
+async function cancelGuardInvite(email, { orderId = null, endDate = null } = {}) {
   if (!GUARD_URL || !SHARED_SECRET) return null;
   const clean = String(email || '').trim().toLowerCase();
   if (!clean.includes('@')) return null;
-  try {
-    const url = new URL(GUARD_URL);
-    url.pathname = url.pathname.replace(/auto-invite\/?$/, 'cancel-invite');
-    const resp = await fetchWithTimeout(url.toString(), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Invite-Secret': SHARED_SECRET },
-      body: JSON.stringify({ email: clean, ...(GUARD_PANEL ? { panel: GUARD_PANEL } : {}) }),
-    });
-    const body = await resp.json().catch(() => ({}));
-    if (!resp.ok || !body.status) {
-      logger.warn(`[cgbGuard] cancel-invite for ${clean} (order #${orderId}) → HTTP ${resp.status}: ${JSON.stringify(body).slice(0, 200)}`);
+  const cancelPanel = cgbRouting.resolveTarget(endDate, GUARD_PANEL).panel;     // the panel the invite went to (main bot)
+
+  // V148: with several bots the order may sit in ANY of them (the active one can have changed since the
+  // purchase), so each is asked; the cancel is harmless where the email is not.
+  const asks = [];
+  const seen = new Set();
+  const addAsk = (origin, pathBase, panel) => { const k = origin + '|' + panel; if (!seen.has(k)) { seen.add(k); asks.push({ origin, pathBase, panel }); } };
+  if (guardUrlValid()) addAsk(new URL(GUARD_URL).origin, GUARD_URL, cancelPanel);
+  for (const bot of cgbBots.list()) if (!bot.isDefault) addAsk(bot.origin, `${bot.origin}/auto-invite`, bot.panel || '');
+
+  const ask = async ({ pathBase, panel }) => {
+    try {
+      const url = new URL(pathBase);
+      url.pathname = url.pathname.replace(/auto-invite\/?$/, 'cancel-invite');
+      const resp = await fetchWithTimeout(url.toString(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Invite-Secret': SHARED_SECRET },
+        body: JSON.stringify({ email: clean, ...(panel ? { panel } : {}) }),
+      });
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok || !body.status) {
+        logger.warn(`[cgbGuard] cancel-invite for ${clean} (order #${orderId}) → HTTP ${resp.status}: ${JSON.stringify(body).slice(0, 200)}`);
+        return 'unreachable';
+      }
+      logger.info(`[cgbGuard] cancel-invite for ${clean} (order #${orderId}): ${body.status}`);
+      return body.status;
+    } catch (e) {
+      logger.warn(`[cgbGuard] could not reach the guard bot to cancel ${clean} (order #${orderId}): ${e.message}`);
       return 'unreachable';
     }
-    logger.info(`[cgbGuard] cancel-invite for ${clean} (order #${orderId}): ${body.status}`);
-    return body.status;
-  } catch (e) {
-    logger.warn(`[cgbGuard] could not reach the guard bot to cancel ${clean} (order #${orderId}): ${e.message}`);
-    return 'unreachable';
-  }
+  };
+  const results = await Promise.all(asks.map(ask));
+  for (const wanted of ['removed', 'processing', 'already_invited']) if (results.includes(wanted)) return wanted;
+  if (results.includes('unreachable')) return 'unreachable';
+  return results.length ? 'not_found' : 'unreachable';
 }
 
 // Say at startup whether the integration is on — "nothing happens" used to
@@ -284,4 +324,13 @@ async function fetchGuardReport() {
   }
 }
 
-module.exports = { notifyGuardOfNewInvite, makeGuardWebhookHandler, cancelGuardInvite, diagnose, fetchGuardReport, _normalizeGuardUrl: normalizeGuardUrl };
+/** The panel ids the invite bot has (for the cycles screen). null = unreachable / not configured. */
+async function fetchGuardPanels() {
+  if (!GUARD_URL || !guardUrlValid()) return null;
+  return cgbRouting.listGuardPanels(GUARD_URL);
+}
+
+/** The main bot's address, secret and default panel — the registry of bots builds on it. */
+function getConfig() { return { url: GUARD_URL, secret: SHARED_SECRET, panel: GUARD_PANEL, valid: !!GUARD_URL && guardUrlValid() }; }
+
+module.exports = { getConfig, fetchGuardPanels, notifyGuardOfNewInvite, makeGuardWebhookHandler, cancelGuardInvite, diagnose, fetchGuardReport, _normalizeGuardUrl: normalizeGuardUrl };

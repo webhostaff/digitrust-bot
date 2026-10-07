@@ -1076,6 +1076,28 @@ async function showSeatCyclePicker(chatId, target, email) {
  * active), never thrown, so callers (a Telegram handler or an HTTP route)
  * can each report it their own way.
  */
+/**
+ * Hand a paid seat's email to the invite bot — to the panel of the seat's CYCLE — and tell the owner
+ * when that fails. Until V147 a failure here was only a line in the log: the paid customer simply
+ * never got an invite and nobody knew.
+ */
+async function handOverToGuard(email, orderId, endDate) {
+  let r = null;
+  try { r = await cgbGuard.notifyGuardOfNewInvite(email, { orderId, endDate }); }
+  catch (e) { r = { ok: false, reason: e.message }; }
+  if (r && r.ok === false) {
+    await bot.sendMessage(ADMIN_ID,
+      `⚠️ <b>Order #${orderId} was NOT handed to the invite bot</b>\n📧 <code>${escapeHtml(email || '')}</code>\n` +
+      `${r.bot && r.bot !== 'main' ? `Bot: <b>${escapeHtml((require('./services/cgbBots').get(r.bot) || {}).name || r.bot)}</b> (the active one)\n` : ''}` +
+      `${r.panel ? `Panel: <code>${escapeHtml(r.panel)}</code>${r.source === 'cycle' ? ' (linked to its cycle)' : ''}\n` : ''}` +
+      `Reason: ${escapeHtml(r.reason || 'unknown')}\n\n<i>Invite this customer yourself, or fix the link in 📅 Cycles and add the email again.</i>`,
+      { parse_mode: 'HTML' }).catch(() => {});
+  } else if (r && r.ok && r.panelState && r.panelState !== 'online') {
+    logger.info(`order #${orderId}: panel ${r.panel} is ${r.panelState}; the order waits in its queue`);
+  }
+  return r;
+}
+
 /** The buttons of a finished (green) card: the done mark, and the way to correct its dates. */
 function activeCardMarkup(orderId) {
   return { inline_keyboard: [
@@ -1400,7 +1422,7 @@ async function cancelSeatOrder(orderIdRaw, { refundToWallet }) {
     }
   }
 
-  const guard = await cgbGuard.cancelGuardInvite(sub.email, { orderId }).catch(() => 'unreachable');
+  const guard = await cgbGuard.cancelGuardInvite(sub.email, { orderId, endDate: sub.end_date }).catch(() => 'unreachable');
 
   try {
     await bot.sendMessage(Number(sub.user_id),
@@ -2260,7 +2282,7 @@ async function confirmPayment(chatId, userId, orderId, txid, sessionData) {
       reply_markup: orderCardButtons(card),
     });
     try { queries.saveCgbAdminCard(orderId, sentCard.chat.id, sentCard.message_id); } catch (e) {}
-    cgbGuard.notifyGuardOfNewInvite(sessionData.email, { orderId }).catch(() => {});
+    handOverToGuard(sessionData.email, orderId, card.endDate).catch(() => {});
   } catch (e) {}
 }
 
@@ -2352,7 +2374,7 @@ async function confirmCryptobotPayment(invoiceId, paidAmount, orderId, userId) {
       reply_markup: orderCardButtons(card),
     });
     try { queries.saveCgbAdminCard(orderId, sentCard.chat.id, sentCard.message_id); } catch (e) {}
-    cgbGuard.notifyGuardOfNewInvite(sub.email, { orderId }).catch(() => {});
+    handOverToGuard(sub.email, orderId, card.endDate).catch(() => {});
   } catch (e) {
     logger.warn(`confirmCryptobotPayment: could not notify admin: ${e.message}`);
   }

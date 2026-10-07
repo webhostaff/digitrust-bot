@@ -28,6 +28,11 @@ const subPricing = require('../utils/subscriptionPricing');
 const cgbCycles = require('../services/cgbCycles');
 const notices   = require('../services/notices');
 const { plainDelivery, formatPrice, formatPriceExact, escapeHtml, expandPremiumEmojis, scaleTiersProportionally, productEmojiId, calcOrderPrice } = require('../utils/format');
+const cgbRouting = require('../services/cgbRouting');
+const cgbBots = require('../services/cgbBots');
+const cgbGuard = require('../services/cgbGuard');
+const reportAdmin = require('./reportAdmin');
+const cgbEmailsAdmin = require('./cgbEmailsAdmin');
 const referralAdmin = require('./referralAdmin');
 const {
   publishToChannel, publishToGroup, broadcastToUsers, autoPublish, autoPublishWithPhoto,
@@ -300,6 +305,51 @@ async function handleAdminText(bot, msg) {
       { parse_mode: 'HTML',
         reply_markup: { inline_keyboard: [[{ text: '💲 Special Prices', callback_data: `admin_cprices_${targetId}` }]] } }
     );
+    return;
+  }
+
+  // ── Registering another invite bot ──────────────────────────────────────
+  if (s === States.ADMIN_CGB_BOT_ADD) {
+    const parsed = cgbBots.parseAddInput(text);
+    if (!parsed.ok) { await bot.sendMessage(chatId, `❌ ${escapeHtml(parsed.reason)}`, { parse_mode: 'HTML' }); return; }
+    // It must exist and accept the secret: a typo here would silently send paid orders nowhere.
+    const probe = await cgbBots.status({ id: 'probe', name: parsed.name, origin: parsed.origin, panel: parsed.panel });
+    if (probe.state === 'unreachable') { await bot.sendMessage(chatId, `❌ I cannot reach <code>${escapeHtml(parsed.origin)}</code> (${escapeHtml(probe.error || 'no answer')}). Deploy it first, check the address, then add it.`, { parse_mode: 'HTML' }); return; }
+    if (probe.state === 'unauthorized') { await bot.sendMessage(chatId, `❌ It answered, but the secret does not match. Set AUTO_INVITE_SECRET there to the same value as GUARD_SECRET here.`); return; }
+    const r = cgbBots.add(parsed);
+    if (!r.ok) { await bot.sendMessage(chatId, `❌ ${escapeHtml(r.reason)}`, { parse_mode: 'HTML' }); return; }
+    session.clear(userId);
+    logger.info(`Admin ${userId} registered invite bot ${r.bot.id} (${r.bot.origin})`);
+    await bot.sendMessage(chatId,
+      `✅ <b>${escapeHtml(r.bot.name)}</b> added — it is ${probe.state === 'old_build' ? '🟠 an OLD build (update it to switch it remotely)' : probe.state === 'no_session' ? '🟡 waiting for its session file' : probe.state === 'running' ? '🟢 working' : '⚪ off'}.\n` +
+      `<i>It does not receive orders until you make it the working bot.</i>`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🤖 Invite bots', callback_data: 'admin_cgb_bots' }]] } });
+    return;
+  }
+
+  // ── The invite-bot panel of a cycle, typed ──────────────────────────────
+  if (s === States.ADMIN_CGB_CYCLE_PANEL) {
+    const cyc = db.getBillingCycles().find((c) => c.id === d.cgbCycleId);
+    if (!cyc) { session.clear(userId); await bot.sendMessage(chatId, '❌ That cycle no longer exists.'); return; }
+    const id = String(text).trim();
+    if (!cgbRouting.PANEL_ID_RE.test(id)) {
+      await bot.sendMessage(chatId, '❌ A panel id is letters, digits, "-", "_" or "." with no spaces, e.g. <code>panel26</code>.', { parse_mode: 'HTML' });
+      return;
+    }
+    const known = await cgbGuard.fetchGuardPanels();
+    if (known && !known.includes(id)) {
+      await bot.sendMessage(chatId,
+        `❌ The invite bot has no panel called <code>${escapeHtml(id)}</code>.\nIt has: ${known.map((k) => `<code>${escapeHtml(k)}</code>`).join(', ') || '—'}\n\nSend one of them.`,
+        { parse_mode: 'HTML' });
+      return;
+    }
+    cgbRouting.setCyclePanel(cyc.end_day, id);
+    session.clear(userId);
+    logger.info(`Admin ${userId} linked the cycle ending on the ${cyc.end_day}th to invite-bot panel ${id} (typed)`);
+    await bot.sendMessage(chatId,
+      `✅ Cycle <b>Day ${cyc.start_day} → ${cyc.end_day}</b> → panel <code>${escapeHtml(id)}</code>` +
+      (known === null ? `\n⚠️ <i>The invite bot could not be reached, so I could not check that this panel exists.</i>` : ''),
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '📅 Cycles', callback_data: 'admin_cgb_cycles' }]] } });
     return;
   }
 
@@ -2731,6 +2781,9 @@ async function handleAdminCallback(bot, query) {
 
   // 🎁 Referrals (V143): programme switch, ranking, per-person block, CSV
   if (/^admin_ref/.test(data) && await referralAdmin.handle(bot, query)) return;
+  // 📄 Binance Report (V149) and 📧 the store bot's emails
+  if (/^admin_binrep/.test(data) && await reportAdmin.handle(bot, query)) return;
+  if (/^admin_cgb_emails/.test(data) && await cgbEmailsAdmin.handle(bot, query)) return;
 
   /**
    * Draw the ordering screen for the list the admin picked.
@@ -7271,6 +7324,7 @@ async function handleAdminCallback(bot, query) {
         [{ text: '📋 Active Subscriptions', callback_data: 'admin_cgb_active' }],
         [{ text: '💰 Set Monthly Price', callback_data: 'admin_cgb_setprice' }],
         [{ text: '📅 Manage Cycles', callback_data: 'admin_cgb_cycles' }],
+        [{ text: '🤖 Invite bots', callback_data: 'admin_cgb_bots' }, { text: '📧 Emails', callback_data: 'admin_cgb_emails' }],
         [{ text: '🔄 Renewals', callback_data: 'admin_cgb_renewals' }],
         [{ text: '🕒 Cycle end time', callback_data: 'admin_cgb_manual' }],
         [{ text: '🔙 Back', callback_data: 'admin_panel' }],
@@ -7569,6 +7623,160 @@ async function handleAdminCallback(bot, query) {
   }
 
   // ── Manage Cycles ──
+  // ── 🤖 Invite bots: one bot per panel, one working at a time (V148) ──────────────
+  if (data === 'admin_cgb_bots') {
+    const bots = cgbBots.list();
+    const active = cgbBots.activeBot();
+    const sts = await Promise.all(bots.map((b) => cgbBots.status(b)));
+    const ICON = { running: '🟢', stopped: '⚪', paused: '🟠', no_session: '🟡', unreachable: '🔴', unauthorized: '🔴', old_build: '🟠', unknown: '🔴' };
+    const WORD = { running: 'working', stopped: 'off', paused: 'paused (a problem)', no_session: 'no session yet', unreachable: 'cannot be reached', unauthorized: 'secret does not match', old_build: 'old build (update it)', unknown: 'unknown' };
+    let txt = `🤖 <b>Invite bots</b>\n━━━━━━━━━━━━━━━━━━\n` +
+      `One bot per panel. <b>Only one works at a time</b>: switching turns the others off.\n\n`;
+    if (!bots.length) txt += `<i>No invite bot is configured (GUARD_AUTO_INVITE_URL / GUARD_SECRET).</i>\n`;
+    for (const st of sts) {
+      const isActive = active ? active.id === st.bot.id : st.bot.isDefault;
+      txt += `${ICON[st.state] || '⚪'} <b>${escapeHtml(st.bot.name)}</b>${isActive ? '  👉 <b>NEW ORDERS GO HERE</b>' : ''}\n` +
+             `    ${WORD[st.state] || st.state}${st.queued ? ` · ⏳ ${st.queued} invite(s) waiting` : ''}` +
+             `${st.bot.panel ? ` · panel <code>${escapeHtml(st.bot.panel)}</code>` : ''}${st.bot.isDefault ? ' · <i>from GUARD_AUTO_INVITE_URL</i>' : ''}\n`;
+    }
+    txt += `\n<i>A bot is never turned off while paid invites wait in its queue unless you insist. All bots must use the same secret (AUTO_INVITE_SECRET = GUARD_SECRET).</i>`;
+    const kb = [];
+    for (const st of sts) {
+      const isActive = active ? active.id === st.bot.id : st.bot.isDefault;
+      const row = [];
+      if (!isActive || st.state !== 'running') row.push({ text: `▶️ Make “${st.bot.name}” the working bot`.slice(0, 60), callback_data: `admin_cgb_bsw_${st.bot.id}` });
+      if (!st.bot.isDefault) row.push({ text: '🗑', callback_data: `admin_cgb_bdel_${st.bot.id}` });
+      if (row.length) kb.push(row);
+    }
+    kb.push([{ text: '➕ Add a bot', callback_data: 'admin_cgb_badd' }, { text: '🔄 Refresh', callback_data: 'admin_cgb_bots' }]);
+    kb.push([{ text: '🔙 Back', callback_data: 'admin_cgb_panel' }]);
+    try { await bot.editMessageText(txt, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } }); }
+    catch (e) { await bot.sendMessage(chatId, txt, { parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } }); }
+    return;
+  }
+
+  if (/^admin_cgb_bsw_[\w-]+$/.test(data)) {
+    const id = data.replace('admin_cgb_bsw_', '');
+    const plan = await cgbBots.planSwitch(id);
+    let txt = `🔀 <b>Make “${escapeHtml(plan.target ? plan.target.name : id)}” the working bot</b>\n\n`;
+    const kb = [];
+    if (!plan.ok) {
+      txt += `❌ <b>Cannot switch:</b>\n` + plan.blockers.map((b) => `• ${escapeHtml(b)}`).join('\n') + `\n\n<i>Nothing was changed.</i>`;
+    } else {
+      txt += (plan.toStop.length
+        ? `⏸ <b>Will be turned OFF:</b>\n` + plan.toStop.map((x) => `• ${escapeHtml(x.bot.name)}${x.queued ? ` — ⚠️ ${x.queued} invite(s) still waiting in it` : ''}`).join('\n') + '\n'
+        : `<i>No other bot is working.</i>\n`) +
+        `▶️ <b>Will be turned ON:</b> ${escapeHtml(plan.target.name)}\n` +
+        `📥 New orders will go to <b>${escapeHtml(plan.target.name)}</b>.\n` +
+        (plan.warnings.length ? `\n⚠️ ` + plan.warnings.map((w) => escapeHtml(w)).join('\n⚠️ ') + '\n' : '');
+      if (plan.waiting.length) {
+        txt += `\n🚨 <b>Invites are waiting in a bot that would be turned off.</b> They are NOT lost: they wait in that bot's queue until you turn it on again — but those customers would not be invited meanwhile.`;
+        kb.push([{ text: '⚠️ Switch anyway', callback_data: `admin_cgb_bgof_${id}` }]);
+      } else {
+        kb.push([{ text: '✅ Switch now', callback_data: `admin_cgb_bgo_${id}` }]);
+      }
+    }
+    kb.push([{ text: '🔙 Cancel', callback_data: 'admin_cgb_bots' }]);
+    await bot.editMessageText(txt, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } }).catch(() => {});
+    return;
+  }
+
+  if (/^admin_cgb_bgof?_[\w-]+$/.test(data)) {
+    const force = data.startsWith('admin_cgb_bgof_');
+    const id = data.replace(/^admin_cgb_bgof?_/, '');
+    const r = await cgbBots.switchTo(id, { force });
+    logger.info(`Admin ${userId} switched the working invite bot to ${id} (force=${force}): ${r.ok ? 'ok' : 'refused'}`);
+    const name = (cgbBots.get(id) || {}).name || id;
+    await bot.editMessageText(
+      (r.ok ? `✅ <b>“${escapeHtml(name)}” is now the working bot</b>\n\n` : `❌ <b>Not switched</b>\n\n`) +
+      r.lines.map((l) => escapeHtml(l)).join('\n') +
+      (r.ok ? '' : `\n\n<i>${r.needsForce ? 'Nothing was left half-done.' : 'Nothing was changed.'}</i>`),
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🤖 Invite bots', callback_data: 'admin_cgb_bots' }]] } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (data === 'admin_cgb_badd') {
+    session.set(userId, States.ADMIN_CGB_BOT_ADD, {});
+    await bot.editMessageText(
+      `➕ <b>Add an invite bot</b>\n\nSend its name and its address:\n<code>Cycle9 https://guard-9.up.railway.app</code>\n\n` +
+      `<i>Each bot is its own Railway service with its own Telegram bot. Give it the SAME AUTO_INVITE_SECRET as GUARD_SECRET here. ` +
+      `If that bot has several panels, add the panel id at the end.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Cancel', callback_data: 'admin_cgb_bots' }]] } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_cgb_bdel_[\w-]+$/.test(data)) {
+    const id = data.replace('admin_cgb_bdel_', '');
+    const r = cgbBots.remove(id);
+    await answer(r.ok ? '🗑 Removed' : `❌ ${r.reason}`);
+    return await handleAdminCallback(bot, { ...query, data: 'admin_cgb_bots' });
+  }
+
+  // ── 🤖 The invite-bot panel of one cycle (V147) ───────────────────────────────
+  if (/^admin_cgb_cpanel_\d+$/.test(data)) {
+    const cid = parseInt(data.split('_').pop(), 10);
+    const cyc = db.getBillingCycles().find((c) => c.id === cid);
+    if (!cyc) { await answer('❌ That cycle no longer exists'); return; }
+    const current = cgbRouting.panelMap()[String(cyc.end_day)] || null;
+    const ids = await cgbGuard.fetchGuardPanels();                 // null = the invite bot cannot be reached
+    const rows = [];
+    if (ids && ids.length) {
+      for (let i = 0; i < ids.length; i += 2) {
+        rows.push(ids.slice(i, i + 2).map((id) => ({ text: `${id === current ? '✅ ' : ''}${id}`.slice(0, 40), callback_data: `admin_cgb_cpset_${cid}_${id}` })));
+      }
+    }
+    rows.push([{ text: '✏️ Type a panel id', callback_data: `admin_cgb_cptype_${cid}` }]);
+    if (current) rows.push([{ text: '🚫 Unlink (use the default panel)', callback_data: `admin_cgb_cpclr_${cid}` }]);
+    rows.push([{ text: '🔙 Cycles', callback_data: 'admin_cgb_cycles' }]);
+    await bot.editMessageText(
+      `🤖 <b>Panel of the cycle Day ${cyc.start_day} → Day ${cyc.end_day}</b>\n\n` +
+      `The seats of this cycle end on the <b>${cyc.end_day}th</b>. Their invites go to: ` +
+      (current ? `panel <code>${escapeHtml(current)}</code>` : `the default panel <i>(not linked)</i>`) + `\n\n` +
+      (ids === null
+        ? `⚠️ <i>The invite bot could not be reached, so I cannot list its panels. Type the panel id yourself.</i>`
+        : ids.length ? `Pick the invite-bot panel that is <b>this cycle's workspace</b>:`
+                     : `<i>The invite bot has no panel yet.</i>`) +
+      `\n\n<i>An order of this cycle is queued in exactly that panel — even if it is stopped or has no session yet (it waits there). It is never sent to another panel.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_cgb_cpset_\d+_.+$/.test(data)) {
+    const m = /^admin_cgb_cpset_(\d+)_(.+)$/.exec(data);
+    const cyc = db.getBillingCycles().find((c) => c.id === parseInt(m[1], 10));
+    if (!cyc) { await answer('❌ That cycle no longer exists'); return; }
+    const r = cgbRouting.setCyclePanel(cyc.end_day, m[2]);
+    if (!r.ok) { await answer(`❌ ${r.reason}`); return; }
+    logger.info(`Admin ${userId} linked the cycle ending on the ${cyc.end_day}th to invite-bot panel ${m[2]}`);
+    await answer(`✅ Linked to ${m[2]}`);
+    return await handleAdminCallback(bot, { ...query, data: 'admin_cgb_cycles' });
+  }
+
+  if (/^admin_cgb_cpclr_\d+$/.test(data)) {
+    const cyc = db.getBillingCycles().find((c) => c.id === parseInt(data.split('_').pop(), 10));
+    if (cyc) { cgbRouting.setCyclePanel(cyc.end_day, null); logger.info(`Admin ${userId} unlinked the cycle ending on the ${cyc.end_day}th`); }
+    await answer('🚫 Unlinked');
+    return await handleAdminCallback(bot, { ...query, data: 'admin_cgb_cycles' });
+  }
+
+  if (/^admin_cgb_cptype_\d+$/.test(data)) {
+    const cid = parseInt(data.split('_').pop(), 10);
+    const cyc = db.getBillingCycles().find((c) => c.id === cid);
+    if (!cyc) { await answer('❌ That cycle no longer exists'); return; }
+    session.set(userId, States.ADMIN_CGB_CYCLE_PANEL, { cgbCycleId: cid });
+    await bot.editMessageText(
+      `✏️ <b>Panel id for the cycle Day ${cyc.start_day} → Day ${cyc.end_day}</b>\n\n` +
+      `Send the panel id exactly as the invite bot shows it (🖥 Panels), e.g. <code>panel26</code>.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Cancel', callback_data: `admin_cgb_cpanel_${cid}` }]] } }
+    ).catch(() => {});
+    return;
+  }
+
   if (data === 'admin_cgb_cycles') {
     const cycles = db.getBillingCycles();
     const best = cgbCycles.calculateBestCycle();
@@ -7618,9 +7826,24 @@ async function handleAdminCallback(bot, query) {
       }
     }
 
+    // V147: which invite-bot panel each cycle's customers are invited into.
+    if (cycles.length) {
+      const map = cgbRouting.panelMap();
+      const linked = cycles.filter((c) => map[String(c.end_day)]);
+      txt += `\n🤖 <b>Invite-bot panel per cycle</b>\n` +
+        cycles.map((c) => `• Day ${c.start_day} → ${c.end_day}: ` +
+          (map[String(c.end_day)] ? `<code>${escapeHtml(map[String(c.end_day)])}</code>` : '<i>not linked</i>')).join('\n') + '\n';
+      if (linked.length && linked.length < cycles.length) {
+        txt += `⚠️ <i>Orders of a cycle that is not linked go to the default panel.</i>\n`;
+      }
+      txt += `<i>Each cycle is its own ChatGPT workspace: a customer must be invited into the workspace of the cycle he bought.</i>\n`;
+    }
+
     const rows = [];
+    const panelMap = cgbRouting.panelMap();
     for (const c of cycles) {
       rows.push([{ text: `🗑 Delete: Day ${c.start_day} → Day ${c.end_day}`, callback_data: `admin_cgb_delcycle_${c.id}` }]);
+      rows.push([{ text: `🤖 Day ${c.start_day} → ${c.end_day}: ${panelMap[String(c.end_day)] || 'link a panel'}`.slice(0, 60), callback_data: `admin_cgb_cpanel_${c.id}` }]);
       // One press on the start day records the renewal time; after that the
       // button shows it and offers to clear it.
       rows.push([c.start_time

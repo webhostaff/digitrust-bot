@@ -223,7 +223,9 @@ router.get('/balance', requireKey, (req, res) => {
  */
 async function notifyAdminsApiOrder(req, { orderId, product, quantity, total, manual }) {
   try {
-    const botRef = req.app && req.app.get('bot');
+    // The STORE bot, not whatever 'bot' is now: index.js swaps 'bot' for the support bot (so support
+    // replies come from it), which made this owner notification appear in the support bot.
+    const botRef = req.app && (req.app.get('storeBot') || req.app.get('bot'));
     if (!botRef) return;   // no bot instance mounted — nothing to notify with
 
     const u = db.getUser(req.userId);
@@ -572,3 +574,4 @@ router.get('/docs.json', (req, res) => {
 });
 
 module.exports = router;
+module.exports._notifyAdminsApiOrder = notifyAdminsApiOrder;   // exposed for tests only
