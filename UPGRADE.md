@@ -6,6 +6,19 @@ existing feature was removed. The migration runs automatically on boot from
 
 ---
 
+## V150 — تقرير Binance مقتصر: TXID · المستخدم · المنتج · الوقت · السعر
+
+زر **📄 Binance Report** يبعث توا **جدولا واحدا** فيه تعاملات Binance برك، سطر لكل دفعة، من الأقدم:
+`# · Date & time (UTC) · TXID · User ID · Username · Product · Price (USDT)`
+- **تعاملات Binance** = كل دفعة تحقّق منها البوت على Binance (on-chain، Off-chain، Binance Pay). **ما يدخلش**: CryptoBot وNOWPayments، والطلبات المدفوعة من رصيد المحفظة، ورصيد الأدمن.
+- **المنتج**: لو الدفعة دفعت طلب ← اسم المنتج ×الكمية. لو شحن محفظة ← **"Wallet top-up"**. لو TXID اتحقّق وما تسجّلش لا طلب ولا رصيد ← "— (no order or credit recorded)" (ما يتخترعش منتج).
+- **السعر بكل أجزائو العشرية**: مبلغ محجوز كيما 10.003 يبقى 10.003 (ما يتقرّبش لـ10).
+- إيداعات شافها Binance وما تقيّدتش (محجوزة للمراجعة، تستنى تطابق) **ما تتحطّش في الجدول**، لكن **عددها يتذكر** في الرسالة باش ما يتخبّى شي.
+- الأزرار: **All time · Last 30 days · Last 90 days · 🔒 anonymised** (يبدّل المستخدم برمز ثابت U-xxxxxx من غير username). يجيك **Excel + CSV**. إيميلات الحرفاء ما تتحطّش.
+- التقرير المفصّل القديم (الطلبات، البوابات الأخرى، صفحة Notes...) باقي، زر **📚 Full detailed report** منفصل.
+
+---
+
 ## V149 — تقرير Binance + إيميلات البوت الأصلي + إصلاح إشعار الـAPI
 
 ### 1) "🔌 New API Order Paid" ما عادش يطلع في بوت الدعم

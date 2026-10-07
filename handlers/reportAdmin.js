@@ -14,23 +14,22 @@ const btn = (text, data) => ({ text, callback_data: data });
 const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
 
 function homeView() {
-  const all = transactionReport.buildReport({});
-  const total = all.summary.find((r) => r[0] === 'Total amount of those records (USDT)');
+  const lean = transactionReport.buildBinanceReport({});
   const text =
     `📄 <b>Binance Report</b>\n━━━━━━━━━━━━━━━━━━\n` +
-    `The proof of payment an exchange asks for, built from this store's own records.\n\n` +
-    `💳 Payments found: <b>${all.counts.payments}</b>${total ? ` · <b>${formatPrice(total[1])}</b>` : ''}\n` +
-    `🛒 Orders: <b>${all.counts.orders}</b>\n` +
-    (all.counts.flagged ? `⚠️ Payments to look at: <b>${all.counts.flagged}</b> (marked CHECK / PENDING in the file)\n` : '') +
-    `\nEvery payment is linked: <b>TXID → user → order → product → payment → delivery</b>, oldest first.\n` +
-    `You get an <b>Excel file</b> (Summary · Transactions · Orders · Per user · Credits without TXID · Notes) and a <b>CSV</b> of the transactions.\n\n` +
-    `<i>It contains customers' Telegram IDs and usernames: use “anonymised” if the exchange does not need to know who they are. Customer emails are never included.</i>`;
+    `Only the payments Binance verified for this shop — one row each:\n` +
+    `<b>TXID · user · product · time · price</b>\n\n` +
+    `💳 Binance payments found: <b>${lean.counts.payments}</b> · <b>${formatPrice(lean.counts.total)}</b>\n` +
+    (lean.counts.skipped ? `ℹ️ ${lean.counts.skipped} deposit(s) were seen on Binance but never credited: not in the file.\n` : '') +
+    `\nYou get an <b>Excel file</b> and the same table as <b>CSV</b>, oldest first, times in UTC. A wallet top-up shows “Wallet top-up” as its product.\n\n` +
+    `<i>It has customers' Telegram IDs and usernames: pick “anonymised” if Binance does not need them. Emails are never included.</i>`;
   return {
     text,
     markup: kb([
       [btn('📄 All time', 'admin_binrep_all')],
       [btn('📅 Last 30 days', 'admin_binrep_30'), btn('📅 Last 90 days', 'admin_binrep_90')],
       [btn('🔒 All time — users anonymised', 'admin_binrep_anon')],
+      [btn('📚 Full detailed report (orders, other gateways…)', 'admin_binrep_full')],
       [btn('🔙 Admin Panel', 'admin_panel')],
     ]),
   };
@@ -41,6 +40,7 @@ const OPTIONS = {
   admin_binrep_30:   { label: 'last 30 days', opts: () => ({ fromDate: daysAgo(30) }) },
   admin_binrep_90:   { label: 'last 90 days', opts: () => ({ fromDate: daysAgo(90) }) },
   admin_binrep_anon: { label: 'all time, users anonymised', opts: { anonymize: true }, suffix: '_anonymised' },
+  admin_binrep_full: { label: 'full detailed report, all time', opts: {}, full: true },
 };
 
 async function handle(bot, query) {
@@ -59,17 +59,29 @@ async function handle(bot, query) {
   const wait = await bot.sendMessage(chatId, `⏳ Building the report (${opt.label})…`).catch(() => null);
   try {
     const opts = typeof opt.opts === 'function' ? opt.opts() : opt.opts;
-    const { xlsx, csv, report } = transactionReport.buildFiles(opts);
     const stamp = new Date().toISOString().slice(0, 10);
-    const base = `binance-transaction-report_${stamp}${opt.suffix || ''}`;
-    await bot.sendDocument(chatId, xlsx,
-      { caption: `📄 <b>Transaction report</b> — ${opt.label}\n💳 ${report.counts.payments} payments · 🛒 ${report.counts.orders} orders` +
-                 (report.counts.flagged ? `\n⚠️ ${report.counts.flagged} to look at (see the Flag column)` : '') +
-                 `\nTimes are UTC. Read the “Notes” sheet for what the database does not record.`, parse_mode: 'HTML' },
-      { filename: `${base}.xlsx`, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-    await bot.sendDocument(chatId, csv, { caption: '📎 The same transactions as CSV (opens anywhere).' },
-      { filename: `${base}.csv`, contentType: 'text/csv' });
-    logger.info(`Admin ${query.from.id} exported the Binance report (${opt.label}): ${report.counts.payments} payments, ${report.counts.orders} orders`);
+    const XLSX_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+    if (opt.full) {
+      const { xlsx, csv, report } = transactionReport.buildFiles(opts);
+      const base = `binance-transaction-report-full_${stamp}`;
+      await bot.sendDocument(chatId, xlsx,
+        { caption: `📚 <b>Full detailed report</b> — ${opt.label}\n💳 ${report.counts.payments} payments · 🛒 ${report.counts.orders} orders` +
+                   (report.counts.flagged ? `\n⚠️ ${report.counts.flagged} to look at (see the Flag column)` : '') +
+                   `\nTimes are UTC. Read the “Notes” sheet for what the database does not record.`, parse_mode: 'HTML' },
+        { filename: `${base}.xlsx`, contentType: XLSX_TYPE });
+      await bot.sendDocument(chatId, csv, { caption: '📎 The same transactions as CSV (opens anywhere).' }, { filename: `${base}.csv`, contentType: 'text/csv' });
+      logger.info(`Admin ${query.from.id} exported the FULL Binance report: ${report.counts.payments} payments, ${report.counts.orders} orders`);
+    } else {
+      const { xlsx, csv, report } = transactionReport.buildBinanceFiles(opts);
+      const base = `binance-transactions_${stamp}${opt.suffix || ''}`;
+      await bot.sendDocument(chatId, xlsx,
+        { caption: `📄 <b>Binance transactions</b> — ${opt.label}\n💳 ${report.counts.payments} payments · <b>${formatPrice(report.counts.total)}</b>\n` +
+                   `TXID · user · product · time · price. Times are UTC.` +
+                   (report.counts.skipped ? `\nℹ️ ${report.counts.skipped} deposit(s) seen on Binance but never credited are not included.` : ''), parse_mode: 'HTML' },
+        { filename: `${base}.xlsx`, contentType: XLSX_TYPE });
+      await bot.sendDocument(chatId, csv, { caption: '📎 The same table as CSV (opens anywhere).' }, { filename: `${base}.csv`, contentType: 'text/csv' });
+      logger.info(`Admin ${query.from.id} exported the Binance transactions (${opt.label}): ${report.counts.payments} payments`);
+    }
   } catch (e) {
     logger.error(`Binance report failed: ${e.stack || e.message}`);
     await bot.sendMessage(chatId, `❌ The report could not be built: ${String(e.message).slice(0, 200)}`).catch(() => {});

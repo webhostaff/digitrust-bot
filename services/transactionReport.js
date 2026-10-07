@@ -354,4 +354,58 @@ function buildFiles(opts = {}) {
   return { xlsx, csv: Buffer.from(toCsv(report.txColumns, report.txRows), 'utf8'), report };
 }
 
-module.exports = { buildReport, buildFiles, toCsv, keyOf, pseudonym };
+
+/**
+ * THE BINANCE REPORT — only what Binance's verification needs, one row per Binance payment:
+ *   TXID · user · product · time · price
+ * Binance payments = every payment the bot verified on Binance (used_txids): on-chain, off-chain and Binance
+ * Pay. CryptoBot / NOWPayments payments, orders paid from the wallet, and deposits that were seen but never
+ * credited are NOT Binance transactions of the shop and are left out (their number is reported).
+ * A top-up has no product: it says "Wallet top-up". Times are UTC.
+ */
+function buildBinanceReport({ anonymize = false, fromDate = null } = {}) {
+  const inPeriod = (dt) => !fromDate || day(dt) >= fromDate;
+  const users = new Map(safeAll('SELECT telegram_id, username FROM users').map((u) => [Number(u.telegram_id), u]));
+  const products = new Map(safeAll('SELECT id, title FROM products').map((p) => [Number(p.id), p]));
+  const orderById = new Map(safeAll('SELECT id, product_id, quantity FROM orders').map((o) => [Number(o.id), o]));
+  const ledgerByRef = new Map();
+  for (const l of safeAll("SELECT ref_id, type, order_id FROM transactions WHERE ref_id IS NOT NULL AND ref_id <> ''")) {
+    const k = keyOf(l.ref_id); if (!ledgerByRef.has(k)) ledgerByRef.set(k, []); ledgerByRef.get(k).push(l);
+  }
+  const used = safeAll('SELECT * FROM used_txids ORDER BY created_at, id');
+  const usedKeys = new Set(used.map((u) => keyOf(u.txid)));
+
+  const rows = [];
+  let total = 0;
+  for (const u of used) {
+    if (!inPeriod(u.created_at)) continue;
+    const L = ledgerByRef.get(keyOf(u.txid)) || [];
+    const orders = [...new Set(L.filter((l) => l.type === 'purchase' && l.order_id).map((l) => Number(l.order_id)))].map((id) => orderById.get(id)).filter(Boolean);
+    const product = orders.length
+      ? orders.map((o) => `${clean((products.get(Number(o.product_id)) || {}).title) || `product #${o.product_id}`} ×${o.quantity}`).join('\n')
+      : (L.some((l) => l.type === 'deposit') ? 'Wallet top-up' : '— (no order or credit recorded)');
+    const uid = Number(u.user_id);
+    const un = (users.get(uid) || {}).username;
+    const amount = round(u.amount);
+    total += amount;
+    rows.push([rows.length + 1, u.created_at, u.txid, anonymize ? pseudonym(uid) : String(uid), anonymize ? '' : (un ? `@${un}` : ''), product, amount]);
+  }
+  // Seen on Binance but never credited: not a completed payment, so not in the table — but never hidden.
+  const skipped = safeAll('SELECT txid, insert_time, created_at FROM deposit_reviews').filter((r) => !usedKeys.has(keyOf(r.txid)) && inPeriod(iso(r.insert_time) || r.created_at)).length
+    + safeAll('SELECT txid, insert_time, first_seen FROM pending_deposits').filter((d) => !usedKeys.has(keyOf(d.txid)) && inPeriod(iso(d.insert_time) || d.first_seen)).length;
+
+  const columns = [
+    { header: '#', width: 6 }, { header: 'Date & time (UTC)', width: 20 }, { header: 'TXID', width: 66 },
+    { header: 'User ID', width: 16 }, { header: 'Username', width: 20 }, { header: 'Product', width: 40, type: 'wrap' },
+    { header: 'Price (USDT)', width: 14, type: 'exact' },
+  ];
+  return { columns, rows, counts: { payments: rows.length, total: round(total, 6), skipped }, anonymize, fromDate };
+}
+
+function buildBinanceFiles(opts = {}) {
+  const report = buildBinanceReport(opts);
+  const xlsx = buildXlsx([{ name: 'Binance transactions', columns: report.columns, rows: report.rows }]);
+  return { xlsx, csv: Buffer.from(toCsv(report.columns, report.rows), 'utf8'), report };
+}
+
+module.exports = { buildReport, buildFiles, buildBinanceReport, buildBinanceFiles, toCsv, keyOf, pseudonym };
