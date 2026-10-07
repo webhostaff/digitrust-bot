@@ -28,6 +28,7 @@ const subPricing = require('../utils/subscriptionPricing');
 const cgbCycles = require('../services/cgbCycles');
 const notices   = require('../services/notices');
 const { plainDelivery, formatPrice, formatPriceExact, escapeHtml, expandPremiumEmojis, scaleTiersProportionally, productEmojiId, calcOrderPrice } = require('../utils/format');
+const PANEL_ICON = { running: '🟢', stopped: '⚪', paused: '🟠', waiting: '🟡' };
 const cgbRouting = require('../services/cgbRouting');
 const cgbBots = require('../services/cgbBots');
 const cgbGuard = require('../services/cgbGuard');
@@ -7715,18 +7716,55 @@ async function handleAdminCallback(bot, query) {
     return await handleAdminCallback(bot, { ...query, data: 'admin_cgb_bots' });
   }
 
+  // ── 📥 The panel new orders go to, chosen by name (V151) ──────────────────────
+  if (data === 'admin_cgb_defpanel') {
+    const named = await cgbGuard.fetchGuardPanelsNamed();
+    const current = cgbRouting.getDefaultPanel();
+    const rows = [];
+    for (const p of named || []) {
+      rows.push([{ text: `${p.id === current ? '✅ ' : ''}${PANEL_ICON[p.state] || '⚪'} ${p.name}${p.name !== p.id ? ` · ${p.id}` : ''}`.slice(0, 60), callback_data: `admin_cgb_defset_${p.id}` }]);
+    }
+    if (current) rows.push([{ text: '🚫 Automatic (the invite bot decides)', callback_data: 'admin_cgb_defclr' }]);
+    rows.push([{ text: '🔙 Cycles', callback_data: 'admin_cgb_cycles' }]);
+    const curName = (named || []).find((p) => p.id === current);
+    await bot.editMessageText(
+      `📥 <b>Which panel gets the new orders?</b>\n\n` +
+      `Now: ${current ? `<b>${escapeHtml(curName ? curName.name : current)}</b> <code>${escapeHtml(current)}</code>` : '<i>automatic</i>'}\n\n` +
+      (named === null ? `⚠️ <i>The invite bot could not be reached, so I cannot list its panels.</i>\n\n`
+        : named.length ? `Pick the panel whose workspace should receive the customers of new orders:\n\n` : `<i>The invite bot has no panel yet.</i>\n\n`) +
+      `<i>An order goes exactly to the panel you pick — and waits there if that panel is stopped (it is never sent to another one). ` +
+      `A cycle linked to its own panel (🤖 on the cycles screen) wins over this.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }
+    ).catch(() => {});
+    return;
+  }
+
+  if (/^admin_cgb_defset_.+$/.test(data)) {
+    const id = data.replace('admin_cgb_defset_', '');
+    const r = cgbRouting.setDefaultPanel(id);
+    if (!r.ok) { await answer(`❌ ${r.reason}`); return; }
+    logger.info(`Admin ${userId} chose invite-bot panel ${id} for new orders`);
+    await answer(`✅ New orders → ${id}`);
+    return await handleAdminCallback(bot, { ...query, data: 'admin_cgb_cycles' });
+  }
+
+  if (data === 'admin_cgb_defclr') {
+    cgbRouting.setDefaultPanel(null);
+    await answer('🚫 Automatic');
+    return await handleAdminCallback(bot, { ...query, data: 'admin_cgb_cycles' });
+  }
+
   // ── 🤖 The invite-bot panel of one cycle (V147) ───────────────────────────────
   if (/^admin_cgb_cpanel_\d+$/.test(data)) {
     const cid = parseInt(data.split('_').pop(), 10);
     const cyc = db.getBillingCycles().find((c) => c.id === cid);
     if (!cyc) { await answer('❌ That cycle no longer exists'); return; }
     const current = cgbRouting.panelMap()[String(cyc.end_day)] || null;
-    const ids = await cgbGuard.fetchGuardPanels();                 // null = the invite bot cannot be reached
+    const named = await cgbGuard.fetchGuardPanelsNamed();            // [{id, name, state}] · null = the invite bot cannot be reached
+    const ids = named ? named.map((p) => p.id) : null;
     const rows = [];
-    if (ids && ids.length) {
-      for (let i = 0; i < ids.length; i += 2) {
-        rows.push(ids.slice(i, i + 2).map((id) => ({ text: `${id === current ? '✅ ' : ''}${id}`.slice(0, 40), callback_data: `admin_cgb_cpset_${cid}_${id}` })));
-      }
+    for (const p of named || []) {
+      rows.push([{ text: `${p.id === current ? '✅ ' : ''}${PANEL_ICON[p.state] || '⚪'} ${p.name}${p.name !== p.id ? ` · ${p.id}` : ''}`.slice(0, 60), callback_data: `admin_cgb_cpset_${cid}_${p.id}` }]);
     }
     rows.push([{ text: '✏️ Type a panel id', callback_data: `admin_cgb_cptype_${cid}` }]);
     if (current) rows.push([{ text: '🚫 Unlink (use the default panel)', callback_data: `admin_cgb_cpclr_${cid}` }]);
@@ -7782,7 +7820,8 @@ async function handleAdminCallback(bot, query) {
     const best = cgbCycles.calculateBestCycle();
     const monthly = cgbCycles.getMonthlyPrice();
 
-    let txt = `📅 <b>Billing Cycles</b>\n\n`;
+    let txt = `📅 <b>Billing Cycles</b>\n\n` +
+      `📥 New orders go to: ${cgbRouting.getDefaultPanel() ? `panel <code>${escapeHtml(cgbRouting.getDefaultPanel())}</code> <i>(chosen by you)</i>` : '<i>automatic (the invite bot decides)</i>'}\n\n`;
     if (!cycles.length) {
       txt += `<i>None configured — falling back to the built-in defaults ` +
              `(26→25 and 16→15). Add one to take control.</i>\n\n`;
@@ -7841,6 +7880,9 @@ async function handleAdminCallback(bot, query) {
 
     const rows = [];
     const panelMap = cgbRouting.panelMap();
+    // V151: the panel new orders go to, chosen here by name.
+    const chosenPanel = cgbRouting.getDefaultPanel();
+    rows.push([{ text: `📥 New orders → ${chosenPanel || 'automatic'}`.slice(0, 60), callback_data: 'admin_cgb_defpanel' }]);
     for (const c of cycles) {
       rows.push([{ text: `🗑 Delete: Day ${c.start_day} → Day ${c.end_day}`, callback_data: `admin_cgb_delcycle_${c.id}` }]);
       rows.push([{ text: `🤖 Day ${c.start_day} → ${c.end_day}: ${panelMap[String(c.end_day)] || 'link a panel'}`.slice(0, 60), callback_data: `admin_cgb_cpanel_${c.id}` }]);

@@ -91,7 +91,7 @@ async function notifyGuardOfNewInvite(email, { orderId = null, endDate = null } 
   // V147: a cycle LINKED to a panel of the main bot goes there, strictly (each cycle is its own workspace).
   // V148: otherwise the ACTIVE bot (one bot per panel, one working at a time) gets it; with none, the main bot as before.
   let target = cgbRouting.resolveTarget(endDate, GUARD_PANEL);
-  const active = target.source === 'cycle' ? null : cgbBots.activeBot();
+  const active = (target.source === 'cycle' || target.source === 'chosen') ? null : cgbBots.activeBot();     // cycle link > the panel you chose > a separate bot > GUARD_PANEL_ID
   let botId = cgbBots.DEFAULT_ID, base = GUARD_URL;
   if (active && !active.isDefault) {
     base = `${active.origin}/auto-invite`;
@@ -187,6 +187,42 @@ function makeGuardWebhookHandler({ queries, logger: log, activateAndNotifySeat, 
       log.warn(`[cgbGuard] could not alert admin about failed invite: ${e.message}`);
     }
     return res.json({ ok: true, matched: true, activated: false });
+  };
+}
+
+/**
+ * GET /webhook/cgb-seats?end_day=30&status=pending,active — the seats of ONE billing cycle, for the invite bot
+ * of that cycle's panel (V151). A seat of the cycle "Day 2 → Day 30" always ends on the 30th, so the cycle is
+ * found by the day the seat ends. The invite bot sets these emails against who is really in the workspace.
+ * Same secret as everything else. Only what that needs leaves the store: email, order, status, dates, whether
+ * it is a renewal — no user ids, usernames or prices.
+ */
+function makeSeatsHandler({ db: rawDb }) {
+  return function handleSeats(req, res) {
+    const supplied = req.get('X-Invite-Secret') || req.query.secret || '';
+    if (!SHARED_SECRET || supplied !== SHARED_SECRET) return res.status(401).json({ error: 'unauthorized' });
+    const day = req.query.end_day === undefined || req.query.end_day === '' ? null : parseInt(req.query.end_day, 10);
+    if (day !== null && !(day >= 1 && day <= 31)) return res.status(400).json({ error: 'end_day must be 1 to 31' });
+    const allowed = ['pending', 'active', 'expired', 'cancelled'];
+    const statuses = String(req.query.status || 'pending,active').split(',').map((x) => x.trim()).filter((x) => allowed.includes(x));
+    if (!statuses.length) return res.status(400).json({ error: 'status must be some of ' + allowed.join(',') });
+    try {
+      const rows = rawDb.prepare(
+        `SELECT order_id, email, status, start_date, end_date, days_remaining, renewed_from
+           FROM chatgpt_subscriptions
+          WHERE status IN (${statuses.map(() => '?').join(',')})
+            ${day !== null ? "AND CAST(strftime('%d', end_date) AS INTEGER) = ?" : ''}
+          ORDER BY created_at, id`).all(...statuses, ...(day !== null ? [day] : []));
+      return res.json({
+        ok: true, end_day: day, statuses,
+        seats: rows.map((r) => ({
+          email: String(r.email || '').trim().toLowerCase(), order_id: r.order_id, status: r.status,
+          start_date: r.start_date, end_date: r.end_date, days: r.days_remaining, renewal: !!r.renewed_from,
+        })),
+      });
+    } catch (e) {
+      return res.status(500).json({ error: 'could not read the seats' });
+    }
   };
 }
 
@@ -330,7 +366,13 @@ async function fetchGuardPanels() {
   return cgbRouting.listGuardPanels(GUARD_URL);
 }
 
+/** Like fetchGuardPanels but with the panels' NAMES: [{id, name, state}]. null = unreachable. */
+async function fetchGuardPanelsNamed(timeoutMs = 8000) {
+  if (!GUARD_URL || !guardUrlValid()) return null;
+  return cgbRouting.listGuardPanelsNamed(GUARD_URL, undefined, timeoutMs);
+}
+
 /** The main bot's address, secret and default panel — the registry of bots builds on it. */
 function getConfig() { return { url: GUARD_URL, secret: SHARED_SECRET, panel: GUARD_PANEL, valid: !!GUARD_URL && guardUrlValid() }; }
 
-module.exports = { getConfig, fetchGuardPanels, notifyGuardOfNewInvite, makeGuardWebhookHandler, cancelGuardInvite, diagnose, fetchGuardReport, _normalizeGuardUrl: normalizeGuardUrl };
+module.exports = { makeSeatsHandler, getConfig, fetchGuardPanels, fetchGuardPanelsNamed, notifyGuardOfNewInvite, makeGuardWebhookHandler, cancelGuardInvite, diagnose, fetchGuardReport, _normalizeGuardUrl: normalizeGuardUrl };

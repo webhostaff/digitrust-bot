@@ -15,6 +15,7 @@
 const db = require('../database/queries');
 
 const KEY = 'cgb_cycle_panels';
+const DEFAULT_KEY = 'cgb_default_panel';        // the panel new orders go to, chosen in the store (V151)
 const PANEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,40}$/;
 
 /** { "9": "panel-9", "30": "main" } — cycle END day → panel id. Never throws. */
@@ -56,8 +57,24 @@ function resolveTarget(endDate, fallbackPanel = '') {
   const endDay = endDayOf(endDate);
   const linked = endDay != null ? panelMap()[String(endDay)] : null;
   if (linked) return { panel: String(linked), strict: true, source: 'cycle', endDay };
+  // V151: the panel the owner CHOSE in the store for new orders. It is his decision, so the order goes exactly
+  // there and waits if that panel is stopped — never rerouted to another one.
+  const chosen = getDefaultPanel();
+  if (chosen) return { panel: chosen, strict: true, source: 'chosen', endDay };
   if (fallbackPanel) return { panel: String(fallbackPanel), strict: false, source: 'default', endDay };
   return { panel: '', strict: false, source: 'none', endDay };
+}
+
+/** The panel chosen in the store for new orders ('' = none: GUARD_PANEL_ID / the invite bot decides). */
+function getDefaultPanel() {
+  const v = String(db.getSetting(DEFAULT_KEY, '') || '').trim();
+  return PANEL_ID_RE.test(v) ? v : '';
+}
+function setDefaultPanel(panelId) {
+  if (!panelId) { db.setSetting(DEFAULT_KEY, ''); return { ok: true }; }
+  if (!PANEL_ID_RE.test(String(panelId).trim())) return { ok: false, reason: 'a panel id is letters, digits, "-", "_" or "." (no spaces)' };
+  db.setSetting(DEFAULT_KEY, String(panelId).trim());
+  return { ok: true };
 }
 
 /** The panel ids the invite bot knows (its public /health). null when it cannot be reached. */
@@ -77,4 +94,26 @@ async function listGuardPanels(guardUrl, fetchImpl = (typeof fetch === 'function
   } catch (_) { return null; }
 }
 
-module.exports = { panelMap, setCyclePanel, resolveTarget, listGuardPanels, endDayOf, PANEL_ID_RE, KEY };
+/** The invite bot's panels WITH names: [{id, name, state}] (state: running|stopped|waiting). null = unreachable. */
+async function listGuardPanelsNamed(guardUrl, fetchImpl = (typeof fetch === 'function' ? fetch : null), timeoutMs = 8000) {
+  try {
+    if (!guardUrl || !fetchImpl) return null;
+    const u = new URL(guardUrl);
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const r = await fetchImpl(`${u.origin}/health`, { signal: ctrl.signal });
+      if (!r.ok) return null;
+      const j = await r.json();
+      const names = j.panel_names || {};
+      const out = Object.entries(j.panels || {}).map(([id, st]) => ({
+        id, name: names[id] || id,
+        state: st && st.owner_stopped ? 'stopped' : (st && st.paused ? 'paused' : 'running'),
+      }));
+      for (const id of Array.isArray(j.waiting_for_session) ? j.waiting_for_session : []) out.push({ id, name: names[id] || id, state: 'waiting' });
+      return out.sort((a, b) => a.name.localeCompare(b.name));
+    } finally { clearTimeout(t); }
+  } catch (_) { return null; }
+}
+
+module.exports = { panelMap, setCyclePanel, resolveTarget, getDefaultPanel, setDefaultPanel, listGuardPanelsNamed, listGuardPanels, endDayOf, PANEL_ID_RE, KEY };

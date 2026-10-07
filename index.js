@@ -2300,6 +2300,9 @@ if (process.env.GUARD_SECRET) {
       activateAndNotifySeat: chatgptBotModule.activateAndNotifySeat,
     }));
     logger.info('ChatGPT Business Guard callback route mounted at /webhook/cgb-guard-status');
+    // V151: each panel's invite bot asks for the seats of its cycle here.
+    app.get('/webhook/cgb-seats', require('./services/cgbGuard').makeSeatsHandler({ db: require('./database/db') }));
+    logger.info('ChatGPT Business seats route mounted at /webhook/cgb-seats');
   } else {
     logger.warn('GUARD_SECRET is set but the ChatGPT Business bot did not load — /webhook/cgb-guard-status not mounted.');
   }
