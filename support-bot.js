@@ -1036,6 +1036,8 @@ async function showManualDetail(chatId, messageId, taskId) {
       kb.push([{ text: '⚙️ Mark as in progress', callback_data: `md_proc_${t.id}` }]);
     }
     kb.push([{ text: '✅ Deliver now (send content)', callback_data: `md_deliver_${t.id}` }]);
+    const pa = require('./services/panelActivate').taskButton(t, '');
+    if (pa) kb.push([pa]);
     kb.push([{ text: '☑️ Mark delivered (no content)', callback_data: `md_done_${t.id}` }]);
     kb.push([{ text: '❌ Cancel & refund', callback_data: `md_cancel_${t.id}` }]);
   }
@@ -1603,6 +1605,22 @@ bot.on('callback_query', async (q) => {
     if (/^md_srch_\d+$/.test(data)) {
       const term = queries.getSetting(`support_md_term_${chatId}`, '');
       await showManualList(chatId, msgId, 'all', parseInt(data.split('_').pop(), 10), term);
+      return;
+    }
+    // V152: 🎟 activate a manual order in an invite-bot panel.
+    if (/^mdpk_\d+$/.test(data) || /^mdp[cy]:\d+:[A-Za-z0-9._-]+$/.test(data)) {
+      const pa = require('./services/panelActivate');
+      let view;
+      if (data.startsWith('mdpk_')) view = await pa.pickerView(parseInt(data.split('_').pop(), 10), '');
+      else {
+        const [, tid, pid] = data.split(':');
+        if (data.startsWith('mdpc:')) view = await pa.confirmView(parseInt(tid, 10), pid, '');
+        else {
+          const r = await pa.activate(bot, parseInt(tid, 10), pid);
+          view = { text: r.text, kb: [[{ text: '📦 Open task', callback_data: `md_view_${tid}` }]] };
+        }
+      }
+      await send(chatId, msgId, view.text, { inline_keyboard: view.kb });
       return;
     }
     if (/^md_proc_\d+$/.test(data)) {

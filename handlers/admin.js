@@ -3354,6 +3354,8 @@ async function handleAdminCallback(bot, query) {
     if (t.status === 'pending' || t.status === 'processing') {
       if (t.status === 'pending') kb.push([{ text: '⚙️ Mark as in progress', callback_data: `admin_md_proc_${t.id}` }]);
       kb.push([{ text: '✅ Deliver now (send content)', callback_data: `admin_md_deliver_${t.id}` }]);
+      const pa = require('../services/panelActivate').taskButton(t, 'admin_');
+      if (pa) kb.push([pa]);
       kb.push([{ text: '☑️ Mark delivered (no content)', callback_data: `admin_md_done_${t.id}` }]);
       kb.push([{ text: '❌ Cancel & refund', callback_data: `admin_md_cancel_${t.id}` }]);
     }
@@ -3363,6 +3365,28 @@ async function handleAdminCallback(bot, query) {
       await bot.editMessageText(txt, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
     } catch (e) {
       await bot.sendMessage(chatId, txt, { parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+    }
+    return;
+  }
+
+  // V152: 🎟 activate a manual order in an invite-bot panel (whitelist + end date + tell the customer).
+  if (/^admin_mdpk_\d+$/.test(data) || /^admin_mdp[cy]:\d+:[A-Za-z0-9._-]+$/.test(data)) {
+    const pa = require('../services/panelActivate');
+    let view;
+    if (data.startsWith('admin_mdpk_')) view = await pa.pickerView(parseInt(data.split('_').pop(), 10), 'admin_');
+    else {
+      const [, tid, pid] = data.split(':');
+      if (data.startsWith('admin_mdpc:')) view = await pa.confirmView(parseInt(tid, 10), pid, 'admin_');
+      else {
+        await answer('⏳ Activating…');
+        const r = await pa.activate(bot, parseInt(tid, 10), pid);
+        view = { text: r.text, kb: [[{ text: '📦 Open task', callback_data: `admin_md_view_${tid}` }]] };
+      }
+    }
+    try {
+      await bot.editMessageText(view.text, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: view.kb } });
+    } catch (e) {
+      await bot.sendMessage(chatId, view.text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: view.kb } });
     }
     return;
   }

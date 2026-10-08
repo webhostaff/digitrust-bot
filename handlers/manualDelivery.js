@@ -192,12 +192,14 @@ async function openManualDelivery(bot, order, paymentMethod) {
     buttons: [
       [{ text: '📦 Open task', callback_data: `admin_md_view_${row.id}` }],
       [{ text: '✅ Mark delivered', callback_data: `admin_md_deliver_${row.id}` }],
+      ...(order.email ? [[{ text: '🎟 Activate in a panel', callback_data: `admin_mdpk_${row.id}` }]] : []),
     ],
     // Fast lane: copy the email, open the work page, or simply reply to this
     // card with the content (services/mdFast.js).
     supportButtons: require('../services/mdFast').taskButtons(
       { ...row, product_title: product?.title || order.product_title, email: order.email || row.email },
-      [[{ text: '📦 Open task', callback_data: `md_view_${row.id}` }]]),
+      [[{ text: '📦 Open task', callback_data: `md_view_${row.id}` }],
+       ...(order.email ? [[{ text: '🎟 Activate in a panel', callback_data: `mdpk_${row.id}` }]] : [])]),
   });
 
   db.markManualNotified(row.id);
@@ -209,7 +211,7 @@ async function openManualDelivery(bot, order, paymentMethod) {
  *
  * @returns {Promise<{ok: boolean, reason?: string}>}
  */
-async function completeManualDelivery(bot, taskId, content = null) {
+async function completeManualDelivery(bot, taskId, content = null, { panelName = '', expiresOn = null } = {}) {
   const task = db.getManualDelivery(taskId);
   if (!task) return { ok: false, reason: 'not_found' };
   if (task.status === 'delivered') return { ok: false, reason: 'already_delivered' };
@@ -239,6 +241,8 @@ async function completeManualDelivery(bot, taskId, content = null) {
     `📦 <b>Product:</b> ${cleanTitle(task.product_title)}\n` +
     `🔢 <b>Quantity:</b> ${task.quantity}\n` +
     (task.email ? `📧 ${escapeHtml(task.email)}\n` : '') +
+    (panelName ? `🖥 <b>Workspace:</b> ${escapeHtml(panelName)}\n` : '') +
+    (expiresOn ? `⏳ <b>Valid until:</b> ${escapeHtml(expiresOn)}\n` : '') +
     `💵 ${formatPrice(task.total_paid)}\n` +
     `📅 <b>Delivered:</b> ${stamp()}\n` +
     (content

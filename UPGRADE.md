@@ -1,3 +1,17 @@
+# V152 — the panel name on activation · 🎟 manual orders activated in a panel
+
+**ChatGPT seats**
+- The activation message tells the customer the workspace: `🖥 Workspace: <panel name>`. The green order card shows `🖥 Panel`, and the name is saved on the seat (the "workspace" field).
+- The name comes from the invite bot when it invited the customer itself (build 39 sends it); otherwise from the panel the seat's cycle is linked to (📅 Manage Cycles → 🤖), or the panel chosen for new orders.
+- Activating BY HAND (🔔 Activate & Notify) also puts the email on that panel's whitelist in the invite bot, with the seat's end date — so the invite bot never flags a paying customer as unknown. If the invite bot cannot be reached, the seat is still activated and the card says why the whitelist step failed.
+
+**Manual products (e.g. separate invites sold "until a date", price per day)**
+- A manual-delivery task with an email has a new button **🎟 Activate in a panel** (store admin panel, support bot, and the new-task alert).
+- Pick the panel (by name) → confirm → the email goes on that panel's whitelist in the invite bot with the product's end date (`sub_end_date`), the customer gets the order with `🖥 Workspace` and `⏳ Valid until`, and the task is closed. The invite bot then alerts you the day before and on the day it ends.
+- If the invite bot cannot be reached, nothing is changed and the customer is told nothing.
+
+**Needs** the invite bot **build 39** (its new `/whitelist` route). Same variables as before: `GUARD_AUTO_INVITE_URL`, `GUARD_SECRET`.
+
 # DIGITRUST Bot — Upgrade Notes
 
 Everything here is additive. No existing table is dropped or rewritten, and no

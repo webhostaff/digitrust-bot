@@ -164,7 +164,9 @@ function makeGuardWebhookHandler({ queries, logger: log, activateAndNotifySeat, 
     }
 
     if (status === 'success') {
-      const result = await activateAndNotifySeat(sub.order_id);
+      let panelName = String((req.body || {}).panel_name || '').trim();
+      if (!panelName && panel) panelName = await panelNameOf(String(panel)).catch(() => String(panel));
+      const result = await activateAndNotifySeat(sub.order_id, { panelName, panelId: panel ? String(panel) : '', fromGuard: true });
       log.info(`[cgbGuard] auto-activated order #${sub.order_id} (${clean}) from guard callback: ${JSON.stringify(result)}`);
       return res.json({ ok: true, matched: true, activated: result.ok });
     }
@@ -372,7 +374,62 @@ async function fetchGuardPanelsNamed(timeoutMs = 8000) {
   return cgbRouting.listGuardPanelsNamed(GUARD_URL, undefined, timeoutMs);
 }
 
+// ── V152: panel names, the panel of a seat, whitelisting by hand-activation ─────────────────────────
+const _names = { at: 0, map: null };
+
+/** A panel's NAME as the invite bot calls it (cached 10 min, remembered in settings for when it is offline). */
+async function panelNameOf(id) {
+  if (!id) return '';
+  const fresh = _names.map && Date.now() - _names.at < 10 * 60 * 1000 && Object.prototype.hasOwnProperty.call(_names.map, id);
+  if (!fresh) {
+    const list = await fetchGuardPanelsNamed(5000).catch(() => null);
+    const q = require('../database/queries');
+    if (list) {
+      _names.map = Object.fromEntries(list.map((p) => [p.id, p.name]));
+      _names.at = Date.now();
+      try { q.setSetting('cgb_panel_names', JSON.stringify(_names.map)); } catch (_) {}
+    } else if (!_names.map) {
+      try { _names.map = JSON.parse(q.getSetting('cgb_panel_names', '{}') || '{}'); } catch (_) { _names.map = {}; }
+    }
+  }
+  return (_names.map && _names.map[id]) || id;
+}
+
+/** The panel a seat ending on `endDate` belongs to: the cycle link, else the panel chosen for new orders, else GUARD_PANEL_ID. */
+function panelForSeat(endDate) {
+  const t = cgbRouting.resolveTarget(endDate, GUARD_PANEL);
+  return t.panel || '';
+}
+
+/**
+ * Put an email on a panel's whitelist in the invite bot, with its end date (V152). Used when the owner activates
+ * by hand — the invite bot did not invite this person itself, so without this it would flag them as unknown.
+ * Never throws. @returns {{ok:boolean, panel?:string, panelName?:string, reason?:string}}
+ */
+async function whitelistInGuard({ panel, email, expiresOn = null, note = '', action = 'add', source = 'store' }) {
+  if (!GUARD_URL || !SHARED_SECRET || !guardUrlValid()) return { ok: false, reason: 'the invite bot is not configured (GUARD_AUTO_INVITE_URL / GUARD_SECRET)' };
+  const clean = String(email || '').trim().toLowerCase();
+  if (!clean.includes('@')) return { ok: false, reason: 'no email on this order' };
+  try {
+    const resp = await fetchWithTimeout(`${new URL(GUARD_URL).origin}/whitelist`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Invite-Secret': SHARED_SECRET },
+      body: JSON.stringify({ action, panel: panel || '', email: clean, expires_on: expiresOn || null, note: String(note || '').slice(0, 120), source }),
+    });
+    let j = {};
+    try { j = await resp.json(); } catch (_) {}
+    if (resp.status === 404 && j.error === 'unknown_panel') return { ok: false, reason: `the invite bot has no panel "${panel}"` };
+    if (resp.status === 404) return { ok: false, reason: 'the invite bot is too old for this (needs build 39)' };
+    if (resp.status === 401) return { ok: false, reason: 'the secret does not match (GUARD_SECRET / AUTO_INVITE_SECRET)' };
+    if (!resp.ok || !j.ok) return { ok: false, reason: `the invite bot answered HTTP ${resp.status}${j.error ? ` (${j.error})` : ''}` };
+    if (j.panel && j.panel_name) { _names.map = { ...(_names.map || {}), [j.panel]: j.panel_name }; }
+    return { ok: true, panel: j.panel, panelName: j.panel_name || j.panel };
+  } catch (e) {
+    return { ok: false, reason: `could not reach the invite bot (${e.message})` };
+  }
+}
+
 /** The main bot's address, secret and default panel — the registry of bots builds on it. */
 function getConfig() { return { url: GUARD_URL, secret: SHARED_SECRET, panel: GUARD_PANEL, valid: !!GUARD_URL && guardUrlValid() }; }
 
-module.exports = { makeSeatsHandler, getConfig, fetchGuardPanels, fetchGuardPanelsNamed, notifyGuardOfNewInvite, makeGuardWebhookHandler, cancelGuardInvite, diagnose, fetchGuardReport, _normalizeGuardUrl: normalizeGuardUrl };
+module.exports = { panelNameOf, panelForSeat, whitelistInGuard, makeSeatsHandler, getConfig, fetchGuardPanels, fetchGuardPanelsNamed, notifyGuardOfNewInvite, makeGuardWebhookHandler, cancelGuardInvite, diagnose, fetchGuardReport, _normalizeGuardUrl: normalizeGuardUrl };

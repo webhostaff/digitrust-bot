@@ -160,6 +160,7 @@ function orderCard(d, activated = false, scheduled = false, cancelNote = null) {
     `🆔 Order: <b>#${d.orderId}</b>\n` +
     `👤 Customer: ${d.name} (<code>${d.userId}</code>)\n` +
     `📧 Email: <code>${d.email}</code>\n` +
+    (d.panel ? `🖥 Panel: <b>${d.panel}</b>\n` : '') +
     `⏱ Duration: <b>${d.days} days</b>\n` +
     `📅 Start date: <b>${d.startDate}</b>\n` +
     `📅 End date: <b>${d.endDate}</b>\n` +
@@ -1106,7 +1107,7 @@ function activeCardMarkup(orderId) {
   ] };
 }
 
-async function activateAndNotifySeat(orderIdRaw, { chatId = null, msgId = null } = {}) {
+async function activateAndNotifySeat(orderIdRaw, { chatId = null, msgId = null, panelName = '', panelId = '', fromGuard = false } = {}) {
   const orderId = parseInt(orderIdRaw, 10);
   if (!Number.isFinite(orderId)) return { ok: false, reason: 'invalid order id' };
 
@@ -1123,10 +1124,27 @@ async function activateAndNotifySeat(orderIdRaw, { chatId = null, msgId = null }
   const days = sub.days_remaining;
   const endDate = sub.end_date;
 
+  // V152: the panel (workspace) the seat is in — told to the customer, stamped on the order and the card.
+  // From the invite bot when it invited them itself; otherwise the seat's cycle → its panel.
+  let guardOk = null;
+  try {
+    const cgbGuard = require('./services/cgbGuard');
+    if (!panelId) panelId = cgbGuard.panelForSeat(endDate);
+    if (!panelName && panelId) panelName = await cgbGuard.panelNameOf(panelId);
+    // Activated by hand: the invite bot did not invite this person, so put them on that panel's whitelist with
+    // the seat's end date — otherwise it would flag them as "unknown".
+    if (!fromGuard && panelId && sub.email) {
+      guardOk = await cgbGuard.whitelistInGuard({ panel: panelId, email: sub.email, expiresOn: endDate, note: `order #${orderId}`, source: 'store' });
+      if (guardOk.ok && guardOk.panelName) panelName = guardOk.panelName;
+      else if (!guardOk.ok) logger.warn(`activateAndNotifySeat #${orderId}: whitelist in panel ${panelId} failed: ${guardOk.reason}`);
+    }
+  } catch (e) { logger.warn(`activateAndNotifySeat #${orderId}: panel lookup: ${e.message}`); }
+
   try {
     await bot.sendMessage(Number(customerId),
       `✅ <b>Your ChatGPT Business Subscription is Now Active!</b>\n\n` +
       `🆔 Order: <b>#${orderId}</b>\n` +
+      (panelName ? `🖥 Workspace: <b>${escapeHtml(panelName)}</b>\n` : '') +
       `⏱ Duration: <b>${days} days</b>\n` +
       `📅 Expiry date: <b>${endDate}</b>\n\n` +
       `Your subscription has been successfully activated on the email you provided.\n` +
@@ -1145,7 +1163,9 @@ async function activateAndNotifySeat(orderIdRaw, { chatId = null, msgId = null }
     // later would show today's workspace on an old seat if the shop ever
     // moves accounts, which is exactly the field a customer would query.
     try {
-      if (!sub.workspace) {
+      if (panelName) {
+        queries.setCgbWorkspace(sub.id, panelName);                 // V152: the real panel it was activated in
+      } else if (!sub.workspace) {
         const wsRow = db.prepare(`SELECT value FROM settings WHERE key='cgb_workspace_name'`).get();
         queries.setCgbWorkspace(sub.id, wsRow?.value || 'chatgpt_Team');
       }
@@ -1179,6 +1199,8 @@ async function activateAndNotifySeat(orderIdRaw, { chatId = null, msgId = null }
     refLabel:  'Order',
     ref:       String(orderId),
     activatedAt: `${p2(now.getDate())}/${p2(now.getMonth() + 1)} ${p2(now.getHours())}:${p2(now.getMinutes())}`,
+    panel:     panelName ? escapeHtml(panelName) : '',
+    editedNote: (guardOk && !guardOk.ok) ? `Not put on the invite bot's whitelist: ${escapeHtml(guardOk.reason)}` : undefined,
   }, true);
   const doneMarkup = activeCardMarkup(orderId);
 
