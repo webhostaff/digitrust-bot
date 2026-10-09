@@ -1,3 +1,37 @@
+# V156 — buttons instead of commands · a clearer ChatGPT Business bot · Binance deposits (TON) as buttons
+
+**ChatGPT Business bot — 🛠 Admin panel** (owner only): `/start` → **🛠 Admin panel**, or `/admin`.
+- Summary: active seats, waiting for activation, ending today / tomorrow.
+- Buttons: 🗓 Ending today · Tomorrow · In 3 days · In 7 days · 📅 Other day — ➕ Add a seat — 📧 Change an email — ✏️ Change dates — 🔎 Check renewals — 🔄 Renewals board — 💰 Custom prices · 💲 Set a price · 🗑 Remove a price — 🔌 Test invite bot.
+- A button that needs words (an email, a day…) shows an example, waits for your message, then runs exactly the same command as typing it (❌ Cancel goes back). The typed commands still work.
+
+**ChatGPT Business bot — the customer's first screen**: each seat is listed (email, workspace, until when, days left; 🟠 when 3 days or less, ⏳ waiting for activation), and the buttons say what they do: 🔄 Renew my seat · ✨ Buy a new seat · 📋 My seats — details.
+
+**Main store — 📥 Binance Deposits** (admin menu, next to 🛡 Deposit Review), also `/deposits` with nothing after it:
+💎 TON · 7 days / 30 days · 🟡 BEP20 · 🔴 TRC20 · 📋 All networks · 🔎 Find an exact amount. `/deposits 30 TON 1.18` typed by hand works as before.
+
+# V155 — ChatGPT Business: a seat in a chosen panel · lists of seats ending on a day · change a seat's email
+
+All in the ChatGPT Business bot, owner only.
+
+**➕ /addseat — now with a panel (or none) and an end date**
+- `/addseat <user id> <email>` → choose the length (as before) → **choose the panel** (from the invite bot, by name) or **⬜ No panel**.
+- Or on one line: `/addseat 5626665035 sara@gmail.com 2026-11-30 c30` (end date as `2026-11-30`, `30/11` or `+30`; the last word is the panel id, or `-` for none). Without the panel word, the panel buttons are shown.
+- In a panel: the email goes on that panel's whitelist in the invite bot with the end date (alerts the day before and on the day — build 39), the seat records the panel's name, and the customer is told the workspace. If the invite bot refuses, nothing is saved.
+
+**🗓 /ending — the seats that end on a day**
+- `/ending` → today and tomorrow · `/ending 2026-10-30` · `/ending 30/10` · `/ending +3`.
+- Grouped by workspace, with the customer, the order and ⏳ for seats not activated yet, then all the emails in one block to copy.
+- **Every day** at the reminder hour, the bot sends you this list for today and tomorrow (once a day; nothing when no seat ends).
+
+**📧 /setemail — a customer wants another email on his seat**
+- `/setemail 20439 new@gmail.com` (by order number) or `/setemail old@gmail.com new@gmail.com` (by the seat's current email — works for hand-added seats too).
+- Shows before/after, then: **✅ Change + invite the new email (invite bot)** · **✅ Change — I invite it myself** · ❌ Cancel. Valid 15 minutes, one tap = one change.
+- Changes the seat, its renewal that is not active yet, and the order's email. Invite bot: the old email's waiting invite is cancelled (not active yet) or taken off the whitelist (active); the new one is queued for an invite, or put on the whitelist with the seat's end date. The customer is told.
+- The OLD email stays a member of the workspace until you remove it (invite bot → 👥 Members → 🗑) — the bot reminds you.
+
+Needs the invite bot build 39.
+
 # V154 — a payment is not lost because the customer tapped another button during it
 
 **What happened:** a customer opens "Pay with Binance Pay", then taps /start or a menu button (that clears the session), then sends the Order ID — the bot ignored it, and the order was never processed.

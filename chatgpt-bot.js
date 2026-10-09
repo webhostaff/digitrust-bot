@@ -30,6 +30,7 @@ const db = new Database(dbPath);
 const queries = require('./database/queries');
 const cgbSeatDates = require('./services/cgbSeatDates');
 const cgbCycles = require('./services/cgbCycles');
+const cgbSeatTools = require('./services/cgbSeatTools');
 
 const bot = new TelegramBot(CHATGPT_BOT_TOKEN, { polling: true });
 require('./utils/emojiLayer').installEmojiLayer(bot, 'cgb');
@@ -372,18 +373,31 @@ async function showMainMenu(chatId, userId, messageId = null) {
   // the bot appear unchanged to customers whose seat simply is not recorded
   // here yet — they had no way to even ask about it.
   rows.push([
-    { text: '🔄 Renew', callback_data: 'cgb_renew_list' },
-    { text: '✨ New',   callback_data: 'cgb_new' },
+    { text: '🔄 Renew my seat', callback_data: 'cgb_renew_list' },
+    { text: '✨ Buy a new seat', callback_data: 'cgb_new' },
   ]);
-  rows.push([{ text: '📋 Details', callback_data: 'cgb_details_list' }]);
+  rows.push([{ text: '📋 My seats — details', callback_data: 'cgb_details_list' }]);
+  if (String(userId) === String(ADMIN_ID)) rows.push([{ text: '🛠 Admin panel', callback_data: 'adm_home' }]);
+
+  // V156: the seats themselves on the first screen — email, workspace, until when, days left.
+  const today = ymdLocal(cgbCycles.localNow(new Date()));
+  const seatLines = subs.slice(0, 8).map((sub) => {
+    const left = sub.end_date ? Math.round((new Date(`${String(sub.end_date).slice(0, 10)}T00:00:00`) - new Date(`${today}T00:00:00`)) / 86400000) : null;
+    const icon = sub.status === 'active' ? (left !== null && left <= 3 ? '🟠' : '🟢') : '⏳';
+    const when = sub.status === 'active'
+      ? `until <b>${escapeHtml(String(sub.end_date || '?'))}</b>${left !== null ? ` · ${left <= 0 ? 'ends today' : `${left} day${left === 1 ? '' : 's'} left`}` : ''}`
+      : 'waiting for activation';
+    return `${icon} <code>${escapeHtml(sub.email || '—')}</code>\n     🏢 ${escapeHtml(workspaceName(sub))} · ${when}`;
+  });
 
   const txt =
     require('./services/notices').banner('cgb') +
-    `🤖 <b>ChatGPT Business</b>\n\n` +
+    `🤖 <b>ChatGPT Business</b>\n━━━━━━━━━━━━━━━━━━\n` +
     (subs.length
-      ? `You have <b>${subs.length}</b> active seat${subs.length === 1 ? '' : 's'}.\n` +
-        `Purchase a new seat or renew a current subscription.\nChoose an option below:`
-      : `Purchase a seat below.`);
+      ? `<b>Your seat${subs.length === 1 ? '' : 's'}</b>\n${seatLines.join('\n')}` +
+        (subs.length > 8 ? `\n… and ${subs.length - 8} more (📋 My seats)` : '') +
+        `\n━━━━━━━━━━━━━━━━━━\nRenew a seat before it ends, or buy a new one:`
+      : `You have no seat yet.\n━━━━━━━━━━━━━━━━━━\nTap <b>✨ Buy a new seat</b> to see the price for this cycle.`);
 
   const opts = { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } };
   if (messageId) {
@@ -633,6 +647,90 @@ async function showRenewPayment(chatId, userId, subId, months, messageId = null)
   } else {
     await bot.sendMessage(chatId, txt, opts);
   }
+}
+
+// ════════════════════════════════════════════════════════════════
+// V156: 🛠 ADMIN PANEL — every owner command as a button
+// ════════════════════════════════════════════════════════════════
+// A button either opens a screen directly, or asks for the few words a command needs and then runs that very
+// command (bot.processUpdate), so a button and a typed command can never behave differently.
+const ADM_PROMPTS = {
+  addseat:  { cmd: '/addseat',  text: '➕ <b>Add a seat</b>\n\nSend the customer\'s Telegram id and the email:\n<code>5626665035 sara@gmail.com</code>\n\nYou choose the length and the panel next.\n<i>Or all at once:</i> <code>5626665035 sara@gmail.com 2026-11-30 c30</code> (<code>-</code> instead of the panel for none)' },
+  setemail: { cmd: '/setemail', text: '📧 <b>Change a seat\'s email</b>\n\nSend the order number (or the seat\'s current email), then the new email:\n<code>20439 new@gmail.com</code>\n<code>old@gmail.com new@gmail.com</code>' },
+  setdates: { cmd: '/setdates', text: '✏️ <b>Change a seat\'s dates</b>\n\nSend the order number, the first day and the last day:\n<code>20439 2026-10-05 2026-11-05</code>\n<i>A note for the customer can follow.</i>' },
+  ending:   { cmd: '/ending',   text: '🗓 <b>Seats ending on a day</b>\n\nSend the day: <code>2026-10-30</code>, <code>30/10</code> or <code>+3</code>' },
+  setprice: { cmd: '/setprice', text: '💲 <b>Custom monthly price for a customer</b>\n\nSend the Telegram id and the price (a note may follow):\n<code>5626665035 12.50</code>' },
+  delprice: { cmd: '/delprice', text: '🗑 <b>Remove a customer\'s custom price</b>\n\nSend the Telegram id:\n<code>5626665035</code>' },
+};
+
+function runAsCommand(chatId, userId, text) {
+  bot.processUpdate({ update_id: Date.now(), message: {
+    message_id: 0, date: Math.floor(Date.now() / 1000), text,
+    from: { id: Number(userId), is_bot: false, first_name: 'admin' }, chat: { id: Number(chatId), type: 'private' },
+  } });
+}
+
+async function showAdminPanel(chatId, msgId = null) {
+  const now = cgbCycles.localNow(new Date());
+  const today = cgbSeatTools.ymd(now);
+  const tomorrow = cgbSeatTools.parseDay('tomorrow', now);
+  const nT = cgbSeatTools.seatsEndingOn(db, today).total;
+  const nM = cgbSeatTools.seatsEndingOn(db, tomorrow).total;
+  let active = 0, waiting = 0;
+  try {
+    active = db.prepare("SELECT COUNT(*) n FROM chatgpt_subscriptions WHERE status = 'active' AND date(end_date) >= date(?)").get(today).n;
+    waiting = db.prepare("SELECT COUNT(*) n FROM chatgpt_subscriptions WHERE COALESCE(status,'pending') = 'pending'").get().n;
+  } catch (_) {}
+  const txt =
+    `🛠 <b>ChatGPT Business — Admin</b>\n━━━━━━━━━━━━━━━━━━\n` +
+    `🟢 Active seats: <b>${active}</b>\n⏳ Waiting for activation: <b>${waiting}</b>\n` +
+    `🗓 Ending today: <b>${nT}</b> · tomorrow: <b>${nM}</b>\n━━━━━━━━━━━━━━━━━━\nChoose:`;
+  const kb = { inline_keyboard: [
+    [{ text: `🗓 Ending today · ${nT}`, callback_data: 'adm_end_today' }, { text: `🗓 Tomorrow · ${nM}`, callback_data: 'adm_end_tomorrow' }],
+    [{ text: '🗓 In 3 days', callback_data: 'adm_end_+3' }, { text: '🗓 In 7 days', callback_data: 'adm_end_+7' }, { text: '📅 Other day', callback_data: 'adm_ask_ending' }],
+    [{ text: '➕ Add a seat', callback_data: 'adm_ask_addseat' }, { text: '📧 Change an email', callback_data: 'adm_ask_setemail' }],
+    [{ text: '✏️ Change dates', callback_data: 'adm_ask_setdates' }, { text: '🔎 Check renewals', callback_data: 'adm_run_checkrenewals' }],
+    [{ text: '🔄 Renewals board', callback_data: 'adm_run_renewals' }],
+    [{ text: '💰 Custom prices', callback_data: 'adm_run_prices' }, { text: '💲 Set a price', callback_data: 'adm_ask_setprice' }],
+    [{ text: '🗑 Remove a price', callback_data: 'adm_ask_delprice' }, { text: '🔌 Test invite bot', callback_data: 'adm_run_guardtest' }],
+    [{ text: '⬅️ Customer menu', callback_data: 'cgb_menu' }],
+  ] };
+  if (msgId) {
+    await bot.editMessageText(txt, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: kb })
+      .catch(() => bot.sendMessage(chatId, txt, { parse_mode: 'HTML', reply_markup: kb }));
+  } else {
+    await bot.sendMessage(chatId, txt, { parse_mode: 'HTML', reply_markup: kb });
+  }
+}
+
+bot.onText(/^\/admin(?:@\w+)?$/i, async (msg) => {
+  if (String(msg.from.id) !== String(ADMIN_ID)) return;
+  await showAdminPanel(msg.chat.id);
+});
+
+/** adm_* buttons → true when handled. */
+async function handleAdminPanelButton(data, chatId, msgId, userId) {
+  if (!data.startsWith('adm_')) return false;
+  if (String(userId) !== String(ADMIN_ID)) return true;
+  if (data === 'adm_home') { await showAdminPanel(chatId, msgId); return true; }
+  let m = /^adm_end_(today|tomorrow|\+\d+)$/.exec(data);
+  if (m) { runAsCommand(chatId, userId, `/ending ${m[1]}`); return true; }
+  m = /^adm_run_(checkrenewals|renewals|prices|guardtest)$/.exec(data);
+  if (m) { runAsCommand(chatId, userId, `/${m[1]}`); return true; }
+  m = /^adm_ask_(\w+)$/.exec(data);
+  if (m && ADM_PROMPTS[m[1]]) {
+    setSession(userId, 'ADM_TYPE', { cmd: ADM_PROMPTS[m[1]].cmd });
+    await bot.sendMessage(chatId, ADM_PROMPTS[m[1]].text, { parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'adm_cancel' }]] } });
+    return true;
+  }
+  if (data === 'adm_cancel') {
+    clearSession(userId);
+    await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msgId }).catch(() => {});
+    await showAdminPanel(chatId);
+    return true;
+  }
+  return true;
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -1017,8 +1115,40 @@ bot.onText(/^\/addseat(?:\s+(.+))?$/i, async (msg, match) => {
     return;
   }
 
+  // V155: everything on one line — /addseat <user> <email> <end date> [panel id | -]
+  if (parts[2]) {
+    const end = cgbSeatTools.parseDay(parts[2], cgbCycles.localNow(new Date()));
+    if (!end) { await bot.sendMessage(chatId, '❌ End date not understood. Use 2026-11-30, 30/11 or +30.'); return; }
+    if (parts[3]) {
+      const panelId = parts[3] === '-' ? '' : parts[3];
+      await createSeatManually(chatId, target, email, end, msg.from.id, { panelId });
+    } else {
+      await askSeatPanel(chatId, target, email, end);
+    }
+    return;
+  }
+
   await showSeatCyclePicker(chatId, target, email);
 });
+
+// ── V155: which panel a hand-added seat is in (or none) ──
+const pendingSeatPanels = new Map();          // token -> { u, e, d, ids, at }
+async function askSeatPanel(chatId, target, email, endDate) {
+  const now = Date.now();
+  for (const [k, v] of pendingSeatPanels) if (now - v.at > PENDING_EDIT_MS) pendingSeatPanels.delete(k);
+  const panels = (await cgbGuard.fetchGuardPanelsNamed(6000).catch(() => null)) || [];
+  const token = require('crypto').randomBytes(4).toString('hex');
+  pendingSeatPanels.set(token, { u: target, e: email, d: endDate, ids: panels.map((p) => p.id), at: now });
+  const icon = { running: '🟢', stopped: '⚪', paused: '⏸', waiting: '⏳' };
+  const rows = panels.slice(0, 20).map((p, i) => [{ text: `${icon[p.state] || '•'} ${p.name}`, callback_data: `cgb_sp_${token}_${i}` }]);
+  rows.push([{ text: '⬜ No panel', callback_data: `cgb_sp_${token}_n` }]);
+  await bot.sendMessage(chatId,
+    `📝 <b>Add seat</b>\n\n👤 <code>${target}</code>\n📧 <code>${escapeHtml(email)}</code>\n📅 Ends <b>${endDate}</b>\n\n` +
+    `Which panel is it in?\n<i>A panel: the email goes on that panel's whitelist in the invite bot with this end date ` +
+    `(you get an alert the day before and on the day). No panel: the seat is only saved here.</i>` +
+    (panels.length ? '' : `\n\n⚠️ <i>Could not get the panels from the invite bot.</i>`),
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
+}
 
 /** Cycle options for a hand-added seat. */
 async function showSeatCyclePicker(chatId, target, email) {
@@ -1363,6 +1493,129 @@ async function handleDateEditButton(data, userId, chatId) {
   return true;
 }
 
+// ── V155: /ending [day] — the seats that end on a day (default: today and tomorrow) ──
+async function sendEndingList(chatId, day, label) {
+  const { text, emails } = cgbSeatTools.endingText(cgbSeatTools.seatsEndingOn(db, day), label);
+  await bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
+  if (emails.length) {
+    await bot.sendMessage(chatId, `<code>${escapeHtml(emails.join('\n'))}</code>`, { parse_mode: 'HTML' }).catch(() => {});
+  }
+  return emails.length;
+}
+bot.onText(/^\/ending(?:@\w+)?(?:\s+(.*))?$/i, async (msg, match) => {
+  if (String(msg.from.id) !== String(ADMIN_ID)) return;
+  const now = cgbCycles.localNow(new Date());
+  const arg = String((match && match[1]) || '').trim();
+  if (!arg) {
+    await sendEndingList(msg.chat.id, cgbSeatTools.parseDay('today', now), 'today');
+    await sendEndingList(msg.chat.id, cgbSeatTools.parseDay('tomorrow', now), 'tomorrow');
+    return;
+  }
+  const day = cgbSeatTools.parseDay(arg, now);
+  if (!day) { await bot.sendMessage(msg.chat.id, '❌ Day not understood. Use /ending 2026-10-30, /ending 30/10, /ending tomorrow or /ending +3.'); return; }
+  await sendEndingList(msg.chat.id, day);
+});
+
+/** Once a day (at the reminder hour): the seats ending today and tomorrow, sent to the owner. */
+async function sendDailyEndingDigest() {
+  if (!ADMIN_ID) return;
+  const now = cgbCycles.localNow(new Date());
+  const { hour } = reminderSettings();
+  if (now.getHours() < hour) return;
+  const today = cgbSeatTools.ymd(now);
+  const last = db.prepare("SELECT value FROM settings WHERE key = 'cgb_ending_digest_last'").get();
+  if (last && last.value === today) return;
+  db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('cgb_ending_digest_last', ?)").run(today);
+  const t = cgbSeatTools.seatsEndingOn(db, today);
+  const m = cgbSeatTools.seatsEndingOn(db, cgbSeatTools.parseDay('tomorrow', now));
+  if (!t.total && !m.total) return;
+  await bot.sendMessage(ADMIN_ID, '🗓 <b>Seats ending</b> — daily list', { parse_mode: 'HTML' }).catch(() => {});
+  if (t.total) await sendEndingList(ADMIN_ID, t.day, 'today');
+  if (m.total) await sendEndingList(ADMIN_ID, m.day, 'tomorrow');
+}
+
+// ── V155: /setemail <order | current email> <new email> — a customer wants another email on his seat ──
+const pendingEmailChanges = new Map();       // token -> { subId, email, at }
+bot.onText(/^\/setemail(?:@\w+)?(?:\s+(.*))?$/i, async (msg, match) => {
+  if (String(msg.from.id) !== String(ADMIN_ID)) return;
+  const chatId = msg.chat.id;
+  const p = cgbSeatTools.parseSetEmail(match && match[1]);
+  if (!p.ok) { await bot.sendMessage(chatId, `❌ ${p.error}\n\nExample: <code>/setemail 20439 new@gmail.com</code> or <code>/setemail old@gmail.com new@gmail.com</code>`, { parse_mode: 'HTML' }); return; }
+  const f = cgbSeatTools.findSeat(db, p.ref);
+  if (f.error) { await bot.sendMessage(chatId, `❌ ${escapeHtml(f.error)}`, { parse_mode: 'HTML' }); return; }
+  const sub = f.sub;
+  if (String(sub.email || '').toLowerCase() === p.email) { await bot.sendMessage(chatId, '❌ That is already the seat\'s email.'); return; }
+  const now = Date.now();
+  for (const [k, v] of pendingEmailChanges) if (now - v.at > PENDING_EDIT_MS) pendingEmailChanges.delete(k);
+  const token = require('crypto').randomBytes(4).toString('hex');
+  pendingEmailChanges.set(token, { subId: sub.id, email: p.email, at: now });
+  const active = sub.status === 'active';
+  await bot.sendMessage(chatId,
+    `📧 <b>Change the email of a seat</b>\n\n` +
+    `${sub.order_id ? `🆔 Order <b>#${sub.order_id}</b>` : '🆔 Manual seat'} · 👤 <code>${sub.user_id}</code>\n` +
+    `📅 ${sub.start_date || '?'} → <b>${sub.end_date}</b> · ${active ? '🟢 active' : '⏳ not activated yet'}\n` +
+    `${sub.workspace ? `🖥 ${escapeHtml(sub.workspace)}\n` : ''}\n` +
+    `before: <code>${escapeHtml(sub.email || '—')}</code>\nafter: <b><code>${escapeHtml(p.email)}</code></b>\n` +
+    (f.others ? `\n<i>${f.others} other seat(s) also use the old email — only this one changes.</i>\n` : '') +
+    `\nThe customer is told. <i>Valid for 15 minutes.</i>`,
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+      [{ text: '✅ Change + invite the new email (invite bot)', callback_data: `cgb_se_i_${token}` }],
+      [{ text: '✅ Change — I invite it myself', callback_data: `cgb_se_m_${token}` }],
+      [{ text: '❌ Cancel', callback_data: `cgb_se_x_${token}` }],
+    ] } });
+});
+
+async function handleEmailChangeButton(data, chatId, msgId, adminId) {
+  const [, , choice, token] = data.split('_');
+  const edit = pendingEmailChanges.get(token);
+  pendingEmailChanges.delete(token);                 // one tap, one change
+  await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msgId }).catch(() => {});
+  if (!edit || Date.now() - edit.at > PENDING_EDIT_MS) { await bot.sendMessage(chatId, '⌛ That change expired — send /setemail again.'); return; }
+  if (choice === 'x') { await bot.sendMessage(chatId, '❌ Cancelled — nothing was changed.'); return; }
+  const sub = db.prepare('SELECT * FROM chatgpt_subscriptions WHERE id = ?').get(edit.subId);
+  if (!sub) { await bot.sendMessage(chatId, '❌ That seat no longer exists.'); return; }
+  const oldEmail = sub.email;
+  const r = cgbSeatTools.changeSeatEmail(db, sub, edit.email);
+  const lines = [`✅ <b>Email changed</b>${sub.order_id ? ` · order #${sub.order_id}` : ''}`,
+    `<code>${escapeHtml(oldEmail || '—')}</code> → <b><code>${escapeHtml(edit.email)}</code></b>`];
+  if (r.changed.length > 1) lines.push(`↪️ also on its renewal that is not active yet`);
+
+  // the invite bot
+  const panelId = cgbGuard.panelForSeat(sub.end_date);
+  if (sub.status !== 'active' && oldEmail) {
+    const c = await cgbGuard.cancelGuardInvite(oldEmail, { orderId: sub.order_id, endDate: sub.end_date }).catch(() => 'unreachable');
+    lines.push(`🗑 Old email's waiting invite: ${escapeHtml(typeof c === 'string' ? c : (c && c.status) || 'asked to cancel')}`);
+  }
+  if (sub.status === 'active' && oldEmail && panelId) {
+    const w = await cgbGuard.whitelistInGuard({ panel: panelId, email: oldEmail, action: 'remove' });
+    lines.push(w.ok ? `➖ Old email taken off the whitelist of <b>${escapeHtml(w.panelName)}</b>` : `⚠️ Old email not taken off the whitelist: ${escapeHtml(w.reason)}`);
+  }
+  if (choice === 'i') {
+    const h = await handOverToGuard(edit.email, sub.order_id, sub.end_date);
+    lines.push(h && h.ok ? `📨 New email handed to the invite bot${h.panel ? ` (panel <code>${escapeHtml(h.panel)}</code>)` : ''} — it is invited in the next batch`
+                         : `⚠️ New email NOT handed to the invite bot — invite it yourself`);
+  } else if (panelId) {
+    const w = await cgbGuard.whitelistInGuard({ panel: panelId, email: edit.email, expiresOn: sub.end_date, note: `email changed · seat ${sub.id}`, source: 'store' });
+    lines.push(w.ok ? `➕ New email on the whitelist of <b>${escapeHtml(w.panelName)}</b> until ${sub.end_date} — invite it yourself`
+                    : `⚠️ New email not whitelisted: ${escapeHtml(w.reason)}`);
+  }
+  if (sub.status === 'active' && oldEmail) lines.push(`\n<i>The old email is still a MEMBER of the workspace until you remove it (invite bot → 👥 Members → 🗑).</i>`);
+
+  let told = false;
+  try {
+    await bot.sendMessage(Number(sub.user_id),
+      `📧 <b>Your ChatGPT Business seat now uses a new email</b>\n\n` +
+      `before: <code>${escapeHtml(oldEmail || '—')}</code>\nnow: <b><code>${escapeHtml(edit.email)}</code></b>\n` +
+      `📅 Until <b>${sub.end_date}</b>\n\n` +
+      (choice === 'i' ? 'An invitation will reach the new email shortly — accept it from that inbox.' : 'You will receive the invitation on the new email.'),
+      { parse_mode: 'HTML' });
+    told = true;
+  } catch (_) {}
+  lines.push(told ? '📨 The customer was told.' : '⚠️ The customer could not be messaged — tell him yourself.');
+  logger.info(`[CGB] seat ${sub.id} email ${oldEmail} -> ${edit.email} by ${adminId} (${choice})`);
+  await bot.sendMessage(chatId, lines.join('\n'), { parse_mode: 'HTML' });
+}
+
 // ── /checkrenewals — paid renewals not yet activated whose dates disagree with the customer's cycle ──
 bot.onText(/^\/checkrenewals(?:@\w+)?$/i, async (msg) => {
   if (String(msg.from.id) !== String(ADMIN_ID)) return;
@@ -1471,7 +1724,7 @@ function guardCancelLine(guard) {
   }
 }
 
-async function createSeatManually(chatId, target, email, endDate, adminId) {
+async function createSeatManually(chatId, target, email, endDate, adminId, { panelId = '' } = {}) {
   const today = new Date();
   const days = Math.max(0, Math.ceil(
     (new Date(`${endDate}T23:59:00`) - today) / 86400000));
@@ -1480,7 +1733,17 @@ async function createSeatManually(chatId, target, email, endDate, adminId) {
 
   try {
     db.prepare('INSERT OR IGNORE INTO users (telegram_id) VALUES (?)').run(target);
-    const ws = db.prepare(`SELECT value FROM settings WHERE key='cgb_workspace_name'`).get()?.value || 'chatgpt_Team';
+    let ws = db.prepare(`SELECT value FROM settings WHERE key='cgb_workspace_name'`).get()?.value || 'chatgpt_Team';
+    // V155: in a chosen panel — whitelisted there with its end date; the seat records the panel's name.
+    let wl = null;
+    if (panelId) {
+      wl = await cgbGuard.whitelistInGuard({ panel: panelId, email, expiresOn: endDate, note: `manual seat · user ${target}`, source: 'store' });
+      if (wl.ok) ws = wl.panelName || ws;
+      else {
+        await bot.sendMessage(chatId, `❌ Not saved — the invite bot refused: ${escapeHtml(wl.reason)}`, { parse_mode: 'HTML' });
+        return;
+      }
+    }
 
     // order_id 0 marks a seat with no order behind it in this bot. Status is
     // 'active' rather than 'awaiting_payment': the admin is stating a fact, not
@@ -1497,13 +1760,16 @@ async function createSeatManually(chatId, target, email, endDate, adminId) {
       `📧 <code>${escapeHtml(email)}</code>\n` +
       `👤 <code>${target}</code>\n` +
       `📅 Ends <b>${endDate}</b> (${days} day${days === 1 ? '' : 's'})\n` +
-      `💰 Recorded at <b>$${price.toFixed(2)}</b> · $${monthly.toFixed(2)}/mo\n\n` +
-      `<i>They can now renew it, and will be reminded before it expires.</i>`,
+      `💰 Recorded at <b>$${price.toFixed(2)}</b> · $${monthly.toFixed(2)}/mo\n` +
+      (wl && wl.ok ? `🖥 Panel <b>${escapeHtml(ws)}</b> — on its whitelist until ${endDate}\n` : `⬜ No panel\n`) +
+      `\n<i>They can now renew it, and will be reminded before it expires.</i>`,
       { parse_mode: 'HTML' });
 
     await bot.sendMessage(target,
       `🤖 <b>Your ChatGPT Business seat is active</b>\n\n` +
-      `📧 <code>${escapeHtml(email)}</code>\n📅 Until <b>${endDate}</b>\n\n` +
+      `📧 <code>${escapeHtml(email)}</code>\n` +
+      (wl && wl.ok ? `🖥 Workspace: <b>${escapeHtml(ws)}</b>\n` : '') +
+      `📅 Until <b>${endDate}</b>\n\n` +
       `Send /menu any time to renew it or see the details.`,
       { parse_mode: 'HTML' }).catch(() => {
       bot.sendMessage(chatId, 'ℹ️ Seat saved, but the customer has not started this bot yet — they will see it when they do.');
@@ -1521,6 +1787,9 @@ bot.on('callback_query', async (q) => {
   const data   = q.data;
 
   await bot.answerCallbackQuery(q.id).catch(() => {});
+
+  // ── V156: 🛠 admin panel buttons ───────────────────────────────────────────
+  if (await handleAdminPanelButton(data, chatId, msgId, userId)) return;
 
   // ── Admin: renewals dashboard ──────────────────────────────────────────────
   if (data.startsWith('rnw_')) {
@@ -1627,7 +1896,29 @@ bot.on('callback_query', async (q) => {
     try { payload = JSON.parse(Buffer.from(data.replace('cgb_seat_', ''), 'base64url').toString('utf8')); }
     catch (_) { await bot.sendMessage(chatId, '❌ Could not read that selection.'); return; }
     await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msgId }).catch(() => {});
-    await createSeatManually(chatId, payload.u, payload.e, payload.d, userId);
+    await askSeatPanel(chatId, payload.u, payload.e, payload.d);
+    return;
+  }
+
+  // V155: the panel of a hand-added seat
+  {
+    const m = /^cgb_sp_([0-9a-f]{8})_(n|\d+)$/.exec(data);
+    if (m) {
+      if (String(userId) !== String(ADMIN_ID)) return;
+      const st = pendingSeatPanels.get(m[1]);
+      pendingSeatPanels.delete(m[1]);                   // one tap, one seat
+      await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msgId }).catch(() => {});
+      if (!st) { await bot.sendMessage(chatId, '⌛ That choice expired — send /addseat again.'); return; }
+      const panelId = m[2] === 'n' ? '' : (st.ids[Number(m[2])] || '');
+      await createSeatManually(chatId, st.u, st.e, st.d, userId, { panelId });
+      return;
+    }
+  }
+
+  // V155: the change of a seat's email
+  if (/^cgb_se_[imx]_[0-9a-f]{8}$/.test(data)) {
+    if (String(userId) !== String(ADMIN_ID)) return;
+    await handleEmailChangeButton(data, chatId, msgId, userId);
     return;
   }
 
@@ -2056,6 +2347,13 @@ bot.on('message', async (msg) => {
   const s = getSession(userId);
   if (!s) return;
 
+  // ─── V156: the words a 🛠 admin-panel button asked for → run that command ───
+  if (s.state === 'ADM_TYPE' && String(userId) === String(ADMIN_ID)) {
+    clearSession(userId);
+    runAsCommand(chatId, userId, `${s.cmd} ${text}`);
+    return;
+  }
+
   // ─── Admin typed an exact end date for a manual seat ───
   if (s.state === 'ADMIN_SEAT_DATE' && String(userId) === String(ADMIN_ID)) {
     const raw = text;
@@ -2068,7 +2366,7 @@ bot.on('message', async (msg) => {
       return;
     }
     clearSession(userId);
-    await createSeatManually(chatId, s.target, s.email, raw, userId);
+    await askSeatPanel(chatId, s.target, s.email, raw);
     return;
   }
 
@@ -2624,8 +2922,10 @@ async function sendRenewalReminders() {
 const REMINDER_INTERVAL_MS = 60 * 60 * 1000;
 setTimeout(() => {
   sendRenewalReminders().catch((e) => logger.error(`reminder run: ${e.message}`));
+  sendDailyEndingDigest().catch((e) => logger.error(`ending digest: ${e.message}`));
   setInterval(() => {
     sendRenewalReminders().catch((e) => logger.error(`reminder run: ${e.message}`));
+    sendDailyEndingDigest().catch((e) => logger.error(`ending digest: ${e.message}`));
   }, REMINDER_INTERVAL_MS);
 }, 30000); // let the process finish booting first
 
@@ -2644,10 +2944,13 @@ if (ADMIN_ID) {
   bot.setMyCommands([
     { command: 'start',    description: '🤖 ChatGPT Business' },
     { command: 'menu',     description: '📋 My subscriptions & renew' },
+    { command: 'admin',    description: '🛠 Admin panel (buttons)' },
     { command: 'renewals', description: '🔄 Who renewed (admin)' },
       { command: 'checkrenewals', description: '🔎 Check paid renewals (admin)' },
       { command: 'setdates', description: '✏️ Change a paid seat\'s dates (admin)' },
     { command: 'addseat',  description: '➕ Add a seat manually (admin)' },
+    { command: 'ending',   description: '🗓 Seats ending on a day (admin)' },
+    { command: 'setemail', description: '📧 Change a seat\'s email (admin)' },
     { command: 'setprice', description: '💰 Custom price for a customer (admin)' },
     { command: 'prices',   description: '💰 List custom prices (admin)' },
     { command: 'guardtest', description: '🔌 Test the link to the invite bot (admin)' },
@@ -2658,4 +2961,4 @@ if (ADMIN_ID) {
 
 bot.on('polling_error', e => logger.error(`CGB polling: ${e.message}`));
 
-module.exports = { bot, confirmCryptobotPayment, sendRenewalReminders, activateAndNotifySeat, cancelSeatOrder };
+module.exports = { bot, confirmCryptobotPayment, sendRenewalReminders, activateAndNotifySeat, cancelSeatOrder, sendDailyEndingDigest };

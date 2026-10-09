@@ -839,78 +839,17 @@ bot.onText(/^\/version$/i, async (msg) => {
 bot.onText(/^\/deposits(?:\s+(.+))?$/i, async (msg, match) => {
   if (!adminHandler.isAdmin(msg.from.id)) return;
   const chatId = msg.chat.id;
-
-  // "/deposits 30 TON" or "/deposits 30 1.180591" — days, then an optional
-  // network or exact amount. Needed because a shop taking hundreds of BSC
-  // deposits a day drowns any single transfer on another network.
-  const args = String((match && match[1]) || '').trim().split(/\s+/).filter(Boolean);
-  let days = 7, network = null, amount = null;
-  for (const a of args) {
-    if (/^\d+$/.test(a) && Number(a) <= 90 && days === 7) { days = Number(a); continue; }
-    if (/^[A-Za-z]{2,10}$/.test(a)) { network = a.toUpperCase(); continue; }
-    if (/^\d+\.\d+$/.test(a)) { amount = Number(a); continue; }
-  }
-
-  await bot.sendMessage(chatId,
-    `⏳ Asking Binance for ${days} day(s)` +
-    `${network ? ` · network ${escapeHtml(network)}` : ''}` +
-    `${amount !== null ? ` · amount ${amount}` : ''}…`,
-    { parse_mode: 'HTML' });
-
-  const binanceSvc = require('./services/binance');
-  const r = await binanceSvc.listRecentDeposits({ days, limit: 15, network, amount });
-
-  if (!r.ok) {
-    await bot.sendMessage(chatId,
-      `❌ <b>Binance call failed</b>\n\n<code>${escapeHtml(r.error)}</code>\n\n` +
-      `<i>Usually the API key lacks <b>Enable Reading</b>, or this server's IP is ` +
-      `not on the key's allow-list.</i>`,
-      { parse_mode: 'HTML' });
+  const dep = require('./services/depositsAdmin');
+  // No arguments: the buttons (V156). With arguments ("/deposits 30 TON", "/deposits 1.180591"): as before.
+  if (!String((match && match[1]) || '').trim()) {
+    await bot.sendMessage(chatId, dep.MENU_TEXT, { parse_mode: 'HTML', reply_markup: dep.menuKb() });
     return;
   }
-
-  const head =
-    `📥 <b>Binance deposits</b> — last ${days} day(s)\n` +
-    `Total in window: <b>${r.total}</b>\n` +
-    `Networks seen: ${r.networks.map((n) => `<code>${escapeHtml(n)}</code>`).join(' ')}\n`;
-
-  if (!r.matched) {
-    // The network list above is the answer: if TON never appears among
-    // hundreds of deposits, Binance never received one — the transfer did not
-    // arrive, whatever the sending wallet shows.
-    await bot.sendMessage(chatId,
-      head +
-      `\n❌ <b>Nothing matched</b>` +
-      `${network ? ` for network <b>${escapeHtml(network)}</b>` : ''}` +
-      `${amount !== null ? ` at <b>${amount}</b>` : ''}.\n\n` +
-      (network && !r.networks.includes(network)
-        ? `⚠️ <b>Binance has received no ${escapeHtml(network)} deposits at all</b> in ` +
-          `this window — not one, out of ${r.total}.\n\n` +
-          `<i>That points at the transfer never reaching Binance, rather than at ` +
-          `the bot failing to match it. Check the receiving address the customer ` +
-          `used against your Binance ${escapeHtml(network)} deposit address.</i>`
-        : `<i>Try a wider window: <code>/deposits 90 ${escapeHtml(network || '')}</code></i>`),
-      { parse_mode: 'HTML' });
-    return;
-  }
-
-  const lines = r.rows.map((d) => {
-    const when = new Date(Number(d.insertTime)).toISOString().slice(0, 16).replace('T', ' ');
-    const state = Number(d.status) === 1 ? '✅' : Number(d.status) === 0 ? '⏳' : `(${d.status})`;
-    // Shown in FULL. A truncated hash cannot be copied, pasted or compared
-    // against what a customer sends — which is the entire purpose of this
-    // screen. A 64-character hash wraps on a phone; that is a far smaller cost
-    // than an id nobody can use.
-    return `${state} <b>${escapeHtml(String(d.amount))}</b> ${escapeHtml(d.coin || '')} · ` +
-           `${escapeHtml(d.network || '?')} · ${when}\n` +
-           `   <code>${escapeHtml(String(d.txId || ''))}</code>`;
-  });
-
+  const a = dep.parseArgs(match[1]);
   await bot.sendMessage(chatId,
-    head +
-    `Matching: <b>${r.matched}</b>${r.matched > r.rows.length ? ` (showing ${r.rows.length})` : ''}\n\n` +
-    lines.join('\n\n'),
+    `⏳ Asking Binance for ${a.days} day(s)${a.network ? ` · network ${escapeHtml(a.network)}` : ''}${a.amount !== null ? ` · amount ${a.amount}` : ''}…`,
     { parse_mode: 'HTML' });
+  await bot.sendMessage(chatId, await dep.render(a), { parse_mode: 'HTML' });
 });
 
 // ── Text messages ─────────────────────────────────────────────────────────────

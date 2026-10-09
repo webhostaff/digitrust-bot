@@ -1909,6 +1909,18 @@ async function handleAdminText(bot, msg) {
     return;
   }
 
+  // ── 📥 Binance deposits: an exact amount (V156) ───────────────────
+  if (s === 'ADMIN_DEP_AMOUNT') {
+    session.clear(userId);
+    const dep = require('../services/depositsAdmin');
+    const a = dep.parseArgs(text);
+    if (a.amount === null) { await bot.sendMessage(chatId, '❌ Send a number, e.g. 10.003'); return; }
+    await bot.sendMessage(chatId, `⏳ Asking Binance for ${a.days} day(s)…`);
+    await bot.sendMessage(chatId, await dep.render(a), { parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '📥 Other search', callback_data: 'admin_deps_menu' }]] } });
+    return;
+  }
+
   // ── TxID tracer: one id, the whole story ──────────────────────────
   if (s === States.ADMIN_TXID_SEARCH) {
     session.clear(userId);
@@ -2784,6 +2796,8 @@ async function handleAdminCallback(bot, query) {
   if (/^admin_ref/.test(data) && await referralAdmin.handle(bot, query)) return;
   // 📄 Binance Report (V149) and 📧 the store bot's emails
   if (/^admin_binrep/.test(data) && await reportAdmin.handle(bot, query)) return;
+  // 📥 Binance deposits as buttons (V156) — the /deposits command, TON included
+  if (/^admin_deps/.test(data) && await require('../services/depositsAdmin').handle(bot, query)) return;
   if (/^admin_cgb_emails/.test(data) && await cgbEmailsAdmin.handle(bot, query)) return;
 
   /**
