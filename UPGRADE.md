@@ -1,3 +1,8 @@
+# V156.1 — ➕ Add a seat: the length buttons never appeared
+
+The length picker of /addseat (and of 🛠 ➕ Add a seat) packed the user id, the email and the date INSIDE each button. Telegram allows 64 bytes per button; even `5626665035 sara@gmail.com` made 81, so Telegram refused the whole message and nothing appeared — no error. The choice now waits in the bot under a short token (valid 15 minutes, one tap = one seat). The typed exact date also accepts `08/11` and `+30`.
+Also: the supplier buttons of the stock screen could pass 64 bytes for long supplier names — trimmed.
+
 # V156 — buttons instead of commands · a clearer ChatGPT Business bot · Binance deposits (TON) as buttons
 
 **ChatGPT Business bot — 🛠 Admin panel** (owner only): `/start` → **🛠 Admin panel**, or `/admin`.

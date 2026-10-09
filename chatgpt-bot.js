@@ -1150,17 +1150,30 @@ async function askSeatPanel(chatId, target, email, endDate) {
     { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
 }
 
+const pendingSeatPicks = new Map();          // token -> { u, e, ends: [date], at } (V156.1)
 /** Cycle options for a hand-added seat. */
 async function showSeatCyclePicker(chatId, target, email) {
   const best = cgbCycles.calculateBestCycle();
   const monthly = cgbCycles.getMonthlyPrice(target);
-  const enc = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+  // V156.1: Telegram allows 64 bytes per button. The user id + email + date used to be packed INTO each button
+  // (80+ bytes even for sara@gmail.com), so Telegram refused the whole message and nothing appeared. The choice
+  // now waits here under a short token.
+  const now = Date.now();
+  for (const [k, v] of pendingSeatPicks) if (now - v.at > PENDING_EDIT_MS) pendingSeatPicks.delete(k);
+  const token = require('crypto').randomBytes(4).toString('hex');
+  const pick = { u: target, e: email, ends: [], at: now };
+  pendingSeatPicks.set(token, pick);
+  const enc = (o) => {
+    if (o.d === undefined) return `${token}_t`;                    // type a date
+    pick.ends.push(o.d);
+    return `${token}_${pick.ends.length - 1}`;
+  };
 
   const rows = [];
   if (best) {
     rows.push([{
       text: `📅 Current cycle — ends ${formatDate(best.endDate)} (${best.daysRemaining}d)`,
-      callback_data: `cgb_seat_${enc({ u: target, e: email, d: formatDate(best.endDate) })}`,
+      callback_data: `cgb_seat_${enc({ d: formatDate(best.endDate) })}`,
     }]);
   }
   // Whole months from today, three per row.
@@ -1170,12 +1183,12 @@ async function showSeatCyclePicker(chatId, target, email) {
     end.setMonth(end.getMonth() + m);
     row.push({
       text: `${m}mo`,
-      callback_data: `cgb_seat_${enc({ u: target, e: email, d: formatDate(end) })}`,
+      callback_data: `cgb_seat_${enc({ d: formatDate(end) })}`,
     });
     if (row.length === 3) { rows.push(row); row = []; }
   }
   if (row.length) rows.push(row);
-  rows.push([{ text: '✏️ Type an exact end date', callback_data: `cgb_seatdate_${enc({ u: target, e: email })}` }]);
+  rows.push([{ text: '✏️ Type an exact end date', callback_data: `cgb_seatdate_${enc({})}` }]);
 
   await bot.sendMessage(chatId,
     `📝 <b>Add seat</b>\n\n` +
@@ -1892,10 +1905,12 @@ bot.on('callback_query', async (q) => {
   // ── Manual seat: the admin picked a cycle ──────────────────────────────────
   if (/^cgb_seat_/.test(data)) {
     if (String(userId) !== String(ADMIN_ID)) return;   // silent for everyone else
-    let payload;
-    try { payload = JSON.parse(Buffer.from(data.replace('cgb_seat_', ''), 'base64url').toString('utf8')); }
-    catch (_) { await bot.sendMessage(chatId, '❌ Could not read that selection.'); return; }
+    const m = /^cgb_seat_([0-9a-f]{8})_(\d+)$/.exec(data);
+    const pick = m && pendingSeatPicks.get(m[1]);
     await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msgId }).catch(() => {});
+    if (!pick || !pick.ends[Number(m[2])]) { await bot.sendMessage(chatId, '⌛ That choice expired — start again with ➕ Add a seat.'); return; }
+    pendingSeatPicks.delete(m[1]);
+    const payload = { u: pick.u, e: pick.e, d: pick.ends[Number(m[2])] };
     await askSeatPanel(chatId, payload.u, payload.e, payload.d);
     return;
   }
@@ -1924,10 +1939,11 @@ bot.on('callback_query', async (q) => {
 
   if (/^cgb_seatdate_/.test(data)) {
     if (String(userId) !== String(ADMIN_ID)) return;
-    let payload;
-    try { payload = JSON.parse(Buffer.from(data.replace('cgb_seatdate_', ''), 'base64url').toString('utf8')); }
-    catch (_) { return; }
-    setSession(userId, 'ADMIN_SEAT_DATE', { target: payload.u, email: payload.e });
+    const m = /^cgb_seatdate_([0-9a-f]{8})_t$/.exec(data);
+    const pick = m && pendingSeatPicks.get(m[1]);
+    if (!pick) { await bot.sendMessage(chatId, '⌛ That choice expired — start again with ➕ Add a seat.'); return; }
+    pendingSeatPicks.delete(m[1]);
+    setSession(userId, 'ADMIN_SEAT_DATE', { target: pick.u, email: pick.e });
     await bot.sendMessage(chatId,
       `📅 Send the end date as <code>YYYY-MM-DD</code>\n\nExample: <code>2026-12-31</code>`,
       { parse_mode: 'HTML' });
@@ -2356,13 +2372,9 @@ bot.on('message', async (msg) => {
 
   // ─── Admin typed an exact end date for a manual seat ───
   if (s.state === 'ADMIN_SEAT_DATE' && String(userId) === String(ADMIN_ID)) {
-    const raw = text;
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
-      await bot.sendMessage(chatId, '❌ Use <code>YYYY-MM-DD</code>, e.g. <code>2026-12-31</code>.', { parse_mode: 'HTML' });
-      return;
-    }
-    if (isNaN(new Date(`${raw}T23:59:00`).getTime())) {
-      await bot.sendMessage(chatId, '❌ That is not a real date.');
+    const raw = cgbSeatTools.parseDay(text, cgbCycles.localNow(new Date()));
+    if (!raw) {
+      await bot.sendMessage(chatId, '❌ Use <code>2026-12-31</code>, <code>31/12</code> or <code>+30</code>.', { parse_mode: 'HTML' });
       return;
     }
     clearSession(userId);

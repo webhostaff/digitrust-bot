@@ -208,7 +208,7 @@ function stockConfirmRows(userId, productId, count) {
 
   if (!current) {
     for (const name of (items.recentSuppliers() || []).slice(0, 4)) {
-      rows.push([{ text: `🏷 ${String(name).slice(0, 30)}`, callback_data: `admin_stock_sup_${Buffer.from(String(name)).toString('base64url').slice(0, 50)}` }]);
+      rows.push([{ text: `🏷 ${String(name).slice(0, 30)}`, callback_data: `admin_stock_sup_${Buffer.from(String(name)).toString('base64url').slice(0, 48)}` }]);
     }
     rows.push([{ text: '✏️ Type supplier name', callback_data: 'admin_stock_supplier' }]);
   } else {
