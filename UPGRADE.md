@@ -1,3 +1,18 @@
+# V154 — a payment is not lost because the customer tapped another button during it
+
+**What happened:** a customer opens "Pay with Binance Pay", then taps /start or a menu button (that clears the session), then sends the Order ID — the bot ignored it, and the order was never processed.
+
+- The last payment prompt (Binance Pay order, USDT TxID for an order, wallet top-up by TxID or Binance Pay) is remembered (also in the database, table `pay_prompts`, so a restart does not lose it).
+- When no other flow is active and the customer sends something that looks like a payment reference (a 9–22 digit Binance Pay / off-chain id, or a 64-character TxID), that prompt is picked back up **only while the payment is still live**: the order is still pending and inside its 20-minute payment window, or the wallet top-up is inside its window. A paid, cancelled or expired payment is never picked back up — nothing else changes.
+
+# V153 — "until a date" products in the API (price per day)
+
+Until now the bot showed "⚡️Chatgpt business invitation — 2 days · $1.20", but the API list (`GET /api/v2/products`) read the table directly and showed the stored base price, no days and no end date.
+
+- **API v2** (`/products`, `/product/:id`, `/quote`, `/purchase`): `price` is today's price for the days left (exactly what the bot shows), the title ends with "— N days", and two new fields: `duration_days` and `time_limited` = `{ ends_on, days_left, price_per_day, min_price, expired, price_tomorrow }` (null for ordinary products). A purchase answers `valid_until` and `duration_days`. A product whose period ended (or has fewer days than its minimum) is refused with 409.
+- **API v1 (resellers)**: the same fields; `retail_price` is today's price; `wholesale_price` on a time-limited product is your wholesale price but **never above today's live price** (so a reseller never pays more for 1 day left than a customer). An ended product is `available: false` and refused.
+- Ordinary products: nothing changes.
+
 # V152 — the panel name on activation · 🎟 manual orders activated in a panel
 
 **ChatGPT seats**

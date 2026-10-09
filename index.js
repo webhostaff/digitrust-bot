@@ -1058,6 +1058,13 @@ bot.on('message', async (msg) => {
   const ok     = await ensureUser(bot, msg);
   if (!ok) return;
 
+  // V154: the customer tapped /start or a menu button after opening a payment, then sent the Order ID / TxID.
+  // The session was cleared, so pick their last payment prompt back up instead of ignoring the payment.
+  try {
+    const resumed = session.resumePayment(userId, msg.text);
+    if (resumed) logger.info(`[PAY RESUME] ${userId}: ${resumed} picked back up for "${String(msg.text).trim().slice(0, 24)}"`);
+  } catch (e) { logger.warn(`[PAY RESUME] ${userId}: ${e.message}`); }
+
   const sess  = session.get(userId);
   const state = sess.state;
 

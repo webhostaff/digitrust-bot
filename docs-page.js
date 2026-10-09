@@ -41,6 +41,24 @@ function docsPage(baseUrl, storeName = 'Store') {
         "price": 1.00,
         "units_left": 15,
         "unlimited": false
+      },
+      "duration_days": null,
+      "time_limited": null
+    },
+    {
+      "id": 31,
+      "title": "ChatGPT Business invitation — 2 days",
+      "price": 1.20,
+      "stock": 999999,
+      "delivery": "manual",
+      "duration_days": 2,
+      "time_limited": {
+        "ends_on": "2026-10-09",
+        "days_left": 2,
+        "price_per_day": 0.60,
+        "min_price": 0,
+        "expired": false,
+        "price_tomorrow": 0.60
       }
     }
   ]

@@ -102,6 +102,7 @@ function requireKey(req, res, next) {
 
 /** Public shape of a product, priced for this caller. */
 function productPayload(userId, product) {
+  const tl = require('./utils/timeLimited').info(product);
   const forMe = db.productForCustomer(userId, product);
   const allowance = db.getCustomerAllowance(userId, product.id);
   return {
@@ -114,6 +115,9 @@ function productPayload(userId, product) {
     stock:         Number(product.stock_quantity) || 0,
     requires_email: Number(product.requires_email) === 1,
     delivery:      product.delivery_type === 'manual' ? 'manual' : 'instant',
+    // V153: "until a date" products (price per day). price above is TODAY's price for the days left.
+    duration_days: tl ? tl.days_left : null,
+    time_limited:  tl,
     special_price: allowance
       ? {
           price: Number(allowance.price),
@@ -172,7 +176,7 @@ router.get('/products', requireKey, (req, res) => {
     res.json({
       success: true,
       count: rows.length,
-      products: rows.map((p) => productPayload(req.userId, p)),
+      products: rows.map((p) => productPayload(req.userId, require('./utils/timeLimited').live(p))),
     });
   } catch (e) {
     logger.error(`[API v2] /products: ${e.message}`);
@@ -272,6 +276,11 @@ router.post(['/purchase', '/order'], requireKey, async (req, res) => {
     const product = db.getProduct(productId);
     if (!product || !product.is_active) return fail(res, 404, 'Product not found');
 
+    if (product.sub_expired) {
+      return fail(res, 409, 'This product\'s period has ended (or has too few days left to be sold)', {
+        time_limited: require('./utils/timeLimited').info(product),
+      });
+    }
     if (Number(product.requires_email) === 1 && !email) {
       return fail(res, 400, 'This product requires an "email" field');
     }
@@ -407,6 +416,7 @@ router.post(['/purchase', '/order'], requireKey, async (req, res) => {
         quantity,
         unit_price: Number(Number(total / quantity).toFixed(6)),
         total,
+        ...(product.sub_end_date ? { valid_until: String(product.sub_end_date).slice(0, 10), duration_days: product.sub_days_left } : {}),
         status: 'delivered',
         items: String(result.content || '').split('\n\n').map(plainItem).filter(Boolean),
         balance: Number(Number(fresh?.balance || 0).toFixed(6)),
@@ -456,6 +466,8 @@ router.get('/quote', requireKey, (req, res) => {
     // Stated plainly so the caller does not have to derive it.
     saved_vs_single: Number((Number(single.unitPrice) * quantity - total).toFixed(6)),
     stock: Number(product.stock_quantity) || 0,
+    duration_days: product.sub_end_date ? (product.sub_days_left ?? null) : null,
+    time_limited: require('./utils/timeLimited').info(product),
     balance: Number(balance.toFixed(6)),
     can_afford: balance >= total - 0.005,
     bulk_pricing: buildBulkLadder(req.userId, product),

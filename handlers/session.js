@@ -122,8 +122,89 @@ function get(userId) {
   return sessions.get(userId);
 }
 
+// ── V154: a payment prompt survives /start and menu taps ────────────────────
+// A customer opens "Pay with Binance Pay", then taps /start or a menu button (which clears the session),
+// then sends the Order ID — and the bot ignored it, so the order was never processed. The last payment prompt
+// is remembered (in memory and in the database, so a restart does not lose it) and, when a message that looks
+// like a payment reference arrives while no other flow is active, that prompt is resumed — ONLY while that
+// payment is still live: the order is still pending and inside its payment window (the same window the
+// payment screen shows), or the wallet top-up is still inside its window. Otherwise nothing changes.
+const PAY_STATES = new Set([
+  'BUY_BINANCE_ORDER_ID', 'BUY_USDT_TXID', 'WALLET_TOPUP_USDT_TX', 'WALLET_TOPUP_BINANCE_ID',
+]);
+const payPrompts = new Map();
+
+function rawDb() {
+  try { return require('../database/queries').db; } catch (_) { return null; }
+}
+let _tableReady = false;
+function ensureTable(d) {
+  if (_tableReady || !d) return;
+  d.exec(`CREATE TABLE IF NOT EXISTS pay_prompts (
+    user_id INTEGER PRIMARY KEY, state TEXT NOT NULL, data TEXT NOT NULL, at INTEGER NOT NULL)`);
+  _tableReady = true;
+}
+function rememberPayPrompt(userId, state, data) {
+  const row = { state, data: { ...data }, at: Date.now() };
+  payPrompts.set(userId, row);
+  try {
+    const d = rawDb(); ensureTable(d);
+    if (d) d.prepare('INSERT OR REPLACE INTO pay_prompts (user_id, state, data, at) VALUES (?, ?, ?, ?)')
+      .run(userId, state, JSON.stringify(row.data), row.at);
+  } catch (_) { /* memory copy still works */ }
+}
+function lastPayPrompt(userId) {
+  let row = payPrompts.get(userId);
+  if (!row) {
+    try {
+      const d = rawDb(); ensureTable(d);
+      const r = d && d.prepare('SELECT state, data, at FROM pay_prompts WHERE user_id = ?').get(userId);
+      if (r) row = { state: r.state, data: JSON.parse(r.data || '{}'), at: Number(r.at) };
+    } catch (_) {}
+  }
+  return row || null;
+}
+function forgetPayPrompt(userId) {
+  payPrompts.delete(userId);
+  try { const d = rawDb(); ensureTable(d); if (d) d.prepare('DELETE FROM pay_prompts WHERE user_id = ?').run(userId); } catch (_) {}
+}
+
+/** Is the payment this prompt belongs to still in progress? */
+function stillLive(row) {
+  const { checkPaymentWindow } = require('../utils/format');
+  if (row.state === 'BUY_BINANCE_ORDER_ID' || row.state === 'BUY_USDT_TXID') {
+    try {
+      const order = require('../database/queries').getOrder(row.data && row.data.orderId);
+      if (!order || order.status !== 'pending') return false;               // paid, cancelled or gone
+      return !checkPaymentWindow(new Date(order.created_at + 'Z').getTime()).expired;
+    } catch (_) { return false; }
+  }
+  return !checkPaymentWindow(row.data && row.data.startedAt).expired;      // wallet top-ups
+}
+
+/** Binance Pay order id, an off-chain transfer id, or an on-chain TxID. */
+function looksLikePaymentRef(text) {
+  const t = String(text || '').trim();
+  return /^(off[\s-]?chain(\s*transfer)?\s*)?\d{9,22}$/i.test(t) || /^(0x)?[0-9a-fA-F]{64}$/.test(t);
+}
+
+/**
+ * If the customer has no active flow and sends something that looks like a payment reference, bring back
+ * their last payment prompt, only while that payment is still live. Returns the restored state, or null.
+ */
+function resumePayment(userId, text) {
+  const cur = get(userId);
+  if (cur.state !== States.IDLE || !looksLikePaymentRef(text)) return null;
+  const row = lastPayPrompt(userId);
+  if (!row) return null;
+  if (!stillLive(row)) { forgetPayPrompt(userId); return null; }
+  sessions.set(userId, { state: row.state, data: { ...row.data } });
+  return row.state;
+}
+
 function set(userId, state, data = {}) {
   sessions.set(userId, { state, data });
+  if (PAY_STATES.has(state)) rememberPayPrompt(userId, state, data);
 }
 
 function update(userId, partialData) {
@@ -136,4 +217,4 @@ function clear(userId) {
   sessions.set(userId, { state: States.IDLE, data: {} });
 }
 
-module.exports = { States, get, set, update, clear };
+module.exports = { States, get, set, update, clear, resumePayment, looksLikePaymentRef, lastPayPrompt, forgetPayPrompt, PAY_STATES };

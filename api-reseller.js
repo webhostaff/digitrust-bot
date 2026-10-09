@@ -94,15 +94,22 @@ function err(res, code, msg) {
 router.get('/products', requireApiKey, (req, res) => {
   try {
     const products = db.getAllActiveProducts();
-    const result = products.map(p => ({
-      id: p.id,
-      title: String(p.title || '').replace(/\[emoji:\d+\]/g, '').trim(),
-      description: p.description || '',
-      retail_price: Number(p.price) || 0,
-      wholesale_price: Number(p.wholesale_price) || 0,
-      stock: Number(p.stock_count || p.stock_quantity || 0),
-      available: (p.wholesale_price > 0) && ((p.stock_count || p.stock_quantity || 0) > 0),
-    }));
+    const TL = require('./utils/timeLimited');
+    const result = products.map(p => {
+      const tl = TL.info(p);
+      const unit = TL.resellerUnit(p);
+      return {
+        id: p.id,
+        title: String(p.title || '').replace(/\[emoji:\d+\]/g, '').trim(),
+        description: p.description || '',
+        retail_price: Number(p.price) || 0,
+        wholesale_price: unit,
+        stock: Number(p.stock_count || p.stock_quantity || 0),
+        available: (unit > 0) && !p.sub_expired && ((p.stock_count || p.stock_quantity || 0) > 0),
+        duration_days: tl ? tl.days_left : null,          // V153: "until a date" products
+        time_limited: tl,
+      };
+    });
     res.json({ success: true, count: result.length, products: result });
   } catch (e) {
     logger.error('API /products: ' + e.message);
@@ -125,16 +132,22 @@ router.get('/product/:id', requireApiKey, (req, res) => {
       FROM products p WHERE p.id = ? AND p.is_active = 1
     `).get(req.params.id);
     if (!p) return err(res, 404, 'Product not found');
+    const TL = require('./utils/timeLimited');
+    const lp = TL.live(p);
+    const tl = TL.info(lp);
+    const unit = TL.resellerUnit(lp);
     res.json({
       success: true,
       product: {
-        id: p.id,
-        title: String(p.title || '').replace(/\[emoji:\d+\]/g, '').trim(),
-        description: p.description || '',
-        retail_price: Number(p.price) || 0,
-        wholesale_price: Number(p.wholesale_price) || 0,
-        stock: Number(p.stock),
-        available: (p.wholesale_price > 0) && (p.stock > 0),
+        id: lp.id,
+        title: String(lp.title || '').replace(/\[emoji:\d+\]/g, '').trim(),
+        description: lp.description || '',
+        retail_price: Number(lp.price) || 0,
+        wholesale_price: unit,
+        stock: lp.sub_expired ? 0 : Number(p.stock),
+        available: (unit > 0) && !lp.sub_expired && (p.stock > 0),
+        duration_days: tl ? tl.days_left : null,
+        time_limited: tl,
       },
     });
   } catch (e) {
@@ -177,10 +190,13 @@ router.post('/order', requireApiKey, (req, res) => {
     }
     if (quantity > 50) return err(res, 400, 'Max 50 per order');
 
-    const product = dbRaw.prepare(`SELECT * FROM products WHERE id = ? AND is_active = 1`).get(productId);
-    if (!product) return err(res, 404, 'Product not found');
+    const TL = require('./utils/timeLimited');
+    const rawProduct = dbRaw.prepare(`SELECT * FROM products WHERE id = ? AND is_active = 1`).get(productId);
+    if (!rawProduct) return err(res, 404, 'Product not found');
+    const product = TL.live(rawProduct);            // V153: today's price and days for "until a date" products
+    if (product.sub_expired) return err(res, 409, "This product's period has ended (or has too few days left to be sold)");
 
-    const wholesale = Number(product.wholesale_price) || 0;
+    const wholesale = TL.resellerUnit(product);
     if (wholesale <= 0) return err(res, 400, 'Product not available for resale');
 
     const total = Number((wholesale * quantity).toFixed(4));
@@ -261,6 +277,7 @@ router.post('/order', requireApiKey, (req, res) => {
         quantity,
         unit_price: wholesale,
         total,
+        ...(product.sub_end_date ? { valid_until: String(product.sub_end_date).slice(0, 10), duration_days: product.sub_days_left } : {}),
         items: txResult.items,
         new_balance: Number(txResult.new_balance.toFixed(4)),
       },
