@@ -161,6 +161,7 @@ function orderCard(d, activated = false, scheduled = false, cancelNote = null) {
     `🆔 Order: <b>#${d.orderId}</b>\n` +
     `👤 Customer: ${d.name} (<code>${d.userId}</code>)\n` +
     `📧 Email: <code>${d.email}</code>\n` +
+    (d.kind ? `${d.kind}\n` : '') +
     (d.panel ? `🖥 Panel: <b>${d.panel}</b>\n` : '') +
     `⏱ Duration: <b>${d.days} days</b>\n` +
     `📅 Start date: <b>${d.startDate}</b>\n` +
@@ -174,12 +175,21 @@ function orderCard(d, activated = false, scheduled = false, cancelNote = null) {
       ? `✅ <i>Activated${d.activatedAt ? ' on ' + d.activatedAt : ''}. The customer has been told.</i>\n` +
         (d.editedNote ? `✏️ <i>${d.editedNote}</i>\n` : '')
       : scheduled
-        ? `🗓 <i>This seat starts on ${d.startDate} (a renewal, or bought between ` +
-          `two cycles). Activate it when that date arrives — pressing the button ` +
-          `now tells them it is live before it is.</i>\n`
+        ? `🗓 <i>This seat starts on ${d.startDate} — its period has not opened yet. Activate it on that ` +
+          `date: pressing the button now tells them it is live before it is.</i>\n`
         : `⬇️ <b>Activate the seat, then press the button below.</b>\n`) +
     `${band}`
   );
+}
+
+/** "🔄 Renewal of …" / "🆕 New seat" for the order card (V156.3). */
+function seatKindLine(renewedFromId) {
+  if (!renewedFromId) return '🆕 <b>New seat</b>';
+  try {
+    const prev = queries.getCgbSubById(renewedFromId);
+    if (!prev) return '🔄 <b>Renewal</b>';
+    return `🔄 <b>Renewal</b> of <code>${escapeHtml(prev.email || '')}</code> (ended ${escapeHtml(String(prev.end_date || '?'))})`;
+  } catch (_) { return ''; }
 }
 
 function orderCardButtons(d) {
@@ -489,6 +499,7 @@ async function showSubDetails(chatId, subId, messageId = null) {
   // payment, and this is the button that leads to one.
   rows.push([{ text: '🔄 Renew & pay', callback_data: `cgb_renewyes_${s.id}` }]);
   if (s.renew_intent !== 'no') rows.push([{ text: '❌ Will not renew', callback_data: `cgb_renewno_${s.id}` }]);
+  rows.push([{ text: '📧 Request an email change', callback_data: `cgb_ereq_${s.id}` }]);
   rows.push([{ text: '🔙 Back', callback_data: 'cgb_menu' }]);
 
   const opts = { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } };
@@ -688,6 +699,7 @@ async function showAdminPanel(chatId, msgId = null) {
   const kb = { inline_keyboard: [
     [{ text: `🗓 Ending today · ${nT}`, callback_data: 'adm_end_today' }, { text: `🗓 Tomorrow · ${nM}`, callback_data: 'adm_end_tomorrow' }],
     [{ text: '🗓 In 3 days', callback_data: 'adm_end_+3' }, { text: '🗓 In 7 days', callback_data: 'adm_end_+7' }, { text: '📅 Other day', callback_data: 'adm_ask_ending' }],
+    [{ text: `📩 Email requests · ${(() => { try { return pendingEmailRequests().length; } catch (_) { return 0; } })()}`, callback_data: 'adm_emailreqs' }],
     [{ text: '➕ Add a seat', callback_data: 'adm_ask_addseat' }, { text: '📧 Change an email', callback_data: 'adm_ask_setemail' }],
     [{ text: '✏️ Change dates', callback_data: 'adm_ask_setdates' }, { text: '🔎 Check renewals', callback_data: 'adm_run_checkrenewals' }],
     [{ text: '🔄 Renewals board', callback_data: 'adm_run_renewals' }],
@@ -713,6 +725,7 @@ async function handleAdminPanelButton(data, chatId, msgId, userId) {
   if (!data.startsWith('adm_')) return false;
   if (String(userId) !== String(ADMIN_ID)) return true;
   if (data === 'adm_home') { await showAdminPanel(chatId, msgId); return true; }
+  if (data === 'adm_emailreqs') { await showEmailRequests(chatId); return true; }
   let m = /^adm_end_(today|tomorrow|\+\d+)$/.exec(data);
   if (m) { runAsCommand(chatId, userId, `/ending ${m[1]}`); return true; }
   m = /^adm_run_(checkrenewals|renewals|prices|guardtest)$/.exec(data);
@@ -1587,6 +1600,13 @@ async function handleEmailChangeButton(data, chatId, msgId, adminId) {
   if (choice === 'x') { await bot.sendMessage(chatId, '❌ Cancelled — nothing was changed.'); return; }
   const sub = db.prepare('SELECT * FROM chatgpt_subscriptions WHERE id = ?').get(edit.subId);
   if (!sub) { await bot.sendMessage(chatId, '❌ That seat no longer exists.'); return; }
+  const lines = await applyEmailChange(sub, edit.email, choice, adminId);
+  await bot.sendMessage(chatId, lines.join('\n'), { parse_mode: 'HTML' });
+}
+
+/** Change a seat's email everywhere (seat, invite bot, customer). Shared by /setemail and request approval. */
+async function applyEmailChange(sub, newEmail, choice, adminId, { requested = false } = {}) {
+  const edit = { email: newEmail };
   const oldEmail = sub.email;
   const r = cgbSeatTools.changeSeatEmail(db, sub, edit.email);
   const lines = [`✅ <b>Email changed</b>${sub.order_id ? ` · order #${sub.order_id}` : ''}`,
@@ -1617,6 +1637,7 @@ async function handleEmailChangeButton(data, chatId, msgId, adminId) {
   let told = false;
   try {
     await bot.sendMessage(Number(sub.user_id),
+      (requested ? `✅ <b>Your email change request was approved</b>\n\n` : '') +
       `📧 <b>Your ChatGPT Business seat now uses a new email</b>\n\n` +
       `before: <code>${escapeHtml(oldEmail || '—')}</code>\nnow: <b><code>${escapeHtml(edit.email)}</code></b>\n` +
       `📅 Until <b>${sub.end_date}</b>\n\n` +
@@ -1626,12 +1647,139 @@ async function handleEmailChangeButton(data, chatId, msgId, adminId) {
   } catch (_) {}
   lines.push(told ? '📨 The customer was told.' : '⚠️ The customer could not be messaged — tell him yourself.');
   logger.info(`[CGB] seat ${sub.id} email ${oldEmail} -> ${edit.email} by ${adminId} (${choice})`);
-  await bot.sendMessage(chatId, lines.join('\n'), { parse_mode: 'HTML' });
+  return lines;
+}
+
+// ════════════════════════════════════════════════════════════════
+// V156.4: 📧 EMAIL CHANGE REQUESTS — the customer asks, the admin decides
+// ════════════════════════════════════════════════════════════════
+function ensureEmailReqTable() {
+  db.exec(`CREATE TABLE IF NOT EXISTS cgb_email_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, sub_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+    old_email TEXT, new_email TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT DEFAULT (datetime('now')), decided_at TEXT, decided_how TEXT)`);
+}
+
+function pendingEmailRequests() {
+  ensureEmailReqTable();
+  return db.prepare(`SELECT r.*, u.username FROM cgb_email_requests r LEFT JOIN users u ON u.telegram_id = r.user_id
+                      WHERE r.status = 'pending' ORDER BY r.id`).all();
+}
+
+/** The customer taps 📧 Request an email change on one of his seats. */
+async function startEmailRequest(chatId, userId, subId) {
+  const sub = queries.getCgbSubById(subId);
+  if (!sub || String(sub.user_id) !== String(userId) || !['active', 'pending'].includes(String(sub.status || 'pending'))) {
+    await bot.sendMessage(chatId, '❌ That seat is not yours or is no longer running.');
+    return;
+  }
+  ensureEmailReqTable();
+  const open = db.prepare(`SELECT new_email FROM cgb_email_requests WHERE sub_id = ? AND status = 'pending'`).get(sub.id);
+  setSession(userId, 'EMAIL_REQ', { subId: sub.id });
+  await bot.sendMessage(chatId,
+    `📧 <b>Change the email of a seat</b>\n\nNow: <code>${escapeHtml(sub.email || '')}</code>\n` +
+    (open ? `<i>You already asked for <code>${escapeHtml(open.new_email)}</code> — a new request replaces it.</i>\n` : '') +
+    `\nSend the <b>new email</b>. The admin checks it and you get a message when it is done.`,
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'cgb_menu' }]] } });
+}
+
+/** The customer sent the new email: record the request and tell the admin. */
+async function submitEmailRequest(chatId, userId, subId, newEmail) {
+  const sub = queries.getCgbSubById(subId);
+  if (!sub || String(sub.user_id) !== String(userId)) { await bot.sendMessage(chatId, '❌ That seat is not yours.'); return; }
+  const email = String(newEmail).trim().toLowerCase();
+  if (!cgbSeatTools.EMAIL_RE.test(email)) {
+    setSession(userId, 'EMAIL_REQ', { subId });
+    await bot.sendMessage(chatId, '❌ That is not an email. Send it again, or tap /start to stop.');
+    return;
+  }
+  if (email === String(sub.email || '').toLowerCase()) { await bot.sendMessage(chatId, 'ℹ️ That is already the email of this seat.'); return; }
+  ensureEmailReqTable();
+  db.prepare(`UPDATE cgb_email_requests SET status = 'replaced', decided_at = datetime('now') WHERE sub_id = ? AND status = 'pending'`).run(sub.id);
+  const reqId = db.prepare(`INSERT INTO cgb_email_requests (sub_id, user_id, old_email, new_email) VALUES (?, ?, ?, ?)`)
+    .run(sub.id, userId, sub.email || '', email).lastInsertRowid;
+  await bot.sendMessage(chatId,
+    `✅ <b>Request sent</b>\n\n<code>${escapeHtml(sub.email || '')}</code> → <code>${escapeHtml(email)}</code>\n\nYou will get a message when the admin has done it.`,
+    { parse_mode: 'HTML' });
+  if (!ADMIN_ID) return;
+  const u = db.prepare('SELECT username, first_name FROM users WHERE telegram_id = ?').get(Number(userId));
+  const who = u?.username ? '@' + u.username : (u?.first_name || String(userId));
+  await bot.sendMessage(ADMIN_ID, emailRequestCard({ id: reqId, sub, who, userId, newEmail: email }),
+    { parse_mode: 'HTML', reply_markup: emailRequestButtons(reqId) }).catch(() => {});
+}
+
+function emailRequestCard({ id, sub, who, userId, newEmail }) {
+  return `📧 <b>Email change request #${id}</b>\n\n` +
+    `👤 ${escapeHtml(who)} (<code>${userId}</code>)\n` +
+    `${sub.order_id ? `🆔 Order #${sub.order_id}` : '🆔 Manual seat'} · 📅 ${sub.start_date || '?'} → <b>${sub.end_date}</b> · ${sub.status === 'active' ? '🟢 active' : '⏳ not activated'}\n` +
+    `🏢 ${escapeHtml(workspaceName(sub))}\n\n` +
+    `before: <code>${escapeHtml(sub.email || '—')}</code>\nafter: <b><code>${escapeHtml(newEmail)}</code></b>`;
+}
+function emailRequestButtons(reqId) {
+  return { inline_keyboard: [
+    [{ text: '✅ Approve + invite the new email (invite bot)', callback_data: `cgb_erq_i_${reqId}` }],
+    [{ text: '✅ Approve — I invite it myself', callback_data: `cgb_erq_m_${reqId}` }],
+    [{ text: '❌ Refuse', callback_data: `cgb_erq_x_${reqId}` }],
+  ] };
+}
+
+/** The admin decides a request. One decision per request. */
+async function decideEmailRequest(data, chatId, msgId, adminId) {
+  const [, , how, idRaw] = data.split('_');
+  ensureEmailReqTable();
+  const req = db.prepare('SELECT * FROM cgb_email_requests WHERE id = ?').get(Number(idRaw));
+  await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msgId }).catch(() => {});
+  if (!req) { await bot.sendMessage(chatId, '❌ Request not found.'); return; }
+  if (req.status !== 'pending') { await bot.sendMessage(chatId, `ℹ️ Request #${req.id} was already ${req.status}.`); return; }
+  // claim it first, so a double tap cannot apply it twice
+  const claimed = db.prepare(`UPDATE cgb_email_requests SET status = 'deciding' WHERE id = ? AND status = 'pending'`).run(req.id).changes;
+  if (!claimed) return;
+  const sub = queries.getCgbSubById(req.sub_id);
+  if (how === 'x') {
+    db.prepare(`UPDATE cgb_email_requests SET status = 'refused', decided_at = datetime('now'), decided_how = 'x' WHERE id = ?`).run(req.id);
+    await bot.sendMessage(Number(req.user_id),
+      `❌ <b>Your email change request was not accepted</b>\n\nYour seat keeps <code>${escapeHtml(req.old_email || '')}</code>. Contact support if you have a question.`,
+      { parse_mode: 'HTML' }).catch(() => {});
+    await bot.sendMessage(chatId, `❌ Request #${req.id} refused — the customer was told.`);
+    return;
+  }
+  if (!sub || String(sub.email || '').toLowerCase() !== String(req.old_email || '').toLowerCase()) {
+    db.prepare(`UPDATE cgb_email_requests SET status = 'stale', decided_at = datetime('now') WHERE id = ?`).run(req.id);
+    await bot.sendMessage(chatId, `⚠️ Request #${req.id} not applied: the seat changed since it was asked (its email is now <code>${escapeHtml(sub ? sub.email : '—')}</code>).`, { parse_mode: 'HTML' });
+    return;
+  }
+  const lines = await applyEmailChange(sub, req.new_email, how, adminId, { requested: true });
+  db.prepare(`UPDATE cgb_email_requests SET status = 'approved', decided_at = datetime('now'), decided_how = ? WHERE id = ?`).run(how, req.id);
+  await bot.sendMessage(chatId, [`✅ <b>Request #${req.id} approved</b>`, ...lines.slice(1)].join('\n'), { parse_mode: 'HTML' });
+}
+
+async function showEmailRequests(chatId) {
+  const list = pendingEmailRequests();
+  if (!list.length) { await bot.sendMessage(chatId, '📧 No email change request is waiting.'); return; }
+  for (const r of list.slice(0, 15)) {
+    const sub = queries.getCgbSubById(r.sub_id);
+    if (!sub) continue;
+    await bot.sendMessage(chatId, emailRequestCard({ id: r.id, sub, who: r.username ? '@' + r.username : String(r.user_id), userId: r.user_id, newEmail: r.new_email }),
+      { parse_mode: 'HTML', reply_markup: emailRequestButtons(r.id) });
+  }
 }
 
 // ── /checkrenewals — paid renewals not yet activated whose dates disagree with the customer's cycle ──
 bot.onText(/^\/checkrenewals(?:@\w+)?$/i, async (msg) => {
   if (String(msg.from.id) !== String(ADMIN_ID)) return;
+  // V156.3: "renewals" sold to a DIFFERENT email than the seat they renew (the Change-Email bug).
+  const mism = cgbSeatTools.mismatchedRenewals(db);
+  if (mism.length) {
+    let t = `🧩 <b>${mism.length} "renewal(s)" on a different email</b>\nThese were new seats: the email was changed during a renewal, so they got the old seat's dates and were linked to it.\n`;
+    const kb = [];
+    for (const r of mism.slice(0, 15)) {
+      t += `\n• ${r.order_id ? `<b>#${r.order_id}</b>` : 'manual'} · <code>${escapeHtml(r.email)}</code> — linked to <code>${escapeHtml(r.prev_email)}</code>\n` +
+           `   has ${r.start_date} → ${r.end_date} · ${r.status === 'active' ? '🟢 active' : '⏳ not activated'}`;
+      kb.push([{ text: `🆕 #${r.order_id || r.id}: treat as a new seat`, callback_data: `cgb_unlink_${r.id}` }]);
+    }
+    t += `\n\n<i>"Treat as a new seat" removes the wrong link (the old seat shows as NOT renewed again and gets its reminders). Then check its dates with ✏️ Change dates on its card.</i>`;
+    await bot.sendMessage(msg.chat.id, t, { parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } });
+  }
   const a = cgbSeatDates.auditRenewals(new Date());
   if (!a.checked) { await bot.sendMessage(msg.chat.id, '🔎 No paid renewal is waiting for activation.'); return; }
   let txt = `🔎 <b>Renewals check</b>\n${a.checked} paid renewal(s) waiting for activation · ✅ ${a.ok.length} right · ⚠️ ${a.bad.length} to look at\n`;
@@ -1665,6 +1813,7 @@ function seatCardData(orderId) {
       startDate: sub.start_date || '—', endDate: sub.end_date || '—',
       paid: Number(sub.final_price ?? ord?.total_price ?? 0).toFixed(2),
       method: ord?.payment_method || '—', refLabel: 'Order', ref: String(orderId),
+      kind: seatKindLine(sub.renewed_from),
     },
   };
 }
@@ -1926,6 +2075,32 @@ bot.on('callback_query', async (q) => {
       if (!st) { await bot.sendMessage(chatId, '⌛ That choice expired — send /addseat again.'); return; }
       const panelId = m[2] === 'n' ? '' : (st.ids[Number(m[2])] || '');
       await createSeatManually(chatId, st.u, st.e, st.d, userId, { panelId });
+      return;
+    }
+  }
+
+  // V156.4: email change requests
+  {
+    const m = /^cgb_ereq_(\d+)$/.exec(data);
+    if (m) { await startEmailRequest(chatId, userId, Number(m[1])); return; }
+    if (/^cgb_erq_[imx]_\d+$/.test(data)) {
+      if (String(userId) !== String(ADMIN_ID)) return;
+      await decideEmailRequest(data, chatId, msgId, userId);
+      return;
+    }
+  }
+
+  // V156.3: undo a wrong renewal link
+  {
+    const m = /^cgb_unlink_(\d+)$/.exec(data);
+    if (m) {
+      if (String(userId) !== String(ADMIN_ID)) return;
+      const r = cgbSeatTools.unlinkRenewal(db, Number(m[1]));
+      await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msgId }).catch(() => {});
+      await bot.sendMessage(chatId, r.ok
+        ? `✅ Seat ${r.order_id ? `#${r.order_id}` : r.id} (<code>${escapeHtml(r.email)}</code>) is now a new seat; <code>${escapeHtml(r.prev_email)}</code> shows as not renewed again.\n` +
+          (r.order_id ? `Check its dates: <code>/setdates ${r.order_id} …</code> or ✏️ Change dates on its card.` : '')
+        : `ℹ️ ${escapeHtml(r.reason)}`, { parse_mode: 'HTML' });
       return;
     }
   }
@@ -2252,6 +2427,17 @@ bot.on('callback_query', async (q) => {
   if (data.startsWith('change_email')) {
     const s = getSession(userId);
     if (!s) return;
+    // V156.3: a renewal continues ONE seat on ONE email. An old "Change Email" button pressed during a renewal
+    // used to swap the email while keeping the renewal's dates and its link to the old seat — a brand-new email
+    // was then sold the old seat's cycle and recorded as its renewal.
+    if (s.renewalOf) {
+      await bot.sendMessage(chatId,
+        `ℹ️ A renewal keeps the same email (<code>${escapeHtml(s.email || '')}</code>).\n\n` +
+        `• To move THIS seat to another email, send a request to the admin.\n` +
+        `• For an extra seat on another email, buy a new one: /start → <b>✨ Buy a new seat</b>.`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '📧 Request an email change', callback_data: `cgb_ereq_${s.renewalOf}` }]] } });
+      return;
+    }
     setSession(userId, 'AWAITING_EMAIL', s);
     await bot.sendMessage(chatId, '📧 Please enter the new email:', { parse_mode: 'HTML' });
     return;
@@ -2363,6 +2549,13 @@ bot.on('message', async (msg) => {
   const s = getSession(userId);
   if (!s) return;
 
+  // ─── V156.4: the new email of an email change request ───
+  if (s.state === 'EMAIL_REQ') {
+    clearSession(userId);
+    await submitEmailRequest(chatId, userId, s.subId, text);
+    return;
+  }
+
   // ─── V156: the words a 🛠 admin-panel button asked for → run that command ───
   if (s.state === 'ADM_TYPE' && String(userId) === String(ADMIN_ID)) {
     clearSession(userId);
@@ -2386,6 +2579,11 @@ bot.on('message', async (msg) => {
   if (s.state === 'AWAITING_EMAIL') {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text)) {
       await bot.sendMessage(chatId, '❌ Invalid email. Please try again.');
+      return;
+    }
+    if (s.renewalOf && String(text).toLowerCase() !== String(s.email || '').toLowerCase()) {   // V156.3, belt and braces
+      clearSession(userId);
+      await bot.sendMessage(chatId, 'ℹ️ A renewal keeps the same email. For another email, buy a new seat: /start → ✨ Buy a new seat.');
       return;
     }
     s.email = text;
@@ -2604,10 +2802,12 @@ async function confirmPayment(chatId, userId, orderId, txid, sessionData) {
       // A wallet payment has no TxID; the field carries the receipt line instead.
       refLabel:  paymentMethod === 'pay_balance' ? 'Wallet' : 'TxID',
       ref:       escapeHtml(txid),
+      kind:      seatKindLine(sessionData.renewalOf),
     };
     // Paid before its period opens — the start date is still in the future.
-    const scheduled = !!(card.startDate &&
-      new Date(`${card.startDate}T00:00:00`) > new Date(new Date().toDateString()));
+    // V156.2: compared with the LOCAL date. The server runs on UTC, so between midnight and 01:00 in Tunisia
+    // "today" was still yesterday there and a seat starting today was labelled PAID EARLY.
+    const scheduled = !!(card.startDate && String(card.startDate) > ymdLocal(cgbCycles.localNow(new Date())));
 
     const sentCard = await bot.sendMessage(ADMIN_ID, orderCard(card, false, scheduled), {
       parse_mode: 'HTML',
@@ -2696,10 +2896,12 @@ async function confirmCryptobotPayment(invoiceId, paidAmount, orderId, userId) {
       method:    '🤖 CryptoBot',
       refLabel:  'Invoice',
       ref:       escapeHtml(String(invoiceId)),
+      kind:      seatKindLine(sub.renewed_from),
     };
     // Paid before its period opens — the start date is still in the future.
-    const scheduled = !!(card.startDate &&
-      new Date(`${card.startDate}T00:00:00`) > new Date(new Date().toDateString()));
+    // V156.2: compared with the LOCAL date. The server runs on UTC, so between midnight and 01:00 in Tunisia
+    // "today" was still yesterday there and a seat starting today was labelled PAID EARLY.
+    const scheduled = !!(card.startDate && String(card.startDate) > ymdLocal(cgbCycles.localNow(new Date())));
 
     const sentCard = await bot.sendMessage(ADMIN_ID, orderCard(card, false, scheduled), {
       parse_mode: 'HTML',

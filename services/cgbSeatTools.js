@@ -127,4 +127,27 @@ function changeSeatEmail(db, sub, newEmail) {
   return { changed: ids, before };
 }
 
-module.exports = { EMAIL_RE, ymd, parseDay, seatsEndingOn, endingText, findSeat, parseSetEmail, changeSeatEmail };
+/** Seats recorded as the renewal of a seat on ANOTHER email (V156.3). */
+function mismatchedRenewals(db) {
+  try {
+    return db.prepare(`
+      SELECT cs.id, cs.order_id, cs.email, cs.start_date, cs.end_date, cs.status, prev.email AS prev_email
+        FROM chatgpt_subscriptions cs JOIN chatgpt_subscriptions prev ON prev.id = cs.renewed_from
+       WHERE lower(COALESCE(cs.email,'')) <> lower(COALESCE(prev.email,''))
+         AND COALESCE(cs.status,'pending') IN ('active','pending')
+       ORDER BY cs.id DESC`).all();
+  } catch (_) { return []; }
+}
+
+/** Remove a wrong renewal link: the seat becomes a new seat. */
+function unlinkRenewal(db, subId) {
+  const r = db.prepare(`SELECT cs.id, cs.order_id, cs.email, prev.email AS prev_email FROM chatgpt_subscriptions cs
+                         LEFT JOIN chatgpt_subscriptions prev ON prev.id = cs.renewed_from WHERE cs.id = ?`).get(subId);
+  if (!r) return { ok: false, reason: 'that seat no longer exists' };
+  if (!r.prev_email) return { ok: false, reason: 'that seat is not linked to another one any more' };
+  if (String(r.email || '').toLowerCase() === String(r.prev_email).toLowerCase()) return { ok: false, reason: 'same email — that is a real renewal, left as it is' };
+  db.prepare('UPDATE chatgpt_subscriptions SET renewed_from = NULL WHERE id = ?').run(subId);
+  return { ok: true, ...r };
+}
+
+module.exports = { mismatchedRenewals, unlinkRenewal, EMAIL_RE, ymd, parseDay, seatsEndingOn, endingText, findSeat, parseSetEmail, changeSeatEmail };

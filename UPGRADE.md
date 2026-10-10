@@ -1,3 +1,23 @@
+# V156.4 — 📧 email change requests: the customer asks, the admin decides
+
+- Customer: on each seat (📋 My seats → a seat) a new button **📧 Request an email change** → he sends the new email → "Request sent". Nothing changes yet. A new request on the same seat replaces the open one. Pressing "Change Email" during a renewal now offers this request instead of a dead end.
+- Admin: the request arrives as a card (customer, order, period, workspace, before → after) with **✅ Approve + invite the new email (invite bot)** · **✅ Approve — I invite it myself** · **❌ Refuse**. Approving does exactly what /setemail does (seat + its pending renewal + order, invite bot, customer told "your request was approved"); refusing tells the customer the seat keeps its email.
+- 🛠 Admin panel: **📩 Email requests · N** lists the waiting ones.
+- Safe: only the owner of the seat can ask, only the admin can decide, one decision per request (a double tap does nothing), a replaced request cannot be applied, and a request is not applied if the seat's email changed since it was asked. Requests are kept in the table `cgb_email_requests` (created by itself).
+
+# V156.3 — a new email could be sold as the "renewal" of another seat
+
+**What happened (order #23507):** the customer opened the RENEWAL of one of his seats (dates 10-09 → 11-09 in that seat's cycle 11 → 9), then pressed an old "✏️ Change Email" button left from an earlier purchase screen and typed a NEW email. The bot kept the renewal's dates and its link to the old seat, so a brand-new email was sold the old seat's cycle — while a real new seat at that moment went to the running cycle (Day 8 → 6, like #23508).
+
+- A renewal keeps its email: "Change Email" during a renewal is refused with a short explanation (buy a new seat for another email), and a different email typed into a renewal is refused too.
+- Every order card now says what it is: 🆕 **New seat**, or 🔄 **Renewal** of `old@email` (ended …).
+- `/checkrenewals` (🛠 → 🔎 Check renewals) first lists the "renewals" whose email is not the seat they renew, with a button **🆕 treat as a new seat** that removes the wrong link (the old seat shows as not renewed again and gets its reminders). Then fix its dates with ✏️ Change dates. Real renewals (same email) are never touched.
+
+# V156.2 — a seat starting today was labelled "PAID EARLY" after midnight
+
+The new-order card compared the seat's start date with the SERVER's date. Railway runs on UTC, so between 00:00 and 01:00 in Tunisia the server was still on yesterday, and a seat starting today was shown as 🔵 PAID EARLY — "activate when the new cycle starts", "a renewal, or bought between two cycles" — though it had to be activated now. Both new-order cards (all payments, and CryptoBot) now compare with the shop's local date, like the rest of the bot. The note on a truly early seat no longer says "a renewal".
+The dates themselves were right: a new seat joins the cycle that is running (e.g. 10 Oct 00:23 → Day 8 → 6, until 6 Nov).
+
 # V156.1 — ➕ Add a seat: the length buttons never appeared
 
 The length picker of /addseat (and of 🛠 ➕ Add a seat) packed the user id, the email and the date INSIDE each button. Telegram allows 64 bytes per button; even `5626665035 sara@gmail.com` made 81, so Telegram refused the whole message and nothing appeared — no error. The choice now waits in the bot under a short token (valid 15 minutes, one tap = one seat). The typed exact date also accepts `08/11` and `+30`.
