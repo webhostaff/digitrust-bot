@@ -324,13 +324,51 @@ function nextCycleAfterCurrent(from = new Date()) {
  *         then the whole month(s) asked for: a seat ending 5 Oct, moved to the cycle that ends on
  *         the 9th, renews 5 Oct → 9 Nov (the 4 days + one cycle). After that it is an ordinary
  *         "own" seat and everything is normal again.
- *   expired / manual / fallback   As before (like a new buyer today; the monthly price).
+ *   window (V156.9)  Renewal is open from ONE DAY BEFORE the seat's last day until ONE day AFTER its
+ *         cycle's start date (setting cgb_renew_grace_days) — cycle 11 → 9: days 8 to 12. Before:
+ *         "notyet". After: "closed" — the customer can ask the admin for a late renewal of the same
+ *         email (lateRenewalQuote: the remaining days only). Inside it, an ended seat renews exactly as
+ *         if it had not ended.
+ *   All renewals start the day AFTER the seat's last day: a seat ending 9 Oct renews 10 Oct → 9 Nov.
+ *   manual / fallback   As before (like a new buyer today; the monthly price).
  *
  * @param {string} endDateStr  the seat's current end, 'YYYY-MM-DD'
  * @param {number} months      whole cycles to buy (1..12); in a stub they come AFTER the extra days
  * @returns {{from:Date,to:Date,days:number,cycle:?object,kind:string,stub:?{days:number,cycleLength:number}}}
  */
-function renewalPeriod(endDateStr, months = 1, now = new Date()) {
+/** Days the renewal stays open after the cycle's start date (setting cgb_renew_grace_days, default 1). */
+function renewGraceDays() {
+  try {
+    const v = parseInt(String(raw.prepare("SELECT value FROM settings WHERE key='cgb_renew_grace_days'").get()?.value ?? '1'), 10);
+    return Number.isFinite(v) && v >= 0 && v <= 25 ? v : 1;
+  } catch (_) { return 1; }
+}
+
+/**
+ * A LATE renewal (V156.9), after the window closed and the admin agreed: the same email in its own cycle,
+ * from today (or the cycle's start when between two periods) to that cycle's current end, priced for the
+ * remaining days only — the price a new buyer of that cycle pays today.
+ */
+function lateRenewalQuote(sub, now = new Date()) {
+  const local = localNow(now);
+  const today = new Date(local); today.setHours(0, 0, 0, 0);
+  const [bh, bm] = boundaryTime();
+  const cycles = getCycles().filter((c) => c.start_day && c.end_day);
+  if (!cycles.length) return null;
+  const seatEnd = new Date(`${sub.end_date}T00:00:00`); seatEnd.setHours(bh, bm, 0, 0);
+  let cyc = cycles.find((c) => dayIn(seatEnd.getFullYear(), seatEnd.getMonth(), c.end_day).getDate() === seatEnd.getDate());
+  if (!cyc) {
+    let near = null;
+    for (const c of cycles) { const ev = evaluateCycle(c, seatEnd, bh, bm); if (!near || ev.endDate < near.endDate) near = { ...ev, cycle: c }; }
+    cyc = near.cycle;
+  }
+  const ev = evaluateCycle(cyc, local, bh, bm);
+  const monthly = getMonthlyPrice(sub.user_id);
+  return { from: ev.inGap ? ev.startDate : today, to: ev.endDate, days: ev.daysRemaining, cycleLength: ev.cycleLength,
+           price: pricePeriod(ev, monthly), monthly, cycle: cyc };
+}
+
+function renewalPeriod(endDateStr, months = 1, now = new Date(), { ignoreWindow = false } = {}) {
   const local = localNow(now);
   const today = new Date(local); today.setHours(0, 0, 0, 0);
   const [bh, bm] = boundaryTime();
@@ -352,8 +390,39 @@ function renewalPeriod(endDateStr, months = 1, now = new Date()) {
 
   const cycles = getCycles().filter((c) => c.start_day && c.end_day);
 
+  // V156.6: the renewal starts the day AFTER the seat's last day (a seat ending 9 Oct renews 10 Oct → 9 Nov).
+  const nextDay = new Date(seatEnd.getTime() + DAY_MS);
+  const ownOf = () => cycles.find((c) => dayIn(seatEnd.getFullYear(), seatEnd.getMonth(), c.end_day).getDate() === seatEnd.getDate());
+  const nearestOf = () => {
+    let near = null;
+    for (const c of cycles) {
+      const ev = evaluateCycle(c, seatEnd, bh, bm);
+      if (!near || ev.endDate < near.ev.endDate) near = { cycle: c, ev };
+    }
+    return near;
+  };
+
+  // V156.7: the RENEWAL WINDOW, the same for every cycle and panel: it opens ONE DAY BEFORE the seat's
+  // last day and stays open until its cycle's START date (inclusive) — for cycle 11 → 9 a seat ending on
+  // the 9th can be renewed on the 8th, 9th, 10th and 11th. Before: "not open yet". After: "closed".
+  if (!ignoreWindow && cycles.length && !manualCycleLocal(local)) {
+    const own = ownOf();
+    const cyc = own || nearestOf().cycle;
+    const seatDay = new Date(seatEnd); seatDay.setHours(0, 0, 0, 0);
+    const opens = new Date(seatDay); opens.setDate(opens.getDate() - 1);
+    let start = dayIn(seatDay.getFullYear(), seatDay.getMonth(), cyc.start_day);
+    while (start <= seatDay) start = dayIn(start.getFullYear(), start.getMonth() + 1, cyc.start_day);
+    // still open for `cgb_renew_grace_days` days AFTER the cycle's start (default 1: 11 → 12).
+    const lastDay = new Date(start); lastDay.setDate(lastDay.getDate() + renewGraceDays()); lastDay.setHours(23, 59, 59, 999);
+    if (local < opens || local > lastDay) {
+      const r = done(today, today, cyc, local < opens ? 'notyet' : 'closed');
+      r.opensOn = opens; r.closedOn = new Date(lastDay.getFullYear(), lastDay.getMonth(), lastDay.getDate()); r.cycleStart = start;
+      return r;
+    }
+  }
+
   // No cycle of their own to follow: renewed like a new buyer today, at the monthly price.
-  if (expired || !cycles.length || manualCycleLocal(local)) {
+  if (!cycles.length || manualCycleLocal(local)) {
     const from = expired ? today : seatEnd;
     const best = calculateBestCycle(now);
     const endDay = best && best.cycle && best.cycle.end_day;
@@ -367,8 +436,10 @@ function renewalPeriod(endDateStr, months = 1, now = new Date()) {
   }
 
   // own: the seat ends exactly where one of the cycles ends.
-  const own = cycles.find((c) => dayIn(seatEnd.getFullYear(), seatEnd.getMonth(), c.end_day).getDate() === seatEnd.getDate());
-  if (own) return done(seatEnd, endAfter(seatEnd, own.end_day), own, 'own');
+  const own = ownOf();
+  // days = what is really covered: from the end of the old seat to the new end (shown as starting the next day)
+  const cover = (r) => { r.days = Math.max(1, Math.round((r.to - seatEnd) / DAY_MS)); return r; };
+  if (own) return cover(done(nextDay, endAfter(seatEnd, own.end_day), own, 'own'));
 
   // stub: the nearest cycle end after the seat's end.
   let near = null;
@@ -380,7 +451,7 @@ function renewalPeriod(endDateStr, months = 1, now = new Date()) {
   const stub = { days: Math.max(1, Math.round((first - seatEnd) / DAY_MS)), cycleLength: near.ev.cycleLength, end: first };
   // …then `months` whole cycles of that same cycle, each ending on its own end day.
   const to = dayIn(first.getFullYear(), first.getMonth() + months, near.cycle.end_day, bh, bm);
-  return done(seatEnd, to, near.cycle, 'stub', stub);
+  return cover(done(nextDay, to, near.cycle, 'stub', stub));
 }
 
 /**
@@ -416,10 +487,14 @@ function renewDiscountFor(months) {
  *
  * @param {{user_id:*, end_date:string}} sub  the seat being renewed
  */
-function quoteRenewal(sub, months, now = new Date()) {
+function quoteRenewal(sub, months, now = new Date(), opts = {}) {
   const monthly = getMonthlyPrice(sub.user_id);
   const bulk = renewDiscountFor(months);
-  const p = renewalPeriod(sub.end_date, months, now);
+  const p = renewalPeriod(sub.end_date, months, now, opts);
+  if (p.kind === 'closed' || p.kind === 'notyet') {                  // V156.7: outside the renewal window
+    return { months, monthly, gross: 0, bulk: 0, price: 0, from: p.from, to: p.to, days: 0, kind: p.kind, cycle: p.cycle, stub: null,
+             opensOn: p.opensOn, closedOn: p.closedOn };
+  }
   const gross = p.stub
     ? priceFor(p.stub.days, p.stub.cycleLength, monthly) + months * monthly
     : monthly * months;
@@ -457,4 +532,4 @@ function globalMonthlyPrice() {
   }
 }
 
-module.exports = { renewalPeriod, quoteRenewal, renewDiscountFor, recordStartTime, clearStartTime, startTimeOf, getCycles, calculateBestCycle, priceFor, pricePeriod, oneMoreCycle, getMonthlyPrice, manualCycle, nextCycleAfterCurrent, boundaryTime, localNow, tzOffsetMinutes };
+module.exports = { lateRenewalQuote, renewGraceDays, renewalPeriod, quoteRenewal, renewDiscountFor, recordStartTime, clearStartTime, startTimeOf, getCycles, calculateBestCycle, priceFor, pricePeriod, oneMoreCycle, getMonthlyPrice, manualCycle, nextCycleAfterCurrent, boundaryTime, localNow, tzOffsetMinutes };

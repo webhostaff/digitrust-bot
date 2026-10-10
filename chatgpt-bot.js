@@ -146,11 +146,14 @@ const BAND_GREY  = '⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛';
  * @param {boolean} scheduled paid early — activate when the cycle opens
  */
 function orderCard(d, activated = false, scheduled = false, cancelNote = null) {
-  const band = cancelNote ? BAND_GREY : activated ? BAND_GREEN : (scheduled ? BAND_BLUE : BAND_RED);
+  // V156.7: a paid RENEWAL is blue until it is activated (then green), like a seat paid early.
+  const band = cancelNote ? BAND_GREY : activated ? BAND_GREEN : ((scheduled || d.renewal) ? BAND_BLUE : BAND_RED);
   const head = cancelNote
     ? '⚫ <b>CANCELLED</b> — no seat to activate'
     : activated
     ? '🟢 <b>ACTIVATED</b> — customer notified'
+    : d.renewal
+      ? `🔵 <b>RENEWAL PAID</b> — activate it on <b>${d.startDate}</b>`
     : scheduled
       ? '🔵 <b>PAID EARLY</b> — activate when the new cycle starts'
       : '🔴 <b>NOT ACTIVATED YET</b> — action needed';
@@ -162,7 +165,7 @@ function orderCard(d, activated = false, scheduled = false, cancelNote = null) {
     `👤 Customer: ${d.name} (<code>${d.userId}</code>)\n` +
     `📧 Email: <code>${d.email}</code>\n` +
     (d.kind ? `${d.kind}\n` : '') +
-    (d.panel ? `🖥 Panel: <b>${d.panel}</b>\n` : '') +
+    ((d.panel || d.cycle) ? `🖥 Panel: <b>${d.panel || '—'}</b>${d.cycle ? ` · 🗓 ${d.cycle}` : ''}\n` : '') +
     `⏱ Duration: <b>${d.days} days</b>\n` +
     `📅 Start date: <b>${d.startDate}</b>\n` +
     `📅 End date: <b>${d.endDate}</b>\n` +
@@ -180,6 +183,17 @@ function orderCard(d, activated = false, scheduled = false, cancelNote = null) {
         : `⬇️ <b>Activate the seat, then press the button below.</b>\n`) +
     `${band}`
   );
+}
+
+/** Where a seat is (V156.7): its panel's name and its cycle. Active seats use the workspace they were activated in. */
+function seatPlace(sub) {
+  let panel = '';
+  if (sub && sub.status === 'active' && sub.workspace) panel = sub.workspace;
+  if (!panel && sub) {
+    try { panel = cgbGuard.panelNameCached(cgbGuard.panelForSeat(sub.end_date)); } catch (_) {}
+  }
+  if (!panel && sub && sub.prev_workspace) panel = sub.prev_workspace;
+  return { panel: escapeHtml(panel || ''), cycle: cgbSeatTools.cycleLabel(db, sub && sub.end_date) };
 }
 
 /** "🔄 Renewal of …" / "🆕 New seat" for the order card (V156.3). */
@@ -552,9 +566,149 @@ function renewDiscountFor(months) {
   return cgbCycles.renewDiscountFor(months);
 }
 
+
+/** V156.7: outside the renewal window (one day before the seat ends → its cycle's start date). */
+async function renewalClosed(chatId, sub) {
+  const q = priceRenewal(sub, 1);
+  if (q.kind === 'notyet') {
+    await bot.sendMessage(chatId,
+      `🕒 <b>Renewal opens soon</b>\n\n` +
+      `📧 <code>${escapeHtml(sub.email || '')}</code> ends on <b>${escapeHtml(String(sub.end_date))}</b>.\n` +
+      `You can renew it from <b>${formatDate(q.opensOn)}</b> until <b>${formatDate(q.closedOn)}</b>.`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'cgb_menu' }]] } });
+    return true;
+  }
+  if (q.kind !== 'closed') return false;
+  await bot.sendMessage(chatId,
+    `⏰ <b>Renewal is closed for this seat</b>\n\n` +
+    `📧 <code>${escapeHtml(sub.email || '')}</code> ended on <b>${escapeHtml(String(sub.end_date))}</b>.\n` +
+    `It could be renewed until <b>${formatDate(q.closedOn)}</b>.\n\n` +
+    `• To keep <b>this email</b>, ask the admin: if he agrees you pay only the days left in its cycle.\n` +
+    `• Or buy a new seat.`,
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+      [{ text: '📨 Ask to renew this email', callback_data: `cgb_lreq_${sub.id}` }],
+      [{ text: '✨ Buy a new seat', callback_data: 'cgb_new' }], [{ text: '🔙 Back', callback_data: 'cgb_menu' }]] } });
+  return true;
+}
+
+// ════════════════════════════════════════════════════════════════
+// V156.9: ⏰ LATE RENEWALS — after the window: ask → admin agrees → pay the days left
+// ════════════════════════════════════════════════════════════════
+function ensureLateTable() {
+  db.exec(`CREATE TABLE IF NOT EXISTS cgb_late_renewals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, sub_id INTEGER NOT NULL, user_id INTEGER NOT NULL, email TEXT,
+    status TEXT NOT NULL DEFAULT 'pending', created_at TEXT DEFAULT (datetime('now')), decided_at TEXT)`);
+}
+function pendingLateRenewals() {
+  ensureLateTable();
+  return db.prepare(`SELECT r.*, u.username FROM cgb_late_renewals r LEFT JOIN users u ON u.telegram_id = r.user_id
+                      WHERE r.status = 'pending' ORDER BY r.id`).all();
+}
+function lateCard(r, sub, who) {
+  const lq = cgbCycles.lateRenewalQuote(sub);
+  const pl = seatPlace(sub);
+  return `⏰ <b>Late renewal request #${r.id}</b>\n\n` +
+    `👤 ${escapeHtml(who)} (<code>${r.user_id}</code>)\n📧 <code>${escapeHtml(sub.email || '')}</code>\n` +
+    `🖥 ${pl.panel || '—'}${pl.cycle ? ` · 🗓 ${pl.cycle}` : ''}\n📅 Ended <b>${escapeHtml(String(sub.end_date))}</b> — the renewal window is closed\n\n` +
+    (lq ? `If you agree he pays the days left: <b>${formatDate(lq.from)} → ${formatDate(lq.to)}</b> · ${lq.days} day(s) · <b>$${lq.price.toFixed(2)}</b>`
+        : 'No cycle configured — cannot price it.');
+}
+
+async function startLateRequest(chatId, userId, subId) {
+  const sub = queries.getCgbSubById(subId);
+  if (!sub || String(sub.user_id) !== String(userId)) { await bot.sendMessage(chatId, '❌ That seat is not yours.'); return; }
+  if (priceRenewal(sub, 1).kind !== 'closed') { await showRenewDurations(chatId, userId, subId); return; }   // still renewable normally
+  ensureLateTable();
+  const open = db.prepare(`SELECT id, status FROM cgb_late_renewals WHERE sub_id = ? AND status IN ('pending','approved')`).get(sub.id);
+  if (open) {
+    if (open.status === 'approved') { await showLatePayment(chatId, userId, open.id); return; }
+    await bot.sendMessage(chatId, 'ℹ️ Your request was already sent — you will get a message when the admin answers.');
+    return;
+  }
+  const id = db.prepare('INSERT INTO cgb_late_renewals (sub_id, user_id, email) VALUES (?, ?, ?)').run(sub.id, userId, sub.email || '').lastInsertRowid;
+  await bot.sendMessage(chatId, `✅ <b>Request sent</b>\n\nThe admin will answer about <code>${escapeHtml(sub.email || '')}</code>. If he agrees, you get a payment button for the days left.`, { parse_mode: 'HTML' });
+  if (!ADMIN_ID) return;
+  const u = db.prepare('SELECT username, first_name FROM users WHERE telegram_id = ?').get(Number(userId));
+  const who = u?.username ? '@' + u.username : (u?.first_name || String(userId));
+  await bot.sendMessage(ADMIN_ID, lateCard({ id, user_id: userId }, sub, who), { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+    [{ text: '✅ Agree — he pays the days left', callback_data: `cgb_lrq_a_${id}` }],
+    [{ text: '❌ Refuse', callback_data: `cgb_lrq_x_${id}` }],
+  ] } }).catch(() => {});
+}
+
+async function decideLateRequest(data, chatId, msgId) {
+  const [, , how, idRaw] = data.split('_');
+  ensureLateTable();
+  const r = db.prepare('SELECT * FROM cgb_late_renewals WHERE id = ?').get(Number(idRaw));
+  await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msgId }).catch(() => {});
+  if (!r) { await bot.sendMessage(chatId, '❌ Request not found.'); return; }
+  const claimed = db.prepare(`UPDATE cgb_late_renewals SET status = ?, decided_at = datetime('now') WHERE id = ? AND status = 'pending'`)
+    .run(how === 'a' ? 'approved' : 'refused', r.id).changes;
+  if (!claimed) { await bot.sendMessage(chatId, `ℹ️ Request #${r.id} was already ${r.status}.`); return; }
+  if (how === 'x') {
+    await bot.sendMessage(Number(r.user_id), `❌ <b>Your late renewal request was not accepted</b>\n\nYou can buy a new seat from /start.`, { parse_mode: 'HTML' }).catch(() => {});
+    await bot.sendMessage(chatId, `❌ Late renewal #${r.id} refused — the customer was told.`);
+    return;
+  }
+  const sub = queries.getCgbSubById(r.sub_id);
+  const lq = sub && cgbCycles.lateRenewalQuote(sub);
+  await bot.sendMessage(Number(r.user_id),
+    `✅ <b>The admin agreed to renew your seat</b>\n\n📧 <code>${escapeHtml(r.email || '')}</code>\n` +
+    (lq ? `📅 ${formatDate(lq.from)} → ${formatDate(lq.to)} · ${lq.days} day(s)\n💰 <b>$${lq.price.toFixed(2)}</b> (the days left in its cycle)\n\n` : '\n') +
+    `Tap below to pay. <i>The price is counted when you pay: the later, the fewer days.</i>`,
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '💳 Pay the days left', callback_data: `cgb_lpay_${r.id}` }]] } }).catch(() => {});
+  await bot.sendMessage(chatId, `✅ Late renewal #${r.id} agreed — the customer got the payment button.`);
+}
+
+/** The payment screen of an agreed late renewal: the remaining days of its own cycle, priced now. */
+async function showLatePayment(chatId, userId, reqId) {
+  ensureLateTable();
+  const r = db.prepare('SELECT * FROM cgb_late_renewals WHERE id = ?').get(Number(reqId));
+  if (!r || String(r.user_id) !== String(userId)) { await bot.sendMessage(chatId, '❌ Request not found.'); return; }
+  if (r.status === 'paid') { await bot.sendMessage(chatId, 'ℹ️ This renewal is already paid.'); return; }
+  if (r.status !== 'approved') { await bot.sendMessage(chatId, 'ℹ️ This request is not agreed (yet).'); return; }
+  const sub = queries.getCgbSubById(r.sub_id);
+  const lq = sub && cgbCycles.lateRenewalQuote(sub);
+  if (!lq) { await bot.sendMessage(chatId, '❌ Could not price it — contact support.'); return; }
+  if (isOutOfStock()) { await bot.sendMessage(chatId, `🔴 <b>No seats available</b>\n\n${escapeHtml(outOfStockMessage())}`, { parse_mode: 'HTML' }); return; }
+  setSession(userId, 'CONFIRM_ORDER', {
+    daysRemaining: lq.days, extraMonth: false, basePrice: lq.price, finalPrice: lq.price,
+    startDate: formatDate(lq.from), endDate: formatDate(lq.to), monthlyPrice: lq.monthly,
+    email: sub.email, renewalOf: sub.id, renewMonths: 1, lateReqId: r.id,
+  });
+  const balance = getBalance(userId);
+  const rows = [];
+  if (Math.round(balance * 100) >= Math.round(lq.price * 100)) rows.push([{ text: `👛 Pay with Balance ($${balance.toFixed(2)})`, callback_data: 'pay_balance' }]);
+  else if (balance > 0) rows.push([{ text: `👛 Balance $${balance.toFixed(2)} — not enough`, callback_data: 'balance_short' }]);
+  rows.push(
+    [{ text: '💳 Pay with Binance Pay', callback_data: 'pay_binance' }],
+    [{ text: '💎 USDT BEP20', callback_data: 'pay_bep20' }, { text: '💎 USDT TRC20', callback_data: 'pay_trc20' }],
+    [{ text: '🤖 CryptoBot', callback_data: 'pay_cryptobot' }],
+  );
+  await bot.sendMessage(chatId,
+    `⏰ <b>Late renewal</b>\n\n📧 <code>${escapeHtml(sub.email || '')}</code>\n🏢 ${escapeHtml(workspaceName(sub))}\n\n` +
+    `📅 Period: ${formatDate(lq.from)} → ${formatDate(lq.to)}\n⏳ Days: <b>${lq.days}</b> (the days left in its cycle)\n` +
+    `💰 <b>Price: $${lq.price.toFixed(2)}</b>\n👛 Your balance: <b>$${balance.toFixed(2)}</b>\n\nSelect payment method:`,
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
+}
+
+async function showLateRequests(chatId) {
+  const list = pendingLateRenewals();
+  if (!list.length) { await bot.sendMessage(chatId, '⏰ No late renewal request is waiting.'); return; }
+  for (const r of list.slice(0, 15)) {
+    const sub = queries.getCgbSubById(r.sub_id);
+    if (!sub) continue;
+    await bot.sendMessage(chatId, lateCard(r, sub, r.username ? '@' + r.username : String(r.user_id)), { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+      [{ text: '✅ Agree — he pays the days left', callback_data: `cgb_lrq_a_${r.id}` }],
+      [{ text: '❌ Refuse', callback_data: `cgb_lrq_x_${r.id}` }],
+    ] } });
+  }
+}
+
 async function showRenewDurations(chatId, userId, subId, messageId = null) {
   const sub = queries.getCgbSubById(subId);
   if (!sub) { await bot.sendMessage(chatId, '❌ Subscription not found.'); return; }
+  if (await renewalClosed(chatId, sub)) return;
 
   // Three per row: twelve full-width buttons would bury the Back button below
   // the fold and make the screen a scroll rather than a choice.
@@ -603,6 +757,7 @@ async function showRenewPayment(chatId, userId, subId, months, messageId = null)
     return;
   }
 
+  if (await renewalClosed(chatId, sub)) return;
   const q = priceRenewal(sub, months);
 
   setSession(userId, 'CONFIRM_ORDER', {
@@ -699,7 +854,9 @@ async function showAdminPanel(chatId, msgId = null) {
   const kb = { inline_keyboard: [
     [{ text: `🗓 Ending today · ${nT}`, callback_data: 'adm_end_today' }, { text: `🗓 Tomorrow · ${nM}`, callback_data: 'adm_end_tomorrow' }],
     [{ text: '🗓 In 3 days', callback_data: 'adm_end_+3' }, { text: '🗓 In 7 days', callback_data: 'adm_end_+7' }, { text: '📅 Other day', callback_data: 'adm_ask_ending' }],
-    [{ text: `📩 Email requests · ${(() => { try { return pendingEmailRequests().length; } catch (_) { return 0; } })()}`, callback_data: 'adm_emailreqs' }],
+    [{ text: `💙 Paid renewals · ${(() => { try { return db.prepare("SELECT COUNT(*) n FROM chatgpt_subscriptions WHERE renewed_from IS NOT NULL AND COALESCE(status,'pending')='pending'").get().n; } catch (_) { return 0; } })()}`, callback_data: 'adm_paidrenewals' },
+     { text: `📩 Email requests · ${(() => { try { return pendingEmailRequests().length; } catch (_) { return 0; } })()}`, callback_data: 'adm_emailreqs' }],
+    [{ text: `⏰ Late renewal requests · ${(() => { try { return pendingLateRenewals().length; } catch (_) { return 0; } })()}`, callback_data: 'adm_laterenewals' }],
     [{ text: '➕ Add a seat', callback_data: 'adm_ask_addseat' }, { text: '📧 Change an email', callback_data: 'adm_ask_setemail' }],
     [{ text: '✏️ Change dates', callback_data: 'adm_ask_setdates' }, { text: '🔎 Check renewals', callback_data: 'adm_run_checkrenewals' }],
     [{ text: '🔄 Renewals board', callback_data: 'adm_run_renewals' }],
@@ -726,6 +883,8 @@ async function handleAdminPanelButton(data, chatId, msgId, userId) {
   if (String(userId) !== String(ADMIN_ID)) return true;
   if (data === 'adm_home') { await showAdminPanel(chatId, msgId); return true; }
   if (data === 'adm_emailreqs') { await showEmailRequests(chatId); return true; }
+  if (data === 'adm_paidrenewals') { await showPaidRenewals(chatId); return true; }
+  if (data === 'adm_laterenewals') { await showLateRequests(chatId); return true; }
   let m = /^adm_end_(today|tomorrow|\+\d+)$/.exec(data);
   if (m) { runAsCommand(chatId, userId, `/ending ${m[1]}`); return true; }
   m = /^adm_run_(checkrenewals|renewals|prices|guardtest)$/.exec(data);
@@ -1356,6 +1515,7 @@ async function activateAndNotifySeat(orderIdRaw, { chatId = null, msgId = null, 
     ref:       String(orderId),
     activatedAt: `${p2(now.getDate())}/${p2(now.getMonth() + 1)} ${p2(now.getHours())}:${p2(now.getMinutes())}`,
     panel:     panelName ? escapeHtml(panelName) : '',
+    cycle:     cgbSeatTools.cycleLabel(db, endDate),
     editedNote: (guardOk && !guardOk.ok) ? `Not put on the invite bot's whitelist: ${escapeHtml(guardOk.reason)}` : undefined,
   }, true);
   const doneMarkup = activeCardMarkup(orderId);
@@ -1753,6 +1913,35 @@ async function decideEmailRequest(data, chatId, msgId, adminId) {
   await bot.sendMessage(chatId, [`✅ <b>Request #${req.id} approved</b>`, ...lines.slice(1)].join('\n'), { parse_mode: 'HTML' });
 }
 
+// ── V156.7: 💙 paid renewals, each with its panel and cycle ──
+async function showPaidRenewals(chatId) {
+  const today = ymdLocal(cgbCycles.localNow(new Date()));
+  const rows = cgbSeatTools.paidRenewals(db, today, 20);
+  if (!rows.length) { await bot.sendMessage(chatId, '💙 No paid renewal waiting, none activated in the last 20 days.'); return; }
+  const groups = new Map();
+  for (const r of rows) {
+    const pl = seatPlace(r);
+    const key = `${pl.panel || '—'}${pl.cycle ? ` · 🗓 ${pl.cycle}` : ''}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(r);
+  }
+  const waiting = rows.filter((r) => r.status !== 'active').length;
+  let txt = `💙 <b>Paid renewals</b> — 🔵 ${waiting} to activate · 🟢 ${rows.length - waiting} activated (20 days)\n`;
+  const blocks = [];
+  for (const [place, list] of groups) {
+    txt += `\n🖥 <b>${place}</b> · ${list.length}\n`;
+    for (const r of list) {
+      const who = r.username ? `@${escapeHtml(r.username)}` : `<code>${r.user_id}</code>`;
+      txt += `${r.status === 'active' ? '🟢' : '🔵'} <code>${escapeHtml(r.email)}</code> — ${who}${r.order_id ? ` · #${r.order_id}` : ''} · ${r.start_date} → ${r.end_date}\n`;
+    }
+    blocks.push({ place, emails: list.map((r) => r.email) });
+  }
+  for (const chunk of txt.match(/[\s\S]{1,3800}(?=\n|$)/g) || [txt]) await bot.sendMessage(chatId, chunk, { parse_mode: 'HTML' });
+  for (const b of blocks) {
+    await bot.sendMessage(chatId, `🖥 <b>${b.place}</b>\n<code>${escapeHtml(b.emails.join('\n'))}</code>`, { parse_mode: 'HTML' }).catch(() => {});
+  }
+}
+
 async function showEmailRequests(chatId) {
   const list = pendingEmailRequests();
   if (!list.length) { await bot.sendMessage(chatId, '📧 No email change request is waiting.'); return; }
@@ -1814,6 +2003,8 @@ function seatCardData(orderId) {
       paid: Number(sub.final_price ?? ord?.total_price ?? 0).toFixed(2),
       method: ord?.payment_method || '—', refLabel: 'Order', ref: String(orderId),
       kind: seatKindLine(sub.renewed_from),
+      renewal: !!sub.renewed_from,
+      ...seatPlace(sub),
     },
   };
 }
@@ -2079,6 +2270,19 @@ bot.on('callback_query', async (q) => {
     }
   }
 
+  // V156.9: late renewals
+  {
+    let m = /^cgb_lreq_(\d+)$/.exec(data);
+    if (m) { await startLateRequest(chatId, userId, Number(m[1])); return; }
+    m = /^cgb_lpay_(\d+)$/.exec(data);
+    if (m) { await showLatePayment(chatId, userId, Number(m[1])); return; }
+    if (/^cgb_lrq_[ax]_\d+$/.test(data)) {
+      if (String(userId) !== String(ADMIN_ID)) return;
+      await decideLateRequest(data, chatId, msgId);
+      return;
+    }
+  }
+
   // V156.4: email change requests
   {
     const m = /^cgb_ereq_(\d+)$/.exec(data);
@@ -2281,6 +2485,7 @@ bot.on('callback_query', async (q) => {
         );
         // Records which seat this renews, so the history of one email stays
         // readable instead of looking like unrelated purchases.
+        if (s.lateReqId) { try { db.prepare("UPDATE cgb_late_renewals SET status = 'paid' WHERE id = ?").run(s.lateReqId); } catch (_) {} }   // V156.9
         if (s.renewalOf && newSubId) {
           try { queries.linkCgbRenewal(s.renewalOf, newSubId); } catch (_) {}
         }
@@ -2387,6 +2592,7 @@ bot.on('callback_query', async (q) => {
         );
         // Records which seat this renews, so the history of one email stays
         // readable instead of looking like unrelated purchases.
+        if (s.lateReqId) { try { db.prepare("UPDATE cgb_late_renewals SET status = 'paid' WHERE id = ?").run(s.lateReqId); } catch (_) {} }   // V156.9
         if (s.renewalOf && newSubId) {
           try { queries.linkCgbRenewal(s.renewalOf, newSubId); } catch (_) {}
         }
@@ -2803,6 +3009,8 @@ async function confirmPayment(chatId, userId, orderId, txid, sessionData) {
       refLabel:  paymentMethod === 'pay_balance' ? 'Wallet' : 'TxID',
       ref:       escapeHtml(txid),
       kind:      seatKindLine(sessionData.renewalOf),
+      renewal:   !!sessionData.renewalOf,
+      ...seatPlace({ end_date: sessionData.endDate, status: 'pending' }),
     };
     // Paid before its period opens — the start date is still in the future.
     // V156.2: compared with the LOCAL date. The server runs on UTC, so between midnight and 01:00 in Tunisia
@@ -2897,6 +3105,8 @@ async function confirmCryptobotPayment(invoiceId, paidAmount, orderId, userId) {
       refLabel:  'Invoice',
       ref:       escapeHtml(String(invoiceId)),
       kind:      seatKindLine(sub.renewed_from),
+      renewal:   !!sub.renewed_from,
+      ...seatPlace(sub),
     };
     // Paid before its period opens — the start date is still in the future.
     // V156.2: compared with the LOCAL date. The server runs on UTC, so between midnight and 01:00 in Tunisia
@@ -3078,7 +3288,7 @@ async function sendRenewalReminders() {
   let sent = 0;
   for (const sub of seats) {
     const end = String(sub.end_date).slice(0, 10);
-    const first = addDaysYmd(end, -before);
+    const first = addDaysYmd(end, -Math.min(before, 1));   // V156.7: never before the renewal window opens (1 day before the end)
     const last = nextCycleStartYmd(end);
     if (today < first || today > last) continue;
     if (hasPaidSuccessor(sub.id)) continue;

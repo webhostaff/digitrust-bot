@@ -150,4 +150,30 @@ function unlinkRenewal(db, subId) {
   return { ok: true, ...r };
 }
 
-module.exports = { mismatchedRenewals, unlinkRenewal, EMAIL_RE, ymd, parseDay, seatsEndingOn, endingText, findSeat, parseSetEmail, changeSeatEmail };
+/** "Day 11 → 9" — the cycle a seat ending on `endDate` belongs to (by its end day), or ''. */
+function cycleLabel(db, endDate) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(endDate || ''));
+  if (!m) return '';
+  const day = Number(m[3]);
+  const last = new Date(Number(m[1]), Number(m[2]), 0).getDate();
+  try {
+    const rows = db.prepare('SELECT start_day, end_day FROM billing_cycles WHERE COALESCE(is_active,1) = 1').all();
+    const c = rows.find((r) => Math.min(r.end_day, last) === day);
+    return c ? `Day ${c.start_day} → ${c.end_day}` : '';
+  } catch (_) { return ''; }
+}
+
+/** Paid renewals: waiting for activation, and those activated in the last `days` days (V156.7). */
+function paidRenewals(db, todayYmd, days = 20) {
+  return db.prepare(`
+    SELECT cs.id, cs.order_id, cs.user_id, cs.email, cs.start_date, cs.end_date, cs.status, cs.workspace, cs.final_price,
+           prev.workspace AS prev_workspace, u.username
+      FROM chatgpt_subscriptions cs
+      JOIN chatgpt_subscriptions prev ON prev.id = cs.renewed_from
+      LEFT JOIN users u ON u.telegram_id = cs.user_id
+     WHERE COALESCE(cs.status,'pending') = 'pending'
+        OR (cs.status = 'active' AND date(cs.start_date) >= date(?, '-' || ? || ' days'))
+     ORDER BY cs.status DESC, date(cs.start_date), cs.email`).all(todayYmd, days);
+}
+
+module.exports = { cycleLabel, paidRenewals, mismatchedRenewals, unlinkRenewal, EMAIL_RE, ymd, parseDay, seatsEndingOn, endingText, findSeat, parseSetEmail, changeSeatEmail };

@@ -127,7 +127,7 @@ const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0
  * price, from the SAME quote the customer is shown (cgbCycles.quoteRenewal).
  */
 function expectedRenewal(userId, prevEnd, months, at) {
-  const q = cycles.quoteRenewal({ user_id: userId, end_date: prevEnd }, months, at);
+  const q = cycles.quoteRenewal({ user_id: userId, end_date: prevEnd }, months, at, { ignoreWindow: true });   // judges past sales
   const start = ymd(q.from), end = ymd(q.to);
   return { start, end, days: q.days, kind: q.kind, months, price: q.price };
 }
@@ -151,7 +151,8 @@ function auditRenewals(now = new Date()) {
     let match = false;
     for (let m = 1; m <= 12 && !match; m++) {
       const e = expectedRenewal(r.user_id, r.prev_end, m, at);
-      if (e.start === r.start_date && e.end === r.end_date) match = true;
+      // V156.6: renewals start the day after the old end; older ones started ON it — both are right.
+      if ((e.start === r.start_date || r.start_date === r.prev_end) && e.end === r.end_date) match = true;
     }
     // How many months did he pay for? The old rule always billed monthly price × months (less the
     // bulk discount), whatever the days were, so the AMOUNT tells; the days do not (25 days was

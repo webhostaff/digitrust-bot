@@ -1,3 +1,21 @@
+# V156.9 — renewal open until 1 day after the cycle starts · late renewal by request
+
+- **Renewal window:** from one day before the seat's last day until ONE day after its cycle's start date (setting `cgb_renew_grace_days`, now 1). Cycle 11 → 9: days 8 to 12 → 10 Oct → 9 Nov, the monthly price. Same for every cycle and panel.
+- **After that — late renewal by request:** the "Renewal is closed" screen has **📨 Ask to renew this email**. The admin gets "⏰ Late renewal request" with the customer, email, panel · cycle and what he would pay: **only the days left in its cycle** (e.g. on 13 Oct: 13 Oct → 9 Nov, 28 days, $14.19), priced like a new buyer of that cycle. **✅ Agree** → the customer gets **💳 Pay the days left** (priced when he pays); **❌ Refuse** → he is told.
+- The paid late renewal is an ordinary renewal of that email: blue card, 🔄 Renewal of …, in 💙 Paid renewals. One request per seat; the customer cannot approve it; a refused or already-paid request cannot be paid.
+- 🛠 Admin panel: **⏰ Late renewal requests · N**.
+
+# V156.7 — renewal window (all cycles) · blue renewal cards · 💙 paid renewals with panel and cycle
+
+**Renewal window — the same for every cycle and panel.** A seat can be renewed from ONE DAY BEFORE its last day until its cycle's START date (inclusive). Cycle 11 → 9: a seat ending on the 9th renews on the 8th, 9th, 10th or 11th → 10 Oct → 9 Nov, the monthly price. Before: "🕒 Renewal opens soon — from 8 Oct until 11 Oct". After: "⏰ Renewal is closed — buy a new seat". Reminders never start before the window opens.
+Every renewal starts the day after the seat's last day (V156.6).
+
+**Cards.** A paid renewal is **blue** — "🔵 RENEWAL PAID — activate it on <start>" — and turns **green** when activated. Each card shows the place: `🖥 Panel: <name> · 🗓 Day 11 → 9`.
+
+**💙 Paid renewals** (🛠 Admin panel): every renewal waiting for activation (🔵) and those activated in the last 20 days (🟢), grouped by panel and cycle, with the customer, order and period, then the emails of each panel in a block to copy.
+
+🔎 Check renewals judges past renewals by the dates they should have had, whatever the window was then; it accepts renewals that started ON the old end day and those that start the next day.
+
 # V156.4 — 📧 email change requests: the customer asks, the admin decides
 
 - Customer: on each seat (📋 My seats → a seat) a new button **📧 Request an email change** → he sends the new email → "Request sent". Nothing changes yet. A new request on the same seat replaces the open one. Pressing "Change Email" during a renewal now offers this request instead of a dead end.

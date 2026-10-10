@@ -395,6 +395,18 @@ async function panelNameOf(id) {
   return (_names.map && _names.map[id]) || id;
 }
 
+/** A panel's name without waiting on the network (V156.7): the cached names, else the saved ones, else the id. */
+function panelNameCached(id) {
+  if (!id) return '';
+  if (_names.map && _names.map[id]) return _names.map[id];
+  try {
+    const saved = JSON.parse(require('../database/queries').getSetting('cgb_panel_names', '{}') || '{}');
+    if (saved[id]) return saved[id];
+  } catch (_) {}
+  panelNameOf(id).catch(() => {});            // warm the cache for next time
+  return id;
+}
+
 /** The panel a seat ending on `endDate` belongs to: the cycle link, else the panel chosen for new orders, else GUARD_PANEL_ID. */
 function panelForSeat(endDate) {
   const t = cgbRouting.resolveTarget(endDate, GUARD_PANEL);
@@ -432,4 +444,4 @@ async function whitelistInGuard({ panel, email, expiresOn = null, note = '', act
 /** The main bot's address, secret and default panel — the registry of bots builds on it. */
 function getConfig() { return { url: GUARD_URL, secret: SHARED_SECRET, panel: GUARD_PANEL, valid: !!GUARD_URL && guardUrlValid() }; }
 
-module.exports = { panelNameOf, panelForSeat, whitelistInGuard, makeSeatsHandler, getConfig, fetchGuardPanels, fetchGuardPanelsNamed, notifyGuardOfNewInvite, makeGuardWebhookHandler, cancelGuardInvite, diagnose, fetchGuardReport, _normalizeGuardUrl: normalizeGuardUrl };
+module.exports = { panelNameOf, panelNameCached, panelForSeat, whitelistInGuard, makeSeatsHandler, getConfig, fetchGuardPanels, fetchGuardPanelsNamed, notifyGuardOfNewInvite, makeGuardWebhookHandler, cancelGuardInvite, diagnose, fetchGuardReport, _normalizeGuardUrl: normalizeGuardUrl };
