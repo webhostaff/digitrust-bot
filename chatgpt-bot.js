@@ -188,9 +188,10 @@ function orderCard(d, activated = false, scheduled = false, cancelNote = null) {
 /** Where a seat is (V156.7): its panel's name and its cycle. Active seats use the workspace they were activated in. */
 function seatPlace(sub) {
   let panel = '';
-  if (sub && sub.status === 'active' && sub.workspace) panel = sub.workspace;
+  if (sub && sub.id && cgbGuard.seatPanelOf(sub.id)) panel = cgbGuard.panelNameCached(cgbGuard.seatPanelOf(sub.id));   // V157
+  if (!panel && sub && sub.status === 'active' && sub.workspace) panel = sub.workspace;
   if (!panel && sub) {
-    try { panel = cgbGuard.panelNameCached(cgbGuard.panelForSeat(sub.end_date)); } catch (_) {}
+    try { panel = cgbGuard.panelNameCached(cgbGuard.panelForSub(sub)); } catch (_) {}
   }
   if (!panel && sub && sub.prev_workspace) panel = sub.prev_workspace;
   return { panel: escapeHtml(panel || ''), cycle: cgbSeatTools.cycleLabel(db, sub && sub.end_date) };
@@ -221,6 +222,7 @@ function orderCardButtons(d) {
     ], [
       // A paid seat whose dates are wrong (e.g. a renewal quoted on the wrong cycle).
       { text: '✏️ Change dates', callback_data: `cgb_dates_${d.orderId}` },
+      { text: '🖥 Change panel', callback_data: `cgb_cp_${d.orderId}` },
     ]],
   };
 }
@@ -826,6 +828,7 @@ const ADM_PROMPTS = {
   setdates: { cmd: '/setdates', text: '✏️ <b>Change a seat\'s dates</b>\n\nSend the order number, the first day and the last day:\n<code>20439 2026-10-05 2026-11-05</code>\n<i>A note for the customer can follow.</i>' },
   ending:   { cmd: '/ending',   text: '🗓 <b>Seats ending on a day</b>\n\nSend the day: <code>2026-10-30</code>, <code>30/10</code> or <code>+3</code>' },
   setprice: { cmd: '/setprice', text: '💲 <b>Custom monthly price for a customer</b>\n\nSend the Telegram id and the price (a note may follow):\n<code>5626665035 12.50</code>' },
+  setpanel: { cmd: '/setpanel', text: '🖥 <b>Move a seat to another panel</b>\n\nSend the order number or the seat\'s email:\n<code>23586</code>\n<code>sara@gmail.com</code>\n\n<i>The customer is not told.</i>' },
   delprice: { cmd: '/delprice', text: '🗑 <b>Remove a customer\'s custom price</b>\n\nSend the Telegram id:\n<code>5626665035</code>' },
 };
 
@@ -858,7 +861,8 @@ async function showAdminPanel(chatId, msgId = null) {
      { text: `📩 Email requests · ${(() => { try { return pendingEmailRequests().length; } catch (_) { return 0; } })()}`, callback_data: 'adm_emailreqs' }],
     [{ text: `⏰ Late renewal requests · ${(() => { try { return pendingLateRenewals().length; } catch (_) { return 0; } })()}`, callback_data: 'adm_laterenewals' }],
     [{ text: '➕ Add a seat', callback_data: 'adm_ask_addseat' }, { text: '📧 Change an email', callback_data: 'adm_ask_setemail' }],
-    [{ text: '✏️ Change dates', callback_data: 'adm_ask_setdates' }, { text: '🔎 Check renewals', callback_data: 'adm_run_checkrenewals' }],
+    [{ text: '✏️ Change dates', callback_data: 'adm_ask_setdates' }, { text: '🖥 Change a panel', callback_data: 'adm_ask_setpanel' }],
+    [{ text: '🔎 Check renewals', callback_data: 'adm_run_checkrenewals' }],
     [{ text: '🔄 Renewals board', callback_data: 'adm_run_renewals' }],
     [{ text: '💰 Custom prices', callback_data: 'adm_run_prices' }, { text: '💲 Set a price', callback_data: 'adm_ask_setprice' }],
     [{ text: '🗑 Remove a price', callback_data: 'adm_ask_delprice' }, { text: '🔌 Test invite bot', callback_data: 'adm_run_guardtest' }],
@@ -1418,7 +1422,7 @@ async function handOverToGuard(email, orderId, endDate) {
 function activeCardMarkup(orderId) {
   return { inline_keyboard: [
     [{ text: '✅ Done — customer notified', callback_data: 'noop' }],
-    [{ text: '✏️ Change dates', callback_data: `cgb_dates_${orderId}` }],
+    [{ text: '✏️ Change dates', callback_data: `cgb_dates_${orderId}` }, { text: '🖥 Change panel', callback_data: `cgb_cp_${orderId}` }],
   ] };
 }
 
@@ -1444,7 +1448,7 @@ async function activateAndNotifySeat(orderIdRaw, { chatId = null, msgId = null, 
   let guardOk = null;
   try {
     const cgbGuard = require('./services/cgbGuard');
-    if (!panelId) panelId = cgbGuard.panelForSeat(endDate);
+    if (!panelId) panelId = cgbGuard.panelForSub(sub);
     if (!panelName && panelId) panelName = await cgbGuard.panelNameOf(panelId);
     // Activated by hand: the invite bot did not invite this person, so put them on that panel's whitelist with
     // the seat's end date — otherwise it would flag them as "unknown".
@@ -1593,6 +1597,7 @@ async function changeSeatDates(orderId, start, end, { notify = false, note = nul
   await repaintSeatCard(orderId, r.wasActive
     ? `Dates changed on ${stamp}: ${r.before.end} → ${r.after.end}${told === true ? ' — customer told' : ' — customer NOT told'}.`
     : null);
+  await suggestPanelAfterDates(orderId, r.before && r.before.end).catch((e) => logger.warn(`suggestPanelAfterDates #${orderId}: ${e.message}`));
   return { ...r, told };
 }
 
@@ -1774,7 +1779,7 @@ async function applyEmailChange(sub, newEmail, choice, adminId, { requested = fa
   if (r.changed.length > 1) lines.push(`↪️ also on its renewal that is not active yet`);
 
   // the invite bot
-  const panelId = cgbGuard.panelForSeat(sub.end_date);
+  const panelId = cgbGuard.panelForSub(sub);
   if (sub.status !== 'active' && oldEmail) {
     const c = await cgbGuard.cancelGuardInvite(oldEmail, { orderId: sub.order_id, endDate: sub.end_date }).catch(() => 'unreachable');
     lines.push(`🗑 Old email's waiting invite: ${escapeHtml(typeof c === 'string' ? c : (c && c.status) || 'asked to cancel')}`);
@@ -1912,6 +1917,157 @@ async function decideEmailRequest(data, chatId, msgId, adminId) {
   db.prepare(`UPDATE cgb_email_requests SET status = 'approved', decided_at = datetime('now'), decided_how = ? WHERE id = ?`).run(how, req.id);
   await bot.sendMessage(chatId, [`✅ <b>Request #${req.id} approved</b>`, ...lines.slice(1)].join('\n'), { parse_mode: 'HTML' });
 }
+
+// ════════════════════════════════════════════════════════════════
+// V157: 🖥 CHANGE PANEL — admin only, the customer is not told
+// ════════════════════════════════════════════════════════════════
+const pendingPanelMoves = new Map();          // token -> { subId, ids, names, cardOrder, at }
+
+async function startPanelChange(chatId, sub) {
+  if (!sub || !['active', 'pending'].includes(String(sub.status || 'pending'))) { await bot.sendMessage(chatId, '❌ That seat is not running.'); return; }
+  const panels = (await cgbGuard.fetchGuardPanelsNamed(6000).catch(() => null)) || [];
+  if (!panels.length) { await bot.sendMessage(chatId, '❌ Could not get the panels from the invite bot.'); return; }
+  const now = Date.now();
+  for (const [k, v] of pendingPanelMoves) if (now - v.at > PENDING_EDIT_MS) pendingPanelMoves.delete(k);
+  const token = require('crypto').randomBytes(4).toString('hex');
+  pendingPanelMoves.set(token, { subId: sub.id, ids: panels.map((p) => p.id), names: panels.map((p) => p.name), at: now });
+  const cur = await seatPanelNow(sub, panels);
+  const icon = { running: '🟢', stopped: '⚪', paused: '⏸', waiting: '⏳' };
+  const rows = panels.slice(0, 20).map((p, i) => [{ text: `${p.id === cur ? '📍 ' : ''}${icon[p.state] || '•'} ${p.name}`, callback_data: `cgb_cpp_${token}_${i}` }]);
+  rows.push([{ text: '❌ Cancel', callback_data: `cgb_cpd_${token}_x_0` }]);
+  const pl = seatPlace(sub);
+  await bot.sendMessage(chatId,
+    `🖥 <b>Change panel</b> <i>(the customer is not told)</i>\n\n` +
+    `${sub.order_id ? `🆔 Order #${sub.order_id}` : '🆔 Manual seat'} · <code>${escapeHtml(sub.email || '')}</code>\n` +
+    `📅 ${sub.start_date || '?'} → ${sub.end_date} · ${sub.status === 'active' ? '🟢 active' : '⏳ not activated'}\n` +
+    `📍 Now: <b>${pl.panel || '—'}</b>${pl.cycle ? ` · 🗓 ${pl.cycle}` : ''}\n\nMove it to:`,
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
+}
+
+async function handlePanelMoveButton(data, chatId, msgId, adminId) {
+  let m = /^cgb_cp_(\d+)$/.exec(data);
+  if (m) { await startPanelChange(chatId, queries.getCgbSubscriptionByOrder(Number(m[1]))); return; }
+  m = /^cgb_cpp_([0-9a-f]{8})_(\d+)$/.exec(data);
+  if (m) {
+    const st = pendingPanelMoves.get(m[1]);
+    if (!st) { await bot.sendMessage(chatId, '⌛ That choice expired — tap 🖥 Change panel again.'); return; }
+    const i = Number(m[2]);
+    const sub = queries.getCgbSubById(st.subId);
+    const from = await seatPanelNow(sub);
+    if (st.ids[i] === from) { await bot.sendMessage(chatId, 'ℹ️ It is already in that panel.'); return; }
+    const active = sub.status === 'active';
+    await bot.editMessageText(
+      `🖥 <b>Move</b> <code>${escapeHtml(sub.email || '')}</code>\n\n📍 ${escapeHtml((st.ids.indexOf(from) >= 0 ? st.names[st.ids.indexOf(from)] : cgbGuard.panelNameCached(from)) || '—')} → <b>${escapeHtml(st.names[i])}</b>\n\n` +
+      (active
+        ? '<i>It is active: it is taken off the old panel\'s whitelist and put on the new one with its end date. Remove it from the old workspace yourself (invite bot → 👥 Members → 🗑) when you want.</i>'
+        : '<i>Not activated yet: its waiting invite is cancelled in the old panel and it goes to the new one.</i>') +
+      `\n\nThe customer is <b>not</b> told.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+        [{ text: '✅ Move + invite it in the new panel (invite bot)', callback_data: `cgb_cpd_${m[1]}_i_${i}` }],
+        [{ text: '✅ Move — I invite it myself', callback_data: `cgb_cpd_${m[1]}_m_${i}` }],
+        [{ text: '❌ Cancel', callback_data: `cgb_cpd_${m[1]}_x_0` }],
+      ] } }).catch(() => {});
+    return;
+  }
+  m = /^cgb_cpd_([0-9a-f]{8})_([imx])_(\d+)$/.exec(data);
+  if (!m) return;
+  const st = pendingPanelMoves.get(m[1]);
+  pendingPanelMoves.delete(m[1]);                       // one tap, one move
+  await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msgId }).catch(() => {});
+  if (m[2] === 'x') { await bot.sendMessage(chatId, '❌ Cancelled — nothing was moved.'); return; }
+  if (!st) { await bot.sendMessage(chatId, '⌛ That choice expired — tap 🖥 Change panel again.'); return; }
+  const sub = queries.getCgbSubById(st.subId);
+  if (!sub) { await bot.sendMessage(chatId, '❌ That seat no longer exists.'); return; }
+  const lines = await applyPanelMove(sub, st.ids[Number(m[3])], m[2], adminId);
+  await bot.sendMessage(chatId, lines.join('\n'), { parse_mode: 'HTML' });
+}
+
+/**
+ * V157.1: after new dates put a seat in another cycle, its panel did not follow — an active seat kept the
+ * panel it was activated in (the card still said "Panel 26"). When the new end belongs to a cycle linked
+ * to ANOTHER panel, the admin is offered the move in one tap (or to keep it where it is).
+ */
+async function suggestPanelAfterDates(orderId, oldEnd) {
+  if (!ADMIN_ID) return;
+  const sub = queries.getCgbSubscriptionByOrder(orderId);
+  if (!sub || !['active', 'pending'].includes(String(sub.status || 'pending'))) return;
+  const expected = cgbGuard.panelForSeat(sub.end_date);              // the panel linked to the NEW dates' cycle
+  if (!expected) return;
+  const panels = (await cgbGuard.fetchGuardPanelsNamed(6000).catch(() => null)) || [];
+  const byName = (n) => (panels.find((p) => p.name === n) || {}).id;
+  const current = cgbGuard.seatPanelOf(sub.id)
+    || (sub.status === 'active' && sub.workspace ? byName(sub.workspace) : '')
+    || cgbGuard.panelForSeat(oldEnd || sub.end_date);   // (same rule as seatPanelNow, with the OLD end for a seat not activated)
+  if (!current || current === expected) return;
+  const i = panels.findIndex((p) => p.id === expected);
+  if (i < 0) return;
+  const token = require('crypto').randomBytes(4).toString('hex');
+  pendingPanelMoves.set(token, { subId: sub.id, ids: panels.map((p) => p.id), names: panels.map((p) => p.name), at: Date.now() });
+  const curName = (panels.find((p) => p.id === current) || {}).name || current;
+  const newName = panels[i].name;
+  await bot.sendMessage(ADMIN_ID,
+    `🖥 <b>Order #${orderId}: new dates, other panel?</b>\n\n<code>${escapeHtml(sub.email || '')}</code> now ends <b>${escapeHtml(String(sub.end_date))}</b> — ` +
+    `that cycle (${escapeHtml(cgbSeatTools.cycleLabel(db, sub.end_date) || '?')}) is linked to <b>${escapeHtml(newName)}</b>, ` +
+    `but the seat is in <b>${escapeHtml(curName)}</b>.\n\n<i>The customer is not told.</i>`,
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+      [{ text: `✅ Move to ${newName} + invite (invite bot)`.slice(0, 60), callback_data: `cgb_cpd_${token}_i_${i}` }],
+      [{ text: `✅ Move to ${newName} — I invite it`.slice(0, 60), callback_data: `cgb_cpd_${token}_m_${i}` }],
+      [{ text: `Keep it in ${curName}`.slice(0, 60), callback_data: `cgb_cpd_${token}_x_0` }],
+    ] } });
+}
+
+/** Where a seat really is now: the admin's choice, else (active) the workspace it was activated in, else its cycle's panel. */
+async function seatPanelNow(sub, panels = null) {
+  const chosen = cgbGuard.seatPanelOf(sub.id);
+  if (chosen) return chosen;
+  if (sub.status === 'active' && sub.workspace) {
+    const list = panels || (await cgbGuard.fetchGuardPanelsNamed(6000).catch(() => null)) || [];
+    const hit = list.find((p) => p.name === sub.workspace || p.id === sub.workspace);
+    if (hit) return hit.id;
+  }
+  return cgbGuard.panelForSub(sub);
+}
+
+/** Move one seat to another panel. The customer is NOT told. */
+async function applyPanelMove(sub, newPanel, mode, adminId) {
+  const oldPanel = await seatPanelNow(sub);
+  const active = sub.status === 'active';
+  const lines = [];
+  // a waiting invite is cancelled where it is BEFORE the seat points elsewhere
+  if (!active && sub.email) {
+    const c = await cgbGuard.cancelGuardInvite(sub.email, { orderId: sub.order_id, endDate: sub.end_date }).catch(() => 'unreachable');
+    lines.push(`🗑 Waiting invite in the old panel: ${escapeHtml(typeof c === 'string' ? c : 'asked to cancel')}`);
+  }
+  cgbGuard.setSeatPanel(sub.id, newPanel);
+  const newName = await cgbGuard.panelNameOf(newPanel).catch(() => newPanel);
+  lines.unshift(`✅ <b>Moved</b> <code>${escapeHtml(sub.email || '')}</code> → <b>${escapeHtml(newName)}</b>${sub.order_id ? ` · order #${sub.order_id}` : ''}`);
+  if (active && oldPanel && oldPanel !== newPanel && sub.email) {
+    const w = await cgbGuard.whitelistInGuard({ panel: oldPanel, email: sub.email, action: 'remove' });
+    lines.push(w.ok ? `➖ Off the whitelist of <b>${escapeHtml(w.panelName)}</b>` : `⚠️ Not taken off the old whitelist: ${escapeHtml(w.reason)}`);
+  }
+  if (mode === 'i' && sub.email) {
+    const h = await handOverToGuard(sub.email, sub.order_id, sub.end_date);
+    lines.push(h && h.ok ? `📨 Handed to the invite bot — invited in <b>${escapeHtml(newName)}</b> in the next batch` : '⚠️ NOT handed to the invite bot — invite it yourself');
+  } else if (sub.email) {
+    const w = await cgbGuard.whitelistInGuard({ panel: newPanel, email: sub.email, expiresOn: sub.end_date, note: `moved · seat ${sub.id}`, source: 'store' });
+    lines.push(w.ok ? `➕ On the whitelist of <b>${escapeHtml(w.panelName)}</b> until ${sub.end_date} — invite it yourself` : `⚠️ Not whitelisted: ${escapeHtml(w.reason)}`);
+  }
+  if (active) { try { queries.setCgbWorkspace(sub.id, newName); } catch (_) {} }
+  if (sub.order_id) await repaintSeatCard(sub.order_id).catch(() => {});
+  if (active && oldPanel && oldPanel !== newPanel) lines.push(`\n<i>It is still a MEMBER of the old workspace until you remove it there.</i>`);
+  lines.push('🔕 The customer was not told.');
+  logger.info(`[CGB] seat ${sub.id} panel ${oldPanel || '—'} -> ${newPanel} by ${adminId} (${mode})`);
+  return lines;
+}
+
+bot.onText(/^\/setpanel(?:@\w+)?(?:\s+(.*))?$/i, async (msg, match) => {
+  if (String(msg.from.id) !== String(ADMIN_ID)) return;
+  const ref = String((match && match[1]) || '').trim();
+  if (!ref) { await bot.sendMessage(msg.chat.id, 'Usage: <code>/setpanel 23586</code> or <code>/setpanel email@gmail.com</code>', { parse_mode: 'HTML' }); return; }
+  const f = cgbSeatTools.findSeat(db, ref);
+  if (f.error) { await bot.sendMessage(msg.chat.id, `❌ ${escapeHtml(f.error)}`, { parse_mode: 'HTML' }); return; }
+  await startPanelChange(msg.chat.id, f.sub);
+});
 
 // ── V156.7: 💙 paid renewals, each with its panel and cycle ──
 async function showPaidRenewals(chatId) {
@@ -2270,6 +2426,13 @@ bot.on('callback_query', async (q) => {
     }
   }
 
+  // V157: 🖥 change panel (admin only)
+  if (/^cgb_cp(p|d)?_/.test(data)) {
+    if (String(userId) !== String(ADMIN_ID)) return;
+    await handlePanelMoveButton(data, chatId, msgId, userId);
+    return;
+  }
+
   // V156.9: late renewals
   {
     let m = /^cgb_lreq_(\d+)$/.exec(data);
@@ -2487,6 +2650,7 @@ bot.on('callback_query', async (q) => {
         // readable instead of looking like unrelated purchases.
         if (s.lateReqId) { try { db.prepare("UPDATE cgb_late_renewals SET status = 'paid' WHERE id = ?").run(s.lateReqId); } catch (_) {} }   // V156.9
         if (s.renewalOf && newSubId) {
+          try { const pc = cgbGuard.seatPanelOf(s.renewalOf); if (pc) cgbGuard.setSeatPanel(newSubId, pc); } catch (_) {}   // V157
           try { queries.linkCgbRenewal(s.renewalOf, newSubId); } catch (_) {}
         }
       } catch (subErr) {
@@ -2594,6 +2758,7 @@ bot.on('callback_query', async (q) => {
         // readable instead of looking like unrelated purchases.
         if (s.lateReqId) { try { db.prepare("UPDATE cgb_late_renewals SET status = 'paid' WHERE id = ?").run(s.lateReqId); } catch (_) {} }   // V156.9
         if (s.renewalOf && newSubId) {
+          try { const pc = cgbGuard.seatPanelOf(s.renewalOf); if (pc) cgbGuard.setSeatPanel(newSubId, pc); } catch (_) {}   // V157
           try { queries.linkCgbRenewal(s.renewalOf, newSubId); } catch (_) {}
         }
       } catch (subErr) {

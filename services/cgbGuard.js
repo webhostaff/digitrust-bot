@@ -91,7 +91,9 @@ async function notifyGuardOfNewInvite(email, { orderId = null, endDate = null } 
   // V147: a cycle LINKED to a panel of the main bot goes there, strictly (each cycle is its own workspace).
   // V148: otherwise the ACTIVE bot (one bot per panel, one working at a time) gets it; with none, the main bot as before.
   let target = cgbRouting.resolveTarget(endDate, GUARD_PANEL);
-  const active = (target.source === 'cycle' || target.source === 'chosen') ? null : cgbBots.activeBot();     // cycle link > the panel you chose > a separate bot > GUARD_PANEL_ID
+  const chosenForSeat = seatPanelOfOrder(orderId);                                    // V157: 🖥 Change panel
+  if (chosenForSeat) target = { panel: chosenForSeat, strict: true, source: 'seat', endDay: target.endDay };
+  const active = (target.source === 'cycle' || target.source === 'chosen' || target.source === 'seat') ? null : cgbBots.activeBot();     // cycle link > the panel you chose > a separate bot > GUARD_PANEL_ID
   let botId = cgbBots.DEFAULT_ID, base = GUARD_URL;
   if (active && !active.isDefault) {
     base = `${active.origin}/auto-invite`;
@@ -240,7 +242,7 @@ async function cancelGuardInvite(email, { orderId = null, endDate = null } = {})
   if (!GUARD_URL || !SHARED_SECRET) return null;
   const clean = String(email || '').trim().toLowerCase();
   if (!clean.includes('@')) return null;
-  const cancelPanel = cgbRouting.resolveTarget(endDate, GUARD_PANEL).panel;     // the panel the invite went to (main bot)
+  const cancelPanel = seatPanelOfOrder(orderId) || cgbRouting.resolveTarget(endDate, GUARD_PANEL).panel;     // the panel the invite went to (main bot)
 
   // V148: with several bots the order may sit in ANY of them (the active one can have changed since the
   // purchase), so each is asked; the cancel is harmless where the email is not.
@@ -407,6 +409,33 @@ function panelNameCached(id) {
   return id;
 }
 
+// ── V157: a panel chosen by the admin for ONE seat (🖥 Change panel). It wins over the cycle link. ──
+function seatPanelDb() {
+  const d = require('../database/queries').db;
+  d.exec('CREATE TABLE IF NOT EXISTS cgb_seat_panels (sub_id INTEGER PRIMARY KEY, panel_id TEXT NOT NULL, set_at TEXT DEFAULT (datetime(\'now\')))');
+  return d;
+}
+function seatPanelOf(subId) {
+  if (!subId) return '';
+  try { return (seatPanelDb().prepare('SELECT panel_id FROM cgb_seat_panels WHERE sub_id = ?').get(Number(subId)) || {}).panel_id || ''; } catch (_) { return ''; }
+}
+function seatPanelOfOrder(orderId) {
+  if (!orderId) return '';
+  try {
+    const d = seatPanelDb();
+    const r = d.prepare(`SELECT p.panel_id FROM cgb_seat_panels p JOIN chatgpt_subscriptions cs ON cs.id = p.sub_id
+                          WHERE cs.order_id = ? ORDER BY cs.id DESC LIMIT 1`).get(Number(orderId));
+    return (r && r.panel_id) || '';
+  } catch (_) { return ''; }
+}
+function setSeatPanel(subId, panelId) {
+  seatPanelDb().prepare('INSERT OR REPLACE INTO cgb_seat_panels (sub_id, panel_id) VALUES (?, ?)').run(Number(subId), String(panelId));
+}
+/** The panel of a seat: the admin's choice for it, else its cycle's panel. */
+function panelForSub(sub) {
+  return seatPanelOf(sub && sub.id) || panelForSeat(sub && sub.end_date);
+}
+
 /** The panel a seat ending on `endDate` belongs to: the cycle link, else the panel chosen for new orders, else GUARD_PANEL_ID. */
 function panelForSeat(endDate) {
   const t = cgbRouting.resolveTarget(endDate, GUARD_PANEL);
@@ -444,4 +473,4 @@ async function whitelistInGuard({ panel, email, expiresOn = null, note = '', act
 /** The main bot's address, secret and default panel — the registry of bots builds on it. */
 function getConfig() { return { url: GUARD_URL, secret: SHARED_SECRET, panel: GUARD_PANEL, valid: !!GUARD_URL && guardUrlValid() }; }
 
-module.exports = { panelNameOf, panelNameCached, panelForSeat, whitelistInGuard, makeSeatsHandler, getConfig, fetchGuardPanels, fetchGuardPanelsNamed, notifyGuardOfNewInvite, makeGuardWebhookHandler, cancelGuardInvite, diagnose, fetchGuardReport, _normalizeGuardUrl: normalizeGuardUrl };
+module.exports = { seatPanelOf, setSeatPanel, panelForSub, panelNameOf, panelNameCached, panelForSeat, whitelistInGuard, makeSeatsHandler, getConfig, fetchGuardPanels, fetchGuardPanelsNamed, notifyGuardOfNewInvite, makeGuardWebhookHandler, cancelGuardInvite, diagnose, fetchGuardReport, _normalizeGuardUrl: normalizeGuardUrl };

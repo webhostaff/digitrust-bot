@@ -1,3 +1,16 @@
+# V157.1 — after a date change, the panel follows (one tap)
+
+New dates can put a seat in another cycle — e.g. order #23581 moved to the cycle 11 → 9 — but its panel did not follow: an active seat kept the panel it was activated in ("Panel 26"). Now, after ✏️ Change dates or /setdates, when the new end belongs to a cycle linked to ANOTHER panel, the bot asks: **✅ Move to Panel 11 + invite** · **✅ Move to Panel 11 — I invite it** · **Keep it in Panel 26**. Moving does what 🖥 Change panel does (off the old whitelist, on the new one with the new end date, workspace name updated, card repainted); the customer is not told. A date change that stays in the same panel asks nothing.
+Also: 🖥 Change panel now reads where an ACTIVE seat really is (the workspace it was activated in), so the right whitelist is cleaned.
+
+# V157 — 🖥 Change panel for one seat (admin only, the customer is not told)
+
+- On every order card (red, blue and green) a new button **🖥 Change panel**; also `/setpanel <order | email>` and 🛠 → **🖥 Change a panel** (works for hand-added seats too). Only the admin sees and can use it; the customer gets no message.
+- Choose the new panel (📍 marks the current one) → confirm: **✅ Move + invite it in the new panel (invite bot)** or **✅ Move — I invite it myself**.
+  - Not activated yet: its waiting invite is cancelled in the OLD panel, then it goes to the new one.
+  - Active: taken off the old panel's whitelist, put on the new one with its end date (or invited there), and its workspace name changes. It stays a member of the old workspace until you remove it there — the bot reminds you.
+- The choice is kept per seat (table `cgb_seat_panels`) and everything follows it: the invite goes STRICTLY to that panel, cancellations, activation (whitelist + workspace name), email changes, the 🖥 line on cards, 💙 Paid renewals — and **its renewals stay in that panel**.
+
 # V156.9 — renewal open until 1 day after the cycle starts · late renewal by request
 
 - **Renewal window:** from one day before the seat's last day until ONE day after its cycle's start date (setting `cgb_renew_grace_days`, now 1). Cycle 11 → 9: days 8 to 12 → 10 Oct → 9 Nov, the monthly price. Same for every cycle and panel.
