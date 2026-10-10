@@ -69,7 +69,13 @@ function setCyclePanel(endDay, panelId) {
     const id = String(panelId).trim();
     if (!PANEL_ID_RE.test(id)) return { ok: false, reason: 'a panel id is letters, digits, "-", "_" or "." (no spaces)' };
     map[String(day)] = id;
-    try { const ph = placeholderMap(); if (ph[String(day)]) { delete ph[String(day)]; db.setSetting(NAME_KEY, JSON.stringify(ph)); } } catch (_) {}   // V157.2: the real panel replaces the name
+    try {
+      const ph = placeholderMap();
+      if (ph[String(day)]) {
+        db.setSetting(`cgb_ph_replaced_${day}`, ph[String(day)]);      // V157.3: remembered for 📤 moving its seats
+        delete ph[String(day)]; db.setSetting(NAME_KEY, JSON.stringify(ph));
+      }
+    } catch (_) {}   // V157.2: the real panel replaces the name
   }
   db.setSetting(KEY, JSON.stringify(map));
   return { ok: true };
@@ -148,4 +154,18 @@ async function listGuardPanelsNamed(guardUrl, fetchImpl = (typeof fetch === 'fun
   } catch (_) { return null; }
 }
 
-module.exports = { placeholderMap, setCyclePlaceholder, placeholderFor, panelMap, setCyclePanel, resolveTarget, getDefaultPanel, setDefaultPanel, listGuardPanelsNamed, listGuardPanels, endDayOf, PANEL_ID_RE, KEY };
+/** Names not linked to a real panel yet, as panel-like entries: [{ id: 'ph:<name>', name }]. */
+function placeholderPanels() {
+  const linked = panelMap();
+  const seen = new Set();
+  const out = [];
+  for (const [day, name] of Object.entries(placeholderMap())) {
+    if (linked[day] || seen.has(name)) continue;
+    seen.add(name);
+    out.push({ id: `ph:${name}`, name, state: 'noBot', placeholder: true });
+  }
+  return out;
+}
+function replacedName(endDay) { return String(db.getSetting(`cgb_ph_replaced_${endDay}`, '') || ''); }
+
+module.exports = { placeholderPanels, replacedName, placeholderMap, setCyclePlaceholder, placeholderFor, panelMap, setCyclePanel, resolveTarget, getDefaultPanel, setDefaultPanel, listGuardPanelsNamed, listGuardPanels, endDayOf, PANEL_ID_RE, KEY };

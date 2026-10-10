@@ -92,7 +92,9 @@ async function notifyGuardOfNewInvite(email, { orderId = null, endDate = null } 
   // V148: otherwise the ACTIVE bot (one bot per panel, one working at a time) gets it; with none, the main bot as before.
   let target = cgbRouting.resolveTarget(endDate, GUARD_PANEL);
   const chosenForSeat = seatPanelOfOrder(orderId);                                    // V157: 🖥 Change panel
-  if (chosenForSeat) target = { panel: chosenForSeat, strict: true, source: 'seat', endDay: target.endDay };
+  if (chosenForSeat && isPlaceholderPanel(chosenForSeat)) {
+    target = { panel: '', strict: true, source: 'placeholder', placeholder: placeholderNameOf(chosenForSeat), endDay: target.endDay };
+  } else if (chosenForSeat) target = { panel: chosenForSeat, strict: true, source: 'seat', endDay: target.endDay };
   // V157.2: its cycle only has a NAME — no invite bot yet. Hold: never send it to another panel.
   if (target.source === 'placeholder') {
     logger.info(`[cgbGuard] order #${orderId} (${clean}) held: its cycle is "${target.placeholder}", which has no invite bot yet`);
@@ -248,7 +250,8 @@ async function cancelGuardInvite(email, { orderId = null, endDate = null } = {})
   if (!GUARD_URL || !SHARED_SECRET) return null;
   const clean = String(email || '').trim().toLowerCase();
   if (!clean.includes('@')) return null;
-  const cancelPanel = seatPanelOfOrder(orderId) || cgbRouting.resolveTarget(endDate, GUARD_PANEL).panel;     // the panel the invite went to (main bot)
+  const ov = seatPanelOfOrder(orderId);
+  const cancelPanel = (ov && !isPlaceholderPanel(ov)) ? ov : cgbRouting.resolveTarget(endDate, GUARD_PANEL).panel;     // the panel the invite went to (main bot)
 
   // V148: with several bots the order may sit in ANY of them (the active one can have changed since the
   // purchase), so each is asked; the cancel is harmless where the email is not.
@@ -388,6 +391,7 @@ const _names = { at: 0, map: null };
 /** A panel's NAME as the invite bot calls it (cached 10 min, remembered in settings for when it is offline). */
 async function panelNameOf(id) {
   if (!id) return '';
+  if (isPlaceholderPanel(id)) return placeholderNameOf(id);
   const fresh = _names.map && Date.now() - _names.at < 10 * 60 * 1000 && Object.prototype.hasOwnProperty.call(_names.map, id);
   if (!fresh) {
     const list = await fetchGuardPanelsNamed(5000).catch(() => null);
@@ -406,6 +410,7 @@ async function panelNameOf(id) {
 /** A panel's name without waiting on the network (V156.7): the cached names, else the saved ones, else the id. */
 function panelNameCached(id) {
   if (!id) return '';
+  if (isPlaceholderPanel(id)) return placeholderNameOf(id);
   if (_names.map && _names.map[id]) return _names.map[id];
   try {
     const saved = JSON.parse(require('../database/queries').getSetting('cgb_panel_names', '{}') || '{}');
@@ -414,6 +419,10 @@ function panelNameCached(id) {
   panelNameOf(id).catch(() => {});            // warm the cache for next time
   return id;
 }
+
+// ── V157.3: a NAME-only panel (no invite bot yet) is written "ph:<name>" wherever a panel id goes. ──
+const isPlaceholderPanel = (id) => String(id || '').startsWith('ph:');
+const placeholderNameOf = (id) => String(id || '').slice(3);
 
 // ── V157: a panel chosen by the admin for ONE seat (🖥 Change panel). It wins over the cycle link. ──
 function seatPanelDb() {
@@ -454,6 +463,9 @@ function panelForSeat(endDate) {
  * Never throws. @returns {{ok:boolean, panel?:string, panelName?:string, reason?:string}}
  */
 async function whitelistInGuard({ panel, email, expiresOn = null, note = '', action = 'add', source = 'store' }) {
+  if (isPlaceholderPanel(panel)) {
+    return { ok: false, held: true, panel, panelName: placeholderNameOf(panel), reason: `"${placeholderNameOf(panel)}" has no invite bot yet — nothing to update` };
+  }
   if (!GUARD_URL || !SHARED_SECRET || !guardUrlValid()) return { ok: false, reason: 'the invite bot is not configured (GUARD_AUTO_INVITE_URL / GUARD_SECRET)' };
   const clean = String(email || '').trim().toLowerCase();
   if (!clean.includes('@')) return { ok: false, reason: 'no email on this order' };
@@ -482,13 +494,12 @@ async function whitelistInGuard({ panel, email, expiresOn = null, note = '', act
  * Not activated yet: handed to the invite bot (invited there). Seats moved by hand (🖥 Change panel) are left.
  * @returns {{active:number, pending:number, failed:Array<string>, panelName:string}}
  */
-async function migrateCycleSeats(endDay, panelId) {
+async function migrateCycleSeats(endDay, panelId, oldName = '') {
   const q = require('../database/queries');
   const d = q.db;
   const panelName = await panelNameOf(panelId).catch(() => panelId);
-  const rows = d.prepare(`SELECT * FROM chatgpt_subscriptions
-                           WHERE COALESCE(status,'pending') IN ('active','pending') AND email IS NOT NULL AND email <> ''`).all()
-    .filter((s) => cgbRouting.endDayOf(s.end_date) === Number(endDay) && !seatPanelOf(s.id));
+  const rows = cycleSeats(endDay, oldName);
+  for (const s of rows) if (oldName && seatPanelOf(s.id) === `ph:${oldName}`) setSeatPanel(s.id, panelId);   // moved by hand to that name
   const out = { active: 0, pending: 0, failed: [], panelName };
   for (const s of rows) {
     if (s.status === 'active') {
@@ -504,16 +515,21 @@ async function migrateCycleSeats(endDay, panelId) {
   return out;
 }
 
-/** Seats of a cycle (by end day) that are running and not moved by hand. */
-function cycleSeatCount(endDay) {
+/** Running seats of a cycle (by end day) not moved by hand — plus, with `oldName`, those moved by hand to that name. */
+function cycleSeats(endDay, oldName = '') {
   try {
-    return require('../database/queries').db.prepare(`SELECT id, end_date FROM chatgpt_subscriptions
+    return require('../database/queries').db.prepare(`SELECT * FROM chatgpt_subscriptions
              WHERE COALESCE(status,'pending') IN ('active','pending') AND email IS NOT NULL AND email <> ''`).all()
-      .filter((s) => cgbRouting.endDayOf(s.end_date) === Number(endDay) && !seatPanelOf(s.id)).length;
-  } catch (_) { return 0; }
+      .filter((s) => {
+        const ov = seatPanelOf(s.id);
+        if (oldName && ov === `ph:${oldName}`) return true;
+        return cgbRouting.endDayOf(s.end_date) === Number(endDay) && !ov;
+      });
+  } catch (_) { return []; }
 }
+function cycleSeatCount(endDay, oldName = '') { return cycleSeats(endDay, oldName).length; }
 
 /** The main bot's address, secret and default panel — the registry of bots builds on it. */
 function getConfig() { return { url: GUARD_URL, secret: SHARED_SECRET, panel: GUARD_PANEL, valid: !!GUARD_URL && guardUrlValid() }; }
 
-module.exports = { migrateCycleSeats, cycleSeatCount, seatPanelOf, setSeatPanel, panelForSub, panelNameOf, panelNameCached, panelForSeat, whitelistInGuard, makeSeatsHandler, getConfig, fetchGuardPanels, fetchGuardPanelsNamed, notifyGuardOfNewInvite, makeGuardWebhookHandler, cancelGuardInvite, diagnose, fetchGuardReport, _normalizeGuardUrl: normalizeGuardUrl };
+module.exports = { isPlaceholderPanel, placeholderNameOf, cycleSeats, migrateCycleSeats, cycleSeatCount, seatPanelOf, setSeatPanel, panelForSub, panelNameOf, panelNameCached, panelForSeat, whitelistInGuard, makeSeatsHandler, getConfig, fetchGuardPanels, fetchGuardPanelsNamed, notifyGuardOfNewInvite, makeGuardWebhookHandler, cancelGuardInvite, diagnose, fetchGuardReport, _normalizeGuardUrl: normalizeGuardUrl };

@@ -227,7 +227,7 @@ function stockConfirmRows(userId, productId, count) {
 
 /** V157.2: after a cycle is linked to a real panel — offer to move its emails there. */
 async function offerCycleMigration(bot, chatId, cyc, panelId) {
-  const n = cgbGuard.cycleSeatCount(cyc.end_day);
+  const n = cgbGuard.cycleSeatCount(cyc.end_day, cgbRouting.replacedName(cyc.end_day));
   if (!n) return;
   const name = await cgbGuard.panelNameOf(panelId).catch(() => panelId);
   await bot.sendMessage(chatId,
@@ -7895,7 +7895,7 @@ async function handleAdminCallback(bot, query) {
     if (!cyc || !panelId) { await answer('❌ That cycle is not linked to a panel'); return; }
     await answer('⏳ Moving…');
     await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msgId }).catch(() => {});
-    const r = await cgbGuard.migrateCycleSeats(cyc.end_day, panelId);
+    const r = await cgbGuard.migrateCycleSeats(cyc.end_day, panelId, cgbRouting.replacedName(cyc.end_day));
     logger.info(`Admin ${userId} moved cycle ${cyc.end_day} seats to ${panelId}: ${r.active} active, ${r.pending} pending, ${r.failed.length} failed`);
     await bot.sendMessage(chatId,
       `📤 <b>Cycle Day ${cyc.start_day} → ${cyc.end_day} → ${escapeHtml(r.panelName)}</b>\n\n` +

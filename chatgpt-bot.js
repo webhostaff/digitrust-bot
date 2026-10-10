@@ -1462,7 +1462,7 @@ async function activateAndNotifySeat(orderIdRaw, { chatId = null, msgId = null, 
     if (!panelName) panelName = require('./services/cgbRouting').placeholderFor(endDate);   // V157.2: a cycle with only a name
     // Activated by hand: the invite bot did not invite this person, so put them on that panel's whitelist with
     // the seat's end date — otherwise it would flag them as "unknown".
-    if (!fromGuard && panelId && sub.email) {
+    if (!fromGuard && panelId && !cgbGuard.isPlaceholderPanel(panelId) && sub.email) {
       guardOk = await cgbGuard.whitelistInGuard({ panel: panelId, email: sub.email, expiresOn: endDate, note: `order #${orderId}`, source: 'store' });
       if (guardOk.ok && guardOk.panelName) panelName = guardOk.panelName;
       else if (!guardOk.ok) logger.warn(`activateAndNotifySeat #${orderId}: whitelist in panel ${panelId} failed: ${guardOk.reason}`);
@@ -1935,15 +1935,17 @@ const pendingPanelMoves = new Map();          // token -> { subId, ids, names, c
 
 async function startPanelChange(chatId, sub) {
   if (!sub || !['active', 'pending'].includes(String(sub.status || 'pending'))) { await bot.sendMessage(chatId, '❌ That seat is not running.'); return; }
-  const panels = (await cgbGuard.fetchGuardPanelsNamed(6000).catch(() => null)) || [];
-  if (!panels.length) { await bot.sendMessage(chatId, '❌ Could not get the panels from the invite bot.'); return; }
+  const real = (await cgbGuard.fetchGuardPanelsNamed(6000).catch(() => null)) || [];
+  // V157.3: the names given to cycles with no invite bot yet are panels too
+  const panels = [...real, ...require('./services/cgbRouting').placeholderPanels().filter((p) => !real.some((r) => r.name === p.name))];
+  if (!panels.length) { await bot.sendMessage(chatId, '❌ No panel: none from the invite bot, and no named cycle.'); return; }
   const now = Date.now();
   for (const [k, v] of pendingPanelMoves) if (now - v.at > PENDING_EDIT_MS) pendingPanelMoves.delete(k);
   const token = require('crypto').randomBytes(4).toString('hex');
   pendingPanelMoves.set(token, { subId: sub.id, ids: panels.map((p) => p.id), names: panels.map((p) => p.name), at: now });
   const cur = await seatPanelNow(sub, panels);
-  const icon = { running: '🟢', stopped: '⚪', paused: '⏸', waiting: '⏳' };
-  const rows = panels.slice(0, 20).map((p, i) => [{ text: `${p.id === cur ? '📍 ' : ''}${icon[p.state] || '•'} ${p.name}`, callback_data: `cgb_cpp_${token}_${i}` }]);
+  const icon = { running: '🟢', stopped: '⚪', paused: '⏸', waiting: '⏳', noBot: '🏷' };
+  const rows = panels.slice(0, 20).map((p, i) => [{ text: `${p.id === cur ? '📍 ' : ''}${icon[p.state] || '•'} ${p.name}${p.placeholder ? ' (no bot yet)' : ''}`.slice(0, 60), callback_data: `cgb_cpp_${token}_${i}` }]);
   rows.push([{ text: '❌ Cancel', callback_data: `cgb_cpd_${token}_x_0` }]);
   const pl = seatPlace(sub);
   await bot.sendMessage(chatId,
@@ -1966,13 +1968,19 @@ async function handlePanelMoveButton(data, chatId, msgId, adminId) {
     const from = await seatPanelNow(sub);
     if (st.ids[i] === from) { await bot.sendMessage(chatId, 'ℹ️ It is already in that panel.'); return; }
     const active = sub.status === 'active';
+    const toName = cgbGuard.isPlaceholderPanel(st.ids[i]);              // V157.3: a name with no invite bot yet
     await bot.editMessageText(
       `🖥 <b>Move</b> <code>${escapeHtml(sub.email || '')}</code>\n\n📍 ${escapeHtml((st.ids.indexOf(from) >= 0 ? st.names[st.ids.indexOf(from)] : cgbGuard.panelNameCached(from)) || '—')} → <b>${escapeHtml(st.names[i])}</b>\n\n` +
-      (active
+      (toName
+        ? `<i>🏷 That panel has no invite bot yet: the seat takes its name and nothing is sent anywhere — invite it yourself. When its bot exists, linking its cycle moves it there.</i>`
+        : active
         ? '<i>It is active: it is taken off the old panel\'s whitelist and put on the new one with its end date. Remove it from the old workspace yourself (invite bot → 👥 Members → 🗑) when you want.</i>'
         : '<i>Not activated yet: its waiting invite is cancelled in the old panel and it goes to the new one.</i>') +
       `\n\nThe customer is <b>not</b> told.`,
-      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: { inline_keyboard: toName ? [
+        [{ text: '✅ Move — I invite it myself', callback_data: `cgb_cpd_${m[1]}_m_${i}` }],
+        [{ text: '❌ Cancel', callback_data: `cgb_cpd_${m[1]}_x_0` }],
+      ] : [
         [{ text: '✅ Move + invite it in the new panel (invite bot)', callback_data: `cgb_cpd_${m[1]}_i_${i}` }],
         [{ text: '✅ Move — I invite it myself', callback_data: `cgb_cpd_${m[1]}_m_${i}` }],
         [{ text: '❌ Cancel', callback_data: `cgb_cpd_${m[1]}_x_0` }],
@@ -2001,12 +2009,15 @@ async function suggestPanelAfterDates(orderId, oldEnd) {
   if (!ADMIN_ID) return;
   const sub = queries.getCgbSubscriptionByOrder(orderId);
   if (!sub || !['active', 'pending'].includes(String(sub.status || 'pending'))) return;
-  const expected = cgbGuard.panelForSeat(sub.end_date);              // the panel linked to the NEW dates' cycle
+  let expected = cgbGuard.panelForSeat(sub.end_date);                // the panel linked to the NEW dates' cycle
+  const phNew = require('./services/cgbRouting').placeholderFor(sub.end_date);
+  if (!expected && phNew) expected = `ph:${phNew}`;                    // V157.3: a cycle with only a name
   if (!expected) return;
-  const panels = (await cgbGuard.fetchGuardPanelsNamed(6000).catch(() => null)) || [];
+  const real = (await cgbGuard.fetchGuardPanelsNamed(6000).catch(() => null)) || [];
+  const panels = [...real, ...require('./services/cgbRouting').placeholderPanels().filter((p) => !real.some((r) => r.name === p.name))];
   const byName = (n) => (panels.find((p) => p.name === n) || {}).id;
   const current = cgbGuard.seatPanelOf(sub.id)
-    || (sub.status === 'active' && sub.workspace ? byName(sub.workspace) : '')
+    || (sub.status === 'active' && sub.workspace ? (byName(sub.workspace) || '') : '')
     || cgbGuard.panelForSeat(oldEnd || sub.end_date);   // (same rule as seatPanelNow, with the OLD end for a seat not activated)
   if (!current || current === expected) return;
   const i = panels.findIndex((p) => p.id === expected);
@@ -2032,7 +2043,8 @@ async function seatPanelNow(sub, panels = null) {
   if (chosen) return chosen;
   if (sub.status === 'active' && sub.workspace) {
     const list = panels || (await cgbGuard.fetchGuardPanelsNamed(6000).catch(() => null)) || [];
-    const hit = list.find((p) => p.name === sub.workspace || p.id === sub.workspace);
+    const hit = list.find((p) => p.name === sub.workspace || p.id === sub.workspace)
+      || require('./services/cgbRouting').placeholderPanels().find((p) => p.name === sub.workspace);   // V157.3
     if (hit) return hit.id;
   }
   return cgbGuard.panelForSub(sub);
@@ -2055,7 +2067,9 @@ async function applyPanelMove(sub, newPanel, mode, adminId) {
     const w = await cgbGuard.whitelistInGuard({ panel: oldPanel, email: sub.email, action: 'remove' });
     lines.push(w.ok ? `➖ Off the whitelist of <b>${escapeHtml(w.panelName)}</b>` : `⚠️ Not taken off the old whitelist: ${escapeHtml(w.reason)}`);
   }
-  if (mode === 'i' && sub.email) {
+  if (cgbGuard.isPlaceholderPanel(newPanel)) {
+    lines.push(`🏷 <b>${escapeHtml(newName)}</b> has no invite bot yet — nothing was sent; invite it yourself in that workspace.`);
+  } else if (mode === 'i' && sub.email) {
     const h = await handOverToGuard(sub.email, sub.order_id, sub.end_date);
     lines.push(h && h.ok ? `📨 Handed to the invite bot — invited in <b>${escapeHtml(newName)}</b> in the next batch` : '⚠️ NOT handed to the invite bot — invite it yourself');
   } else if (sub.email) {

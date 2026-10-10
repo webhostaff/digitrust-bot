@@ -1,3 +1,7 @@
+# V157.3 — the named panels (no bot yet) are in 🖥 Change panel
+
+The names given to cycles with no invite bot yet now appear in 🖥 Change panel as "🏷 Panel 5 (no bot yet)". Moving a seat there: it is taken off its old panel's whitelist, carries the name (card, workspace, lists), and nothing is sent anywhere — the only choice is "✅ Move — I invite it myself". When the cycle with that name is linked to its real panel, 📤 Move also brings the seats you moved there by hand.
+
 # V157.2 — a NAME for a cycle whose panel has no invite bot yet
 
 📅 Manage Cycles → 🤖 (a cycle) → **🏷 Just a name (no bot yet)** → send e.g. `Panel 5`.
