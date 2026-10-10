@@ -96,13 +96,35 @@ function findSeat(db, ref) {
   return { error: 'give the order number or the seat\'s current email' };
 }
 
-/** Parse "/setemail <order|old email> <new email>". */
+/**
+ * Parse "/setemail …" (V157.6). Accepted:
+ *   <order> <new>              · <old> <new>
+ *   <order> <old> <new>        · <order> <new> <old>   (the current one is recognised, the other is the new one)
+ * → { ok, ref, emails:[…] } — the new email is decided against the seat's current email by pickNewEmail().
+ */
 function parseSetEmail(raw) {
   const parts = String(raw || '').trim().split(/\s+/).filter(Boolean);
-  if (parts.length < 2) return { ok: false, error: 'usage: /setemail <order number or current email> <new email>' };
-  const next = parts[1].toLowerCase();
-  if (!EMAIL_RE.test(next)) return { ok: false, error: `"${parts[1]}" is not an email` };
-  return { ok: true, ref: parts[0], email: next };
+  if (parts.length < 2) return { ok: false, error: 'send the order number (or the current email), then the new email' };
+  const ref = parts[0];
+  const emails = parts.slice(1).map((x) => x.toLowerCase());
+  const bad = emails.find((e) => !EMAIL_RE.test(e));
+  if (bad) return { ok: false, error: `"${bad}" is not an email` };
+  if (emails.length > 2) return { ok: false, error: 'too many emails — at most the current one and the new one' };
+  if (EMAIL_RE.test(ref) && emails.length > 1) return { ok: false, error: 'with an email first, send only: current email, new email' };
+  return { ok: true, ref, emails, email: emails[emails.length - 1] };
+}
+
+/** Which of the given emails is the NEW one, knowing the seat's current email. → { email } | { error } */
+function pickNewEmail(currentEmail, emails) {
+  const cur = String(currentEmail || '').toLowerCase();
+  if (emails.length === 1) {
+    return emails[0] === cur ? { error: `that is already the seat's email (${cur})` } : { email: emails[0] };
+  }
+  const [a, b] = emails;
+  if (a === b) return { error: 'the two emails are the same' };
+  if (a === cur) return { email: b };
+  if (b === cur) return { email: a };
+  return { error: `neither email is the seat's current one (${cur || '—'})` };
 }
 
 /**
@@ -176,4 +198,4 @@ function paidRenewals(db, todayYmd, days = 20) {
      ORDER BY cs.status DESC, date(cs.start_date), cs.email`).all(todayYmd, days);
 }
 
-module.exports = { cycleLabel, paidRenewals, mismatchedRenewals, unlinkRenewal, EMAIL_RE, ymd, parseDay, seatsEndingOn, endingText, findSeat, parseSetEmail, changeSeatEmail };
+module.exports = { pickNewEmail, cycleLabel, paidRenewals, mismatchedRenewals, unlinkRenewal, EMAIL_RE, ymd, parseDay, seatsEndingOn, endingText, findSeat, parseSetEmail, changeSeatEmail };

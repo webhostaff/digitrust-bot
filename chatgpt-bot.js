@@ -1749,12 +1749,15 @@ const pendingEmailChanges = new Map();       // token -> { subId, email, at }
 bot.onText(/^\/setemail(?:@\w+)?(?:\s+(.*))?$/i, async (msg, match) => {
   if (String(msg.from.id) !== String(ADMIN_ID)) return;
   const chatId = msg.chat.id;
+  const retry = { inline_keyboard: [[{ text: '📧 Try again', callback_data: 'adm_ask_setemail' }]] };   // V157.6
   const p = cgbSeatTools.parseSetEmail(match && match[1]);
-  if (!p.ok) { await bot.sendMessage(chatId, `❌ ${p.error}\n\nExample: <code>/setemail 20439 new@gmail.com</code> or <code>/setemail old@gmail.com new@gmail.com</code>`, { parse_mode: 'HTML' }); return; }
+  if (!p.ok) { await bot.sendMessage(chatId, `❌ ${escapeHtml(p.error)}\n\nExamples:\n<code>20439 new@gmail.com</code>\n<code>20439 old@gmail.com new@gmail.com</code>\n<code>old@gmail.com new@gmail.com</code>`, { parse_mode: 'HTML', reply_markup: retry }); return; }
   const f = cgbSeatTools.findSeat(db, p.ref);
-  if (f.error) { await bot.sendMessage(chatId, `❌ ${escapeHtml(f.error)}`, { parse_mode: 'HTML' }); return; }
+  if (f.error) { await bot.sendMessage(chatId, `❌ ${escapeHtml(f.error)}`, { parse_mode: 'HTML', reply_markup: retry }); return; }
   const sub = f.sub;
-  if (String(sub.email || '').toLowerCase() === p.email) { await bot.sendMessage(chatId, '❌ That is already the seat\'s email.'); return; }
+  const pick = cgbSeatTools.pickNewEmail(sub.email, p.emails);
+  if (pick.error) { await bot.sendMessage(chatId, `❌ ${escapeHtml(pick.error)}`, { parse_mode: 'HTML', reply_markup: retry }); return; }
+  p.email = pick.email;
   const now = Date.now();
   for (const [k, v] of pendingEmailChanges) if (now - v.at > PENDING_EDIT_MS) pendingEmailChanges.delete(k);
   const token = require('crypto').randomBytes(4).toString('hex');

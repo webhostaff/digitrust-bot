@@ -1,3 +1,7 @@
+# V157.6 — 📧 Change an email: order + old + new works
+
+`/setemail` (and 🛠 → 📧 Change an email) now accepts: `order new` · `order old new` · `order new old` · `old new`. With two emails, the one that is the seat's current email is recognised and the other is the new one. Errors say exactly what is wrong (e.g. which email is the current one) and come with a **📧 Try again** button — before, a second message after an error was silently ignored.
+
 # V157.5 — the order cards are not buried any more
 
 - **🔴 To activate · N** (first button of the 🛠 Admin panel) and **/pending**: every paid seat not activated yet — its card is sent again at the bottom of the chat, with all its buttons. Later changes (activation, dates, panel) edit that newest copy; older copies still work.
