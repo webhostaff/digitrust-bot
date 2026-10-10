@@ -225,6 +225,21 @@ function stockConfirmRows(userId, productId, count) {
   return rows;
 }
 
+/** V157.2: after a cycle is linked to a real panel — offer to move its emails there. */
+async function offerCycleMigration(bot, chatId, cyc, panelId) {
+  const n = cgbGuard.cycleSeatCount(cyc.end_day);
+  if (!n) return;
+  const name = await cgbGuard.panelNameOf(panelId).catch(() => panelId);
+  await bot.sendMessage(chatId,
+    `📤 <b>${n} seat(s) of the cycle Day ${cyc.start_day} → ${cyc.end_day}</b> are running.\n\n` +
+    `Move them to <b>${escapeHtml(name)}</b>?\n• active ones: put on its whitelist with their end date (they are already members — nothing is bought)\n` +
+    `• not activated yet: handed to the invite bot, invited there\n\n<i>Seats you moved by hand (🖥 Change panel) are left alone.</i>`,
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+      [{ text: `📤 Move the ${n} seat(s) to ${name}`.slice(0, 60), callback_data: `admin_cgb_cpmig_${cyc.id}` }],
+      [{ text: 'Not now', callback_data: 'admin_cgb_cycles' }],
+    ] } });
+}
+
 async function handleAdminText(bot, msg) {
   if (!isAdmin(msg.from.id)) return; // silent drop — already guarded in index.js
 
@@ -347,9 +362,27 @@ async function handleAdminText(bot, msg) {
     cgbRouting.setCyclePanel(cyc.end_day, id);
     session.clear(userId);
     logger.info(`Admin ${userId} linked the cycle ending on the ${cyc.end_day}th to invite-bot panel ${id} (typed)`);
+    setTimeout(() => offerCycleMigration(bot, chatId, cyc, id).catch(() => {}), 300);
     await bot.sendMessage(chatId,
       `✅ Cycle <b>Day ${cyc.start_day} → ${cyc.end_day}</b> → panel <code>${escapeHtml(id)}</code>` +
       (known === null ? `\n⚠️ <i>The invite bot could not be reached, so I could not check that this panel exists.</i>` : ''),
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '📅 Cycles', callback_data: 'admin_cgb_cycles' }]] } });
+    return;
+  }
+
+  // ── V157.2: a NAME for a cycle whose panel has no invite bot yet ──────────
+  if (s === States.ADMIN_CGB_CYCLE_NAME) {
+    const cyc = db.getBillingCycles().find((c) => c.id === d.cgbCycleId);
+    session.clear(userId);
+    if (!cyc) { await bot.sendMessage(chatId, '❌ That cycle no longer exists.'); return; }
+    if (cgbRouting.panelMap()[String(cyc.end_day)]) cgbRouting.setCyclePanel(cyc.end_day, null);   // a name means: no bot yet
+    const r = cgbRouting.setCyclePlaceholder(cyc.end_day, text);
+    if (!r.ok || !r.name) { await bot.sendMessage(chatId, '❌ Send a short name, e.g. <code>Panel 5</code>.', { parse_mode: 'HTML' }); return; }
+    logger.info(`Admin ${userId} named the cycle ending on the ${cyc.end_day}th "${r.name}" (no invite bot yet)`);
+    await bot.sendMessage(chatId,
+      `🏷 Cycle <b>Day ${cyc.start_day} → ${cyc.end_day}</b> → <b>${escapeHtml(r.name)}</b> (no invite bot yet)\n\n` +
+      `• its seats carry this name\n• their invites are HELD — never sent to another panel; you get "invite it yourself"\n` +
+      `• when its bot exists: 🤖 → pick the panel, then 📤 move the emails there`,
       { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '📅 Cycles', callback_data: 'admin_cgb_cycles' }]] } });
     return;
   }
@@ -7805,12 +7838,18 @@ async function handleAdminCallback(bot, query) {
       rows.push([{ text: `${p.id === current ? '✅ ' : ''}${PANEL_ICON[p.state] || '⚪'} ${p.name}${p.name !== p.id ? ` · ${p.id}` : ''}`.slice(0, 60), callback_data: `admin_cgb_cpset_${cid}_${p.id}` }]);
     }
     rows.push([{ text: '✏️ Type a panel id', callback_data: `admin_cgb_cptype_${cid}` }]);
+    const phName = cgbRouting.placeholderMap()[String(cyc.end_day)];
+    rows.push([{ text: phName ? `🏷 Rename "${phName}"`.slice(0, 60) : '🏷 Just a name (no bot yet)', callback_data: `admin_cgb_cpname_${cid}` }]);
+    if (phName) rows.push([{ text: '🚫 Remove the name', callback_data: `admin_cgb_cpnclr_${cid}` }]);
     if (current) rows.push([{ text: '🚫 Unlink (use the default panel)', callback_data: `admin_cgb_cpclr_${cid}` }]);
     rows.push([{ text: '🔙 Cycles', callback_data: 'admin_cgb_cycles' }]);
     await bot.editMessageText(
       `🤖 <b>Panel of the cycle Day ${cyc.start_day} → Day ${cyc.end_day}</b>\n\n` +
       `The seats of this cycle end on the <b>${cyc.end_day}th</b>. Their invites go to: ` +
-      (current ? `panel <code>${escapeHtml(current)}</code>` : `the default panel <i>(not linked)</i>`) + `\n\n` +
+      (current ? `panel <code>${escapeHtml(current)}</code>`
+        : cgbRouting.placeholderMap()[String(cyc.end_day)]
+          ? `<b>nowhere yet</b> — named 🏷 <b>${escapeHtml(cgbRouting.placeholderMap()[String(cyc.end_day)])}</b> (no invite bot yet: invites are held, you invite yourself)`
+          : `the default panel <i>(not linked)</i>`) + `\n\n` +
       (ids === null
         ? `⚠️ <i>The invite bot could not be reached, so I cannot list its panels. Type the panel id yourself.</i>`
         : ids.length ? `Pick the invite-bot panel that is <b>this cycle's workspace</b>:`
@@ -7829,7 +7868,41 @@ async function handleAdminCallback(bot, query) {
     if (!r.ok) { await answer(`❌ ${r.reason}`); return; }
     logger.info(`Admin ${userId} linked the cycle ending on the ${cyc.end_day}th to invite-bot panel ${m[2]}`);
     await answer(`✅ Linked to ${m[2]}`);
+    await offerCycleMigration(bot, chatId, cyc, m[2]).catch(() => {});
     return await handleAdminCallback(bot, { ...query, data: 'admin_cgb_cycles' });
+  }
+
+  // ── V157.2: a name for a cycle with no invite bot yet ─────────────────────
+  if (/^admin_cgb_cpname_\d+$/.test(data)) {
+    const cid = parseInt(data.split('_').pop(), 10);
+    const cyc = db.getBillingCycles().find((c) => c.id === cid);
+    if (!cyc) { await answer('❌ That cycle no longer exists'); return; }
+    session.set(userId, States.ADMIN_CGB_CYCLE_NAME, { cgbCycleId: cid });
+    await bot.sendMessage(chatId,
+      `🏷 <b>Name for the cycle Day ${cyc.start_day} → ${cyc.end_day}</b>\n\nSend the name its emails should carry until its invite bot exists, e.g. <code>Panel 5</code>.\n\n<i>/cancel to stop.</i>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+  if (/^admin_cgb_cpnclr_\d+$/.test(data)) {
+    const cyc = db.getBillingCycles().find((c) => c.id === parseInt(data.split('_').pop(), 10));
+    if (cyc) cgbRouting.setCyclePlaceholder(cyc.end_day, null);
+    await answer('🚫 Name removed');
+    return await handleAdminCallback(bot, { ...query, data: 'admin_cgb_cycles' });
+  }
+  if (/^admin_cgb_cpmig_\d+$/.test(data)) {
+    const cyc = db.getBillingCycles().find((c) => c.id === parseInt(data.split('_').pop(), 10));
+    const panelId = cyc && cgbRouting.panelMap()[String(cyc.end_day)];
+    if (!cyc || !panelId) { await answer('❌ That cycle is not linked to a panel'); return; }
+    await answer('⏳ Moving…');
+    await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msgId }).catch(() => {});
+    const r = await cgbGuard.migrateCycleSeats(cyc.end_day, panelId);
+    logger.info(`Admin ${userId} moved cycle ${cyc.end_day} seats to ${panelId}: ${r.active} active, ${r.pending} pending, ${r.failed.length} failed`);
+    await bot.sendMessage(chatId,
+      `📤 <b>Cycle Day ${cyc.start_day} → ${cyc.end_day} → ${escapeHtml(r.panelName)}</b>\n\n` +
+      `✅ ${r.active} active seat(s) put on its whitelist (workspace renamed)\n📨 ${r.pending} waiting seat(s) handed to the invite bot\n` +
+      (r.failed.length ? `⚠️ ${r.failed.length} failed:\n${r.failed.slice(0, 10).map((f) => `• ${escapeHtml(f)}`).join('\n')}` : ''),
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '📅 Cycles', callback_data: 'admin_cgb_cycles' }]] } });
+    return;
   }
 
   if (/^admin_cgb_cpclr_\d+$/.test(data)) {
@@ -7923,7 +7996,8 @@ async function handleAdminCallback(bot, query) {
     rows.push([{ text: `📥 New orders → ${chosenPanel || 'automatic'}`.slice(0, 60), callback_data: 'admin_cgb_defpanel' }]);
     for (const c of cycles) {
       rows.push([{ text: `🗑 Delete: Day ${c.start_day} → Day ${c.end_day}`, callback_data: `admin_cgb_delcycle_${c.id}` }]);
-      rows.push([{ text: `🤖 Day ${c.start_day} → ${c.end_day}: ${panelMap[String(c.end_day)] || 'link a panel'}`.slice(0, 60), callback_data: `admin_cgb_cpanel_${c.id}` }]);
+      const ph = cgbRouting.placeholderMap()[String(c.end_day)];
+      rows.push([{ text: `🤖 Day ${c.start_day} → ${c.end_day}: ${panelMap[String(c.end_day)] || (ph ? `🏷 ${ph} (no bot yet)` : 'link a panel')}`.slice(0, 60), callback_data: `admin_cgb_cpanel_${c.id}` }]);
       // One press on the start day records the renewal time; after that the
       // button shows it and offers to clear it.
       rows.push([c.start_time

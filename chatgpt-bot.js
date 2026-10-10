@@ -193,6 +193,7 @@ function seatPlace(sub) {
   if (!panel && sub) {
     try { panel = cgbGuard.panelNameCached(cgbGuard.panelForSub(sub)); } catch (_) {}
   }
+  if (!panel && sub) { try { panel = require('./services/cgbRouting').placeholderFor(sub.end_date); } catch (_) {} }   // V157.2: its cycle's name
   if (!panel && sub && sub.prev_workspace) panel = sub.prev_workspace;
   return { panel: escapeHtml(panel || ''), cycle: cgbSeatTools.cycleLabel(db, sub && sub.end_date) };
 }
@@ -1405,6 +1406,14 @@ async function handOverToGuard(email, orderId, endDate) {
   let r = null;
   try { r = await cgbGuard.notifyGuardOfNewInvite(email, { orderId, endDate }); }
   catch (e) { r = { ok: false, reason: e.message }; }
+  if (r && r.held) {                                         // V157.2: its cycle has a name but no invite bot yet
+    await bot.sendMessage(ADMIN_ID,
+      `⏸ <b>Order #${orderId} — invite it yourself</b>\n📧 <code>${escapeHtml(email || '')}</code>\n` +
+      `🏷 Its cycle is in <b>${escapeHtml(r.placeholder)}</b>, which has no invite bot yet, so nothing was sent to another panel.\n\n` +
+      `<i>When its bot exists: 📅 Manage Cycles → 🤖 → link it, then 📤 move the cycle's emails there.</i>`,
+      { parse_mode: 'HTML' }).catch(() => {});
+    return r;
+  }
   if (r && r.ok === false) {
     await bot.sendMessage(ADMIN_ID,
       `⚠️ <b>Order #${orderId} was NOT handed to the invite bot</b>\n📧 <code>${escapeHtml(email || '')}</code>\n` +
@@ -1450,6 +1459,7 @@ async function activateAndNotifySeat(orderIdRaw, { chatId = null, msgId = null, 
     const cgbGuard = require('./services/cgbGuard');
     if (!panelId) panelId = cgbGuard.panelForSub(sub);
     if (!panelName && panelId) panelName = await cgbGuard.panelNameOf(panelId);
+    if (!panelName) panelName = require('./services/cgbRouting').placeholderFor(endDate);   // V157.2: a cycle with only a name
     // Activated by hand: the invite bot did not invite this person, so put them on that panel's whitelist with
     // the seat's end date — otherwise it would flag them as "unknown".
     if (!fromGuard && panelId && sub.email) {

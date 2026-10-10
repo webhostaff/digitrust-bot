@@ -1,3 +1,11 @@
+# V157.2 — a NAME for a cycle whose panel has no invite bot yet
+
+📅 Manage Cycles → 🤖 (a cycle) → **🏷 Just a name (no bot yet)** → send e.g. `Panel 5`.
+- The seats of that cycle carry this name: order cards, 💙 Paid renewals, the workspace stamped at activation and what the customer sees ("Workspace: Panel 5") — instead of another panel's name.
+- Their invites are HELD: never sent to another panel (even with "New orders → Panel 26"). You get "⏸ Order #… — invite it yourself". Activation does not whitelist them anywhere.
+- Later, when its bot exists: 🤖 → pick the real panel (it replaces the name) → the bot offers **📤 Move the N seat(s) to <panel>**: active seats go on its whitelist with their end date and take its name (they are already members — nothing is bought), seats not activated yet are handed to the invite bot and invited there. Seats you moved by hand (🖥 Change panel) are left alone.
+- 🏷 Rename / 🚫 Remove the name on the same screen. The cycles list shows "🏷 Panel 5 (no bot yet)".
+
 # V157.1 — after a date change, the panel follows (one tap)
 
 New dates can put a seat in another cycle — e.g. order #23581 moved to the cycle 11 → 9 — but its panel did not follow: an active seat kept the panel it was activated in ("Panel 26"). Now, after ✏️ Change dates or /setdates, when the new end belongs to a cycle linked to ANOTHER panel, the bot asks: **✅ Move to Panel 11 + invite** · **✅ Move to Panel 11 — I invite it** · **Keep it in Panel 26**. Moving does what 🖥 Change panel does (off the old whitelist, on the new one with the new end date, workspace name updated, card repainted); the customer is not told. A date change that stays in the same panel asks nothing.

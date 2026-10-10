@@ -26,6 +26,34 @@ function panelMap() {
   } catch (_) { return {}; }
 }
 
+// ── V157.2: a NAME for a cycle whose panel has no invite bot yet ─────────────────────────────────
+// The seats of that cycle carry this name (cards, workspace, lists) and their invites are HELD — never sent to
+// another panel. Linking the cycle to a real panel later replaces the name, and its emails can then be moved
+// to that panel in one tap.
+const NAME_KEY = 'cgb_cycle_placeholders';
+function placeholderMap() {
+  try {
+    const v = JSON.parse(db.getSetting(NAME_KEY, '{}') || '{}');
+    return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
+  } catch (_) { return {}; }
+}
+function setCyclePlaceholder(endDay, name) {
+  const day = parseInt(endDay, 10);
+  if (!(day >= 1 && day <= 31)) return { ok: false, reason: 'a cycle end day is 1 to 31' };
+  const map = placeholderMap();
+  const clean = String(name || '').replace(/[<>]/g, '').trim().slice(0, 40);
+  if (!clean) delete map[String(day)];
+  else map[String(day)] = clean;
+  db.setSetting(NAME_KEY, JSON.stringify(map));
+  return { ok: true, name: clean };
+}
+/** The temporary name of the cycle a seat ending on `endDate` belongs to ('' = none, or linked to a real panel). */
+function placeholderFor(endDate) {
+  const d = endDayOf(endDate);
+  if (d == null || panelMap()[String(d)]) return '';
+  return placeholderMap()[String(d)] || '';
+}
+
 function endDayOf(endDate) {
   const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(endDate || ''));
   return m ? parseInt(m[3], 10) : null;
@@ -41,6 +69,7 @@ function setCyclePanel(endDay, panelId) {
     const id = String(panelId).trim();
     if (!PANEL_ID_RE.test(id)) return { ok: false, reason: 'a panel id is letters, digits, "-", "_" or "." (no spaces)' };
     map[String(day)] = id;
+    try { const ph = placeholderMap(); if (ph[String(day)]) { delete ph[String(day)]; db.setSetting(NAME_KEY, JSON.stringify(ph)); } } catch (_) {}   // V157.2: the real panel replaces the name
   }
   db.setSetting(KEY, JSON.stringify(map));
   return { ok: true };
@@ -57,6 +86,9 @@ function resolveTarget(endDate, fallbackPanel = '') {
   const endDay = endDayOf(endDate);
   const linked = endDay != null ? panelMap()[String(endDay)] : null;
   if (linked) return { panel: String(linked), strict: true, source: 'cycle', endDay };
+  // V157.2: a cycle with only a NAME (no invite bot yet): hold — never send it to another panel.
+  const ph = endDay != null ? placeholderMap()[String(endDay)] : null;
+  if (ph) return { panel: '', strict: true, source: 'placeholder', placeholder: ph, endDay };
   // V151: the panel the owner CHOSE in the store for new orders. It is his decision, so the order goes exactly
   // there and waits if that panel is stopped — never rerouted to another one.
   const chosen = getDefaultPanel();
@@ -116,4 +148,4 @@ async function listGuardPanelsNamed(guardUrl, fetchImpl = (typeof fetch === 'fun
   } catch (_) { return null; }
 }
 
-module.exports = { panelMap, setCyclePanel, resolveTarget, getDefaultPanel, setDefaultPanel, listGuardPanelsNamed, listGuardPanels, endDayOf, PANEL_ID_RE, KEY };
+module.exports = { placeholderMap, setCyclePlaceholder, placeholderFor, panelMap, setCyclePanel, resolveTarget, getDefaultPanel, setDefaultPanel, listGuardPanelsNamed, listGuardPanels, endDayOf, PANEL_ID_RE, KEY };

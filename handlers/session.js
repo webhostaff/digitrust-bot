@@ -85,7 +85,8 @@ const States = {
   ADMIN_SUPPLIER_LOOKUP: 'ADMIN_SUPPLIER_LOOKUP',
   ADMIN_CGB_CYCLE_END: 'ADMIN_CGB_CYCLE_END',
   ADMIN_CGB_BOT_ADD: 'ADMIN_CGB_BOT_ADD',               // registering another invite bot (V148)
-  ADMIN_CGB_CYCLE_PANEL: 'ADMIN_CGB_CYCLE_PANEL',     // typing the invite-bot panel of a cycle (V147)
+  ADMIN_CGB_CYCLE_PANEL: 'ADMIN_CGB_CYCLE_PANEL',
+  ADMIN_CGB_CYCLE_NAME: 'ADMIN_CGB_CYCLE_NAME',       // typing a NAME for a cycle with no invite bot yet (V157.2)     // typing the invite-bot panel of a cycle (V147)
   REFUND_SEARCH: 'REFUND_SEARCH',
   ADMIN_VIP_REVOKE: 'ADMIN_VIP_REVOKE',
   ADMIN_NOTICE_TEXT: 'ADMIN_NOTICE_TEXT',

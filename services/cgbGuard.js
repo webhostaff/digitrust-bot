@@ -93,6 +93,12 @@ async function notifyGuardOfNewInvite(email, { orderId = null, endDate = null } 
   let target = cgbRouting.resolveTarget(endDate, GUARD_PANEL);
   const chosenForSeat = seatPanelOfOrder(orderId);                                    // V157: 🖥 Change panel
   if (chosenForSeat) target = { panel: chosenForSeat, strict: true, source: 'seat', endDay: target.endDay };
+  // V157.2: its cycle only has a NAME — no invite bot yet. Hold: never send it to another panel.
+  if (target.source === 'placeholder') {
+    logger.info(`[cgbGuard] order #${orderId} (${clean}) held: its cycle is "${target.placeholder}", which has no invite bot yet`);
+    return { ok: false, held: true, panel: '', placeholder: target.placeholder, source: 'placeholder',
+             reason: `its cycle is in "${target.placeholder}", which has no invite bot yet — invite it yourself` };
+  }
   const active = (target.source === 'cycle' || target.source === 'chosen' || target.source === 'seat') ? null : cgbBots.activeBot();     // cycle link > the panel you chose > a separate bot > GUARD_PANEL_ID
   let botId = cgbBots.DEFAULT_ID, base = GUARD_URL;
   if (active && !active.isDefault) {
@@ -470,7 +476,44 @@ async function whitelistInGuard({ panel, email, expiresOn = null, note = '', act
   }
 }
 
+/**
+ * V157.2: a cycle that only had a NAME is now linked to a real panel — bring its seats there.
+ * Active seats: put on the panel's whitelist with their end date, workspace renamed to the panel.
+ * Not activated yet: handed to the invite bot (invited there). Seats moved by hand (🖥 Change panel) are left.
+ * @returns {{active:number, pending:number, failed:Array<string>, panelName:string}}
+ */
+async function migrateCycleSeats(endDay, panelId) {
+  const q = require('../database/queries');
+  const d = q.db;
+  const panelName = await panelNameOf(panelId).catch(() => panelId);
+  const rows = d.prepare(`SELECT * FROM chatgpt_subscriptions
+                           WHERE COALESCE(status,'pending') IN ('active','pending') AND email IS NOT NULL AND email <> ''`).all()
+    .filter((s) => cgbRouting.endDayOf(s.end_date) === Number(endDay) && !seatPanelOf(s.id));
+  const out = { active: 0, pending: 0, failed: [], panelName };
+  for (const s of rows) {
+    if (s.status === 'active') {
+      const w = await whitelistInGuard({ panel: panelId, email: s.email, expiresOn: s.end_date, note: `cycle moved · seat ${s.id}`, source: 'store' });
+      if (w.ok) { out.active++; try { q.setCgbWorkspace(s.id, w.panelName || panelName); } catch (_) {} }
+      else out.failed.push(`${s.email}: ${w.reason}`);
+    } else {
+      const r = await notifyGuardOfNewInvite(s.email, { orderId: s.order_id, endDate: s.end_date });
+      if (r && r.ok) out.pending++;
+      else out.failed.push(`${s.email}: ${(r && r.reason) || 'not sent'}`);
+    }
+  }
+  return out;
+}
+
+/** Seats of a cycle (by end day) that are running and not moved by hand. */
+function cycleSeatCount(endDay) {
+  try {
+    return require('../database/queries').db.prepare(`SELECT id, end_date FROM chatgpt_subscriptions
+             WHERE COALESCE(status,'pending') IN ('active','pending') AND email IS NOT NULL AND email <> ''`).all()
+      .filter((s) => cgbRouting.endDayOf(s.end_date) === Number(endDay) && !seatPanelOf(s.id)).length;
+  } catch (_) { return 0; }
+}
+
 /** The main bot's address, secret and default panel — the registry of bots builds on it. */
 function getConfig() { return { url: GUARD_URL, secret: SHARED_SECRET, panel: GUARD_PANEL, valid: !!GUARD_URL && guardUrlValid() }; }
 
-module.exports = { seatPanelOf, setSeatPanel, panelForSub, panelNameOf, panelNameCached, panelForSeat, whitelistInGuard, makeSeatsHandler, getConfig, fetchGuardPanels, fetchGuardPanelsNamed, notifyGuardOfNewInvite, makeGuardWebhookHandler, cancelGuardInvite, diagnose, fetchGuardReport, _normalizeGuardUrl: normalizeGuardUrl };
+module.exports = { migrateCycleSeats, cycleSeatCount, seatPanelOf, setSeatPanel, panelForSub, panelNameOf, panelNameCached, panelForSeat, whitelistInGuard, makeSeatsHandler, getConfig, fetchGuardPanels, fetchGuardPanelsNamed, notifyGuardOfNewInvite, makeGuardWebhookHandler, cancelGuardInvite, diagnose, fetchGuardReport, _normalizeGuardUrl: normalizeGuardUrl };
