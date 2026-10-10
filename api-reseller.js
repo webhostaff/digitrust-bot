@@ -101,7 +101,7 @@ router.get('/products', requireApiKey, (req, res) => {
       return {
         id: p.id,
         title: String(p.title || '').replace(/\[emoji:\d+\]/g, '').trim(),
-        description: p.description || '',
+        description: String(p.description || '').replace(/\[emoji:\d+\]\s?/g, '').replace(/<\/?tg-emoji[^>]*>/g, '').trim(),
         retail_price: Number(p.price) || 0,
         wholesale_price: unit,
         stock: Number(p.stock_count || p.stock_quantity || 0),
@@ -141,7 +141,7 @@ router.get('/product/:id', requireApiKey, (req, res) => {
       product: {
         id: lp.id,
         title: String(lp.title || '').replace(/\[emoji:\d+\]/g, '').trim(),
-        description: lp.description || '',
+        description: String(lp.description || '').replace(/\[emoji:\d+\]\s?/g, '').replace(/<\/?tg-emoji[^>]*>/g, '').trim(),
         retail_price: Number(lp.price) || 0,
         wholesale_price: unit,
         stock: lp.sub_expired ? 0 : Number(p.stock),

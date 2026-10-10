@@ -1,3 +1,13 @@
+# V157.5 — the order cards are not buried any more
+
+- **🔴 To activate · N** (first button of the 🛠 Admin panel) and **/pending**: every paid seat not activated yet — its card is sent again at the bottom of the chat, with all its buttons. Later changes (activation, dates, panel) edit that newest copy; older copies still work.
+- "⏸ invite it yourself" is no longer a separate message: it is a line ON the order card (`⏸ Panel 8 has no invite bot yet — invite it yourself`), gone once the seat is activated.
+- The daily "seats ending" list arrives silently (no sound).
+
+# V157.4 — product descriptions in the API
+
+Checked on every route (v2 /products, /product/:id; v1 /products, /product/:id): the `description` field is sent. Two fixes so it is usable: premium-emoji markers (`[emoji:123…]`, `<tg-emoji>`) are removed from it like they already were from the title, and the API docs page now shows `description` (and `warranty`) in its examples.
+
 # V157.3 — the named panels (no bot yet) are in 🖥 Change panel
 
 The names given to cycles with no invite bot yet now appear in 🖥 Change panel as "🏷 Panel 5 (no bot yet)". Moving a seat there: it is taken off its old panel's whitelist, carries the name (card, workspace, lists), and nothing is sent anywhere — the only choice is "✅ Move — I invite it myself". When the cycle with that name is linked to its real panel, 📤 Move also brings the seats you moved there by hand.

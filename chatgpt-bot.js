@@ -166,6 +166,7 @@ function orderCard(d, activated = false, scheduled = false, cancelNote = null) {
     `📧 Email: <code>${d.email}</code>\n` +
     (d.kind ? `${d.kind}\n` : '') +
     ((d.panel || d.cycle) ? `🖥 Panel: <b>${d.panel || '—'}</b>${d.cycle ? ` · 🗓 ${d.cycle}` : ''}\n` : '') +
+    ((!activated && !cancelNote && d.held) ? `⏸ <b>${d.held}</b> has no invite bot yet — <b>invite it yourself</b>\n` : '') +
     `⏱ Duration: <b>${d.days} days</b>\n` +
     `📅 Start date: <b>${d.startDate}</b>\n` +
     `📅 End date: <b>${d.endDate}</b>\n` +
@@ -195,7 +196,16 @@ function seatPlace(sub) {
   }
   if (!panel && sub) { try { panel = require('./services/cgbRouting').placeholderFor(sub.end_date); } catch (_) {} }   // V157.2: its cycle's name
   if (!panel && sub && sub.prev_workspace) panel = sub.prev_workspace;
-  return { panel: escapeHtml(panel || ''), cycle: cgbSeatTools.cycleLabel(db, sub && sub.end_date) };
+  // V157.5: not activated and its panel has no invite bot yet → said ON the card, not in a separate message
+  let held = '';
+  if (sub && sub.status !== 'active') {
+    try {
+      const ov = sub.id ? cgbGuard.seatPanelOf(sub.id) : '';
+      if (ov && cgbGuard.isPlaceholderPanel(ov)) held = cgbGuard.placeholderNameOf(ov);
+      else if (!ov) held = require('./services/cgbRouting').placeholderFor(sub.end_date);
+    } catch (_) {}
+  }
+  return { panel: escapeHtml(panel || ''), cycle: cgbSeatTools.cycleLabel(db, sub && sub.end_date), held: escapeHtml(held || '') };
 }
 
 /** "🔄 Renewal of …" / "🆕 New seat" for the order card (V156.3). */
@@ -855,7 +865,9 @@ async function showAdminPanel(chatId, msgId = null) {
     `🛠 <b>ChatGPT Business — Admin</b>\n━━━━━━━━━━━━━━━━━━\n` +
     `🟢 Active seats: <b>${active}</b>\n⏳ Waiting for activation: <b>${waiting}</b>\n` +
     `🗓 Ending today: <b>${nT}</b> · tomorrow: <b>${nM}</b>\n━━━━━━━━━━━━━━━━━━\nChoose:`;
+  let nPend = 0; try { nPend = ordersToActivate().length; } catch (_) {}
   const kb = { inline_keyboard: [
+    [{ text: `🔴 To activate · ${nPend}`, callback_data: 'adm_pending' }],
     [{ text: `🗓 Ending today · ${nT}`, callback_data: 'adm_end_today' }, { text: `🗓 Tomorrow · ${nM}`, callback_data: 'adm_end_tomorrow' }],
     [{ text: '🗓 In 3 days', callback_data: 'adm_end_+3' }, { text: '🗓 In 7 days', callback_data: 'adm_end_+7' }, { text: '📅 Other day', callback_data: 'adm_ask_ending' }],
     [{ text: `💙 Paid renewals · ${(() => { try { return db.prepare("SELECT COUNT(*) n FROM chatgpt_subscriptions WHERE renewed_from IS NOT NULL AND COALESCE(status,'pending')='pending'").get().n; } catch (_) { return 0; } })()}`, callback_data: 'adm_paidrenewals' },
@@ -889,6 +901,7 @@ async function handleAdminPanelButton(data, chatId, msgId, userId) {
   if (data === 'adm_home') { await showAdminPanel(chatId, msgId); return true; }
   if (data === 'adm_emailreqs') { await showEmailRequests(chatId); return true; }
   if (data === 'adm_paidrenewals') { await showPaidRenewals(chatId); return true; }
+  if (data === 'adm_pending') { await showOrdersToActivate(chatId); return true; }
   if (data === 'adm_laterenewals') { await showLateRequests(chatId); return true; }
   let m = /^adm_end_(today|tomorrow|\+\d+)$/.exec(data);
   if (m) { runAsCommand(chatId, userId, `/ending ${m[1]}`); return true; }
@@ -1406,12 +1419,8 @@ async function handOverToGuard(email, orderId, endDate) {
   let r = null;
   try { r = await cgbGuard.notifyGuardOfNewInvite(email, { orderId, endDate }); }
   catch (e) { r = { ok: false, reason: e.message }; }
-  if (r && r.held) {                                         // V157.2: its cycle has a name but no invite bot yet
-    await bot.sendMessage(ADMIN_ID,
-      `⏸ <b>Order #${orderId} — invite it yourself</b>\n📧 <code>${escapeHtml(email || '')}</code>\n` +
-      `🏷 Its cycle is in <b>${escapeHtml(r.placeholder)}</b>, which has no invite bot yet, so nothing was sent to another panel.\n\n` +
-      `<i>When its bot exists: 📅 Manage Cycles → 🤖 → link it, then 📤 move the cycle's emails there.</i>`,
-      { parse_mode: 'HTML' }).catch(() => {});
+  if (r && r.held) {                                         // V157.2/V157.5: said on its card (⏸ … invite it yourself)
+    logger.info(`order #${orderId}: held — "${r.placeholder}" has no invite bot yet (shown on its card)`);
     return r;
   }
   if (r && r.ok === false) {
@@ -1695,11 +1704,11 @@ async function handleDateEditButton(data, userId, chatId) {
 }
 
 // ── V155: /ending [day] — the seats that end on a day (default: today and tomorrow) ──
-async function sendEndingList(chatId, day, label) {
+async function sendEndingList(chatId, day, label, silent = false) {
   const { text, emails } = cgbSeatTools.endingText(cgbSeatTools.seatsEndingOn(db, day), label);
-  await bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
+  await bot.sendMessage(chatId, text, { parse_mode: 'HTML', disable_notification: silent });
   if (emails.length) {
-    await bot.sendMessage(chatId, `<code>${escapeHtml(emails.join('\n'))}</code>`, { parse_mode: 'HTML' }).catch(() => {});
+    await bot.sendMessage(chatId, `<code>${escapeHtml(emails.join('\n'))}</code>`, { parse_mode: 'HTML', disable_notification: silent }).catch(() => {});
   }
   return emails.length;
 }
@@ -1730,9 +1739,9 @@ async function sendDailyEndingDigest() {
   const t = cgbSeatTools.seatsEndingOn(db, today);
   const m = cgbSeatTools.seatsEndingOn(db, cgbSeatTools.parseDay('tomorrow', now));
   if (!t.total && !m.total) return;
-  await bot.sendMessage(ADMIN_ID, '🗓 <b>Seats ending</b> — daily list', { parse_mode: 'HTML' }).catch(() => {});
-  if (t.total) await sendEndingList(ADMIN_ID, t.day, 'today');
-  if (m.total) await sendEndingList(ADMIN_ID, m.day, 'tomorrow');
+  await bot.sendMessage(ADMIN_ID, '🗓 <b>Seats ending</b> — daily list', { parse_mode: 'HTML', disable_notification: true }).catch(() => {});
+  if (t.total) await sendEndingList(ADMIN_ID, t.day, 'today', true);
+  if (m.total) await sendEndingList(ADMIN_ID, m.day, 'tomorrow', true);
 }
 
 // ── V155: /setemail <order | current email> <new email> — a customer wants another email on his seat ──
@@ -2091,6 +2100,30 @@ bot.onText(/^\/setpanel(?:@\w+)?(?:\s+(.*))?$/i, async (msg, match) => {
   const f = cgbSeatTools.findSeat(db, ref);
   if (f.error) { await bot.sendMessage(msg.chat.id, `❌ ${escapeHtml(f.error)}`, { parse_mode: 'HTML' }); return; }
   await startPanelChange(msg.chat.id, f.sub);
+});
+
+// ── V157.5: 🔴 orders to activate — their cards again, at the bottom of the chat ──
+function ordersToActivate() {
+  return db.prepare(`SELECT order_id FROM chatgpt_subscriptions
+                      WHERE COALESCE(status,'pending') = 'pending' AND order_id > 0
+                      ORDER BY date(start_date), id`).all().map((r) => r.order_id);
+}
+async function showOrdersToActivate(chatId) {
+  const ids = ordersToActivate();
+  if (!ids.length) { await bot.sendMessage(chatId, '✅ Nothing to activate — every paid seat is active.'); return; }
+  await bot.sendMessage(chatId, `🔴 <b>${ids.length} order(s) to activate</b> — their cards follow${ids.length > 25 ? ' (the first 25)' : ''}. Older copies above still work.`, { parse_mode: 'HTML' });
+  const today = ymdLocal(cgbCycles.localNow(new Date()));
+  for (const id of ids.slice(0, 25)) {
+    const data = seatCardData(id);
+    if (!data) continue;
+    const scheduled = String(data.card.startDate) > today;
+    const sentCard = await bot.sendMessage(chatId, orderCard(data.card, false, scheduled), { parse_mode: 'HTML', reply_markup: orderCardButtons(data.card) }).catch(() => null);
+    if (sentCard) { try { queries.saveCgbAdminCard(id, sentCard.chat.id, sentCard.message_id); } catch (_) {} }   // later changes edit THIS copy
+  }
+}
+bot.onText(/^\/pending(?:@\w+)?$/i, async (msg) => {
+  if (String(msg.from.id) !== String(ADMIN_ID)) return;
+  await showOrdersToActivate(msg.chat.id);
 });
 
 // ── V156.7: 💙 paid renewals, each with its panel and cycle ──
@@ -3558,6 +3591,7 @@ if (ADMIN_ID) {
     { command: 'start',    description: '🤖 ChatGPT Business' },
     { command: 'menu',     description: '📋 My subscriptions & renew' },
     { command: 'admin',    description: '🛠 Admin panel (buttons)' },
+    { command: 'pending',  description: '🔴 Orders to activate (cards again)' },
     { command: 'renewals', description: '🔄 Who renewed (admin)' },
       { command: 'checkrenewals', description: '🔎 Check paid renewals (admin)' },
       { command: 'setdates', description: '✏️ Change a paid seat\'s dates (admin)' },

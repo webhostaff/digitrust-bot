@@ -32,6 +32,8 @@ function docsPage(baseUrl, storeName = 'Store') {
     {
       "id": 10,
       "title": "Netflix Premium 1 Month",
+      "description": "4K · private profile · 30 days warranty",
+      "warranty": "30 days",
       "price": 1.00,
       "public_price": 2.00,
       "stock": 47,
@@ -69,7 +71,7 @@ function docsPage(baseUrl, storeName = 'Store') {
       blurb: 'One product. Use it to re-check stock and price right before buying.',
       req: `curl -H "X-API-Key: $KEY" \\
   ${b}/api/v2/product/10`,
-      res: `{ "success": true, "product": { "id": 10, "price": 1.00, "stock": 47 } }`,
+      res: `{ "success": true, "product": { "id": 10, "title": "Netflix Premium 1 Month", "description": "4K · private profile", "price": 1.00, "stock": 47 } }`,
     },
     {
       method: 'GET', path: '/balance', anchor: 'balance',

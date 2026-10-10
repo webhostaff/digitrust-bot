@@ -101,6 +101,11 @@ function requireKey(req, res, next) {
 }
 
 /** Public shape of a product, priced for this caller. */
+function cleanDescription(d) {
+  const t = String(d || '').replace(/\[emoji:\d+\]\s?/g, '').replace(/<\/?tg-emoji[^>]*>/g, '').trim();
+  return t || null;
+}
+
 function productPayload(userId, product) {
   const tl = require('./utils/timeLimited').info(product);
   const forMe = db.productForCustomer(userId, product);
@@ -108,7 +113,8 @@ function productPayload(userId, product) {
   return {
     id:            product.id,
     title:         cleanTitle(product.title),
-    description:   product.description || null,
+    // V157.4: the premium-emoji markers ([emoji:123…]) are for Telegram; an API caller gets clean text.
+    description:   cleanDescription(product.description),
     warranty:      product.warranty || null,
     price:         Number(Number(forMe.price).toFixed(6)),
     public_price:  Number(Number(product.price).toFixed(6)),
