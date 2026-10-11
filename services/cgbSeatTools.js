@@ -198,4 +198,30 @@ function paidRenewals(db, todayYmd, days = 20) {
      ORDER BY cs.status DESC, date(cs.start_date), cs.email`).all(todayYmd, days);
 }
 
-module.exports = { pickNewEmail, cycleLabel, paidRenewals, mismatchedRenewals, unlinkRenewal, EMAIL_RE, ymd, parseDay, seatsEndingOn, endingText, findSeat, parseSetEmail, changeSeatEmail };
+/**
+ * V157.7: the seats whose last day is `fromDay` (active, pending or expired) — for a one-time move to another
+ * day/panel (a cycle whose panel was closed and whose emails were moved into another workspace by hand).
+ */
+function seatsEndingExactly(db, fromDay) {
+  return db.prepare(`SELECT cs.*, u.username FROM chatgpt_subscriptions cs LEFT JOIN users u ON u.telegram_id = cs.user_id
+                      WHERE date(cs.end_date) = date(?) AND COALESCE(cs.status,'pending') IN ('active','pending','expired')
+                        AND cs.email IS NOT NULL AND cs.email <> ''
+                      ORDER BY cs.email`).all(fromDay);
+}
+
+/** Write the new last day on those seats (an expired one is active again — it is in the new workspace). */
+function moveSeatsToDay(db, ids, toDay) {
+  const tx = db.transaction(() => {
+    for (const id of ids) {
+      const s = db.prepare('SELECT start_date, status FROM chatgpt_subscriptions WHERE id = ?').get(id);
+      if (!s) continue;
+      const days = Math.max(1, Math.round((new Date(`${toDay}T00:00:00Z`) - new Date(`${String(s.start_date).slice(0, 10)}T00:00:00Z`)) / 86400000));
+      db.prepare(`UPDATE chatgpt_subscriptions SET end_date = ?, days_remaining = ?,
+                    status = CASE WHEN status = 'expired' THEN 'active' ELSE status END,
+                    notified_3d = 0, notified_1d = 0, notified_0d = 0, updated_at = datetime('now') WHERE id = ?`).run(toDay, days, id);
+    }
+  });
+  tx();
+}
+
+module.exports = { seatsEndingExactly, moveSeatsToDay, pickNewEmail, cycleLabel, paidRenewals, mismatchedRenewals, unlinkRenewal, EMAIL_RE, ymd, parseDay, seatsEndingOn, endingText, findSeat, parseSetEmail, changeSeatEmail };

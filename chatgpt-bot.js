@@ -592,16 +592,60 @@ async function renewalClosed(chatId, sub) {
     return true;
   }
   if (q.kind !== 'closed') return false;
+  // V157.8: after the window the customer chooses — his own workspace for the days left, or the panel running now.
+  const lq = cgbCycles.lateRenewalQuote(sub);
+  const sw = switchQuote(sub);
+  const rows = [];
+  if (lq && lq.days > 0) rows.push([{ text: `🔄 Same workspace — $${lq.price.toFixed(2)} until ${formatDate(lq.to)}`.slice(0, 60), callback_data: `cgb_lsame_${sub.id}` }]);
+  if (sw) rows.push([{ text: `✨ Current panel — $${sw.price.toFixed(2)} until ${formatDate(sw.to)}`.slice(0, 60), callback_data: `cgb_lswitch_${sub.id}` }]);
+  rows.push([{ text: '🔙 Back', callback_data: 'cgb_menu' }]);
   await bot.sendMessage(chatId,
-    `⏰ <b>Renewal is closed for this seat</b>\n\n` +
-    `📧 <code>${escapeHtml(sub.email || '')}</code> ended on <b>${escapeHtml(String(sub.end_date))}</b>.\n` +
-    `It could be renewed until <b>${formatDate(q.closedOn)}</b>.\n\n` +
-    `• To keep <b>this email</b>, ask the admin: if he agrees you pay only the days left in its cycle.\n` +
-    `• Or buy a new seat.`,
-    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
-      [{ text: '📨 Ask to renew this email', callback_data: `cgb_lreq_${sub.id}` }],
-      [{ text: '✨ Buy a new seat', callback_data: 'cgb_new' }], [{ text: '🔙 Back', callback_data: 'cgb_menu' }]] } });
+    `⏰ <b>The renewal period is over for this seat</b>\n\n` +
+    `📧 <code>${escapeHtml(sub.email || '')}</code> ended on <b>${escapeHtml(String(sub.end_date))}</b> (renewal was open until ${formatDate(q.closedOn)}).\n\n` +
+    `<b>Choose:</b>\n` +
+    (lq && lq.days > 0 ? `🔄 <b>Same workspace</b> (🏢 ${escapeHtml(workspaceName(sub))}) — you pay only the <b>${lq.days} day(s)</b> left in its cycle: <b>$${lq.price.toFixed(2)}</b>, until ${formatDate(lq.to)}.\n` : '') +
+    (sw ? `✨ <b>The panel running now</b> — a new period: <b>${sw.days} day(s)</b>, <b>$${sw.price.toFixed(2)}</b>, until ${formatDate(sw.to)}. You are invited into that workspace.\n` : '') +
+    `\n<i>Same email in both cases.</i>`,
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
   return true;
+}
+
+/** V157.8: "the panel running now" for an ended seat — what a new buyer gets today, on the same email. */
+function switchQuote(sub) {
+  const best = calculateBestCycle();
+  if (!best) return null;
+  const monthly = cgbCycles.getMonthlyPrice(sub.user_id);
+  const price = cgbCycles.pricePeriod(best, monthly);
+  return { from: best.startDate || new Date(), to: best.endDate, days: best.daysRemaining, price, monthly, cycle: best.cycle };
+}
+
+/** V157.8: pay screen for both choices after the window. */
+async function showAfterWindowPayment(chatId, userId, sub, mode, lateReqId = null) {
+  if (isOutOfStock()) { await bot.sendMessage(chatId, `🔴 <b>No seats available</b>\n\n${escapeHtml(outOfStockMessage())}`, { parse_mode: 'HTML' }); return; }
+  const q = mode === 'same' ? cgbCycles.lateRenewalQuote(sub) : switchQuote(sub);
+  if (!q) { await bot.sendMessage(chatId, '❌ Could not price it — contact support.'); return; }
+  setSession(userId, 'CONFIRM_ORDER', {
+    daysRemaining: q.days, extraMonth: false, basePrice: q.price, finalPrice: q.price,
+    startDate: formatDate(q.from), endDate: formatDate(q.to), monthlyPrice: q.monthly,
+    email: sub.email, renewalOf: sub.id, renewMonths: 1,
+    ...(lateReqId ? { lateReqId } : {}),
+    ...(mode === 'switch' ? { switchPanel: true } : {}),
+  });
+  const balance = getBalance(userId);
+  const rows = [];
+  if (Math.round(balance * 100) >= Math.round(q.price * 100)) rows.push([{ text: `👛 Pay with Balance ($${balance.toFixed(2)})`, callback_data: 'pay_balance' }]);
+  else if (balance > 0) rows.push([{ text: `👛 Balance $${balance.toFixed(2)} — not enough`, callback_data: 'balance_short' }]);
+  rows.push(
+    [{ text: '💳 Pay with Binance Pay', callback_data: 'pay_binance' }],
+    [{ text: '💎 USDT BEP20', callback_data: 'pay_bep20' }, { text: '💎 USDT TRC20', callback_data: 'pay_trc20' }],
+    [{ text: '🤖 CryptoBot', callback_data: 'pay_cryptobot' }],
+  );
+  await bot.sendMessage(chatId,
+    (mode === 'same' ? `🔄 <b>Same workspace</b>\n\n🏢 ${escapeHtml(workspaceName(sub))}\n` : `✨ <b>The panel running now</b>\n\n`) +
+    `📧 <code>${escapeHtml(sub.email || '')}</code>\n📅 Period: ${formatDate(q.from)} → ${formatDate(q.to)}\n⏳ Days: <b>${q.days}</b>\n` +
+    `💰 <b>Price: $${q.price.toFixed(2)}</b>\n👛 Your balance: <b>$${balance.toFixed(2)}</b>\n\n` +
+    (mode === 'switch' ? '<i>You will be invited into that workspace after payment.</i>\n\n' : '') + 'Select payment method:',
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -681,7 +725,8 @@ async function showLatePayment(chatId, userId, reqId) {
   if (r.status === 'paid') { await bot.sendMessage(chatId, 'ℹ️ This renewal is already paid.'); return; }
   if (r.status !== 'approved') { await bot.sendMessage(chatId, 'ℹ️ This request is not agreed (yet).'); return; }
   const sub = queries.getCgbSubById(r.sub_id);
-  const lq = sub && cgbCycles.lateRenewalQuote(sub);
+  if (sub) { await showAfterWindowPayment(chatId, userId, sub, 'same', r.id); return; }
+  const lq = null;
   if (!lq) { await bot.sendMessage(chatId, '❌ Could not price it — contact support.'); return; }
   if (isOutOfStock()) { await bot.sendMessage(chatId, `🔴 <b>No seats available</b>\n\n${escapeHtml(outOfStockMessage())}`, { parse_mode: 'HTML' }); return; }
   setSession(userId, 'CONFIRM_ORDER', {
@@ -839,6 +884,7 @@ const ADM_PROMPTS = {
   setdates: { cmd: '/setdates', text: '✏️ <b>Change a seat\'s dates</b>\n\nSend the order number, the first day and the last day:\n<code>20439 2026-10-05 2026-11-05</code>\n<i>A note for the customer can follow.</i>' },
   ending:   { cmd: '/ending',   text: '🗓 <b>Seats ending on a day</b>\n\nSend the day: <code>2026-10-30</code>, <code>30/10</code> or <code>+3</code>' },
   setprice: { cmd: '/setprice', text: '💲 <b>Custom monthly price for a customer</b>\n\nSend the Telegram id and the price (a note may follow):\n<code>5626665035 12.50</code>' },
+  moveday:  { cmd: '/moveday',  text: '🔀 <b>Move the seats of one day</b>\n\nSend the day they end now, then the new day:\n<code>2026-10-05 2026-10-09</code>\n\nYou see the list and choose the panel before anything changes.' },
   setpanel: { cmd: '/setpanel', text: '🖥 <b>Move a seat to another panel</b>\n\nSend the order number or the seat\'s email:\n<code>23586</code>\n<code>sara@gmail.com</code>\n\n<i>The customer is not told.</i>' },
   delprice: { cmd: '/delprice', text: '🗑 <b>Remove a customer\'s custom price</b>\n\nSend the Telegram id:\n<code>5626665035</code>' },
 };
@@ -875,7 +921,7 @@ async function showAdminPanel(chatId, msgId = null) {
     [{ text: `⏰ Late renewal requests · ${(() => { try { return pendingLateRenewals().length; } catch (_) { return 0; } })()}`, callback_data: 'adm_laterenewals' }],
     [{ text: '➕ Add a seat', callback_data: 'adm_ask_addseat' }, { text: '📧 Change an email', callback_data: 'adm_ask_setemail' }],
     [{ text: '✏️ Change dates', callback_data: 'adm_ask_setdates' }, { text: '🖥 Change a panel', callback_data: 'adm_ask_setpanel' }],
-    [{ text: '🔎 Check renewals', callback_data: 'adm_run_checkrenewals' }],
+    [{ text: '🔎 Check renewals', callback_data: 'adm_run_checkrenewals' }, { text: '🔀 Move a day', callback_data: 'adm_ask_moveday' }],
     [{ text: '🔄 Renewals board', callback_data: 'adm_run_renewals' }],
     [{ text: '💰 Custom prices', callback_data: 'adm_run_prices' }, { text: '💲 Set a price', callback_data: 'adm_ask_setprice' }],
     [{ text: '🗑 Remove a price', callback_data: 'adm_ask_delprice' }, { text: '🔌 Test invite bot', callback_data: 'adm_run_guardtest' }],
@@ -2129,6 +2175,106 @@ bot.onText(/^\/pending(?:@\w+)?$/i, async (msg) => {
   await showOrdersToActivate(msg.chat.id);
 });
 
+// ════════════════════════════════════════════════════════════════
+// V157.7: 🔀 MOVE A DAY — the seats ending on one day → another day + a panel (one time)
+// e.g. the cycle ending on the 5th was closed and its emails were moved into panel 11 (ends on the 9th)
+// ════════════════════════════════════════════════════════════════
+const pendingDayMoves = new Map();            // token -> { from, to, ids, panels, at }
+
+bot.onText(/^\/moveday(?:@\w+)?(?:\s+(.*))?$/i, async (msg, match) => {
+  if (String(msg.from.id) !== String(ADMIN_ID)) return;
+  const chatId = msg.chat.id;
+  const now = cgbCycles.localNow(new Date());
+  const parts = String((match && match[1]) || '').trim().split(/\s+/).filter(Boolean);
+  const from = cgbSeatTools.parseDay(parts[0], now);
+  const to = cgbSeatTools.parseDay(parts[1], now);
+  const retry = { inline_keyboard: [[{ text: '🔀 Try again', callback_data: 'adm_ask_moveday' }]] };
+  if (!from || !to) { await bot.sendMessage(chatId, '❌ Send two dates: the day they end now, then the new day.\nExample: <code>2026-10-05 2026-10-09</code>', { parse_mode: 'HTML', reply_markup: retry }); return; }
+  if (from === to) { await bot.sendMessage(chatId, '❌ The two dates are the same.', { reply_markup: retry }); return; }
+  const seats = cgbSeatTools.seatsEndingExactly(db, from);
+  if (!seats.length) { await bot.sendMessage(chatId, `ℹ️ No seat ends on ${from}.`, { reply_markup: retry }); return; }
+  const real = (await cgbGuard.fetchGuardPanelsNamed(6000).catch(() => null)) || [];
+  const panels = [...real, ...require('./services/cgbRouting').placeholderPanels().filter((p) => !real.some((r) => r.name === p.name))];
+  const token = require('crypto').randomBytes(4).toString('hex');
+  for (const [k, v] of pendingDayMoves) if (Date.now() - v.at > PENDING_EDIT_MS) pendingDayMoves.delete(k);
+  pendingDayMoves.set(token, { from, to, ids: seats.map((x) => x.id), panels: panels.map((p) => ({ id: p.id, name: p.name })), at: Date.now() });
+  const icon = { active: '🟢', pending: '⏳', expired: '⚫' };
+  const list = seats.slice(0, 40).map((x) => `${icon[x.status] || '•'} <code>${escapeHtml(x.email)}</code>${x.username ? ` — @${escapeHtml(x.username)}` : ''}${x.order_id ? ` · #${x.order_id}` : ''}`).join('\n');
+  const rows = panels.slice(0, 20).map((p, i) => [{ text: `${p.placeholder ? '🏷 ' : ''}${p.name}${p.placeholder ? ' (no bot yet)' : ''}`.slice(0, 60), callback_data: `cgb_md_${token}_p${i}` }]);
+  rows.push([{ text: '⬜ Keep their panel', callback_data: `cgb_md_${token}_pn` }]);
+  rows.push([{ text: '❌ Cancel', callback_data: `cgb_md_${token}_x` }]);
+  await bot.sendMessage(chatId,
+    `🔀 <b>${seats.length} seat(s) end on ${from}</b>\n${list}${seats.length > 40 ? `\n… and ${seats.length - 40} more` : ''}\n\n` +
+    `They will end on <b>${to}</b> instead.\nWhich panel are they in now?`,
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
+});
+
+async function handleDayMoveButton(data, chatId, msgId, adminId) {
+  const m = /^cgb_md_([0-9a-f]{8})_(x|pn|p\d+|go[st]_(?:n|\d+))$/.exec(data);
+  if (!m) return;
+  const st = pendingDayMoves.get(m[1]);
+  await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msgId }).catch(() => {});
+  if (m[2] === 'x') { pendingDayMoves.delete(m[1]); await bot.sendMessage(chatId, '❌ Cancelled — nothing was changed.'); return; }
+  if (!st) { await bot.sendMessage(chatId, '⌛ That expired — send /moveday again.'); return; }
+  if (m[2] === 'pn' || /^p\d+$/.test(m[2])) {
+    const pi = m[2] === 'pn' ? 'n' : m[2].slice(1);
+    const name = pi === 'n' ? 'their current panel' : st.panels[Number(pi)].name;
+    await bot.sendMessage(chatId,
+      `🔀 <b>Confirm</b>\n\n${st.ids.length} seat(s): <b>${st.from} → ${st.to}</b>\n🖥 Panel: <b>${escapeHtml(name)}</b>\n\n` +
+      `• the end date changes (reminders and the renewal window follow it)\n• an ended (expired) seat is active again\n` +
+      (pi === 'n' ? '' : `• they are put on that panel's whitelist with the new end date (they are already members — nothing is bought)\n`) +
+      `• their open late-renewal requests are closed and they are told they can renew normally`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+        [{ text: '✅ Move (customers not told)', callback_data: `cgb_md_${m[1]}_gos_${pi}` }],
+        [{ text: '✅ Move and tell each customer', callback_data: `cgb_md_${m[1]}_got_${pi}` }],
+        [{ text: '❌ Cancel', callback_data: `cgb_md_${m[1]}_x` }],
+      ] } });
+    return;
+  }
+  pendingDayMoves.delete(m[1]);                         // one tap, one move
+  const tell = m[2].startsWith('got');
+  const pi = m[2].split('_')[1];
+  const panel = pi === 'n' ? null : st.panels[Number(pi)];
+  const seats = st.ids.map((id) => queries.getCgbSubById(id)).filter(Boolean).filter((x) => String(x.end_date).slice(0, 10) === st.from);
+  cgbSeatTools.moveSeatsToDay(db, seats.map((x) => x.id), st.to);
+  let wl = 0, wlFail = 0, told = 0, lateClosed = 0;
+  for (const old of seats) {
+    const sub = queries.getCgbSubById(old.id);
+    if (panel) {
+      cgbGuard.setSeatPanel(sub.id, panel.id);
+      if (sub.status === 'active') { try { queries.setCgbWorkspace(sub.id, panel.name); } catch (_) {} }
+      if (!cgbGuard.isPlaceholderPanel(panel.id) && sub.status === 'active') {
+        const w = await cgbGuard.whitelistInGuard({ panel: panel.id, email: sub.email, expiresOn: st.to, note: `moved ${st.from} → ${st.to}`, source: 'store' });
+        if (w.ok) wl++; else wlFail++;
+      }
+    }
+    // open late-renewal requests: no longer needed — the renewal is open again
+    let hadLate = false;
+    try {
+      ensureLateTable();
+      hadLate = db.prepare(`UPDATE cgb_late_renewals SET status = 'moved', decided_at = datetime('now') WHERE sub_id = ? AND status IN ('pending','approved')`).run(sub.id).changes > 0;
+      if (hadLate) lateClosed++;
+    } catch (_) {}
+    if (tell || hadLate) {
+      const ok = await bot.sendMessage(Number(sub.user_id),
+        `📅 <b>Your ChatGPT Business seat was updated</b>\n\n📧 <code>${escapeHtml(sub.email || '')}</code>\n` +
+        (panel ? `🏢 Workspace: <b>${escapeHtml(panel.name)}</b>\n` : '') +
+        `📅 It now ends on <b>${st.to}</b> (was ${st.from}).\n\n` +
+        (priceRenewal(sub, 1).kind === 'own' || priceRenewal(sub, 1).kind === 'stub' ? 'You can renew it now: /start → 🔄 Renew my seat.' : 'You will be reminded before it ends.'),
+        { parse_mode: 'HTML' }).then(() => true).catch(() => false);
+      if (ok) told++;
+    }
+    if (sub.order_id) await repaintSeatCard(sub.order_id).catch(() => {});
+  }
+  logger.info(`[CGB] moveday ${st.from} -> ${st.to} panel ${panel ? panel.id : '-'}: ${seats.length} seats by ${adminId}`);
+  await bot.sendMessage(chatId,
+    `✅ <b>${seats.length} seat(s) moved: ${st.from} → ${st.to}</b>${panel ? ` · 🖥 ${escapeHtml(panel.name)}` : ''}\n` +
+    (panel && !cgbGuard.isPlaceholderPanel(panel.id) ? `➕ ${wl} put on its whitelist${wlFail ? ` · ⚠️ ${wlFail} failed` : ''}\n` : '') +
+    (lateClosed ? `⏰ ${lateClosed} late-renewal request(s) closed — those customers were told they can renew\n` : '') +
+    `📨 ${told} customer(s) told`,
+    { parse_mode: 'HTML' });
+}
+
 // ── V156.7: 💙 paid renewals, each with its panel and cycle ──
 async function showPaidRenewals(chatId) {
   const today = ymdLocal(cgbCycles.localNow(new Date()));
@@ -2486,11 +2632,30 @@ bot.on('callback_query', async (q) => {
     }
   }
 
+  // V157.7: 🔀 move a day (admin only)
+  if (/^cgb_md_/.test(data)) {
+    if (String(userId) !== String(ADMIN_ID)) return;
+    await handleDayMoveButton(data, chatId, msgId, userId);
+    return;
+  }
+
   // V157: 🖥 change panel (admin only)
   if (/^cgb_cp(p|d)?_/.test(data)) {
     if (String(userId) !== String(ADMIN_ID)) return;
     await handlePanelMoveButton(data, chatId, msgId, userId);
     return;
+  }
+
+  // V157.8: after the window — the customer's own choice
+  {
+    const m = /^cgb_l(same|switch)_(\d+)$/.exec(data);
+    if (m) {
+      const sub = queries.getCgbSubById(Number(m[2]));
+      if (!sub || String(sub.user_id) !== String(userId)) { await bot.sendMessage(chatId, '❌ That seat is not yours.'); return; }
+      if (priceRenewal(sub, 1).kind !== 'closed') { await showRenewDurations(chatId, userId, sub.id); return; }   // the normal renewal is open
+      await showAfterWindowPayment(chatId, userId, sub, m[1]);
+      return;
+    }
   }
 
   // V156.9: late renewals
@@ -2710,7 +2875,7 @@ bot.on('callback_query', async (q) => {
         // readable instead of looking like unrelated purchases.
         if (s.lateReqId) { try { db.prepare("UPDATE cgb_late_renewals SET status = 'paid' WHERE id = ?").run(s.lateReqId); } catch (_) {} }   // V156.9
         if (s.renewalOf && newSubId) {
-          try { const pc = cgbGuard.seatPanelOf(s.renewalOf); if (pc) cgbGuard.setSeatPanel(newSubId, pc); } catch (_) {}   // V157
+          if (!s.switchPanel) { try { const pc = cgbGuard.seatPanelOf(s.renewalOf); if (pc) cgbGuard.setSeatPanel(newSubId, pc); } catch (_) {} }   // V157 (not when switching panel — V157.8)
           try { queries.linkCgbRenewal(s.renewalOf, newSubId); } catch (_) {}
         }
       } catch (subErr) {
@@ -2818,7 +2983,7 @@ bot.on('callback_query', async (q) => {
         // readable instead of looking like unrelated purchases.
         if (s.lateReqId) { try { db.prepare("UPDATE cgb_late_renewals SET status = 'paid' WHERE id = ?").run(s.lateReqId); } catch (_) {} }   // V156.9
         if (s.renewalOf && newSubId) {
-          try { const pc = cgbGuard.seatPanelOf(s.renewalOf); if (pc) cgbGuard.setSeatPanel(newSubId, pc); } catch (_) {}   // V157
+          if (!s.switchPanel) { try { const pc = cgbGuard.seatPanelOf(s.renewalOf); if (pc) cgbGuard.setSeatPanel(newSubId, pc); } catch (_) {} }   // V157 (not when switching panel — V157.8)
           try { queries.linkCgbRenewal(s.renewalOf, newSubId); } catch (_) {}
         }
       } catch (subErr) {

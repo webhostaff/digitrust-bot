@@ -336,12 +336,12 @@ function nextCycleAfterCurrent(from = new Date()) {
  * @param {number} months      whole cycles to buy (1..12); in a stub they come AFTER the extra days
  * @returns {{from:Date,to:Date,days:number,cycle:?object,kind:string,stub:?{days:number,cycleLength:number}}}
  */
-/** Days the renewal stays open after the cycle's start date (setting cgb_renew_grace_days, default 1). */
+/** Days the renewal stays open after the cycle's start date (setting cgb_renew_grace_days, default 4 — V157.8). */
 function renewGraceDays() {
   try {
-    const v = parseInt(String(raw.prepare("SELECT value FROM settings WHERE key='cgb_renew_grace_days'").get()?.value ?? '1'), 10);
-    return Number.isFinite(v) && v >= 0 && v <= 25 ? v : 1;
-  } catch (_) { return 1; }
+    const v = parseInt(String(raw.prepare("SELECT value FROM settings WHERE key='cgb_renew_grace_days'").get()?.value ?? '4'), 10);
+    return Number.isFinite(v) && v >= 0 && v <= 25 ? v : 4;
+  } catch (_) { return 4; }
 }
 
 /**
@@ -412,7 +412,7 @@ function renewalPeriod(endDateStr, months = 1, now = new Date(), { ignoreWindow 
     const opens = new Date(seatDay); opens.setDate(opens.getDate() - 1);
     let start = dayIn(seatDay.getFullYear(), seatDay.getMonth(), cyc.start_day);
     while (start <= seatDay) start = dayIn(start.getFullYear(), start.getMonth() + 1, cyc.start_day);
-    // still open for `cgb_renew_grace_days` days AFTER the cycle's start (default 1: 11 → 12).
+    // still open for `cgb_renew_grace_days` days AFTER the cycle's start (default 4: 11 → 15).
     const lastDay = new Date(start); lastDay.setDate(lastDay.getDate() + renewGraceDays()); lastDay.setHours(23, 59, 59, 999);
     if (local < opens || local > lastDay) {
       const r = done(today, today, cyc, local < opens ? 'notyet' : 'closed');

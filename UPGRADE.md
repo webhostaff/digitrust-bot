@@ -1,3 +1,20 @@
+# V157.8 — renewal open 4 days after the cycle starts · then the customer chooses
+
+- **Renewal in the same panel:** open from one day before the seat's last day until **4 days after its cycle's start** (setting `cgb_renew_grace_days`, now 4). Cycle 11 → 9: days 8 to 15.
+- **After that, the customer chooses (no request to the admin):**
+  - **🔄 Same workspace** — the days left in its own cycle only (e.g. 27 days, $13.68), same email, same panel; or
+  - **✨ The panel running now** — what a new buyer gets today (the running cycle with the most days), same email; he is invited into that workspace (the invite goes to that cycle's panel; the old seat's panel is NOT inherited).
+  Both are recorded as a renewal of that email (blue card, 💙 Paid renewals).
+- Late-renewal requests sent before this version still work (an agreed one opens the "Same workspace" payment).
+
+# V157.7 — 🔀 Move a day: the seats of a closed cycle → another day and panel
+
+For a cycle whose panel was closed and whose emails were moved by hand into another workspace (e.g. the cycle ending on the 5th → panel 11, ending on the 9th): 🛠 → **🔀 Move a day**, or `/moveday 2026-10-05 2026-10-09`.
+- Preview first: every seat whose last day is that date (active, waiting or expired), then choose the panel (or keep their panel), then confirm — **✅ Move (customers not told)** or **✅ Move and tell each customer**.
+- Each seat: new last day (reminders and the renewal window follow it — 10-09 renews 10 Oct → 9 Nov as usual), an expired seat is active again, the panel is recorded (workspace name, cards, lists, its renewals) and it is put on that panel's whitelist with the new end date (they are already members — nothing is bought).
+- Their open late-renewal requests are closed and those customers are told they can renew normally.
+- Only seats ending EXACTLY on that date are touched.
+
 # V157.6 — 📧 Change an email: order + old + new works
 
 `/setemail` (and 🛠 → 📧 Change an email) now accepts: `order new` · `order old new` · `order new old` · `old new`. With two emails, the one that is the seat's current email is recognised and the other is the new one. Errors say exactly what is wrong (e.g. which email is the current one) and come with a **📧 Try again** button — before, a second message after an error was silently ignored.
