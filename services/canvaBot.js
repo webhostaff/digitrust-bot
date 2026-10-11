@@ -79,8 +79,8 @@ function volumeCheck(dir) {
 }
 const VOLUME = volumeCheck(DATA_DIR);
 const PERSISTENT = VOLUME ? VOLUME.persistent : !DATA_DIR.startsWith('/tmp');
-const PEOPLE_URL = 'https://www.canva.com/settings/people';
-const MIN_GAP_MS = 20 * 1000;             // never two invites closer than this
+const PEOPLE_URL = process.env.CANVA_PEOPLE_URL_TEST || 'https://www.canva.com/settings/people';   // the env var exists only for tests
+const MIN_GAP_MS = process.env.CANVA_PEOPLE_URL_TEST ? 0 : 20 * 1000;   // never two invites closer than this (0 only in tests)
 const NAV_TIMEOUT = 45 * 1000;
 
 let playwright = null;
@@ -166,9 +166,9 @@ function importEnvSession() {
     const state = parseSessionText(raw);
     envImport = { used: false, error: null, count: state.cookies.length };
     const seen = mem.getState('canva_env_hash', null);
-    if (seen === hash && hasSession()) return envImport; // already imported; disk copy is fresher
+    if (seen === hash && hasSession('main')) return envImport; // already imported; disk copy is fresher
     ensureDir();
-    fs.writeFileSync(STORAGE, JSON.stringify(state));
+    fs.writeFileSync(STORAGE, JSON.stringify(state));                 // CANVA_SESSION is the first panel's ('main')
     mem.setState('canva_env_hash', hash);
     mem.setState('canva_last_login', new Date().toISOString());
     envImport.used = true;
@@ -179,8 +179,84 @@ function importEnvSession() {
   }
   return envImport;
 }
-function hasSession() { try { return fs.statSync(STORAGE).size > 50; } catch (_) { return false; } }
-function forgetSession() { try { fs.unlinkSync(STORAGE); } catch (_) {} }
+// ── V158: several Canva panels (a team holds 50 people) ───────────────────────
+// Each panel is a Canva account/team with its OWN session file. One is ACTIVE: invites go out from it. When
+// Canva says the team is full, the bot marks it ⛔ and moves to the next logged-in panel that is not full.
+// The first panel ('main') keeps the original storage.json, so an existing login keeps working.
+function panelList() {
+  let v = mem.getState('canva_panels', null);
+  try { if (typeof v === 'string') v = JSON.parse(v); } catch (_) { v = null; }        // the memory store keeps text
+  const list = Array.isArray(v) && v.length ? v : [{ id: 'main', name: 'Panel 1' }];
+  return list.filter((p) => p && p.id);
+}
+function savePanels(list) { mem.setState('canva_panels', JSON.stringify(list)); }
+function activeId() {
+  const a = mem.getState('canva_active', 'main');
+  return panelList().some((p) => p.id === a) ? a : panelList()[0].id;
+}
+function setActive(id) { if (panelList().some((p) => p.id === id)) mem.setState('canva_active', id); return activeId(); }
+function panelName(id) { return (panelList().find((p) => p.id === id) || {}).name || id; }
+function storagePath(id = activeId()) { return id === 'main' ? STORAGE : path.join(DATA_DIR, `storage_${id}.json`); }
+function addPanel(name) {
+  const clean = String(name || '').replace(/[<>]/g, '').trim().slice(0, 30);
+  if (!clean) return { ok: false, reason: 'give it a name' };
+  const list = panelList();
+  if (list.some((p) => p.name.toLowerCase() === clean.toLowerCase())) return { ok: false, reason: 'a panel with that name exists' };
+  let base = clean.toLowerCase().replace(/[^a-z0-9]+/g, '').slice(0, 12) || 'p';
+  let id = base, n = 2;
+  while (list.some((p) => p.id === id) || id === 'main') id = `${base}${n++}`;
+  list.push({ id, name: clean });
+  savePanels(list);
+  return { ok: true, id, name: clean };
+}
+function removePanel(id) {
+  if (id === 'main') return { ok: false, reason: 'the first panel cannot be removed (rename it instead)' };
+  const list = panelList();
+  if (!list.some((p) => p.id === id)) return { ok: false, reason: 'no such panel' };
+  savePanels(list.filter((p) => p.id !== id));
+  try { fs.unlinkSync(storagePath(id)); } catch (_) {}
+  if (mem.getState('canva_active', 'main') === id) mem.setState('canva_active', 'main');
+  return { ok: true };
+}
+function renamePanel(id, name) {
+  const clean = String(name || '').replace(/[<>]/g, '').trim().slice(0, 30);
+  if (!clean) return { ok: false, reason: 'give it a name' };
+  savePanels(panelList().map((p) => (p.id === id ? { ...p, name: clean } : p)));
+  return { ok: true, name: clean };
+}
+function isFull(id) { return !!mem.getState(`canva_full_${id}`, null); }
+function setFull(id, on, count = null) {
+  mem.setState(`canva_full_${id}`, on ? new Date().toISOString() : null);
+  if (count != null) mem.setState(`canva_count_${id}`, count);
+}
+function memberCount(id) { const v = mem.getState(`canva_count_${id}`, null); return v == null ? null : Number(v); }
+function loginTarget() {
+  const t = mem.getState('canva_login_target', null);
+  return panelList().some((p) => p.id === t) ? t : activeId();
+}
+function setLoginTarget(id) { if (panelList().some((p) => p.id === id)) mem.setState('canva_login_target', id); }
+
+/**
+ * V158.1: "the team is full — I log in a NEW account". One tap: a new panel "Panel N" is created and becomes the
+ * login target; once the login succeeds it becomes the ACTIVE one by itself (no other step).
+ */
+function newAccountForLogin() {
+  const used = new Set(panelList().map((p) => p.name));
+  let n = panelList().length + 1;
+  while (used.has(`Panel ${n}`)) n++;
+  const r = addPanel(`Panel ${n}`);
+  if (!r.ok) return r;
+  setLoginTarget(r.id);
+  mem.setState('canva_activate_on_login', r.id);
+  return r;
+}
+function panelsStatus() {
+  const a = activeId();
+  return panelList().map((p) => ({ ...p, active: p.id === a, logged_in: hasSession(p.id), full: isFull(p.id), count: memberCount(p.id) }));
+}
+
+function hasSession(id = activeId()) { try { return fs.statSync(storagePath(id)).size > 50; } catch (_) { return false; } }
+function forgetSession(id = activeId()) { try { fs.unlinkSync(storagePath(id)); } catch (_) {} }
 
 // ── One shared browser, one invite at a time ──────────────────────────────────
 
@@ -255,19 +331,19 @@ async function selfTest() {
   });
 }
 
-async function newContext(withSession = true) {
+async function newContext(withSession = true, id = activeId()) {
   const b = await launch();
   return b.newContext({
-    storageState: withSession && hasSession() ? STORAGE : undefined,
+    storageState: withSession && hasSession(id) ? storagePath(id) : undefined,
     viewport: { width: 1280, height: 800 },
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     locale: 'en-US',
   });
 }
 
-async function saveSession(context) {
+async function saveSession(context, id = activeId()) {
   ensureDir();
-  await context.storageState({ path: STORAGE });
+  await context.storageState({ path: storagePath(id) });
 }
 
 /** Run `fn` with sole control of the browser (queued behind everything else). */
@@ -337,13 +413,13 @@ async function startLogin() {
     const ctx = await newContext(false);
     const page = await ctx.newPage();
     let navErr = null;
-    await page.goto('https://www.canva.com/login', { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT })
+    await page.goto(process.env.CANVA_LOGIN_URL_TEST || 'https://www.canva.com/login', { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT })
       .catch((e) => { navErr = e.message; });
     if (navErr && !page.url().includes('canva')) {
       await ctx.close().catch(() => {});
       return { ok: false, error: `Opened the browser but could not reach Canva: ${navErr}` };
     }
-    loginSession = { context: ctx, page, id: Math.random().toString(36).slice(2, 10), createdAt: Date.now() };
+    loginSession = { context: ctx, page, id: Math.random().toString(36).slice(2, 10), createdAt: Date.now(), panelId: loginTarget() };
     return { ok: true, id: loginSession.id };
   } catch (e) {
     return { ok: false, error: e.message };
@@ -370,10 +446,14 @@ async function finishLogin() {
   try {
     await page.goto(PEOPLE_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
     const ok = await isOnPeoplePage(page);
-    if (ok) { await saveSession(context); }
+    const pid = loginSession.panelId || activeId();
+    if (ok) {
+      await saveSession(context, pid); setFull(pid, false);
+      if (mem.getState('canva_activate_on_login', null) === pid) { setActive(pid); mem.setState('canva_activate_on_login', null); }   // V158.1
+    }
     await endLogin();
     if (ok) mem.setState('canva_last_login', new Date().toISOString());
-    return ok ? { ok: true } : { ok: false, error: 'still not logged in — could not reach the People page' };
+    return ok ? { ok: true, panel: pid, panelName: panelName(pid) } : { ok: false, error: 'still not logged in — could not reach the People page' };
   } catch (e) {
     await endLogin();
     return { ok: false, error: e.message };
@@ -397,8 +477,40 @@ async function inviteEmail(email) {
   if (!available()) return { ok: false, reason: 'automation off' };
   const clean = String(email || '').trim();
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(clean)) return { ok: false, reason: 'invalid email' };
-  if (!hasSession()) return { ok: false, reason: 'not logged in', needLogin: true };
+  // V158: the active panel; if its team is full, the next logged-in panel that is not full (once each).
+  const tried = [];
+  const switched = [];
+  for (let guard = 0; guard < panelList().length + 1; guard++) {
+    const id = activeId();
+    if (tried.includes(id)) break;
+    tried.push(id);
+    if (!hasSession(id)) { const next = nextUsablePanel(tried); if (next) { switched.push({ from: id, to: next, why: 'not logged in' }); setActive(next); continue; } return { ok: false, reason: `not logged in (${panelName(id)})`, needLogin: true, panel: id, panelName: panelName(id), switched }; }
+    if (isFull(id)) { const next = nextUsablePanel(tried); if (next) { switched.push({ from: id, to: next, why: 'team full' }); setActive(next); continue; } return { ok: false, reason: `every panel is full (${panelName(id)} ${memberCount(id) || 50}/50)`, teamFull: true, panel: id, panelName: panelName(id), switched }; }
+    const r = await inviteOnPanel(clean, id);
+    if (r.teamFull) {
+      setFull(id, true, r.count);
+      logger.warn(`[canva] panel ${panelName(id)} is full (${r.count}/${r.limit}) — looking for another panel`);
+      const next = nextUsablePanel(tried);
+      if (next) { switched.push({ from: id, to: next, why: `team full ${r.count}/${r.limit}` }); setActive(next); continue; }
+      return { ...r, ok: false, reason: `team full on ${panelName(id)} (${r.count}/${r.limit}) and no other panel is ready`, panel: id, panelName: panelName(id), switched };
+    }
+    return { ...r, panel: id, panelName: panelName(id), switched };
+  }
+  return { ok: false, reason: 'no Canva panel is ready', switched };
+}
 
+/** The next panel (in list order, after the active one) that is logged in, not full and not tried yet. */
+function nextUsablePanel(tried = []) {
+  const list = panelList();
+  const start = Math.max(0, list.findIndex((p) => p.id === activeId()));
+  for (let k = 1; k <= list.length; k++) {
+    const p = list[(start + k) % list.length];
+    if (!tried.includes(p.id) && hasSession(p.id) && !isFull(p.id)) return p.id;
+  }
+  return null;
+}
+
+async function inviteOnPanel(clean, panelId) {
   return exclusive(async () => {
     const gap = Date.now() - lastInviteAt;
     if (gap < MIN_GAP_MS) await sleep(MIN_GAP_MS - gap + rand(200, 1200));
@@ -407,7 +519,7 @@ async function inviteEmail(email) {
     // What we saw, for the link hunt and for the owner's report on failure.
     const trace = { baseline: new Set(), net: new Set(), copied: new Set(), dom: new Set(), postConfirm: new Set(), sent: false, clickAt: 0, confirmAt: 0, reqAfter: new WeakSet(), reqPostConfirm: new WeakSet() };
     try {
-      ctx = await newContext(true);
+      ctx = await newContext(true, panelId);
       await ctx.addInitScript(COPY_HOOK);
       await ctx.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: 'https://www.canva.com' }).catch(() => {});
       page = await ctx.newPage();
@@ -446,13 +558,15 @@ async function inviteEmail(email) {
       await page.goto(PEOPLE_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
 
       if (!(await isOnPeoplePage(page))) {
-        forgetSession();
+        forgetSession(panelId);
         return { ok: false, reason: 'session expired', needLogin: true };
       }
 
       const res = await doInvite(page, clean, trace);
       lastInviteAt = Date.now();
-      await saveSession(ctx); // keep the session warm (and the accepted cookie banner)
+      await saveSession(ctx, panelId); // keep the session warm (and the accepted cookie banner)
+      if (res.teamFull) return { ok: false, teamFull: true, count: res.count, limit: res.limit, reason: res.reason, invited: false, debug: await failureDebug(page, trace) };
+      if (res.count != null) mem.setState(`canva_count_${panelId}`, res.count);
       if (res.link) { rememberLink(res.link, clean); return { ok: true, link: res.link, reused: !!res.reused }; }
       return {
         ok: false,
@@ -526,13 +640,21 @@ async function doInvite(page, email, trace) {
   const dialog = await findInviteDialog(page);
   if (!dialog) return { reason: 'the invite window did not open', invited: false };
   await sleep(700);
+  await acceptCookies(page);                 // V158: the banner can come back over the window (owner's screenshot #24075)
   for (const l of await domLinks(page)) addBaseline(trace, l); // anything already shown = team's
+
+  // V158: "Your team has 50 people. To grow beyond your team size limit of 50 people…" → full: nothing can be sent.
+  const size = teamSize(await dialog.innerText().catch(() => ''));
+  if (size.full) {
+    await page.keyboard.press('Escape').catch(() => {});
+    return { reason: `team full (${size.count}/${size.limit})`, invited: false, teamFull: true, count: size.count, limit: size.limit };
+  }
 
   const input = dialog.locator('input[placeholder*="email" i]:not([placeholder*="search" i])').first();
   try { await input.waitFor({ state: 'visible', timeout: 5000 }); }
-  catch (_) { return { reason: 'no email box in the invite window', invited: false }; }
-  await input.click();
-  await input.fill(email);
+  catch (_) { return { reason: 'no email box in the invite window', invited: false, count: size.count }; }
+  // fill() focuses by itself — no mouse click that a banner over the box could swallow (V158)
+  await input.fill(email, { timeout: 8000 });
   // No Enter: with several address rows Enter may jump rows or submit early.
   await sleep(rand(700, 1300));
 
@@ -543,7 +665,9 @@ async function doInvite(page, email, trace) {
       const label = (await confirm.innerText().catch(() => '')) || '';
       if (/get invite link/i.test(label)) throw new Error('refusing the team-link button');
       trace.confirmAt = Date.now();
-      await confirm.click(); sent = true;
+      try { await confirm.click({ timeout: 6000 }); }
+      catch (_) { await acceptCookies(page); await confirm.click({ timeout: 6000 }); }   // V158: a banner in the way
+      sent = true;
     }
   } catch (_) {}
   if (!sent) return { reason: 'no "Confirm and invite" button in the invite window', invited: false };
@@ -720,6 +844,16 @@ async function clearSearch(page) {
   try { if (await search.isVisible({ timeout: 1000 })) { await search.fill(''); await sleep(600); } } catch (_) {}
 }
 
+/** "Your team has 50 people … team size limit of 50 people" → { count, limit, full } (V158). */
+function teamSize(text) {
+  const t = String(text || '');
+  const m = /team has\s+(\d+)\s+(?:people|members?)/i.exec(t);
+  const l = /team size limit of\s+(\d+)/i.exec(t);
+  const count = m ? Number(m[1]) : null;
+  const limit = l ? Number(l[1]) : 50;
+  return { count, limit, full: count != null && count >= limit };
+}
+
 /** The cookie banner covers the bottom rows on a fresh browser — accept it once. */
 async function acceptCookies(page) {
   await clickAny(page, [
@@ -790,32 +924,44 @@ const COPY_HOOK = `(() => {
 function addBaseline(trace, l) {
   trace.baseline.add(l);
   try {
-    const ban = mem.getState('canva_team_links_v2', null) || {};
+    const ban = memMap('canva_team_links_v2');
     const k = linkKey(l);
-    if (!ban[k]) { ban[k] = Date.now(); mem.setState('canva_team_links_v2', ban); }
+    if (!ban[k]) { ban[k] = Date.now(); saveMemMap('canva_team_links_v2', ban); }
   } catch (_) {}
   return false;
 }
+/**
+ * V158: the memory store keeps TEXT. These maps used to be stored as objects, so after the first invite they
+ * read back as the string "[object Object]" and the NEXT invite failed ("Cannot create property … on string").
+ * Read/write them as JSON; an old broken value reads as an empty map.
+ */
+function memMap(key) {
+  const v = mem.getState(key, null);
+  if (v && typeof v === 'object') return v;
+  try { const o = JSON.parse(v); return o && typeof o === 'object' && !Array.isArray(o) ? o : {}; } catch (_) { return {}; }
+}
+function saveMemMap(key, obj) { mem.setState(key, JSON.stringify(obj)); }
+
 function isBanned(link, email) {
   // v2: the V114 list ('canva_team_links') also holds customers' OWN links
   // banned by the rule fixed above, so it is no longer read.
-  const ban = mem.getState('canva_team_links_v2', null) || {};
+  const ban = memMap('canva_team_links_v2');
   return !!ban[linkKey(link)] || deliveredElsewhere(link, email);
 }
 
 /** Remember which email got which link, to spot a shared (public) link. */
 function linkKey(l) { return require('crypto').createHash('sha256').update(l).digest('hex').slice(0, 20); }
 function deliveredElsewhere(link, email) {
-  const map = mem.getState('canva_links', null) || {};
+  const map = memMap('canva_links');
   const who = map[linkKey(link)];
   return !!(who && who !== String(email).toLowerCase());
 }
 function rememberLink(link, email) {
-  const map = mem.getState('canva_links', null) || {};
+  const map = memMap('canva_links');
   map[linkKey(link)] = String(email).toLowerCase();
   const keys = Object.keys(map); // keep the last 2000
   if (keys.length > 2000) for (const k of keys.slice(0, keys.length - 2000)) delete map[k];
-  mem.setState('canva_links', map);
+  saveMemMap('canva_links', map);
 }
 
 /** Screenshot + what the page offers + which links were seen, for the owner. */
@@ -863,6 +1009,9 @@ async function status() {
     available: available(),
     enabled: ENABLED,
     logged_in: hasSession(),
+    active: activeId(),
+    active_name: panelName(activeId()),
+    panels: panelsStatus(),
     last_login: mem.getState('canva_last_login', null),
     login_in_progress: !!loginSession,
     launch_error: launchError,
@@ -880,5 +1029,6 @@ module.exports = {
   available, status, checkLogin, inviteEmail, selfTest,
   startLogin, loginShot, loginClick, loginType, loginKey, finishLogin, endLogin,
   forgetSession, importEnvSession,
-  _test: { parseSessionText, resolveDataDir, volumeCheck, findJoinLinks, doInvite, findRow, COPY_HOOK, rememberLink, deliveredElsewhere, isBanned, DATA_DIR, STORAGE },
+  newAccountForLogin, panelList, panelsStatus, activeId, setActive, panelName, addPanel, removePanel, renamePanel, setFull, isFull, setLoginTarget, loginTarget, nextUsablePanel,
+  _test: { teamSize, storagePath, inviteOnPanel, parseSessionText, resolveDataDir, volumeCheck, findJoinLinks, doInvite, findRow, COPY_HOOK, rememberLink, deliveredElsewhere, isBanned, DATA_DIR, STORAGE },
 };

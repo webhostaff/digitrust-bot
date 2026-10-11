@@ -1,3 +1,24 @@
+# V158.2 — API: best sellers first (for the posting bot)
+
+`GET /api/v2/products?sort=best` lists the products by units delivered in the last 30 days (best sellers first). The counts are not sent. Without `sort=best` nothing changes. Used by POOST v4 to write posts from your best sellers.
+
+# V158.1 — Canva: one button for a new account · buttons instead of commands
+
+- **🎨 Canva** button in the admin menu (no need to type /canva).
+- **🔐 Log in a NEW Canva account**: one tap creates "Panel N" and opens the login page; once you are in, invites go out from that account by itself — no other step. The team-full alert carries the same button.
+- The screen shows each account (✅ active · 🔐 · N/50 · ⛔ full) with buttons: ✅ Use · 🔁 Re-login · ✔ Not full · 🗑 (old accounts). /canvaadd etc. still work but are not needed.
+- 📥 Binance Deposits: every result has ready buttons — 💎 TON 7d · 30d · 90d · 🟡 BEP20 · 🔴 TRC20 · 📋 All · 🔎 Exact amount.
+
+# V158 — Canva: several panels (a team holds 50) · team-full switch · two invite bugs fixed
+
+**Why order #24075 failed:** the invite window said "Your team has 50 people · team size limit of 50" — the Canva team was FULL, so "Confirm and invite" could not work; the cookie banner was also over the email box.
+
+- **Several Canva panels** (/canva): each panel is a Canva account/team with its OWN session. ✅ Use <panel> = invites go out from it; 🔐 Log in <panel> = the login page logs into THAT panel; ✔ Not full after freeing seats. Add one with `/canvaadd Panel 2`, `/canvarename Panel 1 = Team A`, `/canvaremove Panel 2`. Your current login stays the first panel ("Panel 1"); CANVA_SESSION still fills it.
+- **Team full → next panel by itself:** the bot reads "Your team has N people … limit of 50"; when full it sends nothing there, marks the panel ⛔ full, moves to the next logged-in panel that is not full and invites there. The "sent automatically" notice says which panel and the switch; if every panel is full you get "⛔ The Canva team is full" with what to do.
+- **Cookie banner:** accepted again once the invite window is open; the email is typed without a click the banner could swallow; "Confirm and invite" retries after accepting it.
+- **Bug fixed — every invite after the first failed:** the delivered-links and team-links lists were saved as objects in a text store, read back as "[object Object]", and the next invite threw "Cannot create property … on string". They are JSON now; an old broken value is ignored.
+- Tested with a real Chromium against a copy of Canva's People page (your video + the screenshot): full team → nothing sent → switched → invited, the customer's PERSONAL link delivered (never the team-wide link), three invites in a row.
+
 # V157.8 — renewal open 4 days after the cycle starts · then the customer chooses
 
 - **Renewal in the same panel:** open from one day before the seat's last day until **4 days after its cycle's start** (setting `cgb_renew_grace_days`, now 4). Cycle 11 → 9: days 8 to 15.

@@ -87,6 +87,8 @@ async function openManualDelivery(bot, order, paymentMethod) {
               type: 'manual_delivery',
               title: '🤖 Canva invite sent automatically',
               body: `🆔 Task #${row.id} · Order #${order.id}\n📧 <code>${escapeHtml(order.email)}</code>\n` +
+                    (r.panelName ? `🎨 Panel: <b>${escapeHtml(r.panelName)}</b>\n` : '') +
+                    ((r.switched || []).length ? r.switched.map((x) => `🔀 ${escapeHtml(canva.panelName(x.from))} → ${escapeHtml(canva.panelName(x.to))} (${escapeHtml(x.why)})`).join('\n') + '\n' : '') +
                     `✅ Invited and delivered to the customer — no action needed.`,
               dedupeKey: `canva_auto:${row.id}`, refType: 'manual_delivery', refId: row.id,
             });
@@ -105,6 +107,8 @@ async function openManualDelivery(bot, order, paymentMethod) {
             title: '⚠️ Canva auto-invite failed → manual',
             body: `🆔 Order #${order.id}\n📧 <code>${escapeHtml(order.email)}</code>\n` +
                   `❌ ${escapeHtml(String(r.reason || 'unknown'))}` +
+                  (r.panelName ? `\n🎨 Panel: <b>${escapeHtml(r.panelName)}</b>` : '') +
+                  (r.teamFull ? '\n⛔ <b>The Canva team is full (50).</b> Tap 🔐 Log in a NEW Canva account below.' : '') +
                   (r.needLogin ? '\n🔑 Session expired — paste a fresh CANVA_SESSION.' : '') +
                   // The invite may already be in Canva: inviting again would
                   // send the customer a second email. Say so loudly.
@@ -113,6 +117,7 @@ async function openManualDelivery(bot, order, paymentMethod) {
                     : '\n\n➕ <b>Not invited yet</b> — invite this email as usual.') +
                   `\n\n<i>The manual task below is ready as usual.</i>`,
             dedupeKey: `canva_fail:${row.id}`, refType: 'manual_delivery', refId: row.id,
+            ...(r.teamFull ? { buttons: [[{ text: '🔐 Log in a NEW Canva account', callback_data: 'canva_newacct' }], [{ text: '🎨 Canva', callback_data: 'canva_menu' }]] } : {}),
           });
         } catch (_) {}
         // What the bot saw (screenshot + buttons + masked links), so the next

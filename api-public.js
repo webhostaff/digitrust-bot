@@ -174,11 +174,21 @@ function buildBulkLadder(userId, product) {
 // ── GET /products ────────────────────────────────────────────────────────────
 router.get('/products', requireKey, (req, res) => {
   try {
-    const rows = dbRaw.prepare(`
-      SELECT * FROM products
-      WHERE is_active = 1
-      ORDER BY display_order ASC, id ASC
-    `).all();
+    // V158.2: ?sort=best — best sellers first (units delivered in the last 30 days). The counts are NOT sent.
+    const best = String(req.query.sort || '').toLowerCase() === 'best';
+    const rows = best
+      ? dbRaw.prepare(`
+          SELECT p.* FROM products p
+          LEFT JOIN (SELECT product_id, SUM(COALESCE(quantity, 1)) AS sold FROM orders
+                      WHERE status IN ('delivered','completed') AND datetime(created_at) >= datetime('now','-30 days')
+                      GROUP BY product_id) s ON s.product_id = p.id
+          WHERE p.is_active = 1
+          ORDER BY COALESCE(s.sold, 0) DESC, p.display_order ASC, p.id ASC`).all()
+      : dbRaw.prepare(`
+          SELECT * FROM products
+          WHERE is_active = 1
+          ORDER BY display_order ASC, id ASC
+        `).all();
     res.json({
       success: true,
       count: rows.length,

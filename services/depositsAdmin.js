@@ -49,9 +49,20 @@ function menuKb() {
   return { inline_keyboard: [
     [b('💎 TON · 7 days', '7_TON'), b('💎 TON · 30 days', '30_TON')],
     [b('🟡 BEP20 · 7 days', '7_BSC'), b('🔴 TRC20 · 7 days', '7_TRX')],
-    [b('📋 All networks · 7 days', '7_ALL'), b('📋 All · 30 days', '30_ALL')],
+    [b('💎 TON · 90 days', '90_TON'), b('📋 All networks · 7 days', '7_ALL')],
+    [b('📋 All · 30 days', '30_ALL')],
     [{ text: '🔎 Find an exact amount', callback_data: 'admin_deps_amt' }],
     [{ text: '🔙 Admin', callback_data: 'admin_panel' }],
+  ] };
+}
+
+/** V158.1: ready buttons under every result — no typing. */
+function quickKb() {
+  const b = (text, d) => ({ text, callback_data: `admin_deps_q_${d}` });
+  return { inline_keyboard: [
+    [b('💎 TON · 7d', '7_TON'), b('💎 TON · 30d', '30_TON'), b('💎 TON · 90d', '90_TON')],
+    [b('🟡 BEP20 · 7d', '7_BSC'), b('🔴 TRC20 · 7d', '7_TRX'), b('📋 All · 7d', '7_ALL')],
+    [{ text: '🔎 Exact amount', callback_data: 'admin_deps_amt' }, { text: '🔙 Admin', callback_data: 'admin_panel' }],
   ] };
 }
 
@@ -79,7 +90,7 @@ async function handle(bot, query) {
     const network = m[2] === 'ALL' ? null : m[2];
     await bot.sendMessage(chatId, `⏳ Asking Binance for ${days} day(s)${network ? ` · ${network}` : ''}…`);
     const text = await render({ days, network });
-    await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '📥 Other search', callback_data: 'admin_deps_menu' }]] } });
+    await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: quickKb() });
     return true;
   }
   if (data === 'admin_deps_menu') {
@@ -89,4 +100,4 @@ async function handle(bot, query) {
   return false;
 }
 
-module.exports = { parseArgs, render, handle, menuKb, MENU_TEXT };
+module.exports = { parseArgs, render, handle, menuKb, quickKb, MENU_TEXT };

@@ -1949,8 +1949,7 @@ async function handleAdminText(bot, msg) {
     const a = dep.parseArgs(text);
     if (a.amount === null) { await bot.sendMessage(chatId, '❌ Send a number, e.g. 10.003'); return; }
     await bot.sendMessage(chatId, `⏳ Asking Binance for ${a.days} day(s)…`);
-    await bot.sendMessage(chatId, await dep.render(a), { parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: [[{ text: '📥 Other search', callback_data: 'admin_deps_menu' }]] } });
+    await bot.sendMessage(chatId, await dep.render(a), { parse_mode: 'HTML', reply_markup: dep.quickKb() });
     return;
   }
 

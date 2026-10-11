@@ -344,6 +344,7 @@ const adminMainKb = () => mk([
   [btn('🎨 Emoji Library',   'admin_emojis'),         btn('🚧 Maintenance',  'admin_maintenance')],
   [btn('🔔 Notifications',   'admin_notifications'), btn('📦 Manual Delivery', 'admin_md_list_pending_0')],
   [btn('🛡 Deposit Review',  'admin_deposits'), btn('📥 Binance Deposits', 'admin_deps')],
+  [btn('🎨 Canva', 'canva_menu')],
   [btn('🔄 Refund Requests', 'admin_refund_requests')],
   [btn('🛡️ Deposit Cutoff',  'admin_cutoff')],
   [btn('👑 VIP Broadcast',    'admin_vip_toggle'), btn('🏆 Ranks', 'admin_ranks')],

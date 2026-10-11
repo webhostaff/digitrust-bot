@@ -681,8 +681,14 @@ bot.onText(/^\/emojistatus$/i, async (msg) => {
 
 bot.onText(/^\/canva$/i, async (msg) => {
   if (!adminHandler.isAdmin(msg.from.id)) return;
+  await showCanvaScreen(msg.chat.id);
+});
+
+/** V158.1: the Canva screen — opened by 🎨 Canva (admin menu) or /canva. Buttons only. */
+async function showCanvaScreen(chatId) {
   const canva = require('./services/canvaBot');
   const st = await canva.status();
+  const msg = { chat: { id: chatId } };
   if (!st.available) {
     await bot.sendMessage(msg.chat.id,
       `🎨 <b>Canva automation is OFF.</b>\n\nTo turn it on: set <code>CANVA_AUTOMATION=1</code> in Railway → Variables ` +
@@ -690,20 +696,62 @@ bot.onText(/^\/canva$/i, async (msg) => {
       { parse_mode: 'HTML' });
     return;
   }
-  const url = agentChat.canvaLoginUrl ? agentChat.canvaLoginUrl() : '';
-  const rows = [];
-  if (url) rows.push([{ text: st.logged_in ? '🔁 Re-login' : '🔐 Log in to Canva', url }]);
-  rows.push([{ text: '🧪 Test browser', callback_data: 'canva_test' }, { text: '🔄 Check login', callback_data: 'canva_check' }]);
-  if (st.logged_in) rows.push([{ text: '🗑 Forget session', callback_data: 'canva_forget' }]);
+  const { text: panelsTxt, rows } = canvaPanelsView(st);
   await bot.sendMessage(msg.chat.id,
     `🎨 <b>Canva automation</b>\n\n` +
-    `${st.logged_in ? '✅ Logged in — invites are automatic.' : '🔴 Not logged in — Canva orders fall back to manual.'}\n` +
+    panelsTxt +
+    `${st.logged_in ? `✅ Active: <b>${escapeHtml(st.active_name)}</b> — invites are automatic.` : `🔴 <b>${escapeHtml(st.active_name)}</b> is not logged in — Canva orders fall back to manual.`}\n` +
     (st.last_login ? `🕒 Last login: ${escapeHtml(String(st.last_login).slice(0, 16).replace('T', ' '))} UTC\n` : '') +
     // Where the session lives: a /tmp folder is wiped by every deploy, so say so.
     `💾 Session: <code>${escapeHtml(String(st.data_dir))}</code> ${st.persistent ? `(volume ✅${st.mount ? ' ' + escapeHtml(st.mount) : ''} — survives deploys)` : '(⚠️ not on a volume — lost on every deploy; put DB_PATH on a Railway volume)'}\n` +
     (st.env_session ? `🔑 CANVA_SESSION: ${escapeHtml(String(st.env_session))}\n` : '') +
-    `\n<i>Log in once through the remote browser, or paste your canva.com cookies into the CANVA_SESSION variable. Only the session is kept — no password.</i>`,
+    `\n<i>Team full? Tap <b>🔐 Log in a NEW Canva account</b> — once you are in, invites go out from it by themselves.</i>`,
     { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
+}
+
+/** V158: the Canva panels (a team holds 50 people) — which is active, logged in, full — and their buttons. */
+function canvaPanelsView(st) {
+  const url = agentChat.canvaLoginUrl ? agentChat.canvaLoginUrl() : '';
+  const lines = ['<b>Panels</b> (a Canva team holds 50 people):'];
+  const rows = [];
+  if (url) rows.push([{ text: '🔐 Log in a NEW Canva account', callback_data: 'canva_newacct' }]);
+  for (const p of st.panels || []) {
+    lines.push(`${p.active ? '✅' : '▫️'} <b>${escapeHtml(p.name)}</b> · ${p.logged_in ? '🔐 logged in' : '🔴 not logged in'}` +
+      `${p.count != null ? ` · ${p.count}/50` : ''}${p.full ? ' · ⛔ <b>full</b>' : ''}${p.active ? ' · <i>invites go here</i>' : ''}`);
+    const r = [];
+    if (!p.active && p.logged_in) r.push({ text: `✅ Use ${p.name}`.slice(0, 40), callback_data: `canva_use_${p.id}` });
+    if (url && p.active) r.push({ text: `🔁 Re-login ${p.name}`.slice(0, 40), callback_data: `canva_login_${p.id}` });
+    if (p.full) r.push({ text: '✔ Not full', callback_data: `canva_unfull_${p.id}` });
+    if (!p.active && p.id !== 'main') r.push({ text: '🗑', callback_data: `canva_del_${p.id}` });
+    if (r.length) rows.push(r);
+  }
+  lines.push('<i>Team full → 🔐 Log in a NEW Canva account. Once logged in, it is used by itself.</i>', '');
+  rows.push([{ text: '🔄 Check login', callback_data: 'canva_check' }, { text: '🔄 Refresh', callback_data: 'canva_menu' }]);
+  rows.push([{ text: '🧪 Test browser', callback_data: 'canva_test' }, ...(st.logged_in ? [{ text: '🗑 Forget session', callback_data: 'canva_forget' }] : [])]);
+  return { text: lines.join('\n') + '\n', rows };
+}
+
+// /canvaadd <name> · /canvarename <old name> = <new name> · /canvaremove <name>
+bot.onText(/^\/canva(add|rename|remove)(?:\s+(.+))?$/i, async (msg, m) => {
+  if (!adminHandler.isAdmin(msg.from.id)) return;
+  const canva = require('./services/canvaBot');
+  const arg = String(m[2] || '').trim();
+  const find = (n) => canva.panelList().find((p) => p.name.toLowerCase() === String(n).trim().toLowerCase() || p.id === String(n).trim());
+  let out;
+  if (m[1].toLowerCase() === 'add') {
+    const r = canva.addPanel(arg);
+    out = r.ok ? `➕ Panel <b>${escapeHtml(r.name)}</b> added. Next: /canva → 🔐 Log in ${escapeHtml(r.name)} (with that Canva account), then ✅ Use it when you want.` : `❌ ${escapeHtml(r.reason)} — e.g. <code>/canvaadd Panel 2</code>`;
+  } else if (m[1].toLowerCase() === 'rename') {
+    const [a, b] = arg.split('=').map((x) => (x || '').trim());
+    const p = find(a);
+    const r = p ? canva.renamePanel(p.id, b) : { ok: false, reason: 'no such panel' };
+    out = r.ok ? `✏️ Renamed to <b>${escapeHtml(r.name)}</b>.` : `❌ ${escapeHtml(r.reason)} — e.g. <code>/canvarename Panel 1 = Team A</code>`;
+  } else {
+    const p = find(arg);
+    const r = p ? canva.removePanel(p.id) : { ok: false, reason: 'no such panel' };
+    out = r.ok ? `🗑 Panel removed (its session file too).` : `❌ ${escapeHtml(r.reason)}`;
+  }
+  await bot.sendMessage(msg.chat.id, out, { parse_mode: 'HTML' });
 });
 
 bot.on('callback_query', async (q) => {
@@ -711,6 +759,46 @@ bot.on('callback_query', async (q) => {
   if (!/^canva_/.test(q.data || '')) return;
   const canva = require('./services/canvaBot');
   const chatId = q.message.chat.id;
+  // V158: the panels
+  let pm = /^canva_(use|login|unfull)_([a-z0-9]+)$/.exec(q.data || '');
+  if (pm) {
+    const name = canva.panelName(pm[2]);
+    if (pm[1] === 'use') {
+      canva.setActive(pm[2]);
+      await bot.sendMessage(chatId, `✅ Canva invites now go out from <b>${escapeHtml(name)}</b>.${canva.isFull(pm[2]) ? '\n⚠️ It is marked full — tap ✔ Not full in /canva if you freed seats.' : ''}`, { parse_mode: 'HTML' }).catch(() => {});
+    } else if (pm[1] === 'unfull') {
+      canva.setFull(pm[2], false);
+      await bot.sendMessage(chatId, `✔ <b>${escapeHtml(name)}</b> is usable again.`, { parse_mode: 'HTML' }).catch(() => {});
+    } else {
+      canva.setLoginTarget(pm[2]);
+      const url = agentChat.canvaLoginUrl ? agentChat.canvaLoginUrl() : '';
+      await bot.sendMessage(chatId, `🔐 The login page now logs in <b>${escapeHtml(name)}</b>.\nLog in with THAT Canva account, then tap "Done" on the page.`,
+        { parse_mode: 'HTML', reply_markup: url ? { inline_keyboard: [[{ text: `🔐 Log in ${name}`.slice(0, 40), url }]] } : undefined }).catch(() => {});
+    }
+    return;
+  }
+  if (q.data === 'canva_menu') { await showCanvaScreen(chatId); return; }
+  if (q.data === 'canva_newacct') {
+    const r = canva.newAccountForLogin();
+    const url = agentChat.canvaLoginUrl ? agentChat.canvaLoginUrl() : '';
+    await bot.sendMessage(chatId, r.ok
+      ? `🔐 <b>${escapeHtml(r.name)}</b> — log in with the NEW Canva account on the page, then tap "Done" there.\n\nOnce you are in, Canva invites go out from <b>${escapeHtml(r.name)}</b> by themselves.`
+      : `❌ ${escapeHtml(r.reason)}`,
+      { parse_mode: 'HTML', reply_markup: (r.ok && url) ? { inline_keyboard: [[{ text: `🔐 Open the login page`, url }]] } : undefined }).catch(() => {});
+    return;
+  }
+  const dm = /^canva_del(ok)?_([a-z0-9]+)$/.exec(q.data || '');
+  if (dm) {
+    if (!dm[1]) {
+      await bot.sendMessage(chatId, `🗑 Remove <b>${escapeHtml(canva.panelName(dm[2]))}</b> and its session?`, { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🗑 Yes, remove', callback_data: `canva_delok_${dm[2]}` }, { text: 'Cancel', callback_data: 'canva_menu' }]] } }).catch(() => {});
+    } else {
+      const r = canva.removePanel(dm[2]);
+      await bot.sendMessage(chatId, r.ok ? '🗑 Removed.' : `❌ ${escapeHtml(r.reason)}`, { parse_mode: 'HTML' }).catch(() => {});
+      await showCanvaScreen(chatId);
+    }
+    return;
+  }
   // WHY results go in MESSAGES, never in the tap popup: the main callback
   // router (handleCallbackQuery) also receives this tap and answers it with an
   // empty reply straight away. Telegram accepts ONE answer per tap, so a popup
@@ -849,7 +937,7 @@ bot.onText(/^\/deposits(?:\s+(.+))?$/i, async (msg, match) => {
   await bot.sendMessage(chatId,
     `⏳ Asking Binance for ${a.days} day(s)${a.network ? ` · network ${escapeHtml(a.network)}` : ''}${a.amount !== null ? ` · amount ${a.amount}` : ''}…`,
     { parse_mode: 'HTML' });
-  await bot.sendMessage(chatId, await dep.render(a), { parse_mode: 'HTML' });
+  await bot.sendMessage(chatId, await dep.render(a), { parse_mode: 'HTML', reply_markup: dep.quickKb() });
 });
 
 // ── Text messages ─────────────────────────────────────────────────────────────
