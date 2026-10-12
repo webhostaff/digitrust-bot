@@ -686,14 +686,32 @@ async function doInvite(page, email, trace) {
   //    and no loose "any button with invite in it" fallback exists that could
   //    land on it.
   await clearSearch(page);
-  const opened = await clickAny(page, [
+  // V159.2: Canva's layout varies — the opener can be a button or a nav/link, labelled "Invite people",
+  // "Invite members", "Invite", or a "+" on the People page. Try them all; verify the dialog each time.
+  let dialog = null;
+  const openers = [
     () => page.getByRole('button', { name: /^invite people$/i }).first(),
-    () => page.getByRole('button', { name: /invite (people|members)/i }).first(),
-  ]);
-  if (!opened) return { reason: 'could not find the "Invite people" button', invited: false };
-  const dialog = await findInviteDialog(page);
-  if (!dialog) return { reason: 'the invite window did not open', invited: false };
-  await sleep(700);
+    () => page.getByRole('button', { name: /invite (people|members|to your team)/i }).first(),
+    () => page.getByRole('link', { name: /invite (people|members)/i }).first(),
+    () => page.getByRole('button', { name: /^invite$/i }).first(),
+    () => page.getByRole('button', { name: /^\+ ?invite/i }).first(),
+    () => page.locator('button:has-text("Invite"), a:has-text("Invite")').first(),
+  ];
+  for (const mk of openers) {
+    try {
+      const el = mk();
+      if (!(await el.count())) continue;
+      await el.click({ timeout: 4000 }).catch(() => {});
+      await sleep(900);
+      await acceptCookies(page);
+      dialog = await findInviteDialog(page);
+      if (dialog) break;
+    } catch (_) {}
+  }
+  if (!dialog) {
+    return { reason: 'the invite window did not open (Canva layout may have changed) — invite by hand, then 🖐', invited: false };
+  }
+  await sleep(500);
   await acceptCookies(page);                 // V158: the banner can come back over the window (owner's screenshot #24075)
   for (const l of await domLinks(page)) addBaseline(trace, l); // anything already shown = team's
 
