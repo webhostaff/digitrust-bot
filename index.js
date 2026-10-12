@@ -726,6 +726,9 @@ function canvaPanelsView(st) {
     if (r.length) rows.push(r);
   }
   lines.push('<i>Team full → 🔐 Log in a NEW Canva account. Once logged in, it is used by itself.</i>', '');
+  rows.push([{ text: '🍪 Paste session (no IP shown)', callback_data: 'canva_paste' }]);
+  const prox = require('./services/canvaBot').getProxy ? require('./services/canvaBot').getProxy() : '';
+  rows.push([{ text: prox ? '🌐 Proxy: on' : '🌐 Proxy (hide IP)', callback_data: 'canva_proxy' }]);
   rows.push([{ text: '🔄 Check login', callback_data: 'canva_check' }, { text: '🔄 Refresh', callback_data: 'canva_menu' }]);
   rows.push([{ text: '🧪 Test browser', callback_data: 'canva_test' }, ...(st.logged_in ? [{ text: '🗑 Forget session', callback_data: 'canva_forget' }] : [])]);
   return { text: lines.join('\n') + '\n', rows };
@@ -778,6 +781,24 @@ bot.on('callback_query', async (q) => {
     return;
   }
   if (q.data === 'canva_menu') { await showCanvaScreen(chatId); return; }
+  if (q.data === 'canva_paste') {
+    session.set(q.from.id, 'AWAIT_CANVA_SESSION', { panel: canva.loginTarget ? canva.loginTarget() : (canva.activeId ? canva.activeId() : 'main') });
+    await bot.sendMessage(chatId,
+      '🍪 <b>Paste the Canva session</b> (this never shows your IP, and nothing clicks around):\n\n' +
+      '1️⃣ In your Chrome on <b>canva.com/settings/people</b> (members list visible).\n' +
+      '2️⃣ Cookie-Editor → <b>Export</b> → <b>JSON</b>.\n' +
+      '3️⃣ If it is short, paste it here. If it is long, send it as a <b>file</b> (📎 → File) — a paste can get cut.\n\n' +
+      '<i>Your message is deleted at once. /cancel to stop.</i>', { parse_mode: 'HTML' });
+    return;
+  }
+  if (q.data === 'canva_proxy') {
+    session.set(q.from.id, 'AWAIT_CANVA_PROXY', {});
+    await bot.sendMessage(chatId,
+      '🌐 <b>Canva proxy</b> — send <code>http://user:pass@host:port</code> to route Canva through another IP, ' +
+      'or <code>off</code> to remove it.\n\n<i>Use it if Canva ever blocks the server address. /cancel to stop.</i>',
+      { parse_mode: 'HTML' });
+    return;
+  }
   if (q.data === 'canva_newacct') {
     const r = canva.newAccountForLogin();
     const url = agentChat.canvaLoginUrl ? agentChat.canvaLoginUrl() : '';
@@ -942,6 +963,47 @@ bot.onText(/^\/deposits(?:\s+(.+))?$/i, async (msg, match) => {
 
 // ── Text messages ─────────────────────────────────────────────────────────────
 bot.on('message', async (msg) => {
+  // ── V159: Canva pasted session / proxy ──────────────────────────────
+  try {
+    const fromId = msg.from && msg.from.id;
+    const stt = fromId && session.get(fromId).state;
+    if (fromId && (stt === 'AWAIT_CANVA_SESSION' || stt === 'AWAIT_CANVA_PROXY') && adminHandler.isAdmin(fromId)) {
+      const canva = require('./services/canvaBot');
+      if (stt === 'AWAIT_CANVA_PROXY') {
+        session.clear(fromId);
+        const v = (msg.text || '').trim();
+        if (/^off$/i.test(v)) { canva.setProxy(''); await bot.sendMessage(msg.chat.id, '🌐 Canva proxy removed.'); }
+        else if (/^https?:\/\//i.test(v)) { canva.setProxy(v); await bot.sendMessage(msg.chat.id, '🌐 Canva proxy set. It is used from the next login/invite.'); }
+        else { await bot.sendMessage(msg.chat.id, '❌ Send http://user:pass@host:port or off.'); }
+        return;
+      }
+      // AWAIT_CANVA_SESSION — accept a pasted text OR a .json/.txt file
+      const data = session.get(fromId).data || {};
+      const panel = data.panel || (canva.activeId ? canva.activeId() : 'main');
+      let raw = msg.text || '';
+      if (msg.document) {
+        try {
+          const f = await bot.getFile(msg.document.file_id);
+          const url = `https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${f.file_path}`;
+          raw = await (await fetch(url)).text();
+        } catch (e) { await bot.sendMessage(msg.chat.id, '❌ Could not read the file.'); return; }
+      }
+      if (!raw || (!raw.trim().startsWith('[') && !raw.trim().startsWith('{') && !raw.includes('name'))) {
+        await bot.sendMessage(msg.chat.id, 'Send the Cookie-Editor JSON export (paste or file), or /cancel.');
+        return;
+      }
+      session.clear(fromId);
+      try { await bot.deleteMessage(msg.chat.id, msg.message_id); } catch (_) {}
+      const status = await bot.sendMessage(msg.chat.id, '⏳ Loading the Canva session…');
+      const r = await canva.importPastedSession(raw, panel);
+      await bot.editMessageText(
+        r.ok ? `✅ Canva session saved (${r.cookies} cookies) for <b>${canva.panelName(panel)}</b> — invites can go out from it.`
+             : `❌ ${r.error}${r.cookies ? ` (${r.cookies} cookies read)` : ''}`,
+        { chat_id: msg.chat.id, message_id: status.message_id, parse_mode: 'HTML' }).catch(() => {});
+      return;
+    }
+  } catch (e) { logger.warn(`[canva paste] ${e.message}`); }
+
   // ── /emoji_id capture handler ──────────────────────────────────────
   try {
     const fromId = msg.from && msg.from.id;

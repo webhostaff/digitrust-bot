@@ -3046,7 +3046,7 @@ bot.on('callback_query', async (q) => {
 async function showPaymentInstructions(chatId, userId, method, amount, orderId) {
   const bep20 = process.env.USDT_BEP20_ADDRESS || '0x...';
   const trc20 = process.env.USDT_TRC20_ADDRESS || 'T...';
-  const binanceId = '263344433';
+  const binanceId = process.env.BINANCE_ID || '';   // V159: was hard-coded 263344433 — now from the env like everywhere else
 
   let txt = '';
   if (method === 'pay_binance') {

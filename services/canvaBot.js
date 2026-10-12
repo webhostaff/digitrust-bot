@@ -137,7 +137,8 @@ function parseSessionText(raw) {
   for (const c of list) {
     if (!c || !c.name || c.value === undefined) continue;
     let domain = String(c.domain || '').trim();
-    if (!/canva\.com$/i.test(domain.replace(/^\./, ''))) continue; // only Canva's own cookies
+    const host = domain.replace(/^\./, '').toLowerCase();
+    if (host !== 'canva.com' && !host.endsWith('.canva.com')) continue; // only Canva's own cookies (not notcanva.com)
     // Cookie-Editor marks host-only cookies with hostOnly:true and no dot;
     // Playwright wants a leading dot for domain-wide ones — keep as exported.
     const expires = typeof c.expires === 'number' ? c.expires
@@ -258,6 +259,38 @@ function panelsStatus() {
 function hasSession(id = activeId()) { try { return fs.statSync(storagePath(id)).size > 50; } catch (_) { return false; } }
 function forgetSession(id = activeId()) { try { fs.unlinkSync(storagePath(id)); } catch (_) {} }
 
+/** V159: save a pasted Cookie-Editor / storage_state export for a panel, then check it reaches the People page. */
+async function importPastedSession(rawText, id = activeId()) {
+  if (!available()) return { ok: false, error: 'Canva automation is off (set CANVA_AUTOMATION=1).' };
+  let state;
+  try { state = parseSessionText(rawText); }
+  catch (e) { return { ok: false, error: `the session is not usable: ${e.message}` }; }
+  ensureDir();
+  fs.writeFileSync(storagePath(id), JSON.stringify(state));
+  setFull(id, false);
+  return exclusive(async () => {
+    let ctx;
+    try {
+      ctx = await newContext(true, id);
+      const page = await ctx.newPage();
+      await page.goto(PEOPLE_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+      const ok = await isOnPeoplePage(page);
+      await saveSession(ctx, id);
+      await ctx.close().catch(() => {});
+      if (!ok) return { ok: false, error: 'the cookies loaded, but Canva did not show the People page (expired or not the team account).', cookies: state.cookies.length };
+      if (mem.getState('canva_activate_on_login', null) === id) { setActive(id); mem.setState('canva_activate_on_login', null); }
+      mem.setState('canva_last_login', new Date().toISOString());
+      return { ok: true, cookies: state.cookies.length, panel: id, panelName: panelName(id) };
+    } catch (e) {
+      try { if (ctx) await ctx.close(); } catch (_) {}
+      return { ok: false, error: e.message.slice(0, 160) };
+    }
+  });
+}
+function setProxy(url) { mem.setState('canva_proxy', (url || '').trim() || null); }
+function getProxy() { return (mem.getState('canva_proxy', null) || process.env.CANVA_PROXY || '').trim(); }
+
+
 // ── One shared browser, one invite at a time ──────────────────────────────────
 
 let browser = null;
@@ -331,14 +364,35 @@ async function selfTest() {
   });
 }
 
+const CANVA_UA = process.env.CANVA_USER_AGENT
+  || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
+
 async function newContext(withSession = true, id = activeId()) {
   const b = await launch();
-  return b.newContext({
+  const major = (CANVA_UA.match(/Chrome\/(\d+)/) || [])[1] || '140';
+  const ctx = await b.newContext({
     storageState: withSession && hasSession(id) ? storagePath(id) : undefined,
     viewport: { width: 1280, height: 800 },
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    userAgent: CANVA_UA,
     locale: 'en-US',
+    timezoneId: process.env.CANVA_TIMEZONE || 'America/New_York',
+    extraHTTPHeaders: {
+      'sec-ch-ua': `"Chromium";v="${major}", "Google Chrome";v="${major}", "Not?A_Brand";v="99"`,
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"',
+      'accept-language': 'en-US,en;q=0.9',
+    },
   });
+  await ctx.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    window.chrome = { runtime: {}, loadTimes: function () {}, csi: function () {}, app: {} };
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+    Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+  });
+  return ctx;
 }
 
 async function saveSession(context, id = activeId()) {
@@ -1028,7 +1082,7 @@ if (ENABLED) { try { importEnvSession(); } catch (_) {} }
 module.exports = {
   available, status, checkLogin, inviteEmail, selfTest,
   startLogin, loginShot, loginClick, loginType, loginKey, finishLogin, endLogin,
-  forgetSession, importEnvSession,
+  forgetSession, importEnvSession, importPastedSession, setProxy, getProxy, parseSessionText,
   newAccountForLogin, panelList, panelsStatus, activeId, setActive, panelName, addPanel, removePanel, renamePanel, setFull, isFull, setLoginTarget, loginTarget, nextUsablePanel,
   _test: { teamSize, storagePath, inviteOnPanel, parseSessionText, resolveDataDir, volumeCheck, findJoinLinks, doInvite, findRow, COPY_HOOK, rememberLink, deliveredElsewhere, isBanned, DATA_DIR, STORAGE },
 };

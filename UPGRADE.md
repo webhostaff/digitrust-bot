@@ -1,3 +1,16 @@
+# V159.1 — Canva: 🍪 Paste session (no IP, professional) · real-browser · optional proxy
+
+The old Canva login drove a visible remote browser click-by-click; some teams/pages made that awkward and it exposed the flow. New, cleaner way:
+- **🍪 Paste session** in /canva: on canva.com/settings/people, Cookie-Editor → Export → JSON → paste it (or send as a file if long). The bot cleans the cookies, loads them, checks it reaches the People page, and saves — no clicking, no IP shown. A file is accepted too (a long paste can be cut by Telegram).
+- The Canva browser now looks like a real Chrome (modern UA 140, sec-ch-ua/accept-language headers, webdriver hidden, window.chrome, plugins, 8 cores, Win32) — the same hardening as the invite bot.
+- **🌐 Proxy (hide IP)** in /canva (or env CANVA_PROXY): route Canva through another address if it is ever blocked by the server IP.
+- Fixed a cookie-domain check that let notcanva.com-style cookies through; now only canva.com and its subdomains are kept.
+The old web login still works; paste is just the clean alternative.
+
+# V159 — ChatGPT Business bot now reads BINANCE_ID from the env (was hard-coded)
+
+The Binance Pay ID shown on the ChatGPT Business payment screen was hard-coded (263344433), so changing BINANCE_ID in Railway did not change it there (the main store bot already read the env correctly). It now reads `process.env.BINANCE_ID` like everywhere else. Change BINANCE_ID, BINANCE_API_KEY, BINANCE_API_SECRET, USDT_BEP20_ADDRESS, USDT_TRC20_ADDRESS, USDT_TON_ADDRESS, USDT_TON_MEMO in Railway and restart — no code change needed for a new account.
+
 # V158.2 — API: best sellers first (for the posting bot)
 
 `GET /api/v2/products?sort=best` lists the products by units delivered in the last 30 days (best sellers first). The counts are not sent. Without `sort=best` nothing changes. Used by POOST v4 to write posts from your best sellers.
