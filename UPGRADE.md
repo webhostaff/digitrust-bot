@@ -1,3 +1,7 @@
+# V160 — 💰 Binance Balance in the admin menu
+
+New button **💰 Binance Balance** (admin menu, next to 📥 Binance Deposits). It reads the wallet with the same API keys the store already uses (read-only): the USDT total split into Funding (where deposits land) and Spot, plus any other coin with a non-zero balance. A 🔄 Refresh button re-reads it. Needs the key's "Enable Reading" permission (already on for deposit verification); the key cannot withdraw.
+
 # V159.2 — Canva invite opens on the current layout ("after invite: 0" fixed)
 
 The invite did nothing ("after invite: 0") because the only openers tried were "Invite people" buttons; on the current Canva layout "Invite people" is a side-nav link and the dialog opens from a "+ Invite" / "Invite members" / "Invite" button. The bot now tries all of those (and ignores the nav link), verifies the dialog actually opened each time, and if none opens it says so clearly ("the invite window did not open — invite by hand, then 🖐") instead of silently reporting 0. The team-wide "Get invite link" is still never clicked.

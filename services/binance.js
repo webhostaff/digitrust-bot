@@ -25,7 +25,7 @@ const axios  = require('axios');
 const config = require('../config');
 const logger = require('../utils/logger');
 
-const BASE_URL = 'https://api.binance.com';
+const BASE_URL = process.env.BINANCE_BASE_URL_TEST || 'https://api.binance.com';
 
 // Binance network codes → human label
 const ALLOWED_NETWORKS = {
@@ -827,7 +827,60 @@ async function listRecentDeposits({ days = 7, limit = 15, network = null, amount
   }
 }
 
+/**
+ * V160: the Binance wallet balance the keys can read. Combines the Funding wallet (where deposits land) and
+ * the Spot wallet, and shows the USDT line plus any other coin with a non-zero balance. Read-only.
+ * @returns {{ok:boolean, usdt?:number, funding?:number, spot?:number, others?:Array, error?:string}}
+ */
+async function fetchBalance() {
+  if (!config.binanceApiKey || !config.binanceApiSecret) {
+    return { ok: false, error: 'Binance API key/secret not set (BINANCE_API_KEY / BINANCE_API_SECRET).' };
+  }
+  const rows = {};              // asset -> { funding, spot }
+  const add = (asset, where, amount) => {
+    const a = String(asset).toUpperCase();
+    const v = Number(amount) || 0;
+    if (!rows[a]) rows[a] = { funding: 0, spot: 0 };
+    rows[a][where] += v;
+  };
+  try {
+    // Funding wallet (deposits arrive here): POST /sapi/v1/asset/get-funding-asset
+    try {
+      const f = await signedPost('/sapi/v1/asset/get-funding-asset', {});
+      for (const r of (f.data || [])) add(r.asset, 'funding', Number(r.free) + Number(r.locked || 0) + Number(r.freeze || 0));
+    } catch (e) { /* some accounts have no funding wallet */ }
+    // Spot wallet: GET /api/v3/account
+    try {
+      const sp = await signedGet('/api/v3/account', {});
+      for (const b of (sp.data.balances || [])) {
+        const amt = Number(b.free) + Number(b.locked);
+        if (amt > 0) add(b.asset, 'spot', amt);
+      }
+    } catch (e) { /* ignore if spot not permitted */ }
+  } catch (e) {
+    return { ok: false, error: `Binance API error: ${e.response?.data?.msg || e.message}` };
+  }
+  if (!Object.keys(rows).length) return { ok: false, error: 'the API returned no balance — check the key permissions (Enable Reading) and IP restriction.' };
+  const usdt = rows.USDT || { funding: 0, spot: 0 };
+  const others = Object.entries(rows)
+    .filter(([a, v]) => a !== 'USDT' && (v.funding + v.spot) >= 0.00000001)
+    .map(([a, v]) => ({ asset: a, total: v.funding + v.spot }))
+    .sort((x, y) => y.total - x.total);
+  return { ok: true, usdt: usdt.funding + usdt.spot, funding: usdt.funding, spot: usdt.spot, others };
+}
+
+/** Signed POST (some wallet endpoints are POST). */
+async function signedPost(path, params = {}) {
+  const timestamp = Date.now();
+  const qs = new URLSearchParams({ ...params, recvWindow: '10000', timestamp: String(timestamp) }).toString();
+  const signature = sign(qs);
+  return axios.post(`${BASE_URL}${path}?${qs}&signature=${signature}`, null, {
+    headers: { 'X-MBX-APIKEY': config.binanceApiKey }, timeout: 15000,
+  });
+}
+
 module.exports = {
+  fetchBalance,
   fetchDepositHistory,
   listRecentDeposits,
   verifyDepositByTxId,

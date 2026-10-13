@@ -2830,6 +2830,29 @@ async function handleAdminCallback(bot, query) {
   if (/^admin_binrep/.test(data) && await reportAdmin.handle(bot, query)) return;
   // 📥 Binance deposits as buttons (V156) — the /deposits command, TON included
   if (/^admin_deps/.test(data) && await require('../services/depositsAdmin').handle(bot, query)) return;
+  if (data === 'admin_balance') {
+    bot.answerCallbackQuery(query.id).catch(() => {});
+    const chatId = query.message.chat.id;
+    await bot.sendMessage(chatId, '⏳ Asking Binance for the wallet balance…');
+    const r = await require('../services/binance').fetchBalance();
+    const fmt = (n) => Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 8 });
+    let text;
+    if (!r.ok) {
+      text = `💰 <b>Binance balance</b>\n\n❌ ${escapeHtml(r.error)}`;
+    } else {
+      text = `💰 <b>Binance wallet balance</b>\n━━━━━━━━━━━━━━━━━━\n` +
+        `💵 <b>USDT: ${fmt(r.usdt)}</b>\n` +
+        `   • Funding (deposits land here): ${fmt(r.funding)}\n` +
+        `   • Spot: ${fmt(r.spot)}\n`;
+      if (r.others && r.others.length) {
+        text += `\n<b>Other coins:</b>\n` + r.others.slice(0, 15).map((o) => `   • ${escapeHtml(o.asset)}: ${fmt(o.total)}`).join('\n');
+      }
+      text += `\n\n<i>Read-only — this key cannot withdraw.</i>`;
+    }
+    await bot.sendMessage(chatId, text, { parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '🔄 Refresh', callback_data: 'admin_balance' }, { text: '🔙 Admin', callback_data: 'admin_panel' }]] } });
+    return;
+  }
   if (/^admin_cgb_emails/.test(data) && await cgbEmailsAdmin.handle(bot, query)) return;
 
   /**
