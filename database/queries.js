@@ -3268,6 +3268,62 @@ module.exports = {
   resetStockAlertFlags: (id) => stock_resetFlags.run(id),
 
   // ═══ V2: support threads ═══
+  // ── V161: replacement stock + requests ──────────────────────────────────
+  // V161.1: move N items from a PRODUCT's sale stock into the replacement pool (sale stock drops by N).
+  replFillFromProduct: (productId, kind, count, byUser) => {
+    const take = Math.max(0, parseInt(count, 10) || 0);
+    if (!take) return { moved: 0, reason: 'count must be at least 1' };
+    const tx = db.transaction(() => {
+      const items = db.prepare(
+        "SELECT id, raw_content FROM product_items WHERE product_id = ? AND status = 'available' ORDER BY id LIMIT ?"
+      ).all(productId, take);
+      let moved = 0;
+      for (const it of items) {
+        // claim the sale item so it can never be sold, then copy it into the pool
+        const claimed = db.prepare("UPDATE product_items SET status = 'moved_to_replacement', sold_at = datetime('now') WHERE id = ? AND status = 'available'").run(it.id).changes;
+        if (!claimed) continue;
+        db.prepare("INSERT INTO replacement_stock (kind, link, added_by) VALUES (?, ?, ?)").run(kind, String(it.raw_content).trim(), byUser);
+        moved++;
+      }
+      return moved;
+    });
+    const moved = tx();
+    return { moved };
+  },
+  productAvailableCount: (productId) =>
+    db.prepare("SELECT COUNT(*) n FROM product_items WHERE product_id = ? AND status = 'available'").get(productId).n,
+
+  replAddStock: (kind, link, addedBy) =>
+    db.prepare("INSERT INTO replacement_stock (kind, link, added_by) VALUES (?, ?, ?)").run(kind, String(link).trim(), addedBy).lastInsertRowid,
+  replStockCounts: () => db.prepare(
+    "SELECT kind, SUM(status='available') AS available, SUM(status='used') AS used, SUM(status='used' AND claimed=0) AS unclaimed FROM replacement_stock GROUP BY kind").all(),
+  replAvailableCount: (kind) => db.prepare("SELECT COUNT(*) n FROM replacement_stock WHERE kind=? AND status='available'").get(kind).n,
+  replTakeOne: (kind, requestId) => {
+    const row = db.prepare("SELECT id, link FROM replacement_stock WHERE kind=? AND status='available' ORDER BY id LIMIT 1").get(kind);
+    if (!row) return null;
+    const changed = db.prepare("UPDATE replacement_stock SET status='used', used_for=?, used_at=datetime('now') WHERE id=? AND status='available'").run(requestId, row.id).changes;
+    return changed ? row : null;   // null if someone grabbed it first
+  },
+  replListStock: (kind, status, limit = 30) =>
+    db.prepare("SELECT * FROM replacement_stock WHERE kind=? AND status=? ORDER BY id DESC LIMIT ?").all(kind, status, limit),
+  replDeleteStock: (id) => db.prepare("DELETE FROM replacement_stock WHERE id=? AND status='available'").run(id).changes,
+  replUnclaimed: (kind) => db.prepare("SELECT * FROM replacement_stock WHERE kind=? AND status='used' AND claimed=0 ORDER BY used_at").all(kind),
+  replClaimAll: (kind) => db.prepare("UPDATE replacement_stock SET claimed=1, claimed_at=datetime('now') WHERE kind=? AND status='used' AND claimed=0").run(kind).changes,
+
+  replCreateRequest: (userId, username, kind, badLink, reason, detail) =>
+    db.prepare("INSERT INTO replacement_requests (user_id, username, kind, bad_link, reason, detail) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(userId, username || null, kind, badLink || null, reason || null, detail || null).lastInsertRowid,
+  replGetRequest: (id) => db.prepare("SELECT * FROM replacement_requests WHERE id=?").get(id),
+  replPendingRequests: (limit = 30) => db.prepare("SELECT * FROM replacement_requests WHERE status='pending' ORDER BY created_at LIMIT ?").all(limit),
+  replPendingCount: () => db.prepare("SELECT COUNT(*) n FROM replacement_requests WHERE status='pending'").get().n,
+  replOpenRequestForUser: (userId, kind) => db.prepare("SELECT * FROM replacement_requests WHERE user_id=? AND kind=? AND status='pending' ORDER BY id DESC LIMIT 1").get(userId, kind),
+  replSetRequest: (id, fields) => {
+    const allow = ['status', 'stock_id', 'sent_link', 'handled_by', 'handled_at', 'bad_link', 'reason', 'detail'];
+    const sets = Object.keys(fields).filter((k) => allow.includes(k));
+    if (!sets.length) return;
+    db.prepare(`UPDATE replacement_requests SET ${sets.map((k) => `${k}=?`).join(', ')} WHERE id=?`).run(...sets.map((k) => fields[k]), id);
+  },
+
   ensureSupportThread: (userId) => { th_ensure.run(userId); return th_get.get(userId); },
   getSupportThread:    (userId) => th_get.get(userId),
   markSupportWelcomed: (userId) => th_setWelcomed.run(userId),

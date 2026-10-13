@@ -1,3 +1,19 @@
+# V161.1 — ⤵️ Fill the spare pool from sale stock
+
+In ♻️ Replacements → 📦 Spare links, a new button **⤵️ Take from sale stock (N available)**. Enter a number; the bot moves that many links from the sale stock of the Gemini product (#10 by default, setting `repl_source_product_id`) into the spare pool. The sale stock drops by exactly that many (100 → 90), the moved links are marked `moved_to_replacement` so they can never be sold, and the spare pool grows by the same count. Asking for more than available moves only what exists. Change the source product any time with the setting.
+
+# V161 — ♻️ Gemini link replacement in the support bot (self-serve, spare stock)
+
+**Customer (support bot):** /start now shows a clean menu. "♻️ Replace a Gemini link that stopped working" → "What is happening?" → "🚫 The link does not work" → paste the dead link. The customer is thanked ("we're checking, a fresh link is coming"). "❓ Something else" or "💬 Something else — talk to support" drops into the normal chat. Minimal taps, friendly wording.
+
+**Staff (♻️ Replacements in the bar):**
+- Each request shows the customer, the dead link to check, and how many spare links are in stock.
+- **✅ Send a working link now** takes one from the spare pool and delivers it to the customer instantly (no buying first). **🔗 Send a link I paste** sends one you type. **❌ Reject** tells the customer it looks fine.
+- **📦 Spare links:** add as many as you want by pasting them (one per line). The pool is used oldest-first.
+- The bot counts every spare link used; **📥 Claim N back from supplier** marks them reclaimed in one tap, so you can request the compensation from the supplier for exactly that many.
+
+New tables: replacement_stock, replacement_requests. Nothing is bought automatically; staff always deliver from the pre-loaded pool.
+
 # V160 — 💰 Binance Balance in the admin menu
 
 New button **💰 Binance Balance** (admin menu, next to 📥 Binance Deposits). It reads the wallet with the same API keys the store already uses (read-only): the USDT total split into Funding (where deposits land) and Spot, plus any other coin with a non-zero balance. A 🔄 Refresh button re-reads it. Needs the key's "Enable Reading" permission (already on for deposit verification); the key cannot withdraw.

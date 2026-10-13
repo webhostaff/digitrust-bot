@@ -276,6 +276,7 @@ const BTN = {
   DELIVERY: '📦 Delivery',
   STOCK:    '🔴 Out of Stock',
   REFUNDS:  '🔄 Refunds',
+  REPL:     '♻️ Replacements',
 };
 
 /**
@@ -300,7 +301,7 @@ function staffKeyboard() {
     keyboard: [
       [{ text: lbl(BTN.INBOX, n.inbox) },       { text: lbl(BTN.PAYMENTS, n.payments) }],
       [{ text: lbl(BTN.DELIVERY, n.delivery) }, { text: lbl(BTN.STOCK, n.stock) }],
-      [{ text: lbl(BTN.REFUNDS, n.refunds) }],
+      [{ text: lbl(BTN.REFUNDS, n.refunds) }, { text: lbl(BTN.REPL, (queries.replPendingCount ? queries.replPendingCount() : 0)) }],
     ],
     resize_keyboard: true,
     is_persistent: true,
@@ -1207,22 +1208,20 @@ bot.onText(/^\/start/, async (msg) => {
     return;
   }
 
-  // Customers: the welcome is sent exactly once, ever.
-  const thread = queries.ensureSupportThread(userId);
-  if (!thread.welcomed) {
-    const welcome = queries.getSetting(
-      'support_welcome_message',
-      '👋 Welcome to Customer Support!\n\nSend your question here and our team will reply as soon as possible.'
-    );
-    await bot.sendMessage(msg.chat.id, welcome, { parse_mode: 'HTML' }).catch(() => {});
-    queries.markSupportWelcomed(userId);
-  } else {
-    await bot.sendMessage(
-      msg.chat.id,
-      '💬 You can continue the conversation here — just send your message.'
-    ).catch(() => {});
-  }
+  queries.ensureSupportThread(userId);
+  queries.markSupportWelcomed(userId);
+  await showCustomerMenu(msg.chat.id);
 });
+
+/** V161: the customer's home — one clear choice, easy on the eyes. */
+async function showCustomerMenu(chatId) {
+  await bot.sendMessage(chatId,
+    '👋 <b>Hi! How can we help?</b>\n\nPick one below, or just type your message.',
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+      [{ text: '♻️ Replace a Gemini link that stopped working', callback_data: 'rc_start_gemini' }],
+      [{ text: '💬 Something else — talk to support', callback_data: 'rc_talk' }],
+    ] } }).catch(() => {});
+}
 
 bot.onText(/^\/inbox/, async (msg) => {
   if (isStaff(msg.from.id)) await showInbox(msg.chat.id);
@@ -1259,8 +1258,126 @@ bot.onText(/^\/close/, async (msg) => {
 // CALLBACKS
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ════════════════════════════════════════════════════════════════════════════
+// V161: CUSTOMER REPLACEMENT FLOW — "Gemini link dead?" → record it → staff sends a spare
+// ════════════════════════════════════════════════════════════════════════════
+const KIND_LABEL = { gemini: 'Gemini' };
+function replState(userId) { return queries.getSetting(`repl_state_${userId}`, '') || ''; }
+function setReplState(userId, v) { queries.setSetting(`repl_state_${userId}`, v || ''); }
+
+async function handleCustomerReplacementCb(q, data) {
+  const userId = q.from.id;
+  const chatId = q.message.chat.id;
+  if (data === 'rc_talk') {
+    setReplState(userId, '');
+    await bot.sendMessage(chatId, '💬 Go ahead — type your message and our team will reply here.').catch(() => {});
+    return;
+  }
+  const mGem = /^rc_start_(\w+)$/.exec(data);
+  if (mGem) {
+    const kind = mGem[1];
+    setReplState(userId, '');
+    await bot.sendMessage(chatId,
+      `♻️ <b>${KIND_LABEL[kind] || kind} link replacement</b>\n\nWhat is happening with it?`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+        [{ text: '🚫 The link does not work', callback_data: `rc_dead_${kind}` }],
+        [{ text: '❓ Something else', callback_data: `rc_other_${kind}` }],
+        [{ text: '🔙 Back', callback_data: 'rc_menu' }],
+      ] } }).catch(() => {});
+    return;
+  }
+  if (data === 'rc_menu') { await showCustomerMenu(chatId); return; }
+  const mDead = /^rc_dead_(\w+)$/.exec(data);
+  if (mDead) {
+    const kind = mDead[1];
+    setReplState(userId, `AWAIT_BAD_LINK:${kind}`);
+    await bot.sendMessage(chatId,
+      '🔗 Please <b>paste the link that is not working</b> here.\n\n<i>Send just the link in one message.</i>',
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: `rc_start_${kind}` }]] } }).catch(() => {});
+    return;
+  }
+  const mOther = /^rc_other_(\w+)$/.exec(data);
+  if (mOther) {
+    const kind = mOther[1];
+    setReplState(userId, `AWAIT_OTHER_DETAIL:${kind}`);
+    await bot.sendMessage(chatId,
+      '✍️ Tell us briefly what the problem is, and our team will help.',
+      { parse_mode: 'HTML' }).catch(() => {});
+    return;
+  }
+}
+
+/** Customer sent text while a replacement state is active. Returns true if it was consumed. */
+async function handleCustomerReplacementText(msg) {
+  const userId = msg.from.id;
+  const chatId = msg.chat.id;
+  const state = replState(userId);
+  if (!state) return false;
+  const text = (msg.text || '').trim();
+
+  if (state.startsWith('AWAIT_BAD_LINK:')) {
+    const kind = state.split(':')[1];
+    if (!text || !/https?:\/\/|\./.test(text)) {
+      await bot.sendMessage(chatId, '❌ That does not look like a link. Please paste the full link, or tap 🔙 Back.').catch(() => {});
+      return true;
+    }
+    setReplState(userId, '');
+    const existing = queries.replOpenRequestForUser(userId, kind);
+    let reqId;
+    if (existing) {
+      queries.replSetRequest(existing.id, { bad_link: text, reason: 'link_dead' });
+      reqId = existing.id;
+    } else {
+      reqId = queries.replCreateRequest(userId, msg.from.username, kind, text, 'link_dead', null);
+    }
+    await bot.sendMessage(chatId,
+      '✅ <b>Got it — thank you.</b>\n\nWe are checking your link now. As soon as it is confirmed, we will send you a fresh working link right here. 🙏',
+      { parse_mode: 'HTML' }).catch(() => {});
+    await notifyReplacementStaff(reqId);
+    return true;
+  }
+  if (state.startsWith('AWAIT_OTHER_DETAIL:')) {
+    const kind = state.split(':')[1];
+    setReplState(userId, '');
+    queries.replCreateRequest(userId, msg.from.username, kind, null, 'other', text);
+    await bot.sendMessage(chatId, '✅ Thank you — your message reached our team. We will reply here shortly.').catch(() => {});
+    // also drop it into the normal support thread so staff see it in the inbox
+    insertMsg.run(userId, msg.from.username, msg.from.first_name, 'in', `[Replacement · other] ${text}`, null, null);
+    await updateReceiptSent(userId).catch(() => {});
+    return true;
+  }
+  return false;
+}
+
+async function notifyReplacementStaff(reqId) {
+  const r = queries.replGetRequest(reqId);
+  if (!r) return;
+  const avail = queries.replAvailableCount(r.kind);
+  await notifyAdmin(bot, {
+    type: 'replacement_request',
+    title: `Replacement request #${r.id}`,
+    body:
+      `♻️ <b>${KIND_LABEL[r.kind] || r.kind} link replacement</b> · #${r.id}\n` +
+      `👤 ${r.username ? '@' + escapeHtml(r.username) : ''} <code>${r.user_id}</code>\n` +
+      (r.bad_link ? `🔗 Dead link:\n<code>${escapeHtml(r.bad_link)}</code>\n` : '') +
+      `📦 Spare ${KIND_LABEL[r.kind] || r.kind} links in stock: <b>${avail}</b>`,
+    dedupeKey: `replacement_request:${r.id}`,
+    refType: 'replacement_request',
+    refId: r.id,
+    buttons: [[{ text: '♻️ Open request', callback_data: `rq_open_${r.id}` }]],
+  }).catch(() => {});
+}
+
 bot.on('callback_query', async (q) => {
+  // ── V161: customer-side replacement flow (runs for non-staff) ──────────
   if (!isStaff(q.from.id)) {
+    const d = q.data || '';
+    if (/^rc_/.test(d)) {
+      await bot.answerCallbackQuery(q.id).catch(() => {});
+      try { await handleCustomerReplacementCb(q, d); }
+      catch (e) { logger.warn(`[repl] customer cb ${d}: ${e.message}`); }
+      return;
+    }
     await bot.answerCallbackQuery(q.id, { text: 'Not authorized', show_alert: true }).catch(() => {});
     return;
   }
@@ -1273,6 +1390,50 @@ bot.on('callback_query', async (q) => {
 
   try {
     if (data === 'noop') return;
+
+    // ── V161: replacements (staff) ──────────────────────────────────────
+    if (data === 'rq_home')  { await showReplacementsHome(chatId, msgId); return; }
+    if (data === 'rq_stock') { await showReplStock(chatId, msgId); return; }
+    if (data === 'rq_addstock') {
+      queries.setSetting(`support_state_${chatId}`, 'AWAIT_REPL_STOCK');
+      await bot.sendMessage(chatId, '➕ Send the working links now — one per line. I will add them all to the spare pool.');
+      return;
+    }
+    if (data === 'rq_fill') {
+      const avail = queries.productAvailableCount(replProductId());
+      if (!avail) { await bot.sendMessage(chatId, `⚠️ The sale stock of product #${replProductId()} is empty. Upload stock first, or add links by hand.`); return; }
+      queries.setSetting(`support_state_${chatId}`, 'AWAIT_REPL_FILL');
+      await bot.sendMessage(chatId, `⤵️ How many links to move from the sale stock into the spare pool?\n\nThere are <b>${avail}</b> available. Send a number (e.g. <code>10</code>).`, { parse_mode: 'HTML' });
+      return;
+    }
+    if (data === 'rq_claim') {
+      const n = queries.replClaimAll(REPL_KIND);
+      await bot.answerCallbackQuery(q.id, { text: `✅ ${n} marked as claimed` }).catch(() => {});
+      await showReplacementsHome(chatId, msgId);
+      return;
+    }
+    let mrq = /^rq_open_(\d+)$/.exec(data);
+    if (mrq) { await showReplacementRequest(chatId, msgId, parseInt(mrq[1], 10)); return; }
+    mrq = /^rq_send_(\d+)$/.exec(data);
+    if (mrq) { await sendReplacement(chatId, msgId, parseInt(mrq[1], 10), q.from.id, null); return; }
+    mrq = /^rq_reject_(\d+)$/.exec(data);
+    if (mrq) {
+      const id = parseInt(mrq[1], 10);
+      const r = queries.replGetRequest(id);
+      if (r && r.status === 'pending') {
+        queries.replSetRequest(id, { status: 'rejected', handled_by: q.from.id, handled_at: new Date().toISOString() });
+        await bot.sendMessage(r.user_id, 'ℹ️ We checked your link and it appears to be working. If you still have trouble, reply here with a screenshot and we will help.', { parse_mode: 'HTML' }).catch(() => {});
+      }
+      await bot.answerCallbackQuery(q.id, { text: 'Rejected — customer told' }).catch(() => {});
+      await showReplacementsHome(chatId, msgId);
+      return;
+    }
+    mrq = /^rq_manual_(\d+)$/.exec(data);
+    if (mrq) {
+      queries.setSetting(`support_state_${chatId}`, `AWAIT_REPL_MANUAL:${mrq[1]}`);
+      await bot.sendMessage(chatId, '🔗 Paste the working link to send to this customer.');
+      return;
+    }
 
     if (data === 'inbox')           { await showInbox(chatId, msgId); return; }
 
@@ -1800,9 +1961,44 @@ bot.on('message', async (msg) => {
         await showManualList(chatId, null, 'pending', 0);
       } else if (barKey === 'STOCK') {
         await showStockAlerts(chatId, null, 'all', 0);
-      } else {
+      } else if (barKey === 'REFUNDS') {
         await showRefunds(chatId, null, 0);
+      } else {
+        await showReplacementsHome(chatId, null);
       }
+      return;
+    }
+
+    // ── V161: replacement stock / manual link (staff text) ────────────────
+    if (state === 'AWAIT_REPL_FILL') {
+      queries.setSetting(`support_state_${chatId}`, '');
+      const n = parseInt(text.replace(/[^0-9]/g, ''), 10);
+      if (!n || n < 1) { await bot.sendMessage(chatId, '❌ Send a number, e.g. 10.'); return; }
+      const avail = queries.productAvailableCount(replProductId());
+      const want = Math.min(n, avail);
+      const r = queries.replFillFromProduct(replProductId(), REPL_KIND, want, userId);
+      await bot.sendMessage(chatId,
+        `✅ Moved <b>${r.moved}</b> link(s) from sale stock → spare pool.\n` +
+        (n > avail ? `⚠️ You asked for ${n} but only ${avail} were in sale stock.\n` : '') +
+        `🛒 Sale stock now: <b>${queries.productAvailableCount(replProductId())}</b> · 📦 Spare pool: <b>${queries.replAvailableCount(REPL_KIND)}</b>`,
+        { parse_mode: 'HTML' });
+      await showReplStock(chatId, null);
+      return;
+    }
+    if (state === 'AWAIT_REPL_STOCK') {
+      queries.setSetting(`support_state_${chatId}`, '');
+      const links = text.split(/\r?\n/).map((x) => x.trim()).filter((x) => x && /https?:\/\/|\./.test(x));
+      let n = 0;
+      for (const l of links) { queries.replAddStock(REPL_KIND, l, userId); n++; }
+      await bot.sendMessage(chatId, n ? `✅ Added ${n} spare ${KIND_LABEL[REPL_KIND]} link(s).` : '❌ No valid link found. Send one link per line.');
+      if (n) await showReplStock(chatId, null);
+      return;
+    }
+    if (state.startsWith('AWAIT_REPL_MANUAL:')) {
+      const reqId = parseInt(state.split(':')[1], 10);
+      queries.setSetting(`support_state_${chatId}`, '');
+      if (!text || !/https?:\/\/|\./.test(text)) { await bot.sendMessage(chatId, '❌ That is not a link.'); return; }
+      await sendReplacement(chatId, null, reqId, userId, text);
       return;
     }
 
@@ -1929,6 +2125,10 @@ bot.on('message', async (msg) => {
   else if (msg.voice)    { fileId = msg.voice.file_id;    mediaType = 'voice'; }
   else if (msg.video)    { fileId = msg.video.file_id;    mediaType = 'video'; }
 
+  // V161: if the customer is mid-replacement-flow, consume the text here.
+  try { if (await handleCustomerReplacementText(msg)) return; }
+  catch (e) { logger.warn(`[repl] text: ${e.message}`); }
+
   const thread = queries.ensureSupportThread(userId);
 
   // One-time welcome — this replaces the old per-message auto-reply.
@@ -1970,6 +2170,104 @@ bot.on('message', async (msg) => {
     logger.warn(`Support staff alert failed: ${e.message}`);
   }
 });
+
+// ════════════════════════════════════════════════════════════════════════════
+// V161: STAFF — replacement requests + spare-link stock
+// ════════════════════════════════════════════════════════════════════════════
+const REPL_KIND = 'gemini';   // the one family for now; easy to extend
+function replProductId() { return parseInt(queries.getSetting('repl_source_product_id', '10'), 10) || 10; }
+
+async function showReplacementsHome(chatId, messageId) {
+  const pending = queries.replPendingRequests(20);
+  const counts = queries.replStockCounts().find((c) => c.kind === REPL_KIND) || { available: 0, used: 0, unclaimed: 0 };
+  let txt = `♻️ <b>Replacements</b>\n━━━━━━━━━━━━━━━━━━\n` +
+    `📦 Spare ${KIND_LABEL[REPL_KIND]} links: <b>${counts.available || 0}</b> ready\n` +
+    `✅ Used so far: <b>${counts.used || 0}</b>` + ((counts.unclaimed || 0) ? ` · 🟠 <b>${counts.unclaimed}</b> to claim back from supplier` : '') + `\n\n`;
+  const rows = [];
+  if (pending.length) {
+    txt += `🔴 <b>${pending.length} waiting:</b>\n`;
+    for (const r of pending.slice(0, 10)) {
+      txt += `• #${r.id} ${r.username ? '@' + escapeHtml(r.username) : r.user_id} — ${r.reason === 'link_dead' ? 'dead link' : 'other'}\n`;
+      rows.push([{ text: `♻️ #${r.id} ${r.username ? '@' + r.username : r.user_id}`.slice(0, 40), callback_data: `rq_open_${r.id}` }]);
+    }
+  } else {
+    txt += `✅ No replacement waiting.\n`;
+  }
+  rows.push([{ text: `📦 Spare links (${counts.available || 0})`, callback_data: 'rq_stock' }]);
+  if ((counts.unclaimed || 0) > 0) rows.push([{ text: `📥 Claim ${counts.unclaimed} back from supplier`, callback_data: 'rq_claim' }]);
+  const opts = { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } };
+  if (messageId) await bot.editMessageText(txt, { chat_id: chatId, message_id: messageId, ...opts }).catch(() => bot.sendMessage(chatId, txt, opts));
+  else await bot.sendMessage(chatId, txt, opts);
+}
+
+async function showReplacementRequest(chatId, messageId, reqId) {
+  const r = queries.replGetRequest(reqId);
+  if (!r) { await bot.sendMessage(chatId, '❌ Request not found.'); return; }
+  const avail = queries.replAvailableCount(r.kind);
+  const done = r.status !== 'pending';
+  let txt = `♻️ <b>Replacement #${r.id}</b> · ${KIND_LABEL[r.kind] || r.kind}\n━━━━━━━━━━━━━━━━━━\n` +
+    `👤 ${r.username ? '@' + escapeHtml(r.username) : ''} <code>${r.user_id}</code>\n` +
+    `📋 Reason: ${r.reason === 'link_dead' ? '🚫 link does not work' : '❓ ' + escapeHtml(r.detail || 'other')}\n`;
+  if (r.bad_link) txt += `\n🔗 <b>The link they say is dead</b> (check it):\n<code>${escapeHtml(r.bad_link)}</code>\n`;
+  txt += `\n📦 Spare ${KIND_LABEL[r.kind] || r.kind} links ready: <b>${avail}</b>\n`;
+  if (done) txt += `\n<b>Status:</b> ${r.status === 'replaced' ? '✅ replaced' : r.status === 'rejected' ? '❌ rejected' : r.status}\n` + (r.sent_link ? `Sent: <code>${escapeHtml(r.sent_link)}</code>` : '');
+  const rows = [];
+  if (!done) {
+    if (avail > 0) rows.push([{ text: '✅ Send a working link now', callback_data: `rq_send_${r.id}` }]);
+    else rows.push([{ text: '⚠️ No spare link — add stock first', callback_data: 'rq_stock' }]);
+    rows.push([{ text: '🔗 Send a link I paste', callback_data: `rq_manual_${r.id}` }, { text: '❌ Reject', callback_data: `rq_reject_${r.id}` }]);
+    rows.push([{ text: '💬 Open chat', callback_data: `chat_${r.user_id}` }]);
+  }
+  rows.push([{ text: '🔙 Replacements', callback_data: 'rq_home' }]);
+  const opts = { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } };
+  if (messageId) await bot.editMessageText(txt, { chat_id: chatId, message_id: messageId, ...opts }).catch(() => bot.sendMessage(chatId, txt, opts));
+  else await bot.sendMessage(chatId, txt, opts);
+}
+
+/** Give the customer a working link: from stock, or one the staff pastes. */
+async function sendReplacement(chatId, messageId, reqId, staffId, manualLink) {
+  const r = queries.replGetRequest(reqId);
+  if (!r || r.status !== 'pending') { await bot.sendMessage(chatId, 'ℹ️ Already handled.'); return; }
+  let link = manualLink, stockId = null;
+  if (!link) {
+    const row = queries.replTakeOne(r.kind, r.id);
+    if (!row) { await bot.sendMessage(chatId, '⚠️ No spare link left — add stock first (📦 Spare links).'); return; }
+    link = row.link; stockId = row.id;
+  }
+  queries.replSetRequest(r.id, { status: 'replaced', stock_id: stockId, sent_link: link, handled_by: staffId, handled_at: new Date().toISOString() });
+  // deliver to the customer in their support chat
+  try {
+    const sent = await bot.sendMessage(r.user_id,
+      `✅ <b>Here is your new working ${KIND_LABEL[r.kind] || r.kind} link</b> 🎉\n\n<code>${escapeHtml(link)}</code>\n\nSorry for the trouble — enjoy!`,
+      { parse_mode: 'HTML' });
+    insertMsg.run(r.user_id, null, null, 'out', `[Replacement sent] ${link}`, null, null);
+    if (sent && sent.message_id) rawDb.prepare('UPDATE support_messages SET tg_msg_id = ? WHERE id = ?').run(sent.message_id, rawDb.prepare('SELECT last_insert_rowid() AS id').get().id);
+  } catch (e) {
+    await bot.sendMessage(chatId, `⚠️ Saved, but could not message the customer: ${e.message}`);
+  }
+  await bot.sendMessage(chatId, `✅ Sent a working link to ${r.username ? '@' + escapeHtml(r.username) : r.user_id}.${stockId ? ' (from stock)' : ''}`, { parse_mode: 'HTML' });
+  await showReplacementsHome(chatId, null);
+}
+
+async function showReplStock(chatId, messageId) {
+  const avail = queries.replListStock(REPL_KIND, 'available', 20);
+  const counts = queries.replStockCounts().find((c) => c.kind === REPL_KIND) || { available: 0, used: 0, unclaimed: 0 };
+  let txt = `📦 <b>Spare ${KIND_LABEL[REPL_KIND]} links</b>\n━━━━━━━━━━━━━━━━━━\n` +
+    `Ready: <b>${counts.available || 0}</b> · Used: <b>${counts.used || 0}</b>` + ((counts.unclaimed || 0) ? ` · 🟠 ${counts.unclaimed} to claim` : '') + `\n\n` +
+    `<i>Add links by sending them here — one per line, as many as you like.</i>\n\n`;
+  if (avail.length) txt += avail.slice(0, 10).map((x) => `• <code>${escapeHtml(x.link.slice(0, 60))}</code>`).join('\n');
+  const saleStock = queries.productAvailableCount(replProductId());
+  txt += `\n\n🛒 In the sale stock of product #${replProductId()}: <b>${saleStock}</b> link(s).`;
+  const rows = [
+    [{ text: `⤵️ Take from sale stock (${saleStock} available)`, callback_data: 'rq_fill' }],
+    [{ text: '➕ Add links by hand', callback_data: 'rq_addstock' }],
+  ];
+  if ((counts.unclaimed || 0) > 0) rows.push([{ text: `📥 Claim ${counts.unclaimed} back from supplier`, callback_data: 'rq_claim' }]);
+  rows.push([{ text: '🔙 Replacements', callback_data: 'rq_home' }]);
+  const opts = { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } };
+  if (messageId) await bot.editMessageText(txt, { chat_id: chatId, message_id: messageId, ...opts }).catch(() => bot.sendMessage(chatId, txt, opts));
+  else await bot.sendMessage(chatId, txt, opts);
+}
 
 bot.on('polling_error', (err) => {
   logger.warn(`Support bot polling error: ${err.message}`);

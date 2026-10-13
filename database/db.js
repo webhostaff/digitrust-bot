@@ -708,6 +708,43 @@ db.exec(`
   );
 `);
 
+// ── V161: replacement (compensation) feature ────────────────────────────────
+// A pool of spare working links the staff pre-load (e.g. Gemini). When a customer's
+// link is dead, support hands one from the pool instantly, and the bot counts how
+// many were used so the owner can claim them back from the supplier in one tap.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS replacement_stock (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT    NOT NULL DEFAULT 'gemini',   -- which product family
+    link        TEXT    NOT NULL,
+    status      TEXT    NOT NULL DEFAULT 'available', -- available | used
+    added_by    INTEGER,
+    added_at    TEXT    DEFAULT (datetime('now')),
+    used_for    INTEGER,                              -- the replacement_requests.id it was given to
+    used_at     TEXT,
+    claimed     INTEGER NOT NULL DEFAULT 0,           -- 1 once the owner reclaimed it from the supplier
+    claimed_at  TEXT
+  );
+  CREATE INDEX IF NOT EXISTS repl_stock_avail ON replacement_stock(kind, status);
+
+  CREATE TABLE IF NOT EXISTS replacement_requests (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id      INTEGER NOT NULL,
+    username     TEXT,
+    kind         TEXT    NOT NULL DEFAULT 'gemini',
+    bad_link     TEXT,                                -- the link the customer says is dead
+    reason       TEXT,                                -- 'link_dead' | 'other'
+    detail       TEXT,                                -- free text for "other"
+    status       TEXT    NOT NULL DEFAULT 'pending',  -- pending | replaced | rejected | closed
+    stock_id     INTEGER,                             -- the replacement_stock row given
+    sent_link    TEXT,
+    created_at   TEXT    DEFAULT (datetime('now')),
+    handled_by   INTEGER,
+    handled_at   TEXT
+  );
+  CREATE INDEX IF NOT EXISTS repl_req_status ON replacement_requests(status, created_at);
+`);
+
 // ── manual_deliveries ────────────────────────────────────────────────────────
 // A paid order that needs a human to hand over the product.
 // UNIQUE(order_id) is the duplicate guard: an order can never open two tasks.
