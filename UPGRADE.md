@@ -1,3 +1,9 @@
+# V161.3 — replacement reachable from an ordinary chat too
+
+The replace buttons only appeared inside a replacement request, so a customer who wrote the old way ("link don't work" + pasted the link) left staff with no button.
+- **In any chat** (💬 open a conversation) there is now **♻️ Send replacement**: one tap opens (or reuses) a replacement request for that exact customer, with the usual ✅ Send a working link / 🔗 paste a link / ❌ reject.
+- **Customer nudge:** when a customer types "link not working" or pastes a Gemini link outside the menu, the bot offers a one-tap **♻️ Replace my Gemini link** button (at most once every 6h, never naggy) so they fall into the clean flow.
+
 # V161.2 — fill from sale stock also lowers the product's shown Stock
 
 The ⤵️ move changed the links but not the product's `stock_quantity` counter, so the card still said 106 while the real items were fewer. The move now lowers `stock_quantity` by the same amount, so the card and the pool agree (take 10 → card drops by 10). Note: if the card and the item count already disagreed before this (e.g. 106 shown vs 100 items), that older gap stays until you set the stock to the real number in the admin product screen.

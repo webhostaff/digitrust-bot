@@ -705,7 +705,8 @@ async function showChat(staffChatId, targetUserId, page = 0, messageId = null) {
     { text: '📋 Copy text',   callback_data: `cpy_list_${targetUserId}` },
     { text: '🗑 Recall reply', callback_data: `del_list_${targetUserId}` },
   ]);
-  kbRows.push([{ text: '📦 Their orders', callback_data: `cust_orders_${targetUserId}` }]);
+  kbRows.push([{ text: '📦 Their orders', callback_data: `cust_orders_${targetUserId}` },
+    { text: '♻️ Send replacement', callback_data: `rq_new_${targetUserId}` }]);
   kbRows.push([
     { text: '🔄 Refresh', callback_data: `chat_p_${targetUserId}_${currentPage}` },
     { text: '🔙 Inbox',   callback_data: 'inbox' },
@@ -1412,7 +1413,19 @@ bot.on('callback_query', async (q) => {
       await showReplacementsHome(chatId, msgId);
       return;
     }
-    let mrq = /^rq_open_(\d+)$/.exec(data);
+    let mrq = /^rq_new_(\d+)$/.exec(data);
+    if (mrq) {
+      const uid = parseInt(mrq[1], 10);
+      let req = queries.replOpenRequestForUser(uid, REPL_KIND);
+      if (!req) {
+        const u = queries.getUser(uid);
+        const id = queries.replCreateRequest(uid, u?.username, REPL_KIND, null, 'link_dead', 'opened by staff from chat');
+        req = queries.replGetRequest(id);
+      }
+      await showReplacementRequest(chatId, msgId, req.id);
+      return;
+    }
+    mrq = /^rq_open_(\d+)$/.exec(data);
     if (mrq) { await showReplacementRequest(chatId, msgId, parseInt(mrq[1], 10)); return; }
     mrq = /^rq_send_(\d+)$/.exec(data);
     if (mrq) { await sendReplacement(chatId, msgId, parseInt(mrq[1], 10), q.from.id, null); return; }
@@ -2128,6 +2141,22 @@ bot.on('message', async (msg) => {
   // V161: if the customer is mid-replacement-flow, consume the text here.
   try { if (await handleCustomerReplacementText(msg)) return; }
   catch (e) { logger.warn(`[repl] text: ${e.message}`); }
+
+  // V161.3: a customer writing the old way ("link not working" / a Gemini link) is gently offered the menu once.
+  try {
+    const t = (msg.text || '').toLowerCase();
+    const looksGemini = /gemini|one\.google\.com|38742386\.top|activate-plan/.test(t);
+    const looksBroken = /(n'?t|not|don'?t|doesn'?t|stop|dead|expire|invalid).{0,15}(work|open|valid)|لا ?يعمل|ما ?يخدم|not working/.test(t);
+    if ((looksGemini || looksBroken) && !replState(userId)) {
+      const last = queries.getSetting(`repl_nudge_${userId}`, '0');
+      if (Date.now() - Number(last) > 6 * 3600 * 1000) {   // at most once every 6h, never naggy
+        queries.setSetting(`repl_nudge_${userId}`, String(Date.now()));
+        await bot.sendMessage(chatId,
+          '♻️ Is this about a <b>Gemini link that stopped working</b>? Tap below and we will replace it fast:',
+          { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '♻️ Replace my Gemini link', callback_data: 'rc_start_gemini' }]] } }).catch(() => {});
+      }
+    }
+  } catch (_) {}
 
   const thread = queries.ensureSupportThread(userId);
 
