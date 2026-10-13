@@ -1,3 +1,7 @@
+# V161.2 — fill from sale stock also lowers the product's shown Stock
+
+The ⤵️ move changed the links but not the product's `stock_quantity` counter, so the card still said 106 while the real items were fewer. The move now lowers `stock_quantity` by the same amount, so the card and the pool agree (take 10 → card drops by 10). Note: if the card and the item count already disagreed before this (e.g. 106 shown vs 100 items), that older gap stays until you set the stock to the real number in the admin product screen.
+
 # V161.1 — ⤵️ Fill the spare pool from sale stock
 
 In ♻️ Replacements → 📦 Spare links, a new button **⤵️ Take from sale stock (N available)**. Enter a number; the bot moves that many links from the sale stock of the Gemini product (#10 by default, setting `repl_source_product_id`) into the spare pool. The sale stock drops by exactly that many (100 → 90), the moved links are marked `moved_to_replacement` so they can never be sold, and the spare pool grows by the same count. Asking for more than available moves only what exists. Change the source product any time with the setting.

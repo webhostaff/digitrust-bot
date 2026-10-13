@@ -3285,6 +3285,8 @@ module.exports = {
         db.prepare("INSERT INTO replacement_stock (kind, link, added_by) VALUES (?, ?, ?)").run(kind, String(it.raw_content).trim(), byUser);
         moved++;
       }
+      // V161.2: this product also keeps a manual stock_quantity counter (the card reads it) — lower it too.
+      if (moved) db.prepare("UPDATE products SET stock_quantity = MAX(0, stock_quantity - ?) WHERE id = ?").run(moved, productId);
       return moved;
     });
     const moved = tx();
