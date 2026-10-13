@@ -1291,9 +1291,10 @@ async function handleCustomerReplacementCb(q, data) {
   const mDead = /^rc_dead_(\w+)$/.exec(data);
   if (mDead) {
     const kind = mDead[1];
-    setReplState(userId, `AWAIT_BAD_LINK:${kind}`);
+    setReplState(userId, `AWAIT_ORDER:${kind}`);
     await bot.sendMessage(chatId,
-      '🔗 Please <b>paste the link that is not working</b> here.\n\n<i>Send just the link in one message.</i>',
+      '🧾 First, send your <b>Order ID</b> (the number of the order you bought this link in).\n\n' +
+      '<i>You can find it in your order confirmation. Warranty is 24 hours from purchase.</i>',
       { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: `rc_start_${kind}` }]] } }).catch(() => {});
     return;
   }
@@ -1316,20 +1317,54 @@ async function handleCustomerReplacementText(msg) {
   if (!state) return false;
   const text = (msg.text || '').trim();
 
-  if (state.startsWith('AWAIT_BAD_LINK:')) {
+  if (state.startsWith('AWAIT_ORDER:')) {
     const kind = state.split(':')[1];
-    if (!text || !/https?:\/\/|\./.test(text)) {
-      await bot.sendMessage(chatId, '❌ That does not look like a link. Please paste the full link, or tap 🔙 Back.').catch(() => {});
+    const orderId = parseInt(String(text).replace(/[^0-9]/g, ''), 10);
+    if (!orderId) {
+      await bot.sendMessage(chatId, '❌ Please send the Order ID — it is a number (e.g. <code>24819</code>).', { parse_mode: 'HTML' }).catch(() => {});
+      return true;
+    }
+    const chk = queries.replCheckOrder(orderId, userId, 24);
+    if (!chk.ok) {
+      if (chk.reason === 'not_found') {
+        await bot.sendMessage(chatId, '❌ We could not find an order with that number. Please check it and send again.').catch(() => {});
+      } else if (chk.reason === 'not_yours') {
+        await bot.sendMessage(chatId, '❌ That order is not on your account. Please send the Order ID of your own purchase.').catch(() => {});
+      } else if (chk.reason === 'expired') {
+        setReplState(userId, '');
+        await bot.sendMessage(chatId,
+          `⌛ <b>Order #${orderId} is outside the 24-hour warranty.</b>\n\n` +
+          `It was bought ${chk.hours}h ago, so an automatic replacement is not available. ` +
+          `If you believe there is still a problem, tap 💬 and our team will look into it.`,
+          { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '💬 Talk to support', callback_data: 'rc_talk' }]] } }).catch(() => {});
+      }
+      return true;
+    }
+    setReplState(userId, `AWAIT_BAD_LINK:${kind}:${orderId}`);
+    await bot.sendMessage(chatId,
+      `✅ Order #${orderId} is in warranty (about ${chk.hoursLeft}h left).\n\n` +
+      '🔗 Now paste the <b>link that is not working</b>. It must start with <code>https://</code>.',
+      { parse_mode: 'HTML' }).catch(() => {});
+    return true;
+  }
+  if (state.startsWith('AWAIT_BAD_LINK:')) {
+    const parts = state.split(':');       // AWAIT_BAD_LINK : kind : orderId
+    const kind = parts[1];
+    const orderId = parseInt(parts[2], 10) || null;
+    if (!text || !/^https:\/\//i.test(text.trim())) {
+      await bot.sendMessage(chatId, '❌ The link must start with <b>https://</b>. Please paste the full link.', { parse_mode: 'HTML' }).catch(() => {});
       return true;
     }
     setReplState(userId, '');
+    const link = text.trim();
     const existing = queries.replOpenRequestForUser(userId, kind);
     let reqId;
     if (existing) {
-      queries.replSetRequest(existing.id, { bad_link: text, reason: 'link_dead' });
+      queries.replSetRequest(existing.id, { bad_link: link, reason: 'link_dead', order_id: orderId });
       reqId = existing.id;
     } else {
-      reqId = queries.replCreateRequest(userId, msg.from.username, kind, text, 'link_dead', null);
+      reqId = queries.replCreateRequest(userId, msg.from.username, kind, link, 'link_dead', null);
+      if (orderId) queries.replSetRequest(reqId, { order_id: orderId });
     }
     await bot.sendMessage(chatId,
       '✅ <b>Got it — thank you.</b>\n\nWe are checking your link now. As soon as it is confirmed, we will send you a fresh working link right here. 🙏',
@@ -2234,8 +2269,14 @@ async function showReplacementRequest(chatId, messageId, reqId) {
   if (!r) { await bot.sendMessage(chatId, '❌ Request not found.'); return; }
   const avail = queries.replAvailableCount(r.kind);
   const done = r.status !== 'pending';
+  let warr = '';
+  if (r.order_id) {
+    const chk = queries.replCheckOrder(r.order_id, r.user_id, 24);
+    warr = chk.ok ? ` · 🛡 in warranty (~${chk.hoursLeft}h left)` : (chk.reason === 'expired' ? ` · ⌛ warranty passed (${chk.hours}h)` : '');
+  }
   let txt = `♻️ <b>Replacement #${r.id}</b> · ${KIND_LABEL[r.kind] || r.kind}\n━━━━━━━━━━━━━━━━━━\n` +
     `👤 ${r.username ? '@' + escapeHtml(r.username) : ''} <code>${r.user_id}</code>\n` +
+    (r.order_id ? `🧾 Order #${r.order_id}${warr}\n` : '') +
     `📋 Reason: ${r.reason === 'link_dead' ? '🚫 link does not work' : '❓ ' + escapeHtml(r.detail || 'other')}\n`;
   if (r.bad_link) txt += `\n🔗 <b>The link they say is dead</b> (check it):\n<code>${escapeHtml(r.bad_link)}</code>\n`;
   txt += `\n📦 Spare ${KIND_LABEL[r.kind] || r.kind} links ready: <b>${avail}</b>\n`;
@@ -2274,8 +2315,12 @@ async function sendReplacement(chatId, messageId, reqId, staffId, manualLink) {
   } catch (e) {
     await bot.sendMessage(chatId, `⚠️ Saved, but could not message the customer: ${e.message}`);
   }
-  await bot.sendMessage(chatId, `✅ Sent a working link to ${r.username ? '@' + escapeHtml(r.username) : r.user_id}.${stockId ? ' (from stock)' : ''}`, { parse_mode: 'HTML' });
-  await showReplacementsHome(chatId, null);
+  await bot.sendMessage(chatId,
+    `✅ Sent a working link to ${r.username ? '@' + escapeHtml(r.username) : r.user_id}.${stockId ? ' (from stock)' : ''}`,
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+      [{ text: '💬 Back to this chat', callback_data: `chat_${r.user_id}` }],
+      [{ text: '♻️ Replacements', callback_data: 'rq_home' }, { text: '📥 Inbox', callback_data: 'inbox' }],
+    ] } });
 }
 
 async function showReplStock(chatId, messageId) {

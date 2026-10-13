@@ -336,6 +336,12 @@ if (!existingProductCols.includes('bulk_tier2_qty'))   db.exec('ALTER TABLE prod
 if (!existingProductCols.includes('bulk_tier2_price')) db.exec('ALTER TABLE products ADD COLUMN bulk_tier2_price REAL DEFAULT 0');
 if (!existingProductCols.includes('bulk_tier3_qty'))   db.exec('ALTER TABLE products ADD COLUMN bulk_tier3_qty INTEGER DEFAULT 0');
 if (!existingProductCols.includes('bulk_tier3_price')) db.exec('ALTER TABLE products ADD COLUMN bulk_tier3_price REAL DEFAULT 0');
+// V161.4: order_id on replacement_requests (older DBs created the table without it)
+try {
+  const replCols = db.prepare("PRAGMA table_info(replacement_requests)").all().map((c) => c.name);
+  if (replCols.length && !replCols.includes('order_id')) db.exec('ALTER TABLE replacement_requests ADD COLUMN order_id INTEGER');
+} catch (_) {}
+
 // V141: bulk tiers 4..MAX_BULK_TIERS (utils/bulkTiers.js). Empty = not shown, not applied.
 for (const n of TIER_NUMBERS) {
   for (const [col, type] of [[`bulk_tier${n}_qty`, 'INTEGER'], [`bulk_tier${n}_price`, 'REAL']]) {
@@ -732,6 +738,7 @@ db.exec(`
     user_id      INTEGER NOT NULL,
     username     TEXT,
     kind         TEXT    NOT NULL DEFAULT 'gemini',
+    order_id     INTEGER,                             -- the order the customer gave (validated, in warranty)
     bad_link     TEXT,                                -- the link the customer says is dead
     reason       TEXT,                                -- 'link_dead' | 'other'
     detail       TEXT,                                -- free text for "other"

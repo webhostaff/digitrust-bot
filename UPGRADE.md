@@ -1,3 +1,10 @@
+# V161.4 — replacement asks for Order ID + 24h warranty, requires https://, and back buttons
+
+- **Customer flow now:** ♻️ Replace → 🚫 doesn't work → **send your Order ID** → the bot checks it is YOUR order and **within 24h of purchase**. If it is someone else's or not found → clear message. If older than 24h → "outside the 24-hour warranty" and it stops (with a 💬 talk-to-support option). If valid → **paste the link, which must start with `https://`** (anything else is refused). The request records the order id and link.
+- **Staff card** shows 🧾 Order #… and 🛡 in warranty (~Nh left) / ⌛ warranty passed.
+- **After sending a replacement**, buttons appear: 💬 Back to this chat · ♻️ Replacements · 📥 Inbox (you were stuck with the keyboard at the bottom).
+- Warranty window is 24h from purchase (orders.created_at); the check is ownership + age.
+
 # V161.3 — replacement reachable from an ordinary chat too
 
 The replace buttons only appeared inside a replacement request, so a customer who wrote the old way ("link don't work" + pasted the link) left staff with no button.

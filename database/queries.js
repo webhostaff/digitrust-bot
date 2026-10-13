@@ -3312,6 +3312,17 @@ module.exports = {
   replUnclaimed: (kind) => db.prepare("SELECT * FROM replacement_stock WHERE kind=? AND status='used' AND claimed=0 ORDER BY used_at").all(kind),
   replClaimAll: (kind) => db.prepare("UPDATE replacement_stock SET claimed=1, claimed_at=datetime('now') WHERE kind=? AND status='used' AND claimed=0").run(kind).changes,
 
+  // V161.4: check an order belongs to this customer and is still within the warranty window (hours from purchase).
+  replCheckOrder: (orderId, userId, warrantyHours = 24) => {
+    const o = db.prepare("SELECT id, user_id, created_at, status FROM orders WHERE id = ?").get(orderId);
+    if (!o) return { ok: false, reason: 'not_found' };
+    if (String(o.user_id) !== String(userId)) return { ok: false, reason: 'not_yours' };
+    const ageMs = Date.now() - new Date(String(o.created_at).replace(' ', 'T') + 'Z').getTime();
+    const hours = ageMs / 3600000;
+    if (hours > warrantyHours) return { ok: false, reason: 'expired', hours: Math.floor(hours), created_at: o.created_at };
+    return { ok: true, order: o, hoursLeft: Math.max(0, Math.round(warrantyHours - hours)) };
+  },
+
   replCreateRequest: (userId, username, kind, badLink, reason, detail) =>
     db.prepare("INSERT INTO replacement_requests (user_id, username, kind, bad_link, reason, detail) VALUES (?, ?, ?, ?, ?, ?)")
       .run(userId, username || null, kind, badLink || null, reason || null, detail || null).lastInsertRowid,
@@ -3320,7 +3331,7 @@ module.exports = {
   replPendingCount: () => db.prepare("SELECT COUNT(*) n FROM replacement_requests WHERE status='pending'").get().n,
   replOpenRequestForUser: (userId, kind) => db.prepare("SELECT * FROM replacement_requests WHERE user_id=? AND kind=? AND status='pending' ORDER BY id DESC LIMIT 1").get(userId, kind),
   replSetRequest: (id, fields) => {
-    const allow = ['status', 'stock_id', 'sent_link', 'handled_by', 'handled_at', 'bad_link', 'reason', 'detail'];
+    const allow = ['status', 'stock_id', 'sent_link', 'handled_by', 'handled_at', 'bad_link', 'reason', 'detail', 'order_id'];
     const sets = Object.keys(fields).filter((k) => allow.includes(k));
     if (!sets.length) return;
     db.prepare(`UPDATE replacement_requests SET ${sets.map((k) => `${k}=?`).join(', ')} WHERE id=?`).run(...sets.map((k) => fields[k]), id);
