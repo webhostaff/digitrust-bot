@@ -1,3 +1,7 @@
+# V162 — ✍️ spelling auto-correct for staff replies (safe, never silent)
+
+When you reply to a customer and the text has common English typos (teh→the, dont→don't, recieve→receive, adress→address, pls→please …), the bot shows the corrected version with two one-tap buttons: **✅ Send corrected** or **📤 Send as I wrote**. Nothing is ever changed silently, and links, @handles, emails, #tags, numbers and code are never touched. Case is preserved (THANX→THANKS). A clean reply goes straight through with no extra step. Toggle it on/off from the Support Console (✍️ Turn auto-correct ON/OFF); default ON.
+
 # V161.4 — replacement asks for Order ID + 24h warranty, requires https://, and back buttons
 
 - **Customer flow now:** ♻️ Replace → 🚫 doesn't work → **send your Order ID** → the bot checks it is YOUR order and **within 24h of purchase**. If it is someone else's or not found → clear message. If older than 24h → "outside the 24-hour warranty" and it stops (with a 💬 talk-to-support option). If valid → **paste the link, which must start with `https://`** (anything else is refused). The request records the order id and link.

@@ -45,6 +45,7 @@ const { renderCustomerOrders } = require('./utils/customerOrders');
 const config  = require('./config');
 const manualDelivery = require('./handlers/manualDelivery');
 const { notifyAdmin } = require('./services/adminNotify');
+const { fixTypos } = require('./services/typoFix');   // V162
 
 /**
  * Who counts as support staff.
@@ -239,6 +240,17 @@ function displayName(username, firstName, userId) {
 function setActiveChat(staffChatId, targetUserId) {
   queries.setSetting(`support_active_chat_${staffChatId}`, String(targetUserId || ''));
 }
+// V162: send a plain-text support reply to a customer (used by the spelling-fix buttons).
+async function sendSupportText(staffChatId, targetUserId, textToSend) {
+  try {
+    const sent = await bot.sendMessage(targetUserId, `📩 <b>Support</b>\n\n${escapeHtml(textToSend)}`, { parse_mode: 'HTML' });
+    insertMsg.run(targetUserId, null, null, 'out', textToSend, null, sent && sent.message_id ? sent.message_id : null);
+    await bot.sendMessage(staffChatId, '✅ Sent.').catch(() => {});
+  } catch (e) {
+    await bot.sendMessage(staffChatId, `⚠️ Could not send: ${e.message}`).catch(() => {});
+  }
+}
+
 function getActiveChat(staffChatId) {
   const v = queries.getSetting(`support_active_chat_${staffChatId}`, '');
   const n = parseInt(v, 10);
@@ -362,10 +374,13 @@ async function showStaffHome(chatId) {
         `${md.pending ? '📦' : '✅'} Deliveries waiting: <b>${md.pending}</b>\n` +
         `${refunds  ? '🔄' : '✅'} Refund requests: <b>${refunds}</b>\n` +
         `${stock    ? '🔴' : '✅'} Out of stock: <b>${stock}</b>\n`) +
+    `\n✍️ Spelling auto-correct: <b>${queries.getSetting('support_autocorrect', '1') === '1' ? 'ON' : 'OFF'}</b>\n` +
     `\n<i>The bar below stays put — tap any section at any time.</i>\n` +
     `<i>Send /menu to refresh the numbers on it.</i>`,
     { parse_mode: 'HTML', reply_markup: staffKeyboard() }
   );
+  await bot.sendMessage(chatId, '✍️ When ON, if your reply has common typos I show a corrected version with a one-tap choice before it is sent.',
+    { reply_markup: { inline_keyboard: [[{ text: queries.getSetting('support_autocorrect', '1') === '1' ? '✍️ Turn auto-correct OFF' : '✍️ Turn auto-correct ON', callback_data: 'ac_toggle' }]] } }).catch(() => {});
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1428,6 +1443,27 @@ bot.on('callback_query', async (q) => {
     if (data === 'noop') return;
 
     // ── V161: replacements (staff) ──────────────────────────────────────
+    // V162: spelling-fix choice
+    {
+      const m = /^ac_(fix|raw)_([a-z0-9]{8})$/.exec(data);
+      if (m) {
+        const saved = queries.getSetting(`ac_${m[2]}`, '');
+        queries.setSetting(`ac_${m[2]}`, '');
+        if (!saved) { await bot.answerCallbackQuery(q.id, { text: 'Expired — type it again.' }).catch(() => {}); return; }
+        let obj; try { obj = JSON.parse(saved); } catch (_) { return; }
+        await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msgId }).catch(() => {});
+        await sendSupportText(chatId, obj.u, m[1] === 'fix' ? obj.fixed : obj.orig);
+        return;
+      }
+      if (data === 'ac_toggle') {
+        const on = queries.getSetting('support_autocorrect', '1') === '1';
+        queries.setSetting('support_autocorrect', on ? '0' : '1');
+        await bot.answerCallbackQuery(q.id, { text: on ? 'Auto-correct off' : 'Auto-correct on' }).catch(() => {});
+        await showStaffHome(chatId).catch(() => {});
+        return;
+      }
+    }
+
     if (data === 'rq_home')  { await showReplacementsHome(chatId, msgId); return; }
     if (data === 'rq_stock') { await showReplStock(chatId, msgId); return; }
     if (data === 'rq_addstock') {
@@ -2110,6 +2146,24 @@ bot.on('message', async (msg) => {
 
     let mediaType = null, fileId = null;
     const contentText = msg.text || msg.caption || '';
+
+    // V162: offer a spelling fix before the reply leaves (staff only, never silent, never touches links/@/numbers).
+    if (msg.text && queries.getSetting('support_autocorrect', '1') === '1') {
+      const { fixed, changes } = fixTypos(msg.text);
+      if (changes.length) {
+        const token = Math.random().toString(36).slice(2, 10);
+        queries.setSetting(`ac_${token}`, JSON.stringify({ u: targetUserId, orig: msg.text, fixed }));
+        await bot.sendMessage(chatId,
+          `✍️ <b>Spelling check</b> — I can fix ${changes.length} word(s):\n` +
+          changes.slice(0, 12).map((c) => `• <s>${escapeHtml(c.from)}</s> → <b>${escapeHtml(c.to)}</b>`).join('\n') +
+          `\n\n<b>Corrected:</b>\n${escapeHtml(fixed)}`,
+          { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+            [{ text: '✅ Send corrected', callback_data: `ac_fix_${token}` }],
+            [{ text: '📤 Send as I wrote', callback_data: `ac_raw_${token}` }],
+          ] } });
+        return;
+      }
+    }
 
     try {
       // Keep the id Telegram assigns in the CUSTOMER's chat — recalling a reply
