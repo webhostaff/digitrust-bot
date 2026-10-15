@@ -2830,6 +2830,8 @@ async function handleAdminCallback(bot, query) {
   if (/^admin_binrep/.test(data) && await reportAdmin.handle(bot, query)) return;
   // 📥 Binance deposits as buttons (V156) — the /deposits command, TON included
   if (/^admin_deps/.test(data) && await require('../services/depositsAdmin').handle(bot, query)) return;
+  // 💲 special prices BY PRODUCT (V163): who has one, remove them together
+  if (/^admin_spx/.test(data) && await require('../services/specialPricesAdmin').handle(bot, query)) return;
   if (data === 'admin_balance') {
     bot.answerCallbackQuery(query.id).catch(() => {});
     const chatId = query.message.chat.id;

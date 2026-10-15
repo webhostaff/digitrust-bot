@@ -1,3 +1,10 @@
+# V163 — 💲 Special prices BY PRODUCT (see who has one, remove them together)
+
+Admin menu → **💲 Special Prices**: the products that have special prices (with how many customers each). Open one (e.g. Gemini) to see every customer with a special price on it and their tiers, then:
+- **🗑 <name>** removes one customer's special price on that product;
+- **🗑 Remove ALL (N)** removes them all — after a confirmation. Those customers pay the public price from then on; their other products are untouched.
+Every removal is written to the log.
+
 # V162 — ✍️ spelling auto-correct for staff replies (safe, never silent)
 
 When you reply to a customer and the text has common English typos (teh→the, dont→don't, recieve→receive, adress→address, pls→please …), the bot shows the corrected version with two one-tap buttons: **✅ Send corrected** or **📤 Send as I wrote**. Nothing is ever changed silently, and links, @handles, emails, #tags, numbers and code are never touched. Case is preserved (THANX→THANKS). A clean reply goes straight through with no extra step. Toggle it on/off from the Support Console (✍️ Turn auto-correct ON/OFF); default ON.
