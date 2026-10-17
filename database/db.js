@@ -752,6 +752,26 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS repl_req_status ON replacement_requests(status, created_at);
 `);
 
+// V164: what each spare link COST (a snapshot of the purchase price when it entered the pool) and a counter
+// that can be reset: archived = 1 means "counted before the last reset". replacement_resets keeps every reset.
+try {
+  const stockCols = db.prepare("PRAGMA table_info(replacement_stock)").all().map((c) => c.name);
+  if (stockCols.length && !stockCols.includes('cost'))     db.exec('ALTER TABLE replacement_stock ADD COLUMN cost REAL NOT NULL DEFAULT 0');
+  if (stockCols.length && !stockCols.includes('archived')) db.exec('ALTER TABLE replacement_stock ADD COLUMN archived INTEGER NOT NULL DEFAULT 0');
+} catch (_) {}
+db.exec(`
+  CREATE TABLE IF NOT EXISTS replacement_resets (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind       TEXT NOT NULL DEFAULT 'gemini',
+    reset_at   TEXT DEFAULT (datetime('now')),
+    reset_by   INTEGER,
+    used       INTEGER NOT NULL DEFAULT 0,
+    unclaimed  INTEGER NOT NULL DEFAULT 0,
+    amount     REAL    NOT NULL DEFAULT 0,
+    unit_price REAL    NOT NULL DEFAULT 0
+  );
+`);
+
 // ── manual_deliveries ────────────────────────────────────────────────────────
 // A paid order that needs a human to hand over the product.
 // UNIQUE(order_id) is the duplicate guard: an order can never open two tasks.

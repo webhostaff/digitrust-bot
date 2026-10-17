@@ -1478,6 +1478,36 @@ bot.on('callback_query', async (q) => {
       await bot.sendMessage(chatId, `⤵️ How many links to move from the sale stock into the spare pool?\n\nThere are <b>${avail}</b> available. Send a number (e.g. <code>10</code>).`, { parse_mode: 'HTML' });
       return;
     }
+    if (data === 'rq_price') {
+      const cur = queries.replUnitPrice(REPL_KIND);
+      queries.setSetting(`support_state_${chatId}`, 'AWAIT_REPL_PRICE');
+      await bot.sendMessage(chatId,
+        `💲 <b>Purchase price per link</b>\n\nNow: ` + (cur > 0 ? `<b>${replMoney(cur)}</b>` : '<i>not set</i>') + `\n\n` +
+        `Send what the supplier charges for ONE link, e.g. <code>0.45</code>.\n` +
+        `It applies to the links that enter the spare pool from now on, and it also prices the links that never had a price. ` +
+        `Links already priced keep their price.\nSend <code>0</code> to clear it.`, { parse_mode: 'HTML' });
+      return;
+    }
+    if (data === 'rq_reset') {
+      const c = queries.replStockCounts().find((x) => x.kind === REPL_KIND) || {};
+      await bot.sendMessage(chatId,
+        `🔄 <b>Reset the count?</b>\n\nThe counter starts again from zero:\n` +
+        `• Used so far: <b>${c.used || 0}</b> (${replMoney(c.used_amount)}) → 0\n` +
+        `• To claim from the supplier: <b>${c.unclaimed || 0}</b> (${replMoney(c.unclaimed_amount)}) → 0\n\n` +
+        `Nothing is deleted: the numbers are saved in the reset history. The spare links that are still ready stay as they are. ` +
+        ((c.unclaimed || 0) ? `\n⚠️ <b>${c.unclaimed}</b> used link(s) were not claimed yet — claim them first if you still want to.` : ''),
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+          [{ text: '✅ Yes, reset', callback_data: 'rq_reset_y' }, { text: '❌ No', callback_data: 'rq_home' }]] } });
+      return;
+    }
+    if (data === 'rq_reset_y') {
+      const r = queries.replResetAccount(REPL_KIND, q.from.id);
+      logger.info(`Staff ${q.from.id} reset the ${REPL_KIND} replacement count (used ${r.used}, unclaimed ${r.unclaimed}, ${r.amount})`);
+      await bot.answerCallbackQuery(q.id, { text: '✅ Reset' }).catch(() => {});
+      await bot.sendMessage(chatId, `✅ <b>Count reset.</b>\nSaved: ${r.used} used (${replMoney(r.amount)}), ${r.unclaimed} not yet claimed.\nCounting again from 0.`, { parse_mode: 'HTML' });
+      await showReplacementsHome(chatId, null);
+      return;
+    }
     if (data === 'rq_claim') {
       const n = queries.replClaimAll(REPL_KIND);
       await bot.answerCallbackQuery(q.id, { text: `✅ ${n} marked as claimed` }).catch(() => {});
@@ -2069,6 +2099,15 @@ bot.on('message', async (msg) => {
       await showReplStock(chatId, null);
       return;
     }
+    if (state === 'AWAIT_REPL_PRICE') {
+      const v = parseFloat(String(text).replace(',', '.').replace(/[^0-9.]/g, ''));
+      if (!Number.isFinite(v) || v < 0) { await bot.sendMessage(chatId, '❌ Send a number, e.g. 0.45 (or 0 to clear).'); return; }
+      queries.setSetting(`support_state_${chatId}`, '');
+      const r = queries.replSetUnitPrice(REPL_KIND, v);
+      await bot.sendMessage(chatId, `✅ Purchase price: <b>${replMoney(r.price)}</b> per link.` + (r.priced ? `\n${r.priced} link(s) that had no price were priced too.` : ''), { parse_mode: 'HTML' });
+      await showReplacementsHome(chatId, null);
+      return;
+    }
     if (state === 'AWAIT_REPL_STOCK') {
       queries.setSetting(`support_state_${chatId}`, '');
       const links = text.split(/\r?\n/).map((x) => x.trim()).filter((x) => x && /https?:\/\/|\./.test(x));
@@ -2293,6 +2332,16 @@ bot.on('message', async (msg) => {
 // V161: STAFF — replacement requests + spare-link stock
 // ════════════════════════════════════════════════════════════════════════════
 const REPL_KIND = 'gemini';   // the one family for now; easy to extend
+const replMoney = (n) => { const v = Number(n) || 0; const d = (String(+v.toFixed(4)).split('.')[1] || '').length; return '$' + v.toFixed(Math.max(2, d)); };
+/** The money lines of the replacement screens (V164): purchase price, value of what was used / to claim. */
+function replMoneyLines(c, unit) {
+  let t = `💲 Purchase price per link: ` + (unit > 0 ? `<b>${replMoney(unit)}</b>` : `<i>not set</i> (tap 💲 below)`) + `\n`;
+  if (unit > 0 || Number(c.used_amount) > 0) {
+    t += `💵 Value used since the last reset: <b>${replMoney(c.used_amount)}</b>` +
+         ((c.unclaimed || 0) ? ` · 🟠 to claim: <b>${replMoney(c.unclaimed_amount)}</b>` : '') + `\n`;
+  }
+  return t;
+}
 function replProductId() { return parseInt(queries.getSetting('repl_source_product_id', '10'), 10) || 10; }
 
 async function showReplacementsHome(chatId, messageId) {
@@ -2300,7 +2349,8 @@ async function showReplacementsHome(chatId, messageId) {
   const counts = queries.replStockCounts().find((c) => c.kind === REPL_KIND) || { available: 0, used: 0, unclaimed: 0 };
   let txt = `♻️ <b>Replacements</b>\n━━━━━━━━━━━━━━━━━━\n` +
     `📦 Spare ${KIND_LABEL[REPL_KIND]} links: <b>${counts.available || 0}</b> ready\n` +
-    `✅ Used so far: <b>${counts.used || 0}</b>` + ((counts.unclaimed || 0) ? ` · 🟠 <b>${counts.unclaimed}</b> to claim back from supplier` : '') + `\n\n`;
+    `✅ Used since the last reset: <b>${counts.used || 0}</b>` + ((counts.unclaimed || 0) ? ` · 🟠 <b>${counts.unclaimed}</b> to claim back from supplier` : '') + `\n` +
+    replMoneyLines(counts, queries.replUnitPrice(REPL_KIND)) + `\n`;
   const rows = [];
   if (pending.length) {
     txt += `🔴 <b>${pending.length} waiting:</b>\n`;
@@ -2312,7 +2362,8 @@ async function showReplacementsHome(chatId, messageId) {
     txt += `✅ No replacement waiting.\n`;
   }
   rows.push([{ text: `📦 Spare links (${counts.available || 0})`, callback_data: 'rq_stock' }]);
-  if ((counts.unclaimed || 0) > 0) rows.push([{ text: `📥 Claim ${counts.unclaimed} back from supplier`, callback_data: 'rq_claim' }]);
+  if ((counts.unclaimed || 0) > 0) rows.push([{ text: `📥 Claim ${counts.unclaimed} back (${replMoney(counts.unclaimed_amount)})`, callback_data: 'rq_claim' }]);
+  rows.push([{ text: '💲 Purchase price', callback_data: 'rq_price' }, { text: '🔄 Reset count', callback_data: 'rq_reset' }]);
   const opts = { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } };
   if (messageId) await bot.editMessageText(txt, { chat_id: chatId, message_id: messageId, ...opts }).catch(() => bot.sendMessage(chatId, txt, opts));
   else await bot.sendMessage(chatId, txt, opts);
@@ -2381,7 +2432,8 @@ async function showReplStock(chatId, messageId) {
   const avail = queries.replListStock(REPL_KIND, 'available', 20);
   const counts = queries.replStockCounts().find((c) => c.kind === REPL_KIND) || { available: 0, used: 0, unclaimed: 0 };
   let txt = `📦 <b>Spare ${KIND_LABEL[REPL_KIND]} links</b>\n━━━━━━━━━━━━━━━━━━\n` +
-    `Ready: <b>${counts.available || 0}</b> · Used: <b>${counts.used || 0}</b>` + ((counts.unclaimed || 0) ? ` · 🟠 ${counts.unclaimed} to claim` : '') + `\n\n` +
+    `Ready: <b>${counts.available || 0}</b> · Used: <b>${counts.used || 0}</b>` + ((counts.unclaimed || 0) ? ` · 🟠 ${counts.unclaimed} to claim` : '') + `\n` +
+    replMoneyLines(counts, queries.replUnitPrice(REPL_KIND)) + `\n` +
     `<i>Add links by sending them here — one per line, as many as you like.</i>\n\n`;
   if (avail.length) txt += avail.slice(0, 10).map((x) => `• <code>${escapeHtml(x.link.slice(0, 60))}</code>`).join('\n');
   const saleStock = queries.productAvailableCount(replProductId());

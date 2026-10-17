@@ -3282,7 +3282,7 @@ module.exports = {
         // claim the sale item so it can never be sold, then copy it into the pool
         const claimed = db.prepare("UPDATE product_items SET status = 'moved_to_replacement', sold_at = datetime('now') WHERE id = ? AND status = 'available'").run(it.id).changes;
         if (!claimed) continue;
-        db.prepare("INSERT INTO replacement_stock (kind, link, added_by) VALUES (?, ?, ?)").run(kind, String(it.raw_content).trim(), byUser);
+        db.prepare("INSERT INTO replacement_stock (kind, link, added_by, cost) VALUES (?, ?, ?, ?)").run(kind, String(it.raw_content).trim(), byUser, module.exports.replUnitPrice(kind));
         moved++;
       }
       // V161.2: this product also keeps a manual stock_quantity counter (the card reads it) — lower it too.
@@ -3296,9 +3296,42 @@ module.exports = {
     db.prepare("SELECT COUNT(*) n FROM product_items WHERE product_id = ? AND status = 'available'").get(productId).n,
 
   replAddStock: (kind, link, addedBy) =>
-    db.prepare("INSERT INTO replacement_stock (kind, link, added_by) VALUES (?, ?, ?)").run(kind, String(link).trim(), addedBy).lastInsertRowid,
+    db.prepare("INSERT INTO replacement_stock (kind, link, added_by, cost) VALUES (?, ?, ?, ?)").run(kind, String(link).trim(), addedBy, module.exports.replUnitPrice(kind)).lastInsertRowid,
+  // V164: "used" and "unclaimed" only count links used SINCE the last reset (archived = 0), with their value.
   replStockCounts: () => db.prepare(
-    "SELECT kind, SUM(status='available') AS available, SUM(status='used') AS used, SUM(status='used' AND claimed=0) AS unclaimed FROM replacement_stock GROUP BY kind").all(),
+    `SELECT kind, SUM(status='available') AS available,
+            SUM(status='used' AND archived=0) AS used,
+            SUM(status='used' AND claimed=0 AND archived=0) AS unclaimed,
+            COALESCE(SUM(CASE WHEN status='used' AND archived=0 THEN cost END),0) AS used_amount,
+            COALESCE(SUM(CASE WHEN status='used' AND claimed=0 AND archived=0 THEN cost END),0) AS unclaimed_amount,
+            COALESCE(SUM(CASE WHEN status='available' THEN cost END),0) AS available_amount
+     FROM replacement_stock GROUP BY kind`).all(),
+  /** Purchase price of one spare link (what the supplier charged) — 0 = not set. */
+  replUnitPrice: (kind) => {
+    const v = parseFloat(String(module.exports.getSetting(`repl_unit_price_${kind}`, '0')));
+    return Number.isFinite(v) && v > 0 ? v : 0;
+  },
+  /** Set the purchase price. It applies to links that enter the pool from now on, and also prices the links that
+   *  were never priced (cost 0) and not yet reset — so an old pool is valued the first time you set it. */
+  replSetUnitPrice: (kind, price) => {
+    const p = Math.max(0, Number(price) || 0);
+    module.exports.setSetting(`repl_unit_price_${kind}`, String(p));
+    const priced = db.prepare("UPDATE replacement_stock SET cost=? WHERE kind=? AND cost=0 AND archived=0").run(p, kind).changes;
+    return { price: p, priced };
+  },
+  /** Start counting from scratch: the used links so far are archived (never deleted), the numbers are logged. */
+  replResetAccount: (kind, adminId) => {
+    const tx = db.transaction(() => {
+      const c = module.exports.replStockCounts().find((x) => x.kind === kind) || {};
+      const out = { used: c.used || 0, unclaimed: c.unclaimed || 0, amount: c.used_amount || 0, unitPrice: module.exports.replUnitPrice(kind) };
+      db.prepare("UPDATE replacement_stock SET archived=1 WHERE kind=? AND status='used' AND archived=0").run(kind);
+      db.prepare("INSERT INTO replacement_resets (kind, reset_by, used, unclaimed, amount, unit_price) VALUES (?,?,?,?,?,?)")
+        .run(kind, adminId || null, out.used, out.unclaimed, out.amount, out.unitPrice);
+      return out;
+    });
+    return tx();
+  },
+  replResets: (kind, limit = 5) => db.prepare("SELECT * FROM replacement_resets WHERE kind=? ORDER BY id DESC LIMIT ?").all(kind, limit),
   replAvailableCount: (kind) => db.prepare("SELECT COUNT(*) n FROM replacement_stock WHERE kind=? AND status='available'").get(kind).n,
   replTakeOne: (kind, requestId) => {
     const row = db.prepare("SELECT id, link FROM replacement_stock WHERE kind=? AND status='available' ORDER BY id LIMIT 1").get(kind);
@@ -3309,8 +3342,8 @@ module.exports = {
   replListStock: (kind, status, limit = 30) =>
     db.prepare("SELECT * FROM replacement_stock WHERE kind=? AND status=? ORDER BY id DESC LIMIT ?").all(kind, status, limit),
   replDeleteStock: (id) => db.prepare("DELETE FROM replacement_stock WHERE id=? AND status='available'").run(id).changes,
-  replUnclaimed: (kind) => db.prepare("SELECT * FROM replacement_stock WHERE kind=? AND status='used' AND claimed=0 ORDER BY used_at").all(kind),
-  replClaimAll: (kind) => db.prepare("UPDATE replacement_stock SET claimed=1, claimed_at=datetime('now') WHERE kind=? AND status='used' AND claimed=0").run(kind).changes,
+  replUnclaimed: (kind) => db.prepare("SELECT * FROM replacement_stock WHERE kind=? AND status='used' AND claimed=0 AND archived=0 ORDER BY used_at").all(kind),
+  replClaimAll: (kind) => db.prepare("UPDATE replacement_stock SET claimed=1, claimed_at=datetime('now') WHERE kind=? AND status='used' AND claimed=0 AND archived=0").run(kind).changes,
 
   // V161.4: check an order belongs to this customer and is still within the warranty window (hours from purchase).
   replCheckOrder: (orderId, userId, warrantyHours = 24) => {

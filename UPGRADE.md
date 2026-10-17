@@ -1,3 +1,10 @@
+# V164 — ♻️ Replacements: purchase price per link + 🔄 Reset count
+
+In the support bot, ♻️ Replacements:
+- **💲 Purchase price** — what the supplier charges for ONE spare link (e.g. 0.45). Each link keeps the price it had when it entered the pool, so changing the price later does not rewrite old links. The first time you set it, links that never had a price are priced too.
+- The screens now show the **value**: used since the last reset, and **what to claim back** from the supplier (e.g. "🟠 3 to claim: $1.35"). The 📥 Claim button shows the amount.
+- **🔄 Reset count** — starts the counting again from 0 (used / to claim / value), after a confirmation that shows the numbers. Nothing is deleted: the used links are archived and every reset is saved (date, who, used, unclaimed, amount, price). Spare links still ready are untouched.
+
 # V163 — 💲 Special prices BY PRODUCT (see who has one, remove them together)
 
 Admin menu → **💲 Special Prices**: the products that have special prices (with how many customers each). Open one (e.g. Gemini) to see every customer with a special price on it and their tiers, then:
