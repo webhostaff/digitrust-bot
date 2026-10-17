@@ -284,6 +284,12 @@ async function handleAdminText(bot, msg) {
   // V2 TEXT STATES
   // ═══════════════════════════════════════════════════════════════════
 
+  // ── V165: replacement link prices (typed after tapping a price button) ──
+  if (s === States.ADMIN_REPL_PRICE || s === States.ADMIN_REPL_CURPRICE) {
+    await require('../services/replCostAdmin').handleText(bot, msg, s, text);
+    return;
+  }
+
   // ── Per-product low-stock threshold ──────────────────────────────
   // ── Set a negotiated price for one customer ──────────────────────
   if (s === States.ADMIN_CUST_PRICE) {
@@ -977,6 +983,14 @@ async function handleAdminText(bot, msg) {
         return;
       }
 
+      // V165: the purchase price is MANDATORY for the product that feeds the replacement pool —
+      // the spare links take their cost from it automatically.
+      if (productId === (parseInt(db.getSetting('repl_source_product_id', '10'), 10) || 10) && !(d.unitCost > 0)) {
+        await bot.sendMessage(chatId,
+          `🔒 <b>The cost is required for this product.</b>\n\nSend what ONE unit costs you, e.g. <code>COST 0.25</code>, then <code>DONE</code> again.\n` +
+          `<i>Nothing was lost — your ${allItems.length} items are still waiting.</i>`, { parse_mode: 'HTML' });
+        return;
+      }
       const prevStock = product.stock_quantity || 0;
       const count     = items.insertItems(productId, allItems, d.supplier || null, d.unitCost ?? null);
       db.adjustStockQuantity(productId, count);
@@ -2831,6 +2845,8 @@ async function handleAdminCallback(bot, query) {
   // 📥 Binance deposits as buttons (V156) — the /deposits command, TON included
   if (/^admin_deps/.test(data) && await require('../services/depositsAdmin').handle(bot, query)) return;
   // 💲 special prices BY PRODUCT (V163): who has one, remove them together
+  // ♻️ replacement link cost (V165)
+  if (/^admin_rc(_|$)/.test(data) && await require('../services/replCostAdmin').handle(bot, query)) return;
   if (/^admin_spx/.test(data) && await require('../services/specialPricesAdmin').handle(bot, query)) return;
   if (data === 'admin_balance') {
     bot.answerCallbackQuery(query.id).catch(() => {});
@@ -4395,7 +4411,9 @@ async function handleAdminCallback(bot, query) {
       `<code>SUPPLIER Ahmed Store</code>\n\n` +
       `💰 To record what you paid per unit, send:\n` +
       `<code>COST 0.25</code>\n` +
-      `<i>Used to work out this batch's profit later.</i>\n\n` +
+      (productId === (parseInt(db.getSetting('repl_source_product_id', '10'), 10) || 10)
+        ? `<b>⚠️ Required for this product</b> — it is also the price of the spare replacement links.\n\n`
+        : `<i>Used to work out this batch's profit later.</i>\n\n`) +
       `When you've sent all batches, type <code>DONE</code> to save everything.\n` +
       `To cancel, type <code>CANCEL</code>.\n\n` +
       `📊 <b>Current stock:</b> ${product.stock_quantity}`,

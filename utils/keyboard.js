@@ -345,6 +345,7 @@ const adminMainKb = () => mk([
   [btn('🔔 Notifications',   'admin_notifications'), btn('📦 Manual Delivery', 'admin_md_list_pending_0')],
   [btn('🛡 Deposit Review',  'admin_deposits'), btn('📥 Binance Deposits', 'admin_deps')],
   [btn('💰 Binance Balance', 'admin_balance'), btn('💲 Special Prices', 'admin_spx')],
+  [btn('♻️ Replacement cost', 'admin_rc')],
   [btn('🎨 Canva', 'canva_menu')],
   [btn('🔄 Refund Requests', 'admin_refund_requests')],
   [btn('🛡️ Deposit Cutoff',  'admin_cutoff')],

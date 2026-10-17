@@ -3273,30 +3273,55 @@ module.exports = {
   replFillFromProduct: (productId, kind, count, byUser) => {
     const take = Math.max(0, parseInt(count, 10) || 0);
     if (!take) return { moved: 0, reason: 'count must be at least 1' };
+    const fb = module.exports.replPriceState(kind);   // fallback for old items uploaded without a COST
     const tx = db.transaction(() => {
       const items = db.prepare(
-        "SELECT id, raw_content FROM product_items WHERE product_id = ? AND status = 'available' ORDER BY id LIMIT ?"
+        "SELECT id, raw_content, unit_cost FROM product_items WHERE product_id = ? AND status = 'available' ORDER BY id LIMIT ?"
       ).all(productId, take);
-      let moved = 0;
+      // V165: the price comes from the COST typed when the stock was uploaded (one batch per cost)
+      const batches = new Map();
+      let moved = 0, skipped = 0;
       for (const it of items) {
-        // claim the sale item so it can never be sold, then copy it into the pool
+        let cost = Number(it.unit_cost) > 0 ? Number(it.unit_cost) : (fb.ready ? fb.price : 0);
+        if (!(cost > 0)) { skipped++; continue; }
         const claimed = db.prepare("UPDATE product_items SET status = 'moved_to_replacement', sold_at = datetime('now') WHERE id = ? AND status = 'available'").run(it.id).changes;
         if (!claimed) continue;
-        db.prepare("INSERT INTO replacement_stock (kind, link, added_by, cost) VALUES (?, ?, ?, ?)").run(kind, String(it.raw_content).trim(), byUser, module.exports.replUnitPrice(kind));
+        let batchId = batches.get(cost);
+        if (!batchId) {
+          batchId = db.prepare("INSERT INTO replacement_batches (kind, source, price, qty, created_by) VALUES (?, 'sale_stock', ?, 0, ?)").run(kind, cost, byUser || null).lastInsertRowid;
+          batches.set(cost, batchId);
+        }
+        db.prepare("INSERT INTO replacement_stock (kind, link, added_by, cost, batch_id) VALUES (?, ?, ?, ?, ?)").run(kind, String(it.raw_content).trim(), byUser, cost, batchId);
+        db.prepare("UPDATE replacement_batches SET qty = qty + 1 WHERE id = ?").run(batchId);
         moved++;
       }
-      // V161.2: this product also keeps a manual stock_quantity counter (the card reads it) — lower it too.
-      if (moved) db.prepare("UPDATE products SET stock_quantity = MAX(0, stock_quantity - ?) WHERE id = ?").run(moved, productId);
-      return moved;
+      if (moved) {
+        if (fb.ready && skipped === 0) module.exports.setSetting(`repl_price_ready_${kind}`, '0');
+        db.prepare("UPDATE products SET stock_quantity = MAX(0, stock_quantity - ?) WHERE id = ?").run(moved, productId);
+      }
+      const list = [...batches.entries()].map(([price, id]) => ({ price, batchId: id }));
+      return { moved, skipped, noPrice: moved === 0 && skipped > 0, batchId: list[0] ? list[0].batchId : null, price: list[0] ? list[0].price : 0, batches: list };
     });
-    const moved = tx();
-    return { moved };
+    return tx();
   },
   productAvailableCount: (productId) =>
     db.prepare("SELECT COUNT(*) n FROM product_items WHERE product_id = ? AND status = 'available'").get(productId).n,
 
-  replAddStock: (kind, link, addedBy) =>
-    db.prepare("INSERT INTO replacement_stock (kind, link, added_by, cost) VALUES (?, ?, ?, ?)").run(kind, String(link).trim(), addedBy, module.exports.replUnitPrice(kind)).lastInsertRowid,
+  /** V165: add links by hand. One call = one batch with ONE price. Refuses when no price was set for this stock. */
+  replAddLinks: (kind, links, addedBy) => {
+    const list = (links || []).map((l) => String(l).trim()).filter(Boolean);
+    if (!list.length) return { added: 0, reason: 'no links' };
+    const pr = module.exports.replPriceState(kind);
+    if (!pr.ready) return { added: 0, noPrice: true, lastPrice: pr.price };
+    const tx = db.transaction(() => {
+      const batchId = db.prepare("INSERT INTO replacement_batches (kind, source, price, qty, created_by) VALUES (?, 'manual', ?, ?, ?)")
+        .run(kind, pr.price, list.length, addedBy || null).lastInsertRowid;
+      for (const l of list) db.prepare("INSERT INTO replacement_stock (kind, link, added_by, cost, batch_id) VALUES (?, ?, ?, ?, ?)").run(kind, l, addedBy, pr.price, batchId);
+      module.exports.setSetting(`repl_price_ready_${kind}`, '0');
+      return { added: list.length, batchId, price: pr.price };
+    });
+    return tx();
+  },
   // V164: "used" and "unclaimed" only count links used SINCE the last reset (archived = 0), with their value.
   replStockCounts: () => db.prepare(
     `SELECT kind, SUM(status='available') AS available,
@@ -3304,37 +3329,86 @@ module.exports = {
             SUM(status='used' AND claimed=0 AND archived=0) AS unclaimed,
             COALESCE(SUM(CASE WHEN status='used' AND archived=0 THEN cost END),0) AS used_amount,
             COALESCE(SUM(CASE WHEN status='used' AND claimed=0 AND archived=0 THEN cost END),0) AS unclaimed_amount,
-            COALESCE(SUM(CASE WHEN status='available' THEN cost END),0) AS available_amount
+            COALESCE(SUM(CASE WHEN status='available' THEN cost END),0) AS available_amount,
+            SUM(status='used') AS total_used,
+            COALESCE(SUM(CASE WHEN status='used' THEN cost END),0) AS total_amount
      FROM replacement_stock GROUP BY kind`).all(),
-  /** Purchase price of one spare link (what the supplier charged) — 0 = not set. */
-  replUnitPrice: (kind) => {
+  /** The price that will be stamped on the NEXT stock, and whether it has been set for it (one-shot, mandatory). */
+  replPriceState: (kind) => {
     const v = parseFloat(String(module.exports.getSetting(`repl_unit_price_${kind}`, '0')));
-    return Number.isFinite(v) && v > 0 ? v : 0;
+    const price = Number.isFinite(v) && v > 0 ? v : 0;
+    const ready = price > 0 && String(module.exports.getSetting(`repl_price_ready_${kind}`, '0')) === '1';
+    return { price, ready };
   },
-  /** Set the purchase price. It applies to links that enter the pool from now on, and also prices the links that
-   *  were never priced (cost 0) and not yet reset — so an old pool is valued the first time you set it. */
+  /** Last price that was set (display only). */
+  replUnitPrice: (kind) => module.exports.replPriceState(kind).price,
+  /** Set the price of the NEXT stock to be added. It is used once: the next add consumes it, then a new price is needed. */
   replSetUnitPrice: (kind, price) => {
     const p = Math.max(0, Number(price) || 0);
+    if (!(p > 0)) return { price: 0, ok: false };
     module.exports.setSetting(`repl_unit_price_${kind}`, String(p));
-    const priced = db.prepare("UPDATE replacement_stock SET cost=? WHERE kind=? AND cost=0 AND archived=0").run(p, kind).changes;
-    return { price: p, priced };
+    module.exports.setSetting(`repl_price_ready_${kind}`, '1');
+    return { price: p, ok: true };
   },
-  /** Start counting from scratch: the used links so far are archived (never deleted), the numbers are logged. */
+  /** The newest batch (the "current stock"). null when only old unbatched links exist. */
+  replCurrentBatch: (kind) => db.prepare("SELECT * FROM replacement_batches WHERE kind=? ORDER BY id DESC LIMIT 1").get(kind) || null,
+  /** Re-price the CURRENT stock (the newest batch): every link of it still counted gets the new cost. */
+  replPriceCurrentStock: (kind, price) => {
+    const p = Number(price);
+    if (!(p > 0)) return { ok: false };
+    const tx = db.transaction(() => {
+      const b = module.exports.replCurrentBatch(kind);
+      if (b) {
+        db.prepare("UPDATE replacement_batches SET price=? WHERE id=?").run(p, b.id);
+        const n = db.prepare("UPDATE replacement_stock SET cost=? WHERE batch_id=? AND archived=0").run(p, b.id).changes;
+        return { ok: true, batchId: b.id, links: n, price: p };
+      }
+      const n = db.prepare("UPDATE replacement_stock SET cost=? WHERE kind=? AND batch_id IS NULL AND archived=0").run(p, kind).changes;
+      return { ok: true, batchId: null, links: n, price: p };
+    });
+    return tx();
+  },
+  /** Batches with how many links are left / used (since the last reset). Legacy links appear as batch 0. */
+  replBatches: (kind, limit = 8) => {
+    const rows = db.prepare(
+      `SELECT b.id, b.source, b.price, b.qty, b.created_at,
+              SUM(s.status='available') AS available, SUM(s.status='used' AND s.archived=0) AS used
+       FROM replacement_batches b LEFT JOIN replacement_stock s ON s.batch_id=b.id
+       WHERE b.kind=? GROUP BY b.id ORDER BY b.id DESC LIMIT ?`).all(kind, limit);
+    const old = db.prepare(
+      `SELECT COUNT(*) n, SUM(status='available') available, SUM(status='used' AND archived=0) used,
+              COALESCE(MAX(cost),0) price FROM replacement_stock WHERE kind=? AND batch_id IS NULL`).get(kind);
+    if (old && old.n) rows.push({ id: 0, source: 'earlier', price: old.price, qty: old.n, created_at: null, available: old.available || 0, used: old.used || 0 });
+    return rows;
+  },
+  replBatchOf: (batchId) => batchId ? db.prepare("SELECT * FROM replacement_batches WHERE id=?").get(batchId) : null,
+  /** Start counting from scratch: used links so far are archived (never deleted), and the links count + price(s) are logged. */
   replResetAccount: (kind, adminId) => {
     const tx = db.transaction(() => {
       const c = module.exports.replStockCounts().find((x) => x.kind === kind) || {};
-      const out = { used: c.used || 0, unclaimed: c.unclaimed || 0, amount: c.used_amount || 0, unitPrice: module.exports.replUnitPrice(kind) };
+      const groups = db.prepare(
+        `SELECT batch_id, cost AS price, COUNT(*) AS n, SUM(cost) AS amount FROM replacement_stock
+         WHERE kind=? AND status='used' AND archived=0 GROUP BY batch_id, cost ORDER BY batch_id`).all(kind);
+      const breakdown = groups.map((g) => ({ batch: g.batch_id || 0, price: g.price, count: g.n, amount: g.amount }));
+      const used = c.used || 0, amount = c.used_amount || 0;
+      const out = { used, unclaimed: c.unclaimed || 0, amount, unitPrice: used ? amount / used : 0, breakdown };
       db.prepare("UPDATE replacement_stock SET archived=1 WHERE kind=? AND status='used' AND archived=0").run(kind);
-      db.prepare("INSERT INTO replacement_resets (kind, reset_by, used, unclaimed, amount, unit_price) VALUES (?,?,?,?,?,?)")
-        .run(kind, adminId || null, out.used, out.unclaimed, out.amount, out.unitPrice);
+      db.prepare("INSERT INTO replacement_resets (kind, reset_by, used, unclaimed, amount, unit_price, breakdown) VALUES (?,?,?,?,?,?,?)")
+        .run(kind, adminId || null, out.used, out.unclaimed, out.amount, out.unitPrice, JSON.stringify(breakdown));
       return out;
     });
     return tx();
   },
-  replResets: (kind, limit = 5) => db.prepare("SELECT * FROM replacement_resets WHERE kind=? ORDER BY id DESC LIMIT ?").all(kind, limit),
+  /** Used links since the last reset grouped by batch and price: what a Reset would record. */
+  replUsedBreakdown: (kind) => db.prepare(
+    `SELECT batch_id AS batch, cost AS price, COUNT(*) AS count, SUM(cost) AS amount FROM replacement_stock
+     WHERE kind=? AND status='used' AND archived=0 GROUP BY batch_id, cost ORDER BY batch_id`).all(kind)
+    .map((g) => ({ ...g, batch: g.batch || 0 })),
+  replResets: (kind, limit = 5) => db.prepare("SELECT * FROM replacement_resets WHERE kind=? ORDER BY id DESC LIMIT ?").all(kind, limit)
+    .map((r) => ({ ...r, breakdown: (() => { try { return JSON.parse(r.breakdown || '[]'); } catch (_) { return []; } })() })),
   replAvailableCount: (kind) => db.prepare("SELECT COUNT(*) n FROM replacement_stock WHERE kind=? AND status='available'").get(kind).n,
   replTakeOne: (kind, requestId) => {
-    const row = db.prepare("SELECT id, link FROM replacement_stock WHERE kind=? AND status='available' ORDER BY id LIMIT 1").get(kind);
+    const row = db.prepare("SELECT id, link, batch_id, cost FROM replacement_stock WHERE kind=? AND status='available' ORDER BY id LIMIT 1").get(kind);
     if (!row) return null;
     const changed = db.prepare("UPDATE replacement_stock SET status='used', used_for=?, used_at=datetime('now') WHERE id=? AND status='available'").run(requestId, row.id).changes;
     return changed ? row : null;   // null if someone grabbed it first

@@ -758,8 +758,21 @@ try {
   const stockCols = db.prepare("PRAGMA table_info(replacement_stock)").all().map((c) => c.name);
   if (stockCols.length && !stockCols.includes('cost'))     db.exec('ALTER TABLE replacement_stock ADD COLUMN cost REAL NOT NULL DEFAULT 0');
   if (stockCols.length && !stockCols.includes('archived')) db.exec('ALTER TABLE replacement_stock ADD COLUMN archived INTEGER NOT NULL DEFAULT 0');
+  // V165: every link remembers the stock batch it came from
+  if (stockCols.length && !stockCols.includes('batch_id')) db.exec('ALTER TABLE replacement_stock ADD COLUMN batch_id INTEGER');
 } catch (_) {}
+
 db.exec(`
+  -- V165: one row per "add stock" action (by hand or taken from sale stock). The price is fixed per batch.
+  CREATE TABLE IF NOT EXISTS replacement_batches (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind       TEXT NOT NULL DEFAULT 'gemini',
+    source     TEXT NOT NULL DEFAULT 'manual',   -- manual | sale_stock
+    price      REAL NOT NULL DEFAULT 0,
+    qty        INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now')),
+    created_by INTEGER
+  );
   CREATE TABLE IF NOT EXISTS replacement_resets (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     kind       TEXT NOT NULL DEFAULT 'gemini',
@@ -771,6 +784,10 @@ db.exec(`
     unit_price REAL    NOT NULL DEFAULT 0
   );
 `);
+try {
+  const rc = db.prepare("PRAGMA table_info(replacement_resets)").all().map((c) => c.name);
+  if (rc.length && !rc.includes('breakdown')) db.exec("ALTER TABLE replacement_resets ADD COLUMN breakdown TEXT");
+} catch (_) {}
 
 // ── manual_deliveries ────────────────────────────────────────────────────────
 // A paid order that needs a human to hand over the product.

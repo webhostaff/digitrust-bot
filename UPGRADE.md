@@ -1,3 +1,20 @@
+# V165.1 — The price comes from the stock upload (COST)
+
+- **Large Stock Upload**: `COST 0.25` is now **required** for the product that feeds the replacement pool (the DONE command refuses without it).
+- Spare links taken from the sale stock **take that COST automatically** (one batch per cost). Links uploaded earlier without a cost are not moved until priced.
+- Replacement screens (support bot + Admin → ♻️ Replacement cost) show the links replaced since the last reset **by price**, and the **all-time total** (count = amount).
+- Links added by hand still use the price set in the main bot.
+
+# V165 — Replacement links: price per stock, mandatory, reset record
+
+- **Price lives in the main bot** — Admin → ♻️ Replacement cost: set the price of the NEXT stock (or ✅ "same price" in one tap), 🏷 set the price of the CURRENT stock, 📦 batches, 🧾 reset history.
+- **Mandatory & one-shot**: the support bot refuses to add stock (by hand or from sale stock) until a price was set for it; adding stock consumes it, so the next stock needs a price again.
+- **Every add = a batch**; every link remembers its batch and its cost (old links appear as "Earlier stock").
+- **Every Reset records** the number of links and the price(s) (per batch), shown in the confirmation and in the reset history.
+- Support bot: the 💲 Purchase price button is removed; clearer Replacements / Spare links screens (current stock, stocks list, batch shown on each handled request).
+- A customer's replacement request now arrives as a **message from the customer** (inbox + alert with "Handle" and "Open chat" buttons).
+- DB (auto-migrated): `replacement_batches`, `replacement_stock.batch_id`, `replacement_resets.breakdown`.
+
 # V164 — ♻️ Replacements: purchase price per link + 🔄 Reset count
 
 In the support bot, ♻️ Replacements:
