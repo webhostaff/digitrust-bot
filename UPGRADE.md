@@ -2474,3 +2474,6 @@ this pass changes the feel. CSS only; no behaviour changed.
 * Fixed during review: the capsule's styles leaked onto waiting chat rows
   (shared class name) — now scoped to the capsule.
 * Reviewed from real renders on desktop and phone; no page errors.
+
+## V165.2 — Recall a wrong manual delivery
+Delivered task card → **🗑 Recall wrong delivery** → confirm. Deletes the delivery message from the customer's chat (Telegram 48h limit; deliveries made before this update have no stored message id, so only the data is erased), erases delivered info from the order and task, and reopens the task as "processing" so the right item can be delivered.

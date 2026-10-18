@@ -216,6 +216,48 @@ async function openManualDelivery(bot, order, paymentMethod) {
  *
  * @returns {Promise<{ok: boolean, reason?: string}>}
  */
+function rememberDeliveryMsg(bot, taskId, m) {
+  try {
+    if (m && m.message_id) db.setManualDeliveryMsg(taskId, m.message_id, String(bot.token || '').split(':')[0] || null);
+  } catch (_) {}
+}
+
+/**
+ * Take back a wrong delivery: delete the message from the customer's chat,
+ * erase the content from their order, reopen the task. The Telegram delete
+ * works only within 48h and only with the bot that sent it.
+ */
+async function recallManualDelivery(bot, taskId) {
+  const task = db.getManualDelivery(taskId);
+  if (!task) return { ok: false, reason: 'not_found' };
+  if (task.status !== 'delivered') return { ok: false, reason: 'not_delivered' };
+  let removed = false, why = '';
+  if (!task.delivery_msg_id) {
+    why = 'message id was not recorded (delivered before this update)';
+  } else {
+    const tokens = [bot.token, process.env.BOT_TOKEN, process.env.SUPPORT_BOT_TOKEN].filter(Boolean);
+    const tok = tokens.find((t) => String(t).split(':')[0] === String(task.delivery_bot_id));
+    try {
+      if (tok === bot.token || !tok) await bot.deleteMessage(task.user_id, task.delivery_msg_id);
+      else {
+        const r = await fetch(`https://api.telegram.org/bot${tok}/deleteMessage`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ chat_id: task.user_id, message_id: task.delivery_msg_id }),
+        });
+        const j = await r.json();
+        if (!j.ok) throw new Error(j.description || 'delete failed');
+      }
+      removed = true;
+    } catch (e) {
+      why = /too old|can't be deleted|not found/i.test(e.message) ? 'older than 48h or already deleted' : e.message;
+    }
+  }
+  const done = db.recallManualDelivery(taskId);
+  if (!done) return { ok: false, reason: 'not_delivered' };
+  logger.info(`Manual delivery #${taskId} recalled (message removed=${removed})`);
+  return { ok: true, removed, why };
+}
+
 async function completeManualDelivery(bot, taskId, content = null, { panelName = '', expiresOn = null } = {}) {
   const task = db.getManualDelivery(taskId);
   if (!task) return { ok: false, reason: 'not_found' };
@@ -268,18 +310,20 @@ async function completeManualDelivery(bot, taskId, content = null, { panelName =
   let sent = false;
   try {
     // Manually delivered goods get the same protection as automatic ones.
-    await bot.sendMessage(task.user_id, body, {
+    const m1 = await bot.sendMessage(task.user_id, body, {
       plain_emoji: true,
       parse_mode: 'HTML',
       disable_web_page_preview: true,
       reply_markup: { inline_keyboard: kbRows },
     });
     sent = true;
+    rememberDeliveryMsg(bot, taskId, m1);
   } catch (e) {
     // HTML can fail on odd content — retry as plain text before giving up.
     try {
-      await bot.sendMessage(task.user_id, body.replace(/<\/?[^>]+>/g, ''));
+      const m2 = await bot.sendMessage(task.user_id, body.replace(/<\/?[^>]+>/g, ''));
       sent = true;
+      rememberDeliveryMsg(bot, taskId, m2);
     } catch (e2) {
       logger.error(`completeManualDelivery: customer ${task.user_id} unreachable: ${e2.message}`);
     }
@@ -333,6 +377,7 @@ async function cancelManualDelivery(bot, taskId, reason = '') {
 }
 
 module.exports = {
+  recallManualDelivery,
   openManualDelivery,
   completeManualDelivery,
   cancelManualDelivery,

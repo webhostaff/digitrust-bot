@@ -2857,6 +2857,16 @@ module.exports = {
   },
   setManualDeliveryStatus:  (id, status, note = null) => md_setStatus.run(status, note, id),
   markManualDelivered:      (id, content = null) => md_markDelivered.run(content, id).changes > 0,
+  setManualDeliveryMsg:     (id, msgId, botId) => db.prepare('UPDATE manual_deliveries SET delivery_msg_id = ?, delivery_bot_id = ? WHERE id = ?').run(msgId, botId, id),
+  /** Undo a delivery: wipe the content everywhere and reopen the task. */
+  recallManualDelivery:     (id) => db.transaction(() => {
+    const t = db.prepare('SELECT * FROM manual_deliveries WHERE id = ?').get(id);
+    if (!t || t.status !== 'delivered') return false;
+    db.prepare(`UPDATE manual_deliveries SET status='processing', delivered_content=NULL, delivered_at=NULL,
+                delivery_msg_id=NULL, delivery_bot_id=NULL, recalled_at=datetime('now'), updated_at=datetime('now') WHERE id=?`).run(id);
+    db.prepare(`UPDATE orders SET status='pending', delivered_content=NULL WHERE id=?`).run(t.order_id);
+    return true;
+  })(),
   markManualNotified:       (id) => md_markNotified.run(id).changes > 0,
   markManualSeen:           (id) => md_markSeen.run(id),
   chargeWalletForManualOrder,

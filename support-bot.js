@@ -1058,6 +1058,9 @@ async function showManualDetail(chatId, messageId, taskId) {
     kb.push([{ text: '☑️ Mark delivered (no content)', callback_data: `md_done_${t.id}` }]);
     kb.push([{ text: '❌ Cancel & refund', callback_data: `md_cancel_${t.id}` }]);
   }
+  if (t.status === 'delivered') {
+    kb.push([{ text: '🗑 Recall wrong delivery', callback_data: `md_recall_${t.id}` }]);
+  }
   kb.push([{ text: '💬 Open customer chat', callback_data: `chat_${t.user_id}` }]);
   kb.push([{ text: '🔙 Back to list', callback_data: `md_list_${t.status}_0` }]);
 
@@ -1943,6 +1946,26 @@ bot.on('callback_query', async (q) => {
       await bot.sendMessage(chatId, res.ok
         ? `✅ Task #${id} marked delivered.${res.notified ? '' : '\n⚠️ Customer could not be messaged.'}`
         : `⚠️ Could not complete: ${res.reason}`);
+      await showManualDetail(chatId, msgId, id);
+      return;
+    }
+    if (/^md_recall_\d+$/.test(data)) {
+      const id = parseInt(data.split('_').pop(), 10);
+      await send(chatId, msgId,
+        `⚠️ <b>Recall delivery #${id}?</b>\n\n• Deletes the delivery message from the customer's chat\n` +
+        `• Erases the delivered info from their order\n• Reopens the task so you can deliver the right item`,
+        { inline_keyboard: [
+          [{ text: '🗑 Yes, recall it', callback_data: `md_recall_y_${id}` }],
+          [{ text: '🔙 No, keep it', callback_data: `md_view_${id}` }],
+        ] });
+      return;
+    }
+    if (/^md_recall_y_\d+$/.test(data)) {
+      const id = parseInt(data.split('_').pop(), 10);
+      const res = await manualDelivery.recallManualDelivery(bot, id);
+      await bot.sendMessage(chatId, !res.ok ? `⚠️ Could not recall: ${res.reason}`
+        : (res.removed ? `✅ Recalled #${id}: message deleted from the customer's chat, order info erased, task reopened.`
+          : `⚠️ Recalled #${id}: order info erased and task reopened, but the message could NOT be deleted from the chat (${res.why}).`));
       await showManualDetail(chatId, msgId, id);
       return;
     }

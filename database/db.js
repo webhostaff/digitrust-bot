@@ -855,6 +855,15 @@ db.exec(`
     created_at TEXT DEFAULT (datetime('now'))
   );
 `);
+// Where the delivery message landed in the customer's chat, so a wrong
+// delivery can be recalled (deleted) later.
+{
+  const mdCols = db.prepare('PRAGMA table_info(manual_deliveries)').all().map((c) => c.name);
+  if (!mdCols.includes('delivery_msg_id'))  db.exec('ALTER TABLE manual_deliveries ADD COLUMN delivery_msg_id INTEGER');
+  if (!mdCols.includes('delivery_bot_id'))  db.exec('ALTER TABLE manual_deliveries ADD COLUMN delivery_bot_id TEXT');
+  if (!mdCols.includes('recalled_at'))      db.exec('ALTER TABLE manual_deliveries ADD COLUMN recalled_at TEXT');
+}
+
 
 // ── admin_notifications ──────────────────────────────────────────────────────
 // Persistent inbox for the admin. dedupe_key is UNIQUE, so INSERT OR IGNORE
