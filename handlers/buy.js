@@ -409,7 +409,7 @@ async function payWithWallet(bot, chatId, userId, orderId, messageId) {
 
     const freshOrder = db.getOrder(orderId);
     await manualDelivery.openManualDelivery(bot, freshOrder, 'wallet');
-    const _paidOrder = db.getOrder(orderId) || order;
+    const _paidOrder = db.getOrder(order.id) || order;
     consumeAllowanceFor(_paidOrder, _paidOrder?.allowance_units);
   await handleReferralReward(bot, userId);
 

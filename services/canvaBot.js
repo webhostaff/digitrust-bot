@@ -765,7 +765,18 @@ async function doInvite(page, email, trace) {
 
   // 4) Fallback: verify via People search and use the row's own Copy link.
   let row = null;
-  for (let i = 0; i < 4 && row !== 'pending'; i++) { row = await findRow(page, email); if (row !== 'pending') await sleep(1500); }
+  // V159.3: Canva's People list does not always refresh by itself after an invite (the row was on screen in the
+  // owner's screenshot while this check said "not there"). So look, and if it is not there, RELOAD the page and
+  // look again — up to 5 looks over ~25 s.
+  for (let i = 0; i < 5 && row !== 'pending'; i++) {
+    row = await findRow(page, email);
+    if (row === 'pending') break;
+    if (i >= 1) {
+      await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
+      await sleep(3500);
+      await acceptCookies(page);
+    } else await sleep(2000);
+  }
   if (row !== 'pending') {
     if (trace.sent) return { reason: 'invited, but the link could not be copied', invited: true };
     // Send was clicked but nothing confirmed it: it MAY have gone out. 'maybe'
@@ -871,8 +882,11 @@ function scanRows(page, email) {
   return page.evaluate(({ email }) => {
     const want = email.toLowerCase();
     const EMAIL = /[^\s@]+@[^\s@]+\.[a-z]{2,}/gi;
+    // V159.3: match elements whose OWN text holds the email — not only childless ones. Canva's row can wrap the
+    // address with extra spans/icons/<br>, and then "no children" matched nothing though the row was on screen.
+    const own = (el) => [...el.childNodes].filter((n) => n.nodeType === 3).map((n) => n.nodeValue).join(' ').toLowerCase();
     const all = [...document.querySelectorAll('body *')].filter((el) =>
-      el.children.length === 0 && (el.textContent || '').toLowerCase().includes(want));
+      !/^(script|style|noscript)$/i.test(el.tagName) && (own(el).includes(want) || (el.children.length === 0 && (el.textContent || '').toLowerCase().includes(want))));
     for (const leaf of all) {
       let el = leaf;
       for (let d = 0; el && d < 8; d++, el = el.parentElement) {

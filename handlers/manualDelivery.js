@@ -95,6 +95,26 @@ async function openManualDelivery(bot, order, paymentMethod) {
           } catch (_) {}
           return db.getManualDelivery(row.id);
         }
+      } else if (r.invited === true && !r.link && !r.teamFull) {
+        // V165.3: Canva CONFIRMED the invite (its email went to the customer) but the personal link could not be
+        // copied. The customer does not need the link — Canva's own email has the Accept button — so deliver anyway
+        // instead of leaving the customer waiting for a manual task.
+        const note = `Canva has sent an invitation to ${order.email}. Open that email (check Spam / Promotions) and press "Accept invitation".`;
+        const done = await completeManualDelivery(bot, row.id, note, { panelName: r.panelName || '' });
+        if (done.ok) {
+          logger.info(`[canva] invite confirmed for #${order.id} (no link copied) — delivered with the email instruction`);
+          try {
+            const { notifyAdmin } = require('../services/adminNotify');
+            await notifyAdmin(bot, {
+              type: 'manual_delivery', title: '🤖 Canva invite sent (email only)',
+              body: `🆔 Task #${row.id} · Order #${order.id}\n📧 <code>${escapeHtml(order.email)}</code>\n` +
+                    (r.panelName ? `🎨 Panel: <b>${escapeHtml(r.panelName)}</b>\n` : '') +
+                    `✅ Invited. The link could not be copied, so the customer was told to accept from Canva's email. No action needed.`,
+              dedupeKey: `canva_auto:${row.id}`, refType: 'manual_delivery', refId: row.id,
+            });
+          } catch (_) {}
+          return db.getManualDelivery(row.id);
+        }
       } else {
         logger.warn(`[canva] auto-invite failed for #${order.id}: ${r.reason}` +
           (r.needLogin ? ' (needs re-login)' : '') + ' — handing to manual');

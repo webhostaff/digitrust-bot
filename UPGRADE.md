@@ -1,3 +1,10 @@
+# V165.3 — Canva auto-invite: the invite was sent but not "seen" · a crash after payment
+
+- **Canva auto-invite**: the invite WAS reaching Canva (it showed in People with "Invite is valid for N more days") but the bot's check said "does not show in People" and handed the order to manual. Two fixes: (1) the row finder now also matches an address wrapped in extra spans/icons (before it only matched childless elements); (2) if the row is not there yet, the bot **reloads People and looks again** (5 looks over ~25 s) — Canva's list does not always refresh by itself.
+- **Crash fixed** (`orderId is not defined`, handlers/buy.js): after a Binance/USDT payment for a manual product (Canva), the order was opened but the code then crashed — so the allowance, referral reward, stock check and admin notice after it were skipped. Now uses the real order id.
+- **Link not copied but invite confirmed**: the order is now delivered anyway — the customer is told Canva emailed him an invitation (check Spam) — instead of waiting for a manual task.
+- If a Canva invite still fails, the same screenshot/"🔍 Canva page after the invite" message arrives; send it again.
+
 # V165.1 — The price comes from the stock upload (COST)
 
 - **Large Stock Upload**: `COST 0.25` is now **required** for the product that feeds the replacement pool (the DONE command refuses without it).
