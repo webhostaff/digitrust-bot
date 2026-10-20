@@ -187,12 +187,18 @@ function cycleLabel(db, endDate) {
 
 /** Paid renewals: waiting for activation, and those activated in the last `days` days (V156.7). */
 function paidRenewals(db, todayYmd, days = 20) {
+  // V166: everything the admin needs to see WHO renewed, for what and when — the customer, the order, the payment,
+  // the previous period, and whether it is the same customer / e-mail as before.
   return db.prepare(`
     SELECT cs.id, cs.order_id, cs.user_id, cs.email, cs.start_date, cs.end_date, cs.status, cs.workspace, cs.final_price,
-           prev.workspace AS prev_workspace, u.username
+           cs.created_at AS renewed_at,
+           prev.workspace AS prev_workspace, prev.user_id AS prev_user_id, prev.email AS prev_email, prev.end_date AS prev_end,
+           u.username, u.first_name,
+           o.payment_method, o.paid_at AS order_paid_at, o.created_at AS order_created_at, o.total_price AS order_total
       FROM chatgpt_subscriptions cs
       JOIN chatgpt_subscriptions prev ON prev.id = cs.renewed_from
       LEFT JOIN users u ON u.telegram_id = cs.user_id
+      LEFT JOIN orders o ON o.id = cs.order_id
      WHERE COALESCE(cs.status,'pending') = 'pending'
         OR (cs.status = 'active' AND date(cs.start_date) >= date(?, '-' || ? || ' days'))
      ORDER BY cs.status DESC, date(cs.start_date), cs.email`).all(todayYmd, days);

@@ -1,3 +1,12 @@
+# V166.1 — 💙 Paid renewals: its own organised section (who renewed, for what, paid how and when)
+
+ChatGPT Business bot → 🛠 Admin → **💙 Paid renewals**:
+- Header: how many renewals and the total amount. Filters: **🔵 To activate · 🟢 Activated (20 days) · 💙 All**.
+- Grouped by **panel · cycle** (with the count and sum of each group). Every renewal is one clear card:
+  `📧 e-mail` · `👤 @customer + id` · `🧾 order #` · `📅 new period (was until …)` · `💵 amount · payment method · paid date/time`.
+- Flags: **⚠️ renewed by ANOTHER customer** (the seat belonged to someone else) and **📧 e-mail changed** (the old e-mail is shown).
+- After the cards, one block of e-mails per panel to copy.
+
 # V166 — Smart reply (whole-sentence fix + intent + AI) · 🧮 compensation calculator
 
 **✍️ Smart reply** (support bot, staff replies only — replaces the old typo check):

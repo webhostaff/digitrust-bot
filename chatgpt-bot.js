@@ -946,7 +946,7 @@ async function handleAdminPanelButton(data, chatId, msgId, userId) {
   if (String(userId) !== String(ADMIN_ID)) return true;
   if (data === 'adm_home') { await showAdminPanel(chatId, msgId); return true; }
   if (data === 'adm_emailreqs') { await showEmailRequests(chatId); return true; }
-  if (data === 'adm_paidrenewals') { await showPaidRenewals(chatId); return true; }
+  { const mp = /^adm_paidrenewals(?:_(wait|done))?$/.exec(data); if (mp) { await showPaidRenewals(chatId, mp[1] || 'all'); return true; } }
   if (data === 'adm_pending') { await showOrdersToActivate(chatId); return true; }
   if (data === 'adm_laterenewals') { await showLateRequests(chatId); return true; }
   let m = /^adm_end_(today|tomorrow|\+\d+)$/.exec(data);
@@ -2275,11 +2275,34 @@ async function handleDayMoveButton(data, chatId, msgId, adminId) {
     { parse_mode: 'HTML' });
 }
 
-// ── V156.7: 💙 paid renewals, each with its panel and cycle ──
-async function showPaidRenewals(chatId) {
+// ── 💙 Paid renewals — V156.7, reorganised in V166: WHO renewed, for what, paid how and when ──
+function fmtLocalTs(ts) {
+  if (!ts) return '';
+  const d = cgbCycles.localNow(new Date(String(ts).includes('T') ? ts : String(ts).replace(' ', 'T') + 'Z'));
+  if (Number.isNaN(d.getTime())) return String(ts).slice(0, 16);
+  return `${ymdLocal(d)} ${p2d(d.getHours())}:${p2d(d.getMinutes())}`;
+}
+const rnMoney = (n) => `$${(Math.round((Number(n) || 0) * 100) / 100).toFixed(2).replace(/\.?0+$/, '')}`;
+
+function paidRenewalsKb(mode, counts) {
+  const b = (k, label) => ({ text: (mode === k ? '● ' : '') + label, callback_data: `adm_paidrenewals${k === 'all' ? '' : '_' + k}` });
+  return { inline_keyboard: [
+    [b('wait', `🔵 To activate · ${counts.wait}`), b('done', `🟢 Activated · ${counts.done}`)],
+    [b('all', `💙 All · ${counts.wait + counts.done}`)],
+    [{ text: '🔙 Admin', callback_data: 'adm_home' }],
+  ] };
+}
+
+async function showPaidRenewals(chatId, mode = 'all') {
   const today = ymdLocal(cgbCycles.localNow(new Date()));
-  const rows = cgbSeatTools.paidRenewals(db, today, 20);
-  if (!rows.length) { await bot.sendMessage(chatId, '💙 No paid renewal waiting, none activated in the last 20 days.'); return; }
+  const all = cgbSeatTools.paidRenewals(db, today, 20);
+  const counts = { wait: all.filter((r) => r.status !== 'active').length, done: all.filter((r) => r.status === 'active').length };
+  const rows = mode === 'wait' ? all.filter((r) => r.status !== 'active') : mode === 'done' ? all.filter((r) => r.status === 'active') : all;
+  if (!all.length) { await bot.sendMessage(chatId, '💙 No paid renewal waiting, none activated in the last 20 days.'); return; }
+  const total = rows.reduce((a, r) => a + (Number(r.order_total ?? r.final_price) || 0), 0);
+  let txt = `💙 <b>Paid renewals</b>${mode === 'wait' ? ' · to activate' : mode === 'done' ? ' · activated (20 days)' : ''}\n` +
+            `<b>${rows.length}</b> renewal${rows.length === 1 ? '' : 's'} · 💵 <b>${rnMoney(total)}</b>\n`;
+  if (!rows.length) txt += `\n<i>Nothing in this list.</i>`;
   const groups = new Map();
   for (const r of rows) {
     const pl = seatPlace(r);
@@ -2287,20 +2310,30 @@ async function showPaidRenewals(chatId) {
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(r);
   }
-  const waiting = rows.filter((r) => r.status !== 'active').length;
-  let txt = `💙 <b>Paid renewals</b> — 🔵 ${waiting} to activate · 🟢 ${rows.length - waiting} activated (20 days)\n`;
   const blocks = [];
   for (const [place, list] of groups) {
-    txt += `\n🖥 <b>${place}</b> · ${list.length}\n`;
+    const sub = list.reduce((a, r) => a + (Number(r.order_total ?? r.final_price) || 0), 0);
+    txt += `\n━━━━━━━━━━━━━━━━━━\n🖥 <b>${place}</b> · ${list.length} · ${rnMoney(sub)}\n`;
     for (const r of list) {
-      const who = r.username ? `@${escapeHtml(r.username)}` : `<code>${r.user_id}</code>`;
-      txt += `${r.status === 'active' ? '🟢' : '🔵'} <code>${escapeHtml(r.email)}</code> — ${who}${r.order_id ? ` · #${r.order_id}` : ''} · ${r.start_date} → ${r.end_date}\n`;
+      const who = (r.username ? `@${escapeHtml(r.username)}` : escapeHtml(r.first_name || '')) || '';
+      const paid = fmtLocalTs(r.order_paid_at || r.order_created_at || r.renewed_at);
+      txt += `\n${r.status === 'active' ? '🟢' : '🔵'} <code>${escapeHtml(r.email)}</code>\n` +
+             `   👤 ${who} <code>${r.user_id}</code>${r.order_id ? ` · 🧾 #${r.order_id}` : ''}\n` +
+             `   📅 ${r.start_date} → ${r.end_date}${r.prev_end ? ` <i>(was until ${String(r.prev_end).slice(0, 10)})</i>` : ''}\n` +
+             `   💵 ${rnMoney(r.order_total ?? r.final_price)}${r.payment_method ? ` · ${escapeHtml(String(r.payment_method))}` : ''}${paid ? ` · paid ${paid}` : ''}\n`;
+      if (r.prev_user_id && String(r.prev_user_id) !== String(r.user_id)) txt += `   ⚠️ renewed by ANOTHER customer — the seat belonged to <code>${r.prev_user_id}</code>\n`;
+      if (r.prev_email && String(r.prev_email).toLowerCase() !== String(r.email).toLowerCase()) txt += `   📧 e-mail changed — it was <code>${escapeHtml(r.prev_email)}</code>\n`;
     }
     blocks.push({ place, emails: list.map((r) => r.email) });
   }
-  for (const chunk of txt.match(/[\s\S]{1,3800}(?=\n|$)/g) || [txt]) await bot.sendMessage(chatId, chunk, { parse_mode: 'HTML' });
-  for (const b of blocks) {
-    await bot.sendMessage(chatId, `🖥 <b>${b.place}</b>\n<code>${escapeHtml(b.emails.join('\n'))}</code>`, { parse_mode: 'HTML' }).catch(() => {});
+  const parts = txt.match(/[\s\S]{1,3800}(?=\n|$)/g) || [txt];
+  for (let i = 0; i < parts.length; i++) {
+    await bot.sendMessage(chatId, parts[i], { parse_mode: 'HTML', ...(i === parts.length - 1 && !blocks.length ? { reply_markup: paidRenewalsKb(mode, counts) } : {}) });
+  }
+  for (let i = 0; i < blocks.length; i++) {
+    const b = blocks[i];
+    await bot.sendMessage(chatId, `📋 <b>${b.place}</b> — emails to copy\n<code>${escapeHtml(b.emails.join('\n'))}</code>`,
+      { parse_mode: 'HTML', ...(i === blocks.length - 1 ? { reply_markup: paidRenewalsKb(mode, counts) } : {}) }).catch(() => {});
   }
 }
 
