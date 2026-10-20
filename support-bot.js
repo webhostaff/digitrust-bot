@@ -46,6 +46,8 @@ const config  = require('./config');
 const manualDelivery = require('./handlers/manualDelivery');
 const { notifyAdmin } = require('./services/adminNotify');
 const { fixTypos } = require('./services/typoFix');   // V162
+const replyAssist = require('./services/replyAssist');   // V166: whole-sentence fix + intent + AI rewrite
+const compCalc = require('./services/compCalc');          // V166: compensation-links calculator
 
 /**
  * Who counts as support staff.
@@ -244,7 +246,8 @@ function setActiveChat(staffChatId, targetUserId) {
 async function sendSupportText(staffChatId, targetUserId, textToSend) {
   try {
     const sent = await bot.sendMessage(targetUserId, `📩 <b>Support</b>\n\n${escapeHtml(textToSend)}`, { parse_mode: 'HTML' });
-    insertMsg.run(targetUserId, null, null, 'out', textToSend, null, sent && sent.message_id ? sent.message_id : null);
+    const ins = insertMsg.run(targetUserId, null, null, 'out', textToSend, null, null);
+    if (sent && sent.message_id) rawDb.prepare('UPDATE support_messages SET tg_msg_id = ? WHERE id = ?').run(sent.message_id, ins.lastInsertRowid);   // V166: Recall works on improved replies too
     await bot.sendMessage(staffChatId, '✅ Sent.').catch(() => {});
   } catch (e) {
     await bot.sendMessage(staffChatId, `⚠️ Could not send: ${e.message}`).catch(() => {});
@@ -379,8 +382,11 @@ async function showStaffHome(chatId) {
     `<i>Send /menu to refresh the numbers on it.</i>`,
     { parse_mode: 'HTML', reply_markup: staffKeyboard() }
   );
-  await bot.sendMessage(chatId, '✍️ When ON, if your reply has common typos I show a corrected version with a one-tap choice before it is sent.',
-    { reply_markup: { inline_keyboard: [[{ text: queries.getSetting('support_autocorrect', '1') === '1' ? '✍️ Turn auto-correct OFF' : '✍️ Turn auto-correct ON', callback_data: 'ac_toggle' }]] } }).catch(() => {});
+  await bot.sendMessage(chatId, '✍️ When ON, I fix the whole sentence (spelling, punctuation, wording), understand what you mean and suggest a ready reply — you choose with one tap before it is sent.',
+    { reply_markup: { inline_keyboard: [
+      [{ text: queries.getSetting('support_autocorrect', '1') === '1' ? '✍️ Smart reply: ON (tap to turn OFF)' : '✍️ Smart reply: OFF (tap to turn ON)', callback_data: 'ac_toggle' }],
+      [{ text: queries.getSetting('support_suggest', '1') === '1' ? '💡 Ready-made suggestions: ON' : '💡 Ready-made suggestions: OFF', callback_data: 'ac_sug_toggle' }],
+    ] } }).catch(() => {});
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1462,14 +1468,22 @@ bot.on('callback_query', async (q) => {
     // ── V161: replacements (staff) ──────────────────────────────────────
     // V162: spelling-fix choice
     {
-      const m = /^ac_(fix|raw)_([a-z0-9]{8})$/.exec(data);
+      const m = /^ac_(fix|raw|alt0|alt1)_([a-z0-9]{8})$/.exec(data);
       if (m) {
         const saved = queries.getSetting(`ac_${m[2]}`, '');
         queries.setSetting(`ac_${m[2]}`, '');
         if (!saved) { await bot.answerCallbackQuery(q.id, { text: 'Expired — type it again.' }).catch(() => {}); return; }
         let obj; try { obj = JSON.parse(saved); } catch (_) { return; }
         await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msgId }).catch(() => {});
-        await sendSupportText(chatId, obj.u, m[1] === 'fix' ? obj.fixed : obj.orig);
+        const pick = m[1] === 'fix' ? obj.fixed : m[1] === 'raw' ? obj.orig : (obj.alts || [])[Number(m[1][3])];
+        await sendSupportText(chatId, obj.u, pick || obj.orig);
+        return;
+      }
+      if (data === 'ac_sug_toggle') {
+        const on = queries.getSetting('support_suggest', '1') === '1';
+        queries.setSetting('support_suggest', on ? '0' : '1');
+        await bot.answerCallbackQuery(q.id, { text: on ? 'Suggestions off' : 'Suggestions on' }).catch(() => {});
+        await showStaffHome(chatId).catch(() => {});
         return;
       }
       if (data === 'ac_toggle') {
@@ -1481,6 +1495,21 @@ bot.on('callback_query', async (q) => {
       }
     }
 
+    {
+      const mc = /^rq_calc_(today|d7|d30|reset|all|x)$/.exec(data);
+      if (mc) {
+        if (mc[1] === 'x') {
+          queries.setSetting(`support_state_${chatId}`, 'AWAIT_CALC');
+          await bot.sendMessage(chatId, compCalc.PROMPT, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Calculator', callback_data: 'rq_calc_reset' }]] } });
+          return;
+        }
+        queries.setSetting(`support_state_${chatId}`, '');
+        const v = compCalc.view(mc[1], { cb: 'rq_calc', back: 'rq_home', backText: '🔙 Replacements' });
+        const o = { parse_mode: 'HTML', reply_markup: { inline_keyboard: v.kb } };
+        await bot.editMessageText(v.text, { chat_id: chatId, message_id: msgId, ...o }).catch(() => bot.sendMessage(chatId, v.text, o));
+        return;
+      }
+    }
     if (data === 'rq_home')  { await showReplacementsHome(chatId, msgId); return; }
     if (data === 'rq_stock') { await showReplStock(chatId, msgId); return; }
     if (data === 'rq_addstock') {
@@ -2133,6 +2162,13 @@ bot.on('message', async (msg) => {
       await showReplStock(chatId, null);
       return;
     }
+    if (state === 'AWAIT_CALC') {
+      const r = compCalc.calc(text);
+      if (!r) { await bot.sendMessage(chatId, '❌ I could not read that.\n\n' + compCalc.PROMPT, { parse_mode: 'HTML' }); return; }
+      await bot.sendMessage(chatId, `🧮 <b>Calculation</b>\n━━━━━━━━━━━━━━━━━━\n${r.text}`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+        [{ text: '➕ Another calculation', callback_data: 'rq_calc_x' }], [{ text: '🔙 Calculator', callback_data: 'rq_calc_reset' }]] } });
+      return;
+    }
     if (state === 'AWAIT_REPL_STOCK') {
       queries.setSetting(`support_state_${chatId}`, '');
       const links = text.split(/\r?\n/).map((x) => x.trim()).filter((x) => x && /https?:\/\/|\./.test(x));
@@ -2212,21 +2248,33 @@ bot.on('message', async (msg) => {
     let mediaType = null, fileId = null;
     const contentText = msg.text || msg.caption || '';
 
-    // V162: offer a spelling fix before the reply leaves (staff only, never silent, never touches links/@/numbers).
-    if (msg.text && queries.getSetting('support_autocorrect', '1') === '1') {
-      const { fixed, changes } = fixTypos(msg.text);
-      if (changes.length) {
-        const token = Math.random().toString(36).slice(2, 10);
-        queries.setSetting(`ac_${token}`, JSON.stringify({ u: targetUserId, orig: msg.text, fixed }));
-        await bot.sendMessage(chatId,
-          `✍️ <b>Spelling check</b> — I can fix ${changes.length} word(s):\n` +
-          changes.slice(0, 12).map((c) => `• <s>${escapeHtml(c.from)}</s> → <b>${escapeHtml(c.to)}</b>`).join('\n') +
-          `\n\n<b>Corrected:</b>\n${escapeHtml(fixed)}`,
-          { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
-            [{ text: '✅ Send corrected', callback_data: `ac_fix_${token}` }],
-            [{ text: '📤 Send as I wrote', callback_data: `ac_raw_${token}` }],
-          ] } });
-        return;
+    // V166: smart reply — fixes the whole sentence, understands what it is about, offers ready wording, optional AI
+    // rewrite. Staff only; nothing leaves without a tap; links / e-mails / numbers are never changed.
+    if (msg.text && !msg.text.startsWith('/') && queries.getSetting('support_autocorrect', '1') === '1') {
+      try {
+        bot.sendChatAction(chatId, 'typing').catch(() => {});
+        const last = rawDb.prepare("SELECT content FROM support_messages WHERE user_id = ? AND direction = 'in' AND content IS NOT NULL AND content != '' ORDER BY id DESC LIMIT 1").get(targetUserId);
+        const a = await replyAssist.analyze(msg.text, { customerText: last ? last.content : '' });
+        const changed = a.fixed.trim() !== msg.text.trim();
+        const wantSug = queries.getSetting('support_suggest', '1') === '1' && a.suggestions.length && msg.text.split(/\s+/).length >= 2;
+        if (changed || wantSug) {
+          const token = Math.random().toString(36).slice(2, 10);
+          const alts = (wantSug ? a.suggestions : []).slice(0, 2);
+          queries.setSetting(`ac_${token}`, JSON.stringify({ u: targetUserId, orig: msg.text, fixed: a.fixed, alts }));
+          const head = `✍️ <b>Smart reply</b>${a.intent ? ` · <i>${escapeHtml(a.intent.label)}</i>` : ''}${a.ai ? ' · 🤖' : ''}`;
+          let txt = head + '\n━━━━━━━━━━━━━━━━━━\n';
+          if (changed) txt += `<b>Improved</b>\n${escapeHtml(a.fixed)}\n`;
+          else txt += `<i>Your wording is fine.</i>\n`;
+          alts.forEach((x, i) => { txt += `\n<b>💡 Option ${i + 1}</b>\n${escapeHtml(x)}\n`; });
+          const rows = [];
+          if (changed) rows.push([{ text: '✅ Send improved', callback_data: `ac_fix_${token}` }]);
+          alts.forEach((x, i) => rows.push([{ text: `💡 Send option ${i + 1}`, callback_data: `ac_alt${i}_${token}` }]));
+          rows.push([{ text: '📤 Send as I wrote', callback_data: `ac_raw_${token}` }]);
+          await bot.sendMessage(chatId, txt.slice(0, 4000), { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
+          return;
+        }
+      } catch (e) {
+        logger.warn(`[replyAssist] skipped: ${e.message}`);   // never block a reply
       }
     }
 
@@ -2407,6 +2455,7 @@ async function showReplacementsHome(chatId, messageId) {
   }
   rows.push([{ text: `📦 Spare links (${counts.available || 0})`, callback_data: 'rq_stock' }]);
   if ((counts.unclaimed || 0) > 0) rows.push([{ text: `📥 Claim ${counts.unclaimed} back (${replMoney(counts.unclaimed_amount)})`, callback_data: 'rq_claim' }]);
+  rows.push([{ text: '🧮 Compensation calculator', callback_data: 'rq_calc_reset' }]);
   rows.push([{ text: '🔄 Record & reset the count', callback_data: 'rq_reset' }]);
   const opts = { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } };
   if (messageId) await bot.editMessageText(txt, { chat_id: chatId, message_id: messageId, ...opts }).catch(() => bot.sendMessage(chatId, txt, opts));

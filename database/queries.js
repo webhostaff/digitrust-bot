@@ -3414,6 +3414,16 @@ module.exports = {
     `SELECT batch_id AS batch, cost AS price, COUNT(*) AS count, SUM(cost) AS amount FROM replacement_stock
      WHERE kind=? AND status='used' AND archived=0 GROUP BY batch_id, cost ORDER BY batch_id`).all(kind)
     .map((g) => ({ ...g, batch: g.batch || 0 })),
+  /** V166 calculator: links given as compensation in a period, grouped by their price. period: today | d7 | d30 | reset | all */
+  replUsedByPeriod: (kind, period) => {
+    const where = { today: "AND used_at >= datetime('now','start of day')", d7: "AND used_at >= datetime('now','-7 days')",
+      d30: "AND used_at >= datetime('now','-30 days')", reset: 'AND archived=0', all: '' }[period] ?? 'AND archived=0';
+    return db.prepare(
+      `SELECT cost AS price, COUNT(*) AS n, COALESCE(SUM(cost),0) AS amount,
+              SUM(CASE WHEN claimed=0 AND archived=0 THEN 1 ELSE 0 END) AS unclaimed,
+              COALESCE(SUM(CASE WHEN claimed=0 AND archived=0 THEN cost END),0) AS unclaimed_amount
+       FROM replacement_stock WHERE kind=? AND status='used' ${where} GROUP BY cost ORDER BY cost DESC`).all(kind);
+  },
   replResets: (kind, limit = 5) => db.prepare("SELECT * FROM replacement_resets WHERE kind=? ORDER BY id DESC LIMIT ?").all(kind, limit)
     .map((r) => ({ ...r, breakdown: (() => { try { return JSON.parse(r.breakdown || '[]'); } catch (_) { return []; } })() })),
   replAvailableCount: (kind) => db.prepare("SELECT COUNT(*) n FROM replacement_stock WHERE kind=? AND status='available'").get(kind).n,

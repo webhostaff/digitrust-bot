@@ -7,6 +7,7 @@
  *            admin_rc_cp (re-price the CURRENT stock) · admin_rc_b (batches) · admin_rc_h (reset history)
  */
 const db = require('../database/queries');
+const compCalc = require('./compCalc');
 const session = require('../handlers/session');
 const { States } = session;
 
@@ -48,6 +49,7 @@ function viewHome(note = '') {
   if (pr.price && !pr.ready) kb.push([{ text: `✅ Same price (${money(pr.price)})`, callback_data: 'admin_rc_same' }]);
   kb.push([{ text: pr.ready ? '✏️ Change the price of the next stock' : '💲 Set the price of the next stock', callback_data: 'admin_rc_np' }]);
   kb.push([{ text: '🏷 Set the price of the current stock', callback_data: 'admin_rc_cp' }]);
+  kb.push([{ text: '🧮 Compensation calculator', callback_data: 'admin_rc_calc_reset' }]);
   kb.push([{ text: '📦 Batches', callback_data: 'admin_rc_b' }, { text: '🧾 Reset history', callback_data: 'admin_rc_h' }]);
   kb.push(BACK);
   return { text: t, kb };
@@ -89,6 +91,13 @@ async function handle(bot, query) {
   const chatId = query.message.chat.id, msgId = query.message.message_id, adminId = query.from.id;
   bot.answerCallbackQuery(query.id).catch(() => {});
   if (data === 'admin_rc') { session.clear(adminId); await show(bot, chatId, msgId, viewHome()); return true; }
+  { const mc = /^admin_rc_calc_(today|d7|d30|reset|all|x)$/.exec(data);
+    if (mc) {
+      if (mc[1] === 'x') { session.set(adminId, States.ADMIN_REPL_CALC, {}); await show(bot, chatId, msgId, { text: compCalc.PROMPT, kb: [[{ text: '🔙 Calculator', callback_data: 'admin_rc_calc_reset' }]] }); return true; }
+      session.clear(adminId);
+      await show(bot, chatId, msgId, compCalc.view(mc[1], { cb: 'admin_rc_calc', back: 'admin_rc', backText: '🔙 Replacement cost' }));
+      return true;
+    } }
   if (data === 'admin_rc_b') { await show(bot, chatId, msgId, viewBatches()); return true; }
   if (data === 'admin_rc_h') { await show(bot, chatId, msgId, viewHistory()); return true; }
   if (data === 'admin_rc_same') {
@@ -114,6 +123,13 @@ async function handle(bot, query) {
 /** Text typed after tapping a price button. Returns true when it handled the message. */
 async function handleText(bot, msg, state, text) {
   const chatId = msg.chat.id, adminId = msg.from.id;
+  if (state === States.ADMIN_REPL_CALC) {
+    const r = compCalc.calc(text);
+    if (!r) { await bot.sendMessage(chatId, '❌ I could not read that.\n\n' + compCalc.PROMPT, { parse_mode: 'HTML' }); return true; }
+    await bot.sendMessage(chatId, `🧮 <b>Calculation</b>\n━━━━━━━━━━━━━━━━━━\n${r.text}`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+      [{ text: '➕ Another calculation', callback_data: 'admin_rc_calc_x' }], [{ text: '🔙 Calculator', callback_data: 'admin_rc_calc_reset' }]] } });
+    return true;
+  }
   const p = parsePrice(text);
   if (!p) { await bot.sendMessage(chatId, '❌ Send a number greater than 0, e.g. <code>2.5</code>', { parse_mode: 'HTML' }); return true; }
   session.clear(adminId);

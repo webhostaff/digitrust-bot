@@ -285,7 +285,7 @@ async function handleAdminText(bot, msg) {
   // ═══════════════════════════════════════════════════════════════════
 
   // ── V165: replacement link prices (typed after tapping a price button) ──
-  if (s === States.ADMIN_REPL_PRICE || s === States.ADMIN_REPL_CURPRICE) {
+  if (s === States.ADMIN_REPL_PRICE || s === States.ADMIN_REPL_CURPRICE || s === States.ADMIN_REPL_CALC) {
     await require('../services/replCostAdmin').handleText(bot, msg, s, text);
     return;
   }

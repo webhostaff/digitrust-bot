@@ -1,3 +1,22 @@
+# V166 — Smart reply (whole-sentence fix + intent + AI) · 🧮 compensation calculator
+
+**✍️ Smart reply** (support bot, staff replies only — replaces the old typo check):
+- Fixes the **whole sentence**: ~600-word spelling dictionary (typos, SMS-speak, brand names: Gemini, ChatGPT, Canva, Gmail…), spacing, punctuation, capital letters, "i" → "I", doubled words, "!!!", a closing full stop; short support phrases ("send me ur email" → "Please send me your email address.").
+- **Understands what you mean** (English, Arabic, Tunisian) — invitation sent, need e-mail, please wait, replacement, refund, payment check, delivered, thanks, apology — and offers 1–2 ready professional replies (**💡 Send option**).
+- **AI rewrite** when `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` is set (the same keys as Sahbi; optional `REPLY_AI_MODEL`): it reads your draft + the customer's last message, writes it in the **customer's language**, fixes and improves it. If the AI is off, slow or changes a link/e-mail/number, the offline engine answers — a reply is never blocked.
+- Never touches links, @handles, #tags, e-mails, order numbers, numbers, prices. Nothing is sent without your tap: ✅ Send improved · 💡 Option · 📤 Send as I wrote.
+- Staff home: two switches — Smart reply ON/OFF and Ready-made suggestions ON/OFF.
+- Fix: a reply sent through the correction buttons can now be recalled (its message id was stored in the wrong column).
+
+**🧮 Compensation calculator** — support bot ♻️ Replacements → 🧮, and main bot Admin → ♻️ Replacement cost → 🧮:
+```
+5 × $0.25 = $1.25
+2 × $0.45 = $0.90
+━━━━━━━━━━━━
+7 links = $2.15
+```
+Periods: Today · 7 days · 30 days · Since last reset · All time (+ what is still to claim from the supplier). **➕ Calculate a number of links**: send `3 x 0.45 + 2 x 0.25` and get the list and total.
+
 # V165.3 — Canva auto-invite: the invite was sent but not "seen" · a crash after payment
 
 - **Canva auto-invite**: the invite WAS reaching Canva (it showed in People with "Invite is valid for N more days") but the bot's check said "does not show in People" and handed the order to manual. Two fixes: (1) the row finder now also matches an address wrapped in extra spans/icons (before it only matched childless elements); (2) if the row is not there yet, the bot **reloads People and looks again** (5 looks over ~25 s) — Canva's list does not always refresh by itself.
