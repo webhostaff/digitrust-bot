@@ -379,10 +379,88 @@ async function fetchGuardPanels() {
   return cgbRouting.listGuardPanels(GUARD_URL);
 }
 
-/** Like fetchGuardPanels but with the panels' NAMES: [{id, name, state}]. null = unreachable. */
+/**
+ * One invite bot's panels → { ok, list:[{id,name,state}], error }.
+ * V166.3: /health first (public, has the names); if it fails or lists nothing, the authenticated status call
+ * (/api/control, X-Invite-Secret — the one the 🤖 Invite bots screen already uses) so the list does not depend on /health.
+ */
+async function healthPanels(origin, timeoutMs) {
+  const withTimeout = async (url, opts) => {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    try { return await fetch(url, { ...opts, signal: ctrl.signal }); } finally { clearTimeout(t); }
+  };
+  const errName = (e) => (e.name === 'AbortError' ? 'timeout' : String(e.message || e).slice(0, 60));
+  let error = '';
+  try {
+    const r = await withTimeout(`${origin}/health`);
+    if (r.ok) {
+      const j = await r.json();
+      const names = j.panel_names || {};
+      const list = Object.entries(j.panels || {}).map(([id, st]) => ({
+        id, name: names[id] || id, state: st && st.owner_stopped ? 'stopped' : (st && st.paused ? 'paused' : 'running') }));
+      for (const id of Array.isArray(j.waiting_for_session) ? j.waiting_for_session : []) list.push({ id, name: names[id] || id, state: 'waiting' });
+      if (list.length) return { ok: true, list };
+      error = 'health lists no panel';
+    } else error = `HTTP ${r.status}`;
+  } catch (e) { error = errName(e); }
+  try {                                              // fallback: the authenticated status call
+    const r = await withTimeout(`${origin}/api/control`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Invite-Secret': SHARED_SECRET }, body: JSON.stringify({ action: 'status' }) });
+    if (r.status === 401) return { ok: false, list: [], error: `${error}; secret rejected` };
+    if (r.ok) {
+      const j = await r.json();
+      const names = j.panel_names || {};
+      const list = Object.entries(j.panels || {}).map(([id, st]) => {
+        const state = (st && st.state) || '';
+        return { id, name: names[id] || (st && st.name) || id, state: state === 'stopped' ? 'stopped' : state === 'paused' ? 'paused' : state === 'no_session' ? 'waiting' : 'running' };
+      });
+      if (list.length) return { ok: true, list };
+      return { ok: true, list: [], error: `${error}; status lists no panel` };
+    }
+    return { ok: false, list: [], error: `${error}; status HTTP ${r.status}` };
+  } catch (e) { return { ok: false, list: [], error: `${error}; ${errName(e)}` }; }
+}
+
+let _lastPanelErrors = [];
+/** Why the last panel listing failed, e.g. ["Main: timeout"] — shown to the admin instead of a bare "could not be reached". */
+const lastPanelErrors = () => _lastPanelErrors.slice();
+
+/**
+ * Like fetchGuardPanels but with the panels' NAMES: [{id, name, state}]. null = no invite bot answered.
+ * V166.2: asks EVERY registered invite bot (the main one + each bot added under 🤖 Invite bots) — a panel that
+ * lives on another bot was never listed, and when the main bot was off the whole list was "unreachable".
+ */
 async function fetchGuardPanelsNamed(timeoutMs = 8000) {
-  if (!GUARD_URL || !guardUrlValid()) return null;
-  return cgbRouting.listGuardPanelsNamed(GUARD_URL, undefined, timeoutMs);
+  const targets = new Map();                       // origin → label
+  if (GUARD_URL && guardUrlValid()) { try { targets.set(new URL(GUARD_URL).origin, 'Main'); } catch (_) {} }
+  try { for (const b of require('./cgbBots').list()) if (b.origin && !targets.has(b.origin)) targets.set(b.origin, b.name); } catch (_) {}
+  if (!targets.size) return null;
+  const results = await Promise.all([...targets].map(async ([origin, label]) => ({ label, ...(await healthPanels(origin, timeoutMs)) })));
+  _lastPanelErrors = results.filter((r) => !r.ok).map((r) => `${r.label}: ${r.error}`);
+  if (!results.some((r) => r.ok)) return null;
+  const seen = new Map();
+  for (const r of results) for (const p of r.list) if (!seen.has(p.id) || p.state === 'running') seen.set(p.id, p);
+  const out = [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
+  try {                                            // remember the names for when a bot is offline
+    const q = require('../database/queries');
+    const old = JSON.parse(q.getSetting('cgb_panel_names', '{}') || '{}');
+    q.setSetting('cgb_panel_names', JSON.stringify({ ...old, ...Object.fromEntries(out.map((p) => [p.id, p.name])) }));
+  } catch (_) {}
+  return out;
+}
+
+/** Panels the bot already KNOWS (saved names, linked cycles, registered bots) — to pick from when no invite bot answers. */
+function rememberedPanels() {
+  const out = new Map();
+  try {
+    const saved = JSON.parse(require('../database/queries').getSetting('cgb_panel_names', '{}') || '{}');
+    for (const [id, name] of Object.entries(saved)) if (id && !isPlaceholderPanel(id)) out.set(id, { id, name: String(name || id), state: 'offline' });
+  } catch (_) {}
+  try { for (const id of Object.values(cgbRouting.panelMap())) if (id && !out.has(id) && !isPlaceholderPanel(id)) out.set(id, { id, name: id, state: 'offline' }); } catch (_) {}
+  try { for (const b of require('./cgbBots').list()) if (b.panel && !out.has(b.panel)) out.set(b.panel, { id: b.panel, name: b.name, state: 'offline' }); } catch (_) {}
+  if (GUARD_PANEL && !out.has(GUARD_PANEL)) out.set(GUARD_PANEL, { id: GUARD_PANEL, name: GUARD_PANEL, state: 'offline' });
+  return [...out.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
 // ── V152: panel names, the panel of a seat, whitelisting by hand-activation ─────────────────────────
@@ -532,4 +610,4 @@ function cycleSeatCount(endDay, oldName = '') { return cycleSeats(endDay, oldNam
 /** The main bot's address, secret and default panel — the registry of bots builds on it. */
 function getConfig() { return { url: GUARD_URL, secret: SHARED_SECRET, panel: GUARD_PANEL, valid: !!GUARD_URL && guardUrlValid() }; }
 
-module.exports = { isPlaceholderPanel, placeholderNameOf, cycleSeats, migrateCycleSeats, cycleSeatCount, seatPanelOf, setSeatPanel, panelForSub, panelNameOf, panelNameCached, panelForSeat, whitelistInGuard, makeSeatsHandler, getConfig, fetchGuardPanels, fetchGuardPanelsNamed, notifyGuardOfNewInvite, makeGuardWebhookHandler, cancelGuardInvite, diagnose, fetchGuardReport, _normalizeGuardUrl: normalizeGuardUrl };
+module.exports = { isPlaceholderPanel, placeholderNameOf, cycleSeats, migrateCycleSeats, cycleSeatCount, seatPanelOf, setSeatPanel, panelForSub, panelNameOf, panelNameCached, panelForSeat, whitelistInGuard, makeSeatsHandler, getConfig, fetchGuardPanels, fetchGuardPanelsNamed, rememberedPanels, lastPanelErrors, notifyGuardOfNewInvite, makeGuardWebhookHandler, cancelGuardInvite, diagnose, fetchGuardReport, _normalizeGuardUrl: normalizeGuardUrl };

@@ -1,3 +1,11 @@
+# V166.2 — the panel pick-list works with several invite bots (and when one is off)
+
+- **V166.3**: if a bot's public /health is closed or lists nothing, the list is read with the authenticated status call (`/api/control` + `X-Invite-Secret`, the one 🤖 Invite bots uses) — so the pick-list no longer depends on /health. Panels that only report an id show as `panel-22`.
+
+- 🤖 Panel of a cycle / 📥 default panel: the list was read from the MAIN invite bot only. A panel living on another bot (🤖 Invite bots) was never shown, and when the main bot was off or slow the screen said "could not be reached" and listed nothing. Now **every registered invite bot is asked** (in parallel) and their panels are merged with their names.
+- If NO bot answers, the screen still shows the panels the bot **remembers** (⚫: saved names, linked cycles, registered bots) so you can pick one — and it says WHY nothing answered, e.g. `(Main: HTTP 503 · Cycle 18: timeout)`.
+- Typing a panel id is now checked against all bots (before, an id from another bot was refused).
+
 # V166.1 — 💙 Paid renewals: its own organised section (who renewed, for what, paid how and when)
 
 ChatGPT Business bot → 🛠 Admin → **💙 Paid renewals**:

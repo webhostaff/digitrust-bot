@@ -28,7 +28,7 @@ const subPricing = require('../utils/subscriptionPricing');
 const cgbCycles = require('../services/cgbCycles');
 const notices   = require('../services/notices');
 const { plainDelivery, formatPrice, formatPriceExact, escapeHtml, expandPremiumEmojis, scaleTiersProportionally, productEmojiId, calcOrderPrice } = require('../utils/format');
-const PANEL_ICON = { running: '🟢', stopped: '⚪', paused: '🟠', waiting: '🟡' };
+const PANEL_ICON = { running: '🟢', stopped: '⚪', paused: '🟠', waiting: '🟡', offline: '⚫' };
 const cgbRouting = require('../services/cgbRouting');
 const cgbBots = require('../services/cgbBots');
 const cgbGuard = require('../services/cgbGuard');
@@ -358,7 +358,8 @@ async function handleAdminText(bot, msg) {
       await bot.sendMessage(chatId, '❌ A panel id is letters, digits, "-", "_" or "." with no spaces, e.g. <code>panel26</code>.', { parse_mode: 'HTML' });
       return;
     }
-    const known = await cgbGuard.fetchGuardPanels();
+    const knownNamed = await cgbGuard.fetchGuardPanelsNamed();       // V166.2: every registered invite bot, not only the main one
+    const known = knownNamed ? knownNamed.map((p) => p.id) : null;
     if (known && !known.includes(id)) {
       await bot.sendMessage(chatId,
         `❌ The invite bot has no panel called <code>${escapeHtml(id)}</code>.\nIt has: ${known.map((k) => `<code>${escapeHtml(k)}</code>`).join(', ') || '—'}\n\nSend one of them.`,
@@ -7831,7 +7832,8 @@ async function handleAdminCallback(bot, query) {
 
   // ── 📥 The panel new orders go to, chosen by name (V151) ──────────────────────
   if (data === 'admin_cgb_defpanel') {
-    const named = await cgbGuard.fetchGuardPanelsNamed();
+    const liveNamed = await cgbGuard.fetchGuardPanelsNamed();
+    const named = liveNamed && liveNamed.length ? liveNamed : (cgbGuard.rememberedPanels().length ? cgbGuard.rememberedPanels() : liveNamed);   // V166.2: remembered panels (⚫) when none answers
     const current = cgbRouting.getDefaultPanel();
     const rows = [];
     for (const p of named || []) {
@@ -7873,7 +7875,10 @@ async function handleAdminCallback(bot, query) {
     const cyc = db.getBillingCycles().find((c) => c.id === cid);
     if (!cyc) { await answer('❌ That cycle no longer exists'); return; }
     const current = cgbRouting.panelMap()[String(cyc.end_day)] || null;
-    const named = await cgbGuard.fetchGuardPanelsNamed();            // [{id, name, state}] · null = the invite bot cannot be reached
+    const live = await cgbGuard.fetchGuardPanelsNamed();             // [{id, name, state}] · null = no invite bot answered
+    // V166.2: when none answers, still offer the panels the bot already knows (⚫ = remembered, not answering now)
+    const remembered = live === null || !live.length ? cgbGuard.rememberedPanels() : [];
+    const named = live && live.length ? live : (remembered.length ? remembered : live);
     const ids = named ? named.map((p) => p.id) : null;
     const rows = [];
     for (const p of named || []) {
@@ -7892,8 +7897,11 @@ async function handleAdminCallback(bot, query) {
         : cgbRouting.placeholderMap()[String(cyc.end_day)]
           ? `<b>nowhere yet</b> — named 🏷 <b>${escapeHtml(cgbRouting.placeholderMap()[String(cyc.end_day)])}</b> (no invite bot yet: invites are held, you invite yourself)`
           : `the default panel <i>(not linked)</i>`) + `\n\n` +
+      (live === null && remembered.length
+        ? `⚠️ <i>No invite bot answered${cgbGuard.lastPanelErrors().length ? ` (${escapeHtml(cgbGuard.lastPanelErrors().join(' · '))})` : ''} — these are the panels I remember (⚫). Pick one, or type an id.</i>\n\n`
+        : '') +
       (ids === null
-        ? `⚠️ <i>The invite bot could not be reached, so I cannot list its panels. Type the panel id yourself.</i>`
+        ? `⚠️ <i>The invite bot could not be reached${cgbGuard.lastPanelErrors().length ? ` (${escapeHtml(cgbGuard.lastPanelErrors().join(' · '))})` : ''}, so I cannot list its panels. Type the panel id yourself.</i>`
         : ids.length ? `Pick the invite-bot panel that is <b>this cycle's workspace</b>:`
                      : `<i>The invite bot has no panel yet.</i>`) +
       `\n\n<i>An order of this cycle is queued in exactly that panel — even if it is stopped or has no session yet (it waits there). It is never sent to another panel.</i>`,
