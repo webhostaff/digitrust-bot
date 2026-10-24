@@ -2304,12 +2304,17 @@ function renewalItems() {
     };
   });
 }
+/** V166.5: panel nicknames the admin typed (original name → nickname). */
+const rnAliasMap = () => { try { return JSON.parse(require('./database/queries').getSetting('rn_panel_alias', '{}') || '{}'); } catch (_) { return {}; } };
+const rnAliasOf = (name) => { const a = rnAliasMap()[name]; return a ? escapeHtml(a) : name; };
+const rnRange = (it) => `${dmShort(it.start)} → ${dmShort(it.end)}`;
+
 const rnGroups = (mode) => {
   const items = renewalItems();
   const shown = mode === 'wait' ? items.filter((x) => x.status === 'wait') : mode === 'done' ? items.filter((x) => x.status === 'done') : items;
   const m = new Map();
   for (const it of shown) {
-    const key = `${it.panel || '—'}${it.cycle ? ` · ${it.cycle}` : ''}`;
+    const key = `${rnAliasOf(it.panel) || '—'}${it.cycle ? ` · ${it.cycle}` : ''}`;
     if (!m.has(key)) m.set(key, []);
     m.get(key).push(it);
   }
@@ -2327,7 +2332,7 @@ function rnTexts(mode) {
     let t = `\n🖥 <b>${escapeHtml(x.key)}</b> (${x.list.length})\n`;
     x.list.forEach((it, i) => {
       t += `${i + 1}. ${it.status === 'done' ? '🟢' : '🔵'} <code>${it.email}</code>\n` +
-           `    ${it.user || it.userId} · ${rnMoney(it.amount)} · ${it.status === 'done' ? 'started' : 'on'} ${dmShort(it.start)}${it.flags.length ? ' ⚠️' : ''}\n`;
+           `    ${it.user || it.userId} · ${rnMoney(it.amount)}\n    📅 ${rnRange(it)}${it.flags.length ? ' ⚠️' : ''}\n`;
     });
     return t;
   });
@@ -2338,6 +2343,7 @@ function rnTexts(mode) {
 }
 const rnKb = (mode, g) => ({ inline_keyboard: [
   [{ text: `${mode === 'wait' ? '● ' : ''}🔵 To activate · ${g.wait}`, callback_data: 'adm_pr_wait' }, { text: `${mode === 'done' ? '● ' : ''}🟢 Activated · ${g.done}`, callback_data: 'adm_pr_done' }],
+  [{ text: '✏️ Rename a panel', callback_data: 'adm_pr_rn' }],
   [{ text: '🔙 Admin', callback_data: 'adm_home' }],
 ] });
 
@@ -2352,10 +2358,26 @@ async function showPaidRenewals(chatId, mode = 'wait') {
 }
 
 async function handlePaidRenewalsButton(data, chatId, msgId) {
-  const m = /^adm_pr_(wait|done)$/.exec(data);
-  if (!m) return false;
-  await showPaidRenewals(chatId, m[1]);
-  return true;
+  let m = /^adm_pr_(wait|done)$/.exec(data);
+  if (m) { await showPaidRenewals(chatId, m[1]); return true; }
+  if (data === 'adm_pr_rn') {                       // pick which panel to rename
+    const names = [...new Set(renewalItems().map((x) => x.panel).filter(Boolean))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    if (!names.length) { await bot.sendMessage(chatId, 'No panel to rename yet.'); return true; }
+    const rows = names.map((n, i) => [{ text: `✏️ ${rnAliasOf(n).replace(/<[^>]+>/g, '')}${rnAliasMap()[n] ? ` (was ${n.replace(/<[^>]+>/g, '')})` : ''}`.slice(0, 60), callback_data: `adm_pr_rn_${i}` }]);
+    rows.push([{ text: '🔙 Back', callback_data: 'adm_pr_wait' }]);
+    await bot.sendMessage(chatId, '✏️ <b>Which panel?</b>', { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
+    return true;
+  }
+  m = /^adm_pr_rn_(\d+)$/.exec(data);
+  if (m) {
+    const names = [...new Set(renewalItems().map((x) => x.panel).filter(Boolean))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    const name = names[Number(m[1])];
+    if (!name) return true;
+    setSession(ADMIN_ID, 'RN_ALIAS', { panel: name });
+    await bot.sendMessage(chatId, `✏️ Type the new name for <b>${name}</b>\n(send <code>-</code> to go back to the original name)`, { parse_mode: 'HTML' });
+    return true;
+  }
+  return false;
 }
 
 async function showEmailRequests(chatId) {
@@ -3203,6 +3225,18 @@ bot.on('message', async (msg) => {
   if (s.state === 'EMAIL_REQ') {
     clearSession(userId);
     await submitEmailRequest(chatId, userId, s.subId, text);
+    return;
+  }
+
+  // ─── V166.5: the new nickname of a panel in the paid-renewals list ───
+  if (s.state === 'RN_ALIAS' && String(userId) === String(ADMIN_ID)) {
+    clearSession(userId);
+    const q = require('./database/queries');
+    const map = rnAliasMap();
+    if (text === '-') delete map[s.panel]; else map[s.panel] = text.slice(0, 40);
+    q.setSetting('rn_panel_alias', JSON.stringify(map));
+    await bot.sendMessage(chatId, text === '-' ? '✅ Back to the original name.' : `✅ Renamed to <b>${escapeHtml(text.slice(0, 40))}</b>`, { parse_mode: 'HTML' });
+    await showPaidRenewals(chatId, 'wait');
     return;
   }
 

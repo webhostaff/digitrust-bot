@@ -1,3 +1,8 @@
+## V166.5.1 — Paid renewals: period + panel rename
+- Each e-mail now shows its period: 📅 start → end.
+- New button ✏️ Rename a panel: pick the panel, type a nickname (send "-" to restore). Display only; Guard is untouched.
+- Not tested on live Telegram.
+
 ## V166.5 — Paid renewals: one simple list (no sub-menus)
 - Admin → "Paid renewals" now sends ONE plain message: a title per panel, then one line per e-mail (tap an e-mail to copy it).
 - Only two buttons: 🔵 To activate / 🟢 Activated. The nested board, per-panel pages and HTML report from V166.4 were removed.
