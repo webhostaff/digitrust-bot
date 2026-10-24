@@ -1,3 +1,15 @@
+## V166.5 — Paid renewals: one simple list (no sub-menus)
+- Admin → "Paid renewals" now sends ONE plain message: a title per panel, then one line per e-mail (tap an e-mail to copy it).
+- Only two buttons: 🔵 To activate / 🟢 Activated. The nested board, per-panel pages and HTML report from V166.4 were removed.
+- Not tested on live Telegram (mock data only).
+
+# V166.4 — 💙 Paid renewals redesigned: a board, one page per panel, and an HTML report
+
+The V166.1 list was one long run of messages. Now (ChatGPT Business bot → 🛠 Admin → 💙 Paid renewals):
+- **The board** — ONE message that updates in place: how many are waiting / activated and the money, then **one line per panel** (`🖥 Panel 26 · Day 26 → 24 — 🔵 6 · 💵 $84`). Filters: 🔵 To activate · 🟢 Activated · All.
+- **Tap a panel → its own page**: numbered, each renewal = e-mail · customer (@username + id) · order # · "activate on 24 Oct → 24 Nov" · amount · method · paid date/time, 8 per page (◀ ▶). Flags: ⚠️ renewed by ANOTHER customer · 📧 e-mail changed. **📋 Copy the e-mails to activate** sends them in one block.
+- **📄 Full report** — an HTML file (opens in any browser, phone or PC): totals, one table per panel, a **search box**, a "Copy e-mails to activate" button per panel, light/dark, printable.
+
 # V166.2 — the panel pick-list works with several invite bots (and when one is off)
 
 - **V166.3**: if a bot's public /health is closed or lists nothing, the list is read with the authenticated status call (`/api/control` + `X-Invite-Secret`, the one 🤖 Invite bots uses) — so the pick-list no longer depends on /health. Panels that only report an id show as `panel-22`.

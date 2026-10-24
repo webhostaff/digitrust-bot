@@ -944,9 +944,10 @@ bot.onText(/^\/admin(?:@\w+)?$/i, async (msg) => {
 async function handleAdminPanelButton(data, chatId, msgId, userId) {
   if (!data.startsWith('adm_')) return false;
   if (String(userId) !== String(ADMIN_ID)) return true;
+  if (data.startsWith('adm_pr_') && await handlePaidRenewalsButton(data, chatId, msgId)) return true;
   if (data === 'adm_home') { await showAdminPanel(chatId, msgId); return true; }
   if (data === 'adm_emailreqs') { await showEmailRequests(chatId); return true; }
-  { const mp = /^adm_paidrenewals(?:_(wait|done))?$/.exec(data); if (mp) { await showPaidRenewals(chatId, mp[1] || 'all'); return true; } }
+  if (data === 'adm_paidrenewals') { await showPaidRenewals(chatId, 'wait'); return true; }
   if (data === 'adm_pending') { await showOrdersToActivate(chatId); return true; }
   if (data === 'adm_laterenewals') { await showLateRequests(chatId); return true; }
   let m = /^adm_end_(today|tomorrow|\+\d+)$/.exec(data);
@@ -2284,57 +2285,77 @@ function fmtLocalTs(ts) {
 }
 const rnMoney = (n) => `$${(Math.round((Number(n) || 0) * 100) / 100).toFixed(2).replace(/\.?0+$/, '')}`;
 
-function paidRenewalsKb(mode, counts) {
-  const b = (k, label) => ({ text: (mode === k ? '● ' : '') + label, callback_data: `adm_paidrenewals${k === 'all' ? '' : '_' + k}` });
-  return { inline_keyboard: [
-    [b('wait', `🔵 To activate · ${counts.wait}`), b('done', `🟢 Activated · ${counts.done}`)],
-    [b('all', `💙 All · ${counts.wait + counts.done}`)],
-    [{ text: '🔙 Admin', callback_data: 'adm_home' }],
-  ] };
+// V166.4 — a BOARD (one message that updates in place) → tap a panel → its clean list. Plus a full HTML report.
+const dmShort = (ymd) => { const d = new Date(`${String(ymd).slice(0, 10)}T12:00:00`); return Number.isNaN(d.getTime()) ? String(ymd || '') : d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }); };
+
+/** Every paid renewal as a flat item (text already HTML-escaped) + the panels they belong to. */
+function renewalItems() {
+  const today = ymdLocal(cgbCycles.localNow(new Date()));
+  return cgbSeatTools.paidRenewals(db, today, 20).map((r) => {
+    const pl = seatPlace(r);
+    const flags = [];
+    if (r.prev_user_id && String(r.prev_user_id) !== String(r.user_id)) flags.push(`⚠️ renewed by ANOTHER customer — the seat belonged to ${r.prev_user_id}`);
+    if (r.prev_email && String(r.prev_email).toLowerCase() !== String(r.email).toLowerCase()) flags.push(`📧 e-mail changed — it was ${escapeHtml(r.prev_email)}`);
+    return {
+      email: escapeHtml(r.email || ''), user: r.username ? `@${escapeHtml(r.username)}` : escapeHtml(r.first_name || ''), userId: r.user_id,
+      orderId: r.order_id || '', amount: Number(r.order_total ?? r.final_price) || 0, method: escapeHtml(String(r.payment_method || '')),
+      paidAt: fmtLocalTs(r.order_paid_at || r.order_created_at || r.renewed_at), start: r.start_date, end: r.end_date, prevEnd: r.prev_end ? String(r.prev_end).slice(0, 10) : '',
+      status: r.status === 'active' ? 'done' : 'wait', panel: pl.panel || '', cycle: pl.cycle || '', flags,
+    };
+  });
+}
+const rnGroups = (mode) => {
+  const items = renewalItems();
+  const shown = mode === 'wait' ? items.filter((x) => x.status === 'wait') : mode === 'done' ? items.filter((x) => x.status === 'done') : items;
+  const m = new Map();
+  for (const it of shown) {
+    const key = `${it.panel || '—'}${it.cycle ? ` · ${it.cycle}` : ''}`;
+    if (!m.has(key)) m.set(key, []);
+    m.get(key).push(it);
+  }
+  const groups = [...m].map(([key, list]) => ({ key, list: list.sort((a, b) => String(a.start).localeCompare(String(b.start)) || String(a.email).localeCompare(String(b.email))) }))
+    .sort((a, b) => a.key.localeCompare(b.key, undefined, { numeric: true }));
+  return { items, shown, groups, wait: items.filter((x) => x.status === 'wait').length, done: items.filter((x) => x.status === 'done').length };
+};
+
+/** The whole list as ONE simple text: a panel title, then one line per e-mail. */
+function rnTexts(mode) {
+  const g = rnGroups(mode);
+  let head = `💙 <b>Paid renewals</b> — ${mode === 'done' ? `🟢 ${g.done} activated` : mode === 'all' ? `${g.wait} to activate · ${g.done} activated` : `🔵 ${g.wait} to activate`}\n`;
+  if (!g.groups.length) return [head + '\n<i>Nothing in this list.</i>'];
+  const blocks = g.groups.map((x) => {
+    let t = `\n🖥 <b>${escapeHtml(x.key)}</b> (${x.list.length})\n`;
+    x.list.forEach((it, i) => {
+      t += `${i + 1}. ${it.status === 'done' ? '🟢' : '🔵'} <code>${it.email}</code>\n` +
+           `    ${it.user || it.userId} · ${rnMoney(it.amount)} · ${it.status === 'done' ? 'started' : 'on'} ${dmShort(it.start)}${it.flags.length ? ' ⚠️' : ''}\n`;
+    });
+    return t;
+  });
+  const out = []; let cur = head;
+  for (const b of blocks) { if ((cur + b).length > 3800) { out.push(cur); cur = ''; } cur += b; }
+  out.push(cur);
+  return out;
+}
+const rnKb = (mode, g) => ({ inline_keyboard: [
+  [{ text: `${mode === 'wait' ? '● ' : ''}🔵 To activate · ${g.wait}`, callback_data: 'adm_pr_wait' }, { text: `${mode === 'done' ? '● ' : ''}🟢 Activated · ${g.done}`, callback_data: 'adm_pr_done' }],
+  [{ text: '🔙 Admin', callback_data: 'adm_home' }],
+] });
+
+/** Admin panel button → the list (simple, no sub-menus). */
+async function showPaidRenewals(chatId, mode = 'wait') {
+  const g = rnGroups(mode);
+  if (!g.items.length) { await bot.sendMessage(chatId, '💙 No paid renewal waiting, none activated in the last 20 days.'); return; }
+  const texts = rnTexts(mode);
+  for (let i = 0; i < texts.length; i++) {
+    await bot.sendMessage(chatId, texts[i], { parse_mode: 'HTML', ...(i === texts.length - 1 ? { reply_markup: rnKb(mode, g) } : {}) });
+  }
 }
 
-async function showPaidRenewals(chatId, mode = 'all') {
-  const today = ymdLocal(cgbCycles.localNow(new Date()));
-  const all = cgbSeatTools.paidRenewals(db, today, 20);
-  const counts = { wait: all.filter((r) => r.status !== 'active').length, done: all.filter((r) => r.status === 'active').length };
-  const rows = mode === 'wait' ? all.filter((r) => r.status !== 'active') : mode === 'done' ? all.filter((r) => r.status === 'active') : all;
-  if (!all.length) { await bot.sendMessage(chatId, '💙 No paid renewal waiting, none activated in the last 20 days.'); return; }
-  const total = rows.reduce((a, r) => a + (Number(r.order_total ?? r.final_price) || 0), 0);
-  let txt = `💙 <b>Paid renewals</b>${mode === 'wait' ? ' · to activate' : mode === 'done' ? ' · activated (20 days)' : ''}\n` +
-            `<b>${rows.length}</b> renewal${rows.length === 1 ? '' : 's'} · 💵 <b>${rnMoney(total)}</b>\n`;
-  if (!rows.length) txt += `\n<i>Nothing in this list.</i>`;
-  const groups = new Map();
-  for (const r of rows) {
-    const pl = seatPlace(r);
-    const key = `${pl.panel || '—'}${pl.cycle ? ` · 🗓 ${pl.cycle}` : ''}`;
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(r);
-  }
-  const blocks = [];
-  for (const [place, list] of groups) {
-    const sub = list.reduce((a, r) => a + (Number(r.order_total ?? r.final_price) || 0), 0);
-    txt += `\n━━━━━━━━━━━━━━━━━━\n🖥 <b>${place}</b> · ${list.length} · ${rnMoney(sub)}\n`;
-    for (const r of list) {
-      const who = (r.username ? `@${escapeHtml(r.username)}` : escapeHtml(r.first_name || '')) || '';
-      const paid = fmtLocalTs(r.order_paid_at || r.order_created_at || r.renewed_at);
-      txt += `\n${r.status === 'active' ? '🟢' : '🔵'} <code>${escapeHtml(r.email)}</code>\n` +
-             `   👤 ${who} <code>${r.user_id}</code>${r.order_id ? ` · 🧾 #${r.order_id}` : ''}\n` +
-             `   📅 ${r.start_date} → ${r.end_date}${r.prev_end ? ` <i>(was until ${String(r.prev_end).slice(0, 10)})</i>` : ''}\n` +
-             `   💵 ${rnMoney(r.order_total ?? r.final_price)}${r.payment_method ? ` · ${escapeHtml(String(r.payment_method))}` : ''}${paid ? ` · paid ${paid}` : ''}\n`;
-      if (r.prev_user_id && String(r.prev_user_id) !== String(r.user_id)) txt += `   ⚠️ renewed by ANOTHER customer — the seat belonged to <code>${r.prev_user_id}</code>\n`;
-      if (r.prev_email && String(r.prev_email).toLowerCase() !== String(r.email).toLowerCase()) txt += `   📧 e-mail changed — it was <code>${escapeHtml(r.prev_email)}</code>\n`;
-    }
-    blocks.push({ place, emails: list.map((r) => r.email) });
-  }
-  const parts = txt.match(/[\s\S]{1,3800}(?=\n|$)/g) || [txt];
-  for (let i = 0; i < parts.length; i++) {
-    await bot.sendMessage(chatId, parts[i], { parse_mode: 'HTML', ...(i === parts.length - 1 && !blocks.length ? { reply_markup: paidRenewalsKb(mode, counts) } : {}) });
-  }
-  for (let i = 0; i < blocks.length; i++) {
-    const b = blocks[i];
-    await bot.sendMessage(chatId, `📋 <b>${b.place}</b> — emails to copy\n<code>${escapeHtml(b.emails.join('\n'))}</code>`,
-      { parse_mode: 'HTML', ...(i === blocks.length - 1 ? { reply_markup: paidRenewalsKb(mode, counts) } : {}) }).catch(() => {});
-  }
+async function handlePaidRenewalsButton(data, chatId, msgId) {
+  const m = /^adm_pr_(wait|done)$/.exec(data);
+  if (!m) return false;
+  await showPaidRenewals(chatId, m[1]);
+  return true;
 }
 
 async function showEmailRequests(chatId) {
