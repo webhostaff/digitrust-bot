@@ -113,6 +113,7 @@ const States = {
   WALLET_TOPUP_USDT_AMOUNT: 'WALLET_TOPUP_USDT_AMOUNT', // reserve a unique deposit amount
   ADMIN_DEP_REVERSE:        'ADMIN_DEP_REVERSE',        // reverse a fraudulent deposit
   ADMIN_CUST_PRICE:         'ADMIN_CUST_PRICE',         // negotiated price for one customer
+  ADMIN_BINREP_RANGE:       'ADMIN_BINREP_RANGE',       // V166.6: from → to dates for the Binance report
   ADMIN_REPL_CALC:          'ADMIN_REPL_CALC',          // V166: compensation calculator input
   ADMIN_REPL_PRICE:         'ADMIN_REPL_PRICE',         // V165: price of the next replacement stock
   ADMIN_REPL_CURPRICE:      'ADMIN_REPL_CURPRICE',      // V165: re-price the current replacement stock

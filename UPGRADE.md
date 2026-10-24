@@ -1,3 +1,8 @@
+## V166.6 — Binance report with a chosen period (from → to)
+- Admin → 📄 Binance Report → 🗓 Choose dates: send `2026-09-01 2026-10-24` (or `01/09 24/10`), get the Excel + CSV for exactly that period.
+- Two new columns: network/method and the shop's receiving wallet.
+- Real database records only; nothing is invented. Tested with a temporary database, not on live Telegram.
+
 ## V166.5.1 — Paid renewals: period + panel rename
 - Each e-mail now shows its period: 📅 start → end.
 - New button ✏️ Rename a panel: pick the panel, type a nickname (send "-" to restore). Display only; Guard is untouched.

@@ -284,6 +284,12 @@ async function handleAdminText(bot, msg) {
   // V2 TEXT STATES
   // ═══════════════════════════════════════════════════════════════════
 
+  // ── V166.6: the from → to dates of the Binance report ──
+  if (s === States.ADMIN_BINREP_RANGE) {
+    if (await require('./reportAdmin').handleText(bot, msg, text)) session.clear(userId);
+    return;
+  }
+
   // ── V165: replacement link prices (typed after tapping a price button) ──
   if (s === States.ADMIN_REPL_PRICE || s === States.ADMIN_REPL_CURPRICE || s === States.ADMIN_REPL_CALC) {
     await require('../services/replCostAdmin').handleText(bot, msg, s, text);

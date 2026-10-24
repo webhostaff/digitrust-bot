@@ -28,6 +28,7 @@ function homeView() {
     markup: kb([
       [btn('📄 All time', 'admin_binrep_all')],
       [btn('📅 Last 30 days', 'admin_binrep_30'), btn('📅 Last 90 days', 'admin_binrep_90')],
+      [btn('🗓 Choose dates (from → to)', 'admin_binrep_range')],
       [btn('🔒 All time — users anonymised', 'admin_binrep_anon')],
       [btn('📚 Full detailed report (orders, other gateways…)', 'admin_binrep_full')],
       [btn('🔙 Admin Panel', 'admin_panel')],
@@ -43,6 +44,52 @@ const OPTIONS = {
   admin_binrep_full: { label: 'full detailed report, all time', opts: {}, full: true },
 };
 
+/** "2026-09-01 2026-10-24" · "01/09 24/10" · "1/9/2026 24/10/2026" → {from,to} (YYYY-MM-DD) or null. */
+function parseRange(text, now = new Date()) {
+  const toks = String(text || '').match(/\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[\/.-]\d{1,2}(?:[\/.-]\d{2,4})?/g) || [];
+  if (toks.length !== 2) return null;
+  const p2 = (n) => String(n).padStart(2, '0');
+  const one = (t) => {
+    let y, m, d;
+    if (/^\d{4}-/.test(t)) [y, m, d] = t.split('-').map(Number);
+    else { const a = t.split(/[\/.-]/).map(Number); d = a[0]; m = a[1]; y = a[2] || now.getUTCFullYear(); if (y < 100) y += 2000; }
+    if (!(m >= 1 && m <= 12 && d >= 1 && d <= 31)) return null;
+    const iso = `${y}-${p2(m)}-${p2(d)}`;
+    const dt = new Date(`${iso}T00:00:00Z`);
+    return Number.isNaN(dt.getTime()) || dt.getUTCDate() !== d ? null : iso;
+  };
+  const from = one(toks[0]), to = one(toks[1]);
+  if (!from || !to) return null;
+  return from <= to ? { from, to } : { from: to, to: from };
+}
+
+async function sendRange(bot, chatId, from, to, adminId) {
+  const wait = await bot.sendMessage(chatId, `⏳ Building the report ${from} → ${to}…`).catch(() => null);
+  try {
+    const { xlsx, csv, report } = transactionReport.buildBinanceFiles({ fromDate: from, toDate: to });
+    const base = `binance-transactions_${from}_to_${to}`;
+    await bot.sendDocument(chatId, xlsx,
+      { caption: `📄 <b>Binance transactions</b> — ${from} → ${to}\n💳 ${report.counts.payments} payments · <b>${formatPrice(report.counts.total)}</b>\nTXID · user · product · time · price · network · receiving wallet. Times are UTC.` +
+                 (report.counts.payments ? '' : '\n⚠️ No payment in this period.'), parse_mode: 'HTML' },
+      { filename: `${base}.xlsx`, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    await bot.sendDocument(chatId, csv, { caption: '📎 The same table as CSV.' }, { filename: `${base}.csv`, contentType: 'text/csv' });
+    logger.info(`Admin ${adminId} exported the Binance transactions ${from}→${to}: ${report.counts.payments}`);
+  } catch (e) {
+    logger.error(`Binance range report failed: ${e.stack || e.message}`);
+    await bot.sendMessage(chatId, `❌ The report could not be built: ${String(e.message).slice(0, 200)}`).catch(() => {});
+  } finally { if (wait && wait.message_id) bot.deleteMessage(chatId, wait.message_id).catch(() => {}); }
+}
+
+async function handleText(bot, msg, text) {
+  const r = parseRange(text);
+  if (!r) {
+    await bot.sendMessage(msg.chat.id, '❌ Send two dates: <code>2026-09-01 2026-10-24</code> or <code>01/09 24/10</code>', { parse_mode: 'HTML' });
+    return false;
+  }
+  await sendRange(bot, msg.chat.id, r.from, r.to, msg.from.id);
+  return true;
+}
+
 async function handle(bot, query) {
   const data = query.data || '';
   if (!/^admin_binrep/.test(data)) return false;
@@ -51,6 +98,11 @@ async function handle(bot, query) {
   if (data === 'admin_binrep') {
     const v = homeView();
     await bot.editMessageText(v.text, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: v.markup }).catch(() => {});
+    return true;
+  }
+  if (data === 'admin_binrep_range') {
+    require('./session').set(query.from.id, require('./session').States.ADMIN_BINREP_RANGE, {});
+    await bot.sendMessage(chatId, '🗓 Send the period: <b>from</b> date then <b>to</b> date\nExample: <code>2026-09-01 2026-10-24</code> or <code>01/09 24/10</code>', { parse_mode: 'HTML' });
     return true;
   }
   const opt = OPTIONS[data];
@@ -91,4 +143,4 @@ async function handle(bot, query) {
   return true;
 }
 
-module.exports = { handle, homeView };
+module.exports = { handle, handleText, homeView, parseRange };

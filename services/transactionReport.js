@@ -68,9 +68,9 @@ function pseudonym(userId) {
  * @param {{anonymize?:boolean, fromDate?:string|null}} opts
  *   fromDate 'YYYY-MM-DD' keeps only payments / orders from that day on.
  */
-function buildReport({ anonymize = false, fromDate = null } = {}) {
+function buildReport({ anonymize = false, fromDate = null, toDate = null } = {}) {
   const generatedAt = new Date().toISOString().slice(0, 19).replace('T', ' ');
-  const inPeriod = (dt) => !fromDate || day(dt) >= fromDate;
+  const inPeriod = (dt) => (!fromDate || day(dt) >= fromDate) && (!toDate || day(dt) <= toDate);
 
   // ── load ───────────────────────────────────────────────────────────────────
   const users = new Map(safeAll('SELECT telegram_id, username, first_name, last_name, balance FROM users').map((u) => [Number(u.telegram_id), u]));
@@ -301,7 +301,7 @@ function buildReport({ anonymize = false, fromDate = null } = {}) {
   const delivered = ords.filter((o) => o.status === 'delivered');
   const first = evs.length ? evs[0].at : '', last = evs.length ? evs[evs.length - 1].at : '';
   const summary = [
-    ['Report generated (UTC)', generatedAt], ['Period', fromDate ? `from ${fromDate} on` : 'all time'], ['Users shown as', anonymize ? 'anonymous codes (U-xxxxxx)' : 'Telegram ID, username and name'],
+    ['Report generated (UTC)', generatedAt], ['Period', fromDate || toDate ? `${fromDate ? `from ${fromDate}` : 'start'} to ${toDate || 'today'}` : 'all time'], ['Users shown as', anonymize ? 'anonymous codes (U-xxxxxx)' : 'Telegram ID, username and name'],
     ['First payment in the report (UTC)', first], ['Last payment in the report (UTC)', last], ['', ''],
     ['PAYMENTS', ''], ['Payment records', evs.length], ['Total amount of those records (USDT)', round(sumBy(evs, (e) => e.amount), 2)],
     ['  of which wallet top-ups', evs.filter((e) => e.kind === 'WALLET TOP-UP').length], ['  of which direct order payments', evs.filter((e) => e.kind === 'ORDER PAYMENT (direct)').length],
@@ -329,7 +329,7 @@ function buildReport({ anonymize = false, fromDate = null } = {}) {
   ];
 
   return {
-    generatedAt, anonymize, fromDate,
+    generatedAt, anonymize, fromDate, toDate,
     counts: { payments: evs.length, orders: ords.length, flagged: flagged.length },
     txColumns, txRows, orderColumns, orderRows, userColumns, userRows, credCols, credRows, summary, notes,
   };
@@ -363,8 +363,8 @@ function buildFiles(opts = {}) {
  * credited are NOT Binance transactions of the shop and are left out (their number is reported).
  * A top-up has no product: it says "Wallet top-up". Times are UTC.
  */
-function buildBinanceReport({ anonymize = false, fromDate = null } = {}) {
-  const inPeriod = (dt) => !fromDate || day(dt) >= fromDate;
+function buildBinanceReport({ anonymize = false, fromDate = null, toDate = null } = {}) {
+  const inPeriod = (dt) => (!fromDate || day(dt) >= fromDate) && (!toDate || day(dt) <= toDate);
   const users = new Map(safeAll('SELECT telegram_id, username FROM users').map((u) => [Number(u.telegram_id), u]));
   const products = new Map(safeAll('SELECT id, title FROM products').map((p) => [Number(p.id), p]));
   const orderById = new Map(safeAll('SELECT id, product_id, quantity FROM orders').map((o) => [Number(o.id), o]));
@@ -388,7 +388,7 @@ function buildBinanceReport({ anonymize = false, fromDate = null } = {}) {
     const un = (users.get(uid) || {}).username;
     const amount = round(u.amount);
     total += amount;
-    rows.push([rows.length + 1, u.created_at, u.txid, anonymize ? pseudonym(uid) : String(uid), anonymize ? '' : (un ? `@${un}` : ''), product, amount]);
+    rows.push([rows.length + 1, u.created_at, u.txid, anonymize ? pseudonym(uid) : String(uid), anonymize ? '' : (un ? `@${un}` : ''), product, amount, methodLabel(u.txid, u.network), receiverFor(u.network, u.address)]);
   }
   // Seen on Binance but never credited: not a completed payment, so not in the table — but never hidden.
   const skipped = safeAll('SELECT txid, insert_time, created_at FROM deposit_reviews').filter((r) => !usedKeys.has(keyOf(r.txid)) && inPeriod(iso(r.insert_time) || r.created_at)).length
@@ -398,8 +398,9 @@ function buildBinanceReport({ anonymize = false, fromDate = null } = {}) {
     { header: '#', width: 6 }, { header: 'Date & time (UTC)', width: 20 }, { header: 'TXID', width: 66 },
     { header: 'User ID', width: 16 }, { header: 'Username', width: 20 }, { header: 'Product', width: 40, type: 'wrap' },
     { header: 'Price (USDT)', width: 14, type: 'exact' },
+    { header: 'Network / method', width: 34 }, { header: 'Receiving wallet (shop)', width: 46 },
   ];
-  return { columns, rows, counts: { payments: rows.length, total: round(total, 6), skipped }, anonymize, fromDate };
+  return { columns, rows, counts: { payments: rows.length, total: round(total, 6), skipped }, anonymize, fromDate, toDate };
 }
 
 function buildBinanceFiles(opts = {}) {
