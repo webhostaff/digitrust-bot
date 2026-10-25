@@ -219,12 +219,7 @@ function makeSeatsHandler({ db: rawDb }) {
     const statuses = String(req.query.status || 'pending,active').split(',').map((x) => x.trim()).filter((x) => allowed.includes(x));
     if (!statuses.length) return res.status(400).json({ error: 'status must be some of ' + allowed.join(',') });
     try {
-      const rows = rawDb.prepare(
-        `SELECT order_id, email, status, start_date, end_date, days_remaining, renewed_from
-           FROM chatgpt_subscriptions
-          WHERE status IN (${statuses.map(() => '?').join(',')})
-            ${day !== null ? "AND CAST(strftime('%d', end_date) AS INTEGER) = ?" : ''}
-          ORDER BY created_at, id`).all(...statuses, ...(day !== null ? [day] : []));
+      const rows = require('./cgbSeatsQuery').readSeats(rawDb, statuses, day);
       return res.json({
         ok: true, end_day: day, statuses,
         seats: rows.map((r) => ({
