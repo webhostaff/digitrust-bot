@@ -14,6 +14,7 @@ const Database    = require('better-sqlite3');
 const logger      = require('./utils/logger');
 const { verifyDepositByTxId, verifyBinancePayOrder, TXID_RE } = require('./services/binance');
 const cgbGuard = require('./services/cgbGuard');
+const { panelChoices, panelChoicePage } = require('./services/cgbPanelChoices');
 
 const CHATGPT_BOT_TOKEN = process.env.CHATGPT_BOT_TOKEN;
 const ADMIN_ID = parseInt(process.env.ADMIN_ID || '5626665035', 10);
@@ -1994,36 +1995,40 @@ const pendingPanelMoves = new Map();          // token -> { subId, ids, names, c
 
 async function startPanelChange(chatId, sub) {
   if (!sub || !['active', 'pending'].includes(String(sub.status || 'pending'))) { await bot.sendMessage(chatId, '❌ That seat is not running.'); return; }
-  const real = (await cgbGuard.fetchGuardPanelsNamed(6000).catch(() => null)) || [];
-  // V157.3: the names given to cycles with no invite bot yet are panels too
-  const panels = [...real, ...require('./services/cgbRouting').placeholderPanels().filter((p) => !real.some((r) => r.name === p.name))];
+  const panels = await panelChoices(cgbGuard, require('./services/cgbRouting'));
   if (!panels.length) { await bot.sendMessage(chatId, '❌ No panel: none from the invite bot, and no named cycle.'); return; }
   const now = Date.now();
   for (const [k, v] of pendingPanelMoves) if (now - v.at > PENDING_EDIT_MS) pendingPanelMoves.delete(k);
   const token = require('crypto').randomBytes(4).toString('hex');
-  pendingPanelMoves.set(token, { subId: sub.id, ids: panels.map((p) => p.id), names: panels.map((p) => p.name), at: now });
   const cur = await seatPanelNow(sub, panels);
-  const icon = { running: '🟢', stopped: '⚪', paused: '⏸', waiting: '⏳', noBot: '🏷' };
-  const rows = panels.slice(0, 20).map((p, i) => [{ text: `${p.id === cur ? '📍 ' : ''}${icon[p.state] || '•'} ${p.name}${p.placeholder ? ' (no bot yet)' : ''}`.slice(0, 60), callback_data: `cgb_cpp_${token}_${i}` }]);
-  rows.push([{ text: '❌ Cancel', callback_data: `cgb_cpd_${token}_x_0` }]);
+  pendingPanelMoves.set(token, { subId: sub.id, ids: panels.map((p) => p.id), names: panels.map((p) => p.name), panels, cur, at: now });
   const pl = seatPlace(sub);
   await bot.sendMessage(chatId,
     `🖥 <b>Change panel</b> <i>(the customer is not told)</i>\n\n` +
     `${sub.order_id ? `🆔 Order #${sub.order_id}` : '🆔 Manual seat'} · <code>${escapeHtml(sub.email || '')}</code>\n` +
     `📅 ${sub.start_date || '?'} → ${sub.end_date} · ${sub.status === 'active' ? '🟢 active' : '⏳ not activated'}\n` +
     `📍 Now: <b>${pl.panel || '—'}</b>${pl.cycle ? ` · 🗓 ${pl.cycle}` : ''}\n\nMove it to:`,
-    { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
+    { parse_mode: 'HTML', reply_markup: panelChoicePage(panels, token, cur) });
 }
 
 async function handlePanelMoveButton(data, chatId, msgId, adminId) {
   let m = /^cgb_cp_(\d+)$/.exec(data);
   if (m) { await startPanelChange(chatId, queries.getCgbSubscriptionByOrder(Number(m[1]))); return; }
+  m = /^cgb_cpg_([0-9a-f]{8})_(\d+)$/.exec(data);
+  if (m) {
+    const st = pendingPanelMoves.get(m[1]);
+    if (!st || Date.now() - st.at > PENDING_EDIT_MS) { pendingPanelMoves.delete(m[1]); await bot.sendMessage(chatId, '⌛ That choice expired — tap 🖥 Change panel again.'); return; }
+    await bot.editMessageReplyMarkup(panelChoicePage(st.panels, m[1], st.cur, Number(m[2])), { chat_id: chatId, message_id: msgId }).catch(() => {});
+    return;
+  }
   m = /^cgb_cpp_([0-9a-f]{8})_(\d+)$/.exec(data);
   if (m) {
     const st = pendingPanelMoves.get(m[1]);
     if (!st) { await bot.sendMessage(chatId, '⌛ That choice expired — tap 🖥 Change panel again.'); return; }
     const i = Number(m[2]);
+    if (!st.ids[i] || Date.now() - st.at > PENDING_EDIT_MS) { await bot.sendMessage(chatId, '⌛ That choice expired — tap 🖥 Change panel again.'); return; }
     const sub = queries.getCgbSubById(st.subId);
+    if (!sub || !['active', 'pending'].includes(String(sub.status || 'pending'))) { await bot.sendMessage(chatId, '❌ That seat is not running.'); return; }
     const from = await seatPanelNow(sub);
     if (st.ids[i] === from) { await bot.sendMessage(chatId, 'ℹ️ It is already in that panel.'); return; }
     const active = sub.status === 'active';
@@ -2053,6 +2058,7 @@ async function handlePanelMoveButton(data, chatId, msgId, adminId) {
   await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msgId }).catch(() => {});
   if (m[2] === 'x') { await bot.sendMessage(chatId, '❌ Cancelled — nothing was moved.'); return; }
   if (!st) { await bot.sendMessage(chatId, '⌛ That choice expired — tap 🖥 Change panel again.'); return; }
+  if (!st.ids[Number(m[3])] || Date.now() - st.at > PENDING_EDIT_MS) { await bot.sendMessage(chatId, '⌛ That choice expired — tap 🖥 Change panel again.'); return; }
   const sub = queries.getCgbSubById(st.subId);
   if (!sub) { await bot.sendMessage(chatId, '❌ That seat no longer exists.'); return; }
   const lines = await applyPanelMove(sub, st.ids[Number(m[3])], m[2], adminId);
@@ -2716,7 +2722,7 @@ bot.on('callback_query', async (q) => {
   }
 
   // V157: 🖥 change panel (admin only)
-  if (/^cgb_cp(p|d)?_/.test(data)) {
+  if (/^cgb_cp(p|d|g)?_/.test(data)) {
     if (String(userId) !== String(ADMIN_ID)) return;
     await handlePanelMoveButton(data, chatId, msgId, userId);
     return;
