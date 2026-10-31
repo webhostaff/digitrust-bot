@@ -62,12 +62,11 @@ function fmtReserved(v) {
 // Same guarantees as the TxID path: the reservation must exist, the transfer
 // must not predate it, the Binance id is stored as used (never credited
 // twice), and the reservation is consumed atomically.
-const NET_FROM_BINANCE = { BSC: 'BEP20', BEP20: 'BEP20', TRX: 'TRC20', TRC20: 'TRC20', TRON: 'TRC20', TON: 'TON' };
+const NET_FROM_BINANCE = { BSC: 'BEP20', BEP20: 'BEP20', TRX: 'TRC20', TRC20: 'TRC20', TRON: 'TRC20', TON: 'TON', ERC20: 'ERC20', ETH: 'ERC20', SOL: 'SOL' };
 let depositScanRunning = false;
 const NETS_OK = ['TRC20', 'BEP20', 'ERC20', 'SOL', 'TON'];
 
 async function scanDepositsOnce(bot) {
-  if (config.paymentVerify !== 'binance') return 0;   // V167: the Binance deposit scan is off in chain mode
   if (depositScanRunning) return 0;
   const open = db.listOpenIntents ? db.listOpenIntents() : [];
   if (!open.length) return 0;
@@ -75,14 +74,28 @@ async function scanDepositsOnce(bot) {
   let credited = 0;
   try {
     const since = Math.min(...open.map((i) => Number(i.created_ms))) - 10 * 60 * 1000;
-    const history = await require('../services/binance').fetchDepositHistory({ coin: 'USDT', startTime: since, endTime: Date.now() });
+    let history;
+    if (config.paymentVerify === 'binance') {
+      history = await require('../services/binance').fetchDepositHistory({ coin: 'USDT', startTime: since, endTime: Date.now() });
+    } else {
+      // V167.2: straight from the blockchain — every network that has an open reservation
+      history = [];
+      const cv = require('../services/chainVerify');
+      for (const net of [...new Set(open.map((i) => i.network))]) {
+        try {
+          for (const t of await cv.recentIncoming(net, since)) {
+            history.push({ txId: t.txid, amount: t.amount, status: 1, network: net === 'BEP20' ? 'BSC' : net === 'TRC20' ? 'TRX' : net, insertTime: t.time, address: t.address, coin: 'USDT' });
+          }
+        } catch (e) { logger.warn(`[AUTO-DEPOSIT] ${net} scan failed: ${e.message}`); }
+      }
+    }
     for (const d of history || []) {
       if (![1, 6].includes(Number(d.status))) continue;          // 1 = success, 6 = credited (locked)
       const id = normalizeTxidInput(String(d.txId || '').trim()) || `binance-deposit-${d.id}`;
       if (db.isTxidUsed(id) || PROCESSING_TXIDS.has(id)) continue;
       const offchain = Number(d.transferType) === 1 || /off-?chain|internal/i.test(id);
       const mapped = NET_FROM_BINANCE[String(d.network || '').toUpperCase()];
-      const nets = offchain || !mapped ? ['BEP20', 'TRC20', 'TON'] : [mapped];
+      const nets = offchain || !mapped ? ['BEP20', 'TRC20', 'ERC20', 'SOL', 'TON'] : [mapped];
       let intent = null;
       for (const n of nets) { intent = db.findIntentForDepositRecent(n, Number(d.amount)); if (intent) break; }
       if (!intent) continue;
@@ -173,7 +186,7 @@ async function startUsdtTopup(bot, chatId, userId, messageId) {
   if (config.usdtBep20Address) rows.push([{ text: '🟡 USDT — BEP20 (BSC)',  callback_data: 'topup_net_BEP20' }]);
   if (config.usdtErc20Address) rows.push([{ text: '🔷 USDT — ERC20 (Ethereum)', callback_data: 'topup_net_ERC20' }]);
   if (config.usdtSolAddress)   rows.push([{ text: '🟣 USDT — Solana',       callback_data: 'topup_net_SOL'   }]);
-  if (config.usdtTonAddress && config.paymentVerify === 'binance') rows.push([{ text: '💎 USDT — TON', callback_data: 'topup_net_TON' }]);
+  if (config.usdtTonAddress) rows.push([{ text: '💎 USDT — TON', callback_data: 'topup_net_TON' }]);
   rows.push([{ text: '🔙 Back', callback_data: 'wallet_topup' }]);
 
   if (rows.length === 1) {
@@ -187,10 +200,13 @@ async function startUsdtTopup(bot, chatId, userId, messageId) {
   await bot.editMessageText(
     `💎 <b>Top Up via USDT</b>\n\n` +
     `Choose the network you will send from:\n\n` +
-    `🔴 <b>TRC20</b> — TRON network\n` +
-    `🟡 <b>BEP20</b> — BNB Smart Chain\n` +
-    `🔷 <b>ERC20</b> — Ethereum\n` +
-    `🟣 <b>Solana</b> — USDT on Solana\n\n` +
+    [
+      config.usdtTrc20Address && `🔴 <b>TRC20</b> — TRON network\n`,
+      config.usdtBep20Address && `🟡 <b>BEP20</b> — BNB Smart Chain\n`,
+      config.usdtErc20Address && `🔷 <b>ERC20</b> — Ethereum\n`,
+      config.usdtSolAddress   && `🟣 <b>Solana</b> — USDT on Solana\n`,
+      config.usdtTonAddress && `💎 <b>TON</b> — The Open Network\n`,
+    ].filter(Boolean).join('') + '\n' +
     `⚠️ <i>Send only USDT on the network you pick. Anything else is lost.</i>`,
     { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }
   ).catch(() => {});
@@ -254,7 +270,7 @@ async function handleUsdtAmount(bot, msg) {
   // without the memo lands nowhere identifiable and is NOT auto-credited. It is
   // shown above the warnings, because a customer who misses it loses the money
   // until Binance support recovers it by hand.
-  const memo = net === 'TON' ? String(config.usdtTonMemo || '').trim() : '';
+  const memo = net === 'TON' && config.paymentVerify === 'binance' ? String(config.usdtTonMemo || '').trim() : '';
   const memoBlock = memo
     ? `\n🏷 <b>MEMO / Comment (REQUIRED):</b>\n<code>${memo}</code>\n` +
       `⚠️ <b>Without this memo the deposit cannot be credited.</b>\n`
@@ -273,10 +289,13 @@ async function handleUsdtAmount(bot, msg) {
     `A different amount cannot be credited automatically.\n\n` +
     `<i>The tiny extra (less than a cent) is credited to your wallet in full.</i>\n\n` +
     `⏰ Reserved for <b>${ttl} minutes</b>.\n\n` +
-    `✨ <b>Nothing else to do:</b> we detect your transfer automatically and credit it ` +
-    `within about a minute of Binance receiving it — from any wallet, or from your own ` +
-    `Binance account (internal transfer).\n` +
-    `<i>You can still paste the TxID here if you like.</i>`,
+    (config.paymentVerify === 'binance'
+      ? `✨ <b>Nothing else to do:</b> we detect your transfer automatically and credit it ` +
+        `within about a minute of Binance receiving it — from any wallet, or from your own ` +
+        `Binance account (internal transfer).\n<i>You can still paste the TxID here if you like.</i>`
+      : `✨ <b>Nothing else to do:</b> we watch the blockchain and credit your wallet automatically, ` +
+        `usually within 1–2 minutes of the transfer being confirmed.\n` +
+        `<i>If it takes longer, paste the TxID here (copy it with the copy icon — don't type it).</i>`),
     {
       parse_mode: 'HTML',
       reply_markup: { inline_keyboard: [

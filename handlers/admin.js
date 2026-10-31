@@ -8762,6 +8762,15 @@ async function handleAdminCallback(bot, query) {
   }
 
   // ── Settings ──────────────────────────────────────────────────────
+  // ── V167.3: Binance Pay on/off ──
+  if (data === 'admin_binpay_toggle') {
+    const next = !require('../config').binancePayEnabled;
+    db.setSetting('binance_pay_enabled', next ? '1' : '0');
+    logger.info(`Admin ${query.from.id} turned Binance Pay ${next ? 'ON' : 'OFF'}`);
+    await bot.answerCallbackQuery(query.id, { text: next ? '🟢 Binance Pay is now OPEN for customers' : '🔴 Binance Pay is now CLOSED', show_alert: true }).catch(() => {});
+    await bot.editMessageReplyMarkup(adminMainKb(), { chat_id: chatId, message_id: msgId }).catch(() => {});
+    return;
+  }
   if (data === 'admin_settings') {
     await bot.editMessageText('⚙️ <b>Settings</b>\n\nSelect a setting to edit:', {
       chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminSettingsKb(),

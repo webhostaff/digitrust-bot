@@ -1,3 +1,23 @@
+## V167.3 — Binance Pay button (open / close)
+- Admin panel → "🟡 Binance Pay: ON/OFF": one tap opens or closes Binance Pay for customers (orders + wallet top-up). Closed = "unavailable for now".
+- The choice is saved in the database; `BINANCE_PAY_ENABLED` is only the starting value.
+- Binance Pay needs the Binance API keys to verify payments, so open it only after Binance works again.
+
+## V167.2 — Automatic crediting again (no TxID needed)
+- The wallet watcher (every ~40 s, only while a reservation is open) now reads the blockchain: BSC, Tron, Solana, TON (+ Ethereum if enabled).
+- A customer who sends the EXACT reserved amount is credited automatically after the transfer is confirmed (≈1–2 min). Pasting the TxID still works.
+- Tested with simulated chain answers and a temporary database (credited once, never twice). NOT tested on the live networks.
+- Log lines to look for: `[AUTO-DEPOSIT] …` (credited) and `[AUTO-DEPOSIT] <NET> scan failed: …` (a node refused: set the optional keys/endpoints).
+- BSC scan covers the last ~4800 blocks (≈1 h); Solana/Tron/TON use their own APIs.
+
+## V167.1 — TON (USDT) verified from the blockchain
+- TON is back, checked on TON Center (jetton transfers received by YOUR address). No Binance.
+- Set `USDT_TON_ADDRESS` = your Trust Wallet TON address (UQ…). Delete `USDT_TON_MEMO` (no memo is needed any more).
+- Optional: `TONCENTER_API_KEY` (free, from the @tonapibot bot) for a higher request limit.
+- A TON wallet can show a different hash than the chain records; for wallet top-ups the customer's reserved amount is used as the proof when the hash does not match. For orders the hash must match.
+- The same TON transfer can never be used twice, whatever spelling (hex / base64) of its hash is sent.
+- Tested with simulated answers only, NOT on the live TON network.
+
 ## V167 — Payments straight from the blockchain (no Binance at all)
 USDT is verified by reading the transaction on the chain: success, real USDT contract, receiver = YOUR address, amount, time, confirmations.
 

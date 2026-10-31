@@ -107,7 +107,7 @@ const translations = {
     wallet_send_orderid: '📋 Send your <b>Binance Pay Order ID</b> after paying:',
     wallet_verifying: '⏳ <b>Verifying your deposit…</b>\n\nThis may take up to 30 seconds.',
     wallet_verified: '✅ <b>Deposit Confirmed!</b>\n\n💵 Amount: <b>${amount} USDT</b> has been added to your wallet.',
-    wallet_invalid_txid: '❌ Invalid TxID format. Please send the transaction hash — or, for a Binance-to-Binance transfer, the number shown as “Off-chain Transfer …” (e.g. 418351948005).',
+    wallet_invalid_txid: '❌ Invalid TxID format. Please copy the whole transaction hash (TxID) from your wallet and send it again.',
     wallet_already_used: '❌ <b>This TxID has already been used.</b>',
     wallet_already_processing: '⏳ Already being verified. Please wait...',
     wallet_timeout: '⚠️ <b>Verification timed out.</b>\n\nPlease try again in a moment.',

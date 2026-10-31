@@ -705,8 +705,8 @@ async function startUsdtPayForOrder(bot, chatId, userId, orderId, messageId) {
     { key: 'BEP20', label: '🟡 <b>BEP20 (USDT):</b>', via: 'BEP20 → send via <b>BNB Smart Chain</b>',    addr: config.usdtBep20Address },
     { key: 'ERC20', label: '🔷 <b>ERC20 (USDT):</b>', via: 'ERC20 → send via <b>Ethereum</b> network',   addr: config.usdtErc20Address },
     { key: 'SOL',   label: '🟣 <b>Solana (USDT):</b>', via: 'SOL → send via <b>Solana</b> network',      addr: config.usdtSolAddress },
-    { key: 'TON',   label: '💎 <b>TON (USDT):</b>',   via: 'TON → send via <b>The Open Network</b>',     addr: config.paymentVerify === 'binance' ? config.usdtTonAddress : '',
-      memo: String(config.usdtTonMemo || '').trim() },
+    { key: 'TON',   label: '💎 <b>TON (USDT):</b>',   via: 'TON → send via <b>The Open Network</b>',     addr: config.usdtTonAddress,
+      memo: config.paymentVerify === 'binance' ? String(config.usdtTonMemo || '').trim() : '' },
   ].filter((n) => n.addr && String(n.addr).trim());
 
   if (!nets.length) {
@@ -787,12 +787,25 @@ async function handleUsdtTxIdForOrder(bot, msg) {
     'This may take 30-60 seconds.\n\n' +
     '<i>Please wait, do not send another message.</i>',
     { parse_mode: 'HTML' });
-  const result = await verifyDepositByTxId(txid);
+  const result = await verifyDepositByTxId(txid, { userId });
   await bot.deleteMessage(chatId, wait.message_id).catch(() => {});
 
   if (!result.found) {
     await bot.sendMessage(chatId, result.message, { parse_mode: 'HTML' });
     return;
+  }
+
+  // V167.2: a TxID is public. A transfer made BEFORE this order existed cannot be its payment —
+  // otherwise anyone could claim an old, unclaimed payment to the shop address.
+  if (_usdtOrder && result.insertTime) {
+    const orderMs = new Date(_usdtOrder.created_at + 'Z').getTime();
+    if (Number.isFinite(orderMs) && Number(result.insertTime) < orderMs - 2 * 60 * 1000) {
+      logger.warn(`[SECURITY] order #${internalOrderId}: TxID ${txid} predates the order (user ${userId}) — refused`);
+      await bot.sendMessage(chatId,
+        '❌ <b>This transfer was made before this order was created.</b>\n\nSend the payment AFTER opening the order, then send its TxID.',
+        { parse_mode: 'HTML' });
+      return;
+    }
   }
 
   await settleDirectPayment(bot, chatId, userId, {

@@ -58,6 +58,8 @@ function networks() {
              usdt: '0xdac17f958d2ee523a2206206994597c13d831ec7', decimals: 6, minConf: Number(env('ETH_MIN_CONF', 12)), addr: config.usdtErc20Address },
     TRC20: { kind: 'tron', label: 'TRC20', name: 'TRON', api: env('TRON_API_URL', 'https://api.trongrid.io'), key: process.env.TRONGRID_API_KEY || '',
              usdt: 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t', decimals: 6, addr: config.usdtTrc20Address },
+    TON:   { kind: 'ton', label: 'TON', name: 'The Open Network', api: env('TON_API_URL', 'https://toncenter.com'), key: process.env.TONCENTER_API_KEY || '',
+             master: 'EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs', decimals: 6, addr: config.usdtTonAddress },
     SOL:   { kind: 'sol', label: 'SOL', name: 'Solana', rpc: env('SOLANA_RPC_URL', 'https://api.mainnet-beta.solana.com'),
              mint: 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', decimals: 6, addr: config.usdtSolAddress },
   };
@@ -66,6 +68,7 @@ const configured = (n) => !!(n.addr && String(n.addr).trim());
 
 // ── http (replaceable in tests) ───────────────────────────────────────────────────────────────
 let http = {
+  get: (url, headers, params) => axios.get(url, { timeout: TIMEOUT, headers: headers || {}, params }).then((r) => r.data),
   post: (url, body, headers) => axios.post(url, body, { timeout: TIMEOUT, headers: headers || {} }).then((r) => r.data),
 };
 function _setHttp(h) { http = h; }
@@ -136,6 +139,56 @@ async function checkTron(n, txid) {
   return { state: 'ok', amount: Number(total) / 10 ** n.decimals, confirmations: confirmed ? 1 : 0, needed: 1, time: info.blockTimeStamp || null };
 }
 
+// ── TON (USDT jetton) ────────────────────────────────────────────────────────────────────────
+/** TON friendly address (EQ…/UQ…) → "0:<hex>" raw form, or null. */
+function tonRaw(addr) {
+  try {
+    const b = Buffer.from(String(addr).replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+    if (b.length !== 36) return null;
+    return `${b[1] === 0xff ? -1 : b[1]}:${b.subarray(2, 34).toString('hex')}`;
+  } catch (_) { return null; }
+}
+/** A TON hash in any spelling (hex, base64, base64url) → 64-char hex, or null. */
+function tonHashHex(h) {
+  const v = String(h || '').trim();
+  if (/^(0x)?[0-9a-fA-F]{64}$/.test(v)) return v.replace(/^0x/, '').toLowerCase();
+  if (/^[A-Za-z0-9+/_-]{43,44}={0,2}$/.test(v)) {
+    const x = Buffer.from(v.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('hex');
+    return x.length === 64 ? x : null;
+  }
+  return null;
+}
+async function checkTon(n, txid, opts = {}) {
+  const hdr = n.key ? { 'X-API-Key': n.key } : {};
+  const since = Math.floor(Date.now() / 1000) - 48 * 3600;
+  const d = await http.get(`${String(n.api).replace(/\/$/, '')}/api/v3/jetton/transfers`, hdr,
+    { owner_address: n.addr, jetton_master: n.master, direction: 'in', start_utime: since, limit: 100, sort: 'desc' });
+  const list = (d && d.jetton_transfers) || [];
+  const wanted = tonHashHex(txid);
+  const masterRaw = tonRaw(n.master);
+  const mk = (t) => ({ state: 'ok', amount: Number(t.amount) / 10 ** n.decimals, confirmations: 1, needed: 1, time: t.transaction_now ? t.transaction_now * 1000 : null, hash: tonHashHex(t.transaction_hash) });
+  const good = list.filter((t) => !t.jetton_master || !masterRaw || String(t.jetton_master).toLowerCase() === masterRaw);
+  let t = wanted && good.find((x) => tonHashHex(x.transaction_hash) === wanted);
+  if (t) return t.transaction_aborted ? { state: 'failed' } : mk(t);
+
+  // The wallet shows the MESSAGE hash, the chain records the TRANSACTION hash: they differ, so a hash that matches
+  // nothing is looked for by the customer's own reserved amount (the reservation is what proves it is theirs).
+  if (opts.userId) {
+    try {
+      const q = require('../database/queries');
+      for (const x of good) {
+        if (x.transaction_aborted) continue;
+        const h = tonHashHex(x.transaction_hash);
+        if (h && q.isTxidUsed(h)) continue;
+        const amt = Number(x.amount) / 10 ** n.decimals;
+        const intent = q.findIntentForDeposit ? q.findIntentForDeposit('TON', amt) : null;
+        if (intent && Number(intent.user_id) === Number(opts.userId)) { logger.info(`[CHAIN] TON matched by reserved amount ${amt} (intent #${intent.id})`); return mk(x); }
+      }
+    } catch (e) { logger.warn(`[CHAIN] TON amount fallback failed: ${e.message}`); }
+  }
+  return { state: 'none' };
+}
+
 // ── Solana ────────────────────────────────────────────────────────────────────────────────────
 async function checkSol(n, sig) {
   const get = (commitment) => rpc(n.rpc, 'getTransaction', [sig, { encoding: 'jsonParsed', commitment, maxSupportedTransactionVersion: 0 }]);
@@ -157,15 +210,16 @@ async function checkSol(n, sig) {
 function candidates(raw) {
   const t = String(raw || '').trim();
   if (/^0x[0-9a-fA-F]{64}$/.test(t)) return { txid: t.toLowerCase(), nets: ['BEP20', 'ERC20'] };
-  if (/^[0-9a-fA-F]{64}$/.test(t)) return { txid: t.toLowerCase(), nets: ['TRC20'] };
+  if (/^[0-9a-fA-F]{64}$/.test(t)) return { txid: t.toLowerCase(), nets: ['TRC20', 'TON'] };   // a TON hash looks the same as a Tron one
+  if (/^[A-Za-z0-9+/_-]{43,44}={0,2}$/.test(t)) return { txid: t, nets: ['TON'] };
   if (/^[1-9A-HJ-NP-Za-km-z]{80,90}$/.test(t)) return { txid: t, nets: ['SOL'] };
   return null;
 }
 const isChainTxid = (raw) => !!candidates(raw);
 
-const RUN = { evm: checkEvm, tron: checkTron, sol: checkSol };
+const RUN = { evm: checkEvm, tron: checkTron, sol: checkSol, ton: checkTon };
 
-async function verifyDeposit(rawTxid, opts = {}) {
+async function verifyDepositInner(rawTxid, opts = {}) {
   const maxAgeMinutes = Number(opts.maxAgeMinutes) > 0 ? Number(opts.maxAgeMinutes) : 0;
   const c = candidates(rawTxid);
   if (!c) return fail('invalid_format', '❌ Invalid TxID format. Please copy the whole transaction hash and resend.');
@@ -178,7 +232,7 @@ async function verifyDeposit(rawTxid, opts = {}) {
   let hit = null, pending = null, apiError = null;
   await Promise.all(nets.map(async (n) => {
     try {
-      const r = await RUN[n.kind](n, c.txid);
+      const r = await RUN[n.kind](n, c.txid, opts);
       seen.push(`${n.label}`);
       if (r.state === 'none') return;
       r.n = n;
@@ -218,9 +272,75 @@ async function verifyDeposit(rawTxid, opts = {}) {
   if (!Number.isFinite(hit.amount) || hit.amount <= 0) return fail('api_error', 'Unexpected amount on the blockchain. Please contact support.');
 
   return {
-    found: true, amount: hit.amount, network: hit.n.label, asset: 'USDT', address: hit.n.addr, txid: c.txid,
+    found: true, amount: hit.amount, network: hit.n.label, asset: 'USDT', address: hit.n.addr, txid: hit.hash || c.txid,
     insertTime: hit.time || null, confirmations: hit.confirmations, tooOld, tooOldMinutes, maxAgeMinutes,
   };
 }
 
-module.exports = { verifyDeposit, isChainTxid, candidates, networks, tronHex, b58decode, _setHttp };
+
+// ── automatic detection: the recent USDT that arrived at our address, per network ─────────────
+/**
+ * recentIncoming('BEP20', sinceMs) → [{ txid, amount, time, address, network }]
+ * Used by the wallet watcher so a customer who sends the exact reserved amount is credited without a TxID.
+ * Only CONFIRMED transfers are returned.
+ */
+async function recentIncoming(key, sinceMs) {
+  const n = networks()[key];
+  if (!n || !configured(n)) return [];
+  const out = [];
+  const push = (txid, amount, time) => { if (txid && Number.isFinite(amount) && amount > 0) out.push({ txid, amount: Math.round(amount * 1e6) / 1e6, time, address: n.addr, network: key }); };
+
+  if (n.kind === 'evm') {
+    const head = parseInt(await rpc(n.rpc, 'eth_blockNumber', []), 16);
+    const span = Number(env(`${key}_SCAN_BLOCKS`, key === 'BEP20' ? 4800 : 300));        // public nodes cap getLogs ranges
+    const logs = await rpc(n.rpc, 'eth_getLogs', [{
+      address: n.usdt, fromBlock: `0x${Math.max(0, head - span).toString(16)}`, toBlock: 'latest',
+      topics: [`0x${TRANSFER_SIG}`, null, `0x${String(n.addr).toLowerCase().replace(/^0x/, '').padStart(64, '0')}`],
+    }]);
+    const blockTimes = new Map();
+    for (const lg of logs || []) {
+      const bn = parseInt(lg.blockNumber, 16);
+      if (head - bn + 1 < n.minConf) continue;
+      if (!blockTimes.has(lg.blockNumber)) { const b = await rpc(n.rpc, 'eth_getBlockByNumber', [lg.blockNumber, false]); blockTimes.set(lg.blockNumber, b && b.timestamp ? parseInt(b.timestamp, 16) * 1000 : null); }
+      const t = blockTimes.get(lg.blockNumber);
+      if (t && t < sinceMs) continue;
+      push(lg.transactionHash, Number(BigInt(lg.data || '0x0')) / 10 ** n.decimals, t);
+    }
+  } else if (n.kind === 'tron') {
+    const d = await http.get(`${String(n.api).replace(/\/$/, '')}/v1/accounts/${n.addr}/transactions/trc20`, n.key ? { 'TRON-PRO-API-KEY': n.key } : {},
+      { only_to: true, only_confirmed: true, contract_address: n.usdt, min_timestamp: sinceMs, limit: 50 });
+    for (const t of (d && d.data) || []) {
+      if (t.token_info && t.token_info.address && t.token_info.address !== n.usdt) continue;
+      push(t.transaction_id, Number(t.value) / 10 ** ((t.token_info && Number(t.token_info.decimals)) || n.decimals), t.block_timestamp);
+    }
+  } else if (n.kind === 'ton') {
+    const d = await http.get(`${String(n.api).replace(/\/$/, '')}/api/v3/jetton/transfers`, n.key ? { 'X-API-Key': n.key } : {},
+      { owner_address: n.addr, jetton_master: n.master, direction: 'in', start_utime: Math.floor(sinceMs / 1000), limit: 50, sort: 'desc' });
+    for (const t of (d && d.jetton_transfers) || []) {
+      if (t.transaction_aborted) continue;
+      push(tonHashHex(t.transaction_hash), Number(t.amount) / 10 ** n.decimals, t.transaction_now ? t.transaction_now * 1000 : null);
+    }
+  } else if (n.kind === 'sol') {
+    // incoming USDT lands in the owner's token account, so look there (not at the wallet address)
+    const accts = await rpc(n.rpc, 'getTokenAccountsByOwner', [n.addr, { mint: n.mint }, { encoding: 'jsonParsed' }]);
+    for (const a of (accts && accts.value) || []) {
+      const sigs = await rpc(n.rpc, 'getSignaturesForAddress', [a.pubkey, { limit: 20, commitment: 'finalized' }]);
+      for (const sg of sigs || []) {
+        if (sg.err || (sg.blockTime && sg.blockTime * 1000 < sinceMs)) continue;
+        const r = await checkSol(n, sg.signature);
+        if (r.state === 'ok') push(sg.signature, r.amount, r.time);
+      }
+    }
+  }
+  return out;
+}
+
+/** Same answer, plus one log line so the Railway log shows what happened to every TxID. */
+async function verifyDeposit(rawTxid, opts = {}) {
+  const r = await verifyDepositInner(rawTxid, opts);
+  const id = String(rawTxid || '').trim();
+  logger.info(`[CHAIN] ${id.slice(0, 14)}…(${id.length} chars) user=${opts.userId || '-'} → ${r.found ? `OK ${r.amount} ${r.network}${r.tooOld ? ' (too old)' : ''}` : `NO ${r.reason}`}`);
+  return r;
+}
+
+module.exports = { recentIncoming, tonRaw, tonHashHex, verifyDeposit, isChainTxid, candidates, networks, tronHex, b58decode, _setHttp };

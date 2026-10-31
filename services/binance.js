@@ -151,7 +151,17 @@ async function fetchDepositHistory({ coin = 'USDT', startTime, endTime } = {}) {
  */
 async function verifyDepositByTxId(rawTxid, opts = {}) {
   // V167: by default the blockchain itself is asked — Binance is not called at all.
-  if (config.paymentVerify !== 'binance') return require('./chainVerify').verifyDeposit(rawTxid, opts);
+  if (config.paymentVerify !== 'binance') {
+    const r = await require('./chainVerify').verifyDeposit(rawTxid, opts);
+    // one transfer, several spellings of its hash (TON: hex / base64): never let it pay twice
+    if (r.found && r.network === 'TON') {
+      try {
+        const q = require('../database/queries');
+        if (txidForms(r.txid).some((f) => q.isTxidUsed(f))) return { found: false, reason: 'used', message: '❌ This transaction was already used.' };
+      } catch (_) {}
+    }
+    return r;
+  }
   // opts.maxAgeMinutes — reject deposits whose on-chain arrival is older than
   //                      this. The TxID of a shared deposit address is public,
   //                      so an unbounded window means every historical transfer

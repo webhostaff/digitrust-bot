@@ -28,7 +28,15 @@ const config = {
 
   // Binance Spot API (Enable Reading only — for deposit history lookup)
   // V166.8: Binance Pay is switched OFF until the Binance problem is fixed. Set BINANCE_PAY_ENABLED=true to turn it back on.
-  binancePayEnabled: String(process.env.BINANCE_PAY_ENABLED || '').toLowerCase() === 'true',
+  // V167.3: the admin button 🟡 Binance Pay ON/OFF (stored in the database) wins; the env var is only the starting value.
+  get binancePayEnabled() {
+    try {
+      const v = require('../database/queries').getSetting('binance_pay_enabled', '');
+      if (v === '1') return true;
+      if (v === '0') return false;
+    } catch (_) { /* database not ready yet */ }
+    return String(process.env.BINANCE_PAY_ENABLED || '').toLowerCase() === 'true';
+  },
   binanceId:        process.env.BINANCE_ID         || '',
   binanceApiKey:    process.env.BINANCE_API_KEY    || '',
   binanceApiSecret: process.env.BINANCE_API_SECRET || '',
