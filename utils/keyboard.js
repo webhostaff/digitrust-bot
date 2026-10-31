@@ -281,7 +281,7 @@ const orderConfirmKb = () => mk([
 
 const paymentMethodKb = (orderId, showCryptobot = true) => mk([
   [btn('💰 Pay with Wallet',       `pay_wallet_${orderId}`)],
-  [btn('🟡 Pay with Binance Pay',  `pay_binance_${orderId}`)],
+  [btn(require('../config').binancePayEnabled ? '🟡 Pay with Binance Pay' : '🟡 Binance Pay — unavailable for now',  `pay_binance_${orderId}`)],
   [btn('💎 Pay with USDT',         `pay_usdt_${orderId}`)],
   ...(showCryptobot ? [[btn('🤖 Pay with CryptoBot', `pay_cryptobot_${orderId}`)]] : []),
   [btn('❌ Cancel',                `cancel_order_${orderId}`)],
@@ -294,7 +294,7 @@ const walletMenuKb = () => mk([
 ]);
 
 const walletTopupMethodKb = () => mk([
-  [btn('🟡 Top Up with Binance Pay', 'wallet_topup_binance')],
+  [btn(require('../config').binancePayEnabled ? '🟡 Top Up with Binance Pay' : '🟡 Binance Pay — unavailable for now', 'wallet_topup_binance')],
   [btn('💎 Top Up with USDT', 'wallet_topup_usdt')],
   [btn('🤖 Top Up with CryptoBot', 'wallet_topup_cryptobot')],
   [btn('🔙 Back to Wallet', 'menu_wallet')],

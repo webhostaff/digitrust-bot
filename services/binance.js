@@ -41,7 +41,7 @@ const TXID_RE = /^((0x)?[a-fA-F0-9]{64}|[A-Za-z0-9+/_-]{43,48}={0,2})$/;
 // V146: a Binance-to-Binance transfer has no hash — only "Off-chain Transfer 418351948005".
 const { offchainDigits, isOffchainTxid, normalizeTxidInput } = require('../utils/txid');
 /** Does this look like a TxID the customer could really have: a blockchain hash OR an off-chain id? */
-const isTxidInput = (raw) => TXID_RE.test(String(raw || '').trim()) || isOffchainTxid(raw);
+const isTxidInput = (raw) => TXID_RE.test(String(raw || '').trim()) || isOffchainTxid(raw) || require('./chainVerify').isChainTxid(raw);   // V167: + Solana signatures
 
 /**
  * Every spelling a transaction hash can arrive in.
@@ -150,6 +150,8 @@ async function fetchDepositHistory({ coin = 'USDT', startTime, endTime } = {}) {
  * Verify a single USDT deposit by TxID against Binance deposit history.
  */
 async function verifyDepositByTxId(rawTxid, opts = {}) {
+  // V167: by default the blockchain itself is asked — Binance is not called at all.
+  if (config.paymentVerify !== 'binance') return require('./chainVerify').verifyDeposit(rawTxid, opts);
   // opts.maxAgeMinutes — reject deposits whose on-chain arrival is older than
   //                      this. The TxID of a shared deposit address is public,
   //                      so an unbounded window means every historical transfer

@@ -556,6 +556,11 @@ async function payWithWallet(bot, chatId, userId, orderId, messageId) {
 // ── Pay with Binance Pay (Order ID) ──────────────────────────────────────────
 
 async function startBinancePayForOrder(bot, chatId, userId, orderId, messageId) {
+  if (!config.binancePayEnabled) {   // V166.8: switched off until fixed — send them back to the choice of methods
+    await bot.editMessageText(`🟡 <b>Binance Pay is temporarily unavailable</b>\n\nIt is being fixed and will be back soon. Please choose another payment method.`,
+      { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: paymentMethodKb(orderId) }).catch(() => {});
+    return;
+  }
   // Customer's language, so the whole purchase flow speaks it.
   const lang = db.getUserLanguage ? db.getUserLanguage(userId) : 'en';
   const order = db.getOrder(orderId);
@@ -698,7 +703,9 @@ async function startUsdtPayForOrder(bot, chatId, userId, orderId, messageId) {
   const nets = [
     { key: 'TRC20', label: '🔴 <b>TRC20 (USDT):</b>', via: 'TRC20 → send via <b>TRON</b> network',       addr: config.usdtTrc20Address },
     { key: 'BEP20', label: '🟡 <b>BEP20 (USDT):</b>', via: 'BEP20 → send via <b>BNB Smart Chain</b>',    addr: config.usdtBep20Address },
-    { key: 'TON',   label: '💎 <b>TON (USDT):</b>',   via: 'TON → send via <b>The Open Network</b>',     addr: config.usdtTonAddress,
+    { key: 'ERC20', label: '🔷 <b>ERC20 (USDT):</b>', via: 'ERC20 → send via <b>Ethereum</b> network',   addr: config.usdtErc20Address },
+    { key: 'SOL',   label: '🟣 <b>Solana (USDT):</b>', via: 'SOL → send via <b>Solana</b> network',      addr: config.usdtSolAddress },
+    { key: 'TON',   label: '💎 <b>TON (USDT):</b>',   via: 'TON → send via <b>The Open Network</b>',     addr: config.paymentVerify === 'binance' ? config.usdtTonAddress : '',
       memo: String(config.usdtTonMemo || '').trim() },
   ].filter((n) => n.addr && String(n.addr).trim());
 
@@ -727,7 +734,7 @@ async function startUsdtPayForOrder(bot, chatId, userId, orderId, messageId) {
     `⚠️ <b>Important — the network must match the address:</b>\n` +
     `${viaBlock}\n\n` +
     `💡 If something goes wrong (wrong amount / out of stock), funds are added to your wallet automatically.\n\n` +
-    `<i>Example TxID:</i>\n<code>0x1234...abcd</code> (64 chars)\n\n🔁 <i>Paying from a Binance account (no fee, no network)? Send the number shown as “Off-chain Transfer …” instead, e.g. <code>418351948005</code>.</i>\n\n` +
+    `<i>Example TxID:</i>\n<code>0x1234...abcd</code>\n\n` +
     `⏰ Valid for ${PAYMENT_CONFIRM_VALIDITY_MIN} minutes. TxID can only be used once.`,
     {
       chat_id: chatId, message_id: messageId,
@@ -887,7 +894,7 @@ async function settleDirectPayment(bot, chatId, userId, info) {
     session.clear(userId);
     const freshManualOrder = db.getOrder(order.id);
     await manualDelivery.openManualDelivery(bot, freshManualOrder, method);
-    const _paidOrder = db.getOrder(orderId) || order;
+    const _paidOrder = db.getOrder(order.id) || order;
     consumeAllowanceFor(_paidOrder, _paidOrder?.allowance_units);
   await handleReferralReward(bot, userId);
 

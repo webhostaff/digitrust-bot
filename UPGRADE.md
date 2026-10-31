@@ -1,3 +1,27 @@
+## V167 — Payments straight from the blockchain (no Binance at all)
+USDT is verified by reading the transaction on the chain: success, real USDT contract, receiver = YOUR address, amount, time, confirmations.
+
+Networks: **TRC20 (Tron) · ERC20 (Ethereum) · BEP20 (BSC) · Solana**. TON is hidden (it only worked through Binance).
+
+Railway variables (your Trust Wallet receiving addresses, one per network):
+- `USDT_TRC20_ADDRESS`  (starts with T)
+- `USDT_BEP20_ADDRESS`  (0x…, BSC)
+- `USDT_ERC20_ADDRESS`  (0x…, Ethereum) — new
+- `USDT_SOL_ADDRESS`    (Solana address) — new
+A network with no address is simply not shown.
+
+Optional (recommended for stability): `TRONGRID_API_KEY` (free, trongrid.io), and private endpoints `BSC_RPC_URL`, `ETH_RPC_URL`, `SOLANA_RPC_URL`. The public ones work but are rate-limited.
+
+- `BINANCE_API_KEY/SECRET` are no longer used. To go back to the old path: `PAYMENT_VERIFY=binance`.
+- Binance Pay stays off (V166.8).
+- The customer still sends the TxID (wallet top-ups still use the unique reserved amount to prove ownership). Automatic detection without a TxID is NOT in this version.
+- Tested with simulated blockchain answers only, NOT against the live networks.
+
+## V166.8 — Binance Pay switched off until fixed
+- "Pay with Binance Pay" and "Top up with Binance Pay" now read "🟡 Binance Pay — unavailable for now"; tapping shows a notice and goes back to the other methods.
+- Turn it back on with the Railway variable `BINANCE_PAY_ENABLED=true`.
+- The plain "USDT" method (TRC20/BEP20/TON) is untouched: it still checks deposits through the Binance API.
+
 ## V166.6 — Binance report with a chosen period (from → to)
 - Admin → 📄 Binance Report → 🗓 Choose dates: send `2026-09-01 2026-10-24` (or `01/09 24/10`), get the Excel + CSV for exactly that period.
 - Two new columns: network/method and the shop's receiving wallet.

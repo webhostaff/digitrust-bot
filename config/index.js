@@ -14,6 +14,12 @@ const config = {
   // USDT deposit addresses (Binance Deposit addresses)
   usdtTrc20Address: process.env.USDT_TRC20_ADDRESS || '',
   usdtBep20Address: process.env.USDT_BEP20_ADDRESS || '',
+  // V167: Ethereum and Solana receiving addresses (your Trust Wallet addresses for those networks).
+  usdtErc20Address: process.env.USDT_ERC20_ADDRESS || '',
+  usdtSolAddress:   process.env.USDT_SOL_ADDRESS   || '',
+  // V167: how payments are verified. 'chain' (default) = straight from the blockchain, Binance is never called.
+  // 'binance' = the old Binance API path (needs BINANCE_API_KEY/SECRET).
+  paymentVerify:    (process.env.PAYMENT_VERIFY || 'chain').toLowerCase() === 'binance' ? 'binance' : 'chain',
   usdtTonAddress:   process.env.USDT_TON_ADDRESS   || '',
   // Optional. Binance issues a unique TON address per account and needs no
   // memo, so this is normally left empty — it exists for exchanges that do use
@@ -21,6 +27,8 @@ const config = {
   usdtTonMemo:      process.env.USDT_TON_MEMO      || '',
 
   // Binance Spot API (Enable Reading only — for deposit history lookup)
+  // V166.8: Binance Pay is switched OFF until the Binance problem is fixed. Set BINANCE_PAY_ENABLED=true to turn it back on.
+  binancePayEnabled: String(process.env.BINANCE_PAY_ENABLED || '').toLowerCase() === 'true',
   binanceId:        process.env.BINANCE_ID         || '',
   binanceApiKey:    process.env.BINANCE_API_KEY    || '',
   binanceApiSecret: process.env.BINANCE_API_SECRET || '',

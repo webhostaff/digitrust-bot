@@ -64,8 +64,10 @@ function fmtReserved(v) {
 // twice), and the reservation is consumed atomically.
 const NET_FROM_BINANCE = { BSC: 'BEP20', BEP20: 'BEP20', TRX: 'TRC20', TRC20: 'TRC20', TRON: 'TRC20', TON: 'TON' };
 let depositScanRunning = false;
+const NETS_OK = ['TRC20', 'BEP20', 'ERC20', 'SOL', 'TON'];
 
 async function scanDepositsOnce(bot) {
+  if (config.paymentVerify !== 'binance') return 0;   // V167: the Binance deposit scan is off in chain mode
   if (depositScanRunning) return 0;
   const open = db.listOpenIntents ? db.listOpenIntents() : [];
   if (!open.length) return 0;
@@ -169,7 +171,9 @@ async function startUsdtTopup(bot, chatId, userId, messageId) {
   const rows = [];
   if (config.usdtTrc20Address) rows.push([{ text: '🔴 USDT — TRC20 (TRON)', callback_data: 'topup_net_TRC20' }]);
   if (config.usdtBep20Address) rows.push([{ text: '🟡 USDT — BEP20 (BSC)',  callback_data: 'topup_net_BEP20' }]);
-  if (config.usdtTonAddress)   rows.push([{ text: '💎 USDT — TON',          callback_data: 'topup_net_TON'   }]);
+  if (config.usdtErc20Address) rows.push([{ text: '🔷 USDT — ERC20 (Ethereum)', callback_data: 'topup_net_ERC20' }]);
+  if (config.usdtSolAddress)   rows.push([{ text: '🟣 USDT — Solana',       callback_data: 'topup_net_SOL'   }]);
+  if (config.usdtTonAddress && config.paymentVerify === 'binance') rows.push([{ text: '💎 USDT — TON', callback_data: 'topup_net_TON' }]);
   rows.push([{ text: '🔙 Back', callback_data: 'wallet_topup' }]);
 
   if (rows.length === 1) {
@@ -185,7 +189,8 @@ async function startUsdtTopup(bot, chatId, userId, messageId) {
     `Choose the network you will send from:\n\n` +
     `🔴 <b>TRC20</b> — TRON network\n` +
     `🟡 <b>BEP20</b> — BNB Smart Chain\n` +
-    `💎 <b>TON</b> — The Open Network\n\n` +
+    `🔷 <b>ERC20</b> — Ethereum\n` +
+    `🟣 <b>Solana</b> — USDT on Solana\n\n` +
     `⚠️ <i>Send only USDT on the network you pick. Anything else is lost.</i>`,
     { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } }
   ).catch(() => {});
@@ -195,7 +200,7 @@ async function startUsdtTopup(bot, chatId, userId, messageId) {
  * STEP 2 — ask for the amount.
  */
 async function startUsdtAmount(bot, chatId, userId, messageId, network) {
-  const net = ['TRC20', 'BEP20', 'TON'].includes(network) ? network : 'BEP20';
+  const net = NETS_OK.includes(network) ? network : 'BEP20';
   session.set(userId, States.WALLET_TOPUP_USDT_AMOUNT, { network: net, startedAt: Date.now() });
 
   await bot.editMessageText(
@@ -217,7 +222,7 @@ async function handleUsdtAmount(bot, msg) {
   const chatId = msg.chat.id;
   const sess   = session.get(userId);
   const chosen = sess.data && sess.data.network;
-  const net    = ['TRC20', 'BEP20', 'TON'].includes(chosen) ? chosen : 'BEP20';
+  const net    = NETS_OK.includes(chosen) ? chosen : 'BEP20';
 
   const base = parseFloat(String(msg.text || '').replace(',', '.').trim());
   if (isNaN(base) || base < minDeposit()) {
@@ -238,6 +243,8 @@ async function handleUsdtAmount(bot, msg) {
 
   const address = net === 'TRC20' ? config.usdtTrc20Address
                 : net === 'TON'   ? config.usdtTonAddress
+                : net === 'ERC20' ? config.usdtErc20Address
+                : net === 'SOL'   ? config.usdtSolAddress
                 : config.usdtBep20Address;
   session.set(userId, States.WALLET_TOPUP_USDT_TX, {
     network: net, intentId: intent.id, startedAt: Date.now(),
@@ -283,6 +290,11 @@ async function handleUsdtAmount(bot, msg) {
 // ── Method 2: Binance Pay (internal) — Order ID ───────────────────────────────
 
 async function startBinancePayTopup(bot, chatId, userId, messageId) {
+  if (!config.binancePayEnabled) {   // V166.8
+    await bot.editMessageText(`🟡 <b>Binance Pay is temporarily unavailable</b>\n\nIt is being fixed and will be back soon. Please choose another way to top up.`,
+      { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: walletTopupMethodKb() }).catch(() => {});
+    return;
+  }
   const lang = db.getUserLanguage ? db.getUserLanguage(userId) : 'en';
   session.set(userId, States.WALLET_TOPUP_BINANCE_ID, { startedAt: Date.now() });
 
@@ -464,7 +476,7 @@ async function handleUsdtTxId(bot, msg) {
       // An off-chain transfer has no network (it never touched a blockchain): the reservation can be
       // on any of them. The automatic scan does the same.
       const intent = result.offchain
-        ? ['BEP20', 'TRC20', 'TON'].map((n) => db.findIntentForDeposit(n, result.amount)).find(Boolean)
+        ? ['BEP20', 'TRC20', 'ERC20', 'SOL', 'TON'].map((n) => db.findIntentForDeposit(n, result.amount)).find(Boolean)
         : db.findIntentForDeposit(result.network, result.amount);
 
       // (a) No reservation at all → never auto-credit. Park it for the admin.

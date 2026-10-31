@@ -923,6 +923,8 @@ bot.onText(/^\/version$/i, async (msg) => {
   const addr = {
     TRC20: config.usdtTrc20Address,
     BEP20: config.usdtBep20Address,
+    ERC20: config.usdtErc20Address,
+    SOL:   config.usdtSolAddress,
     TON:   config.usdtTonAddress,
   };
 
@@ -1652,7 +1654,7 @@ async function handleCallbackQuery(query) {
   if (data === 'menu_wallet')          { await answer(); await walletHandler.showWallet(bot, chatId, userId, msgId); return; }
   if (data === 'wallet_topup')         { await answer(); await walletHandler.showTopupMethods(bot, chatId, userId, msgId); return; }
   // ── V3: USDT network choice + reservation cancel ──────────────────
-  if (/^topup_net_(TRC20|BEP20|TON)$/.test(data)) {
+  if (/^topup_net_(TRC20|BEP20|ERC20|SOL|TON)$/.test(data)) {
     await answer();
     await walletHandler.startUsdtAmount(bot, chatId, userId, msgId, data.split('_').pop());
     return;
