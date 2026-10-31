@@ -219,9 +219,10 @@ function makeSeatsHandler({ db: rawDb }) {
     const statuses = String(req.query.status || 'pending,active').split(',').map((x) => x.trim()).filter((x) => allowed.includes(x));
     if (!statuses.length) return res.status(400).json({ error: 'status must be some of ' + allowed.join(',') });
     try {
-      const rows = require('./cgbSeatsQuery').readSeats(rawDb, statuses, day);
+      const panel = /^[A-Za-z0-9_.:-]{1,64}$/.test(String(req.query.panel || '')) ? String(req.query.panel) : '';
+      const rows = require('./cgbSeatsQuery').readSeats(rawDb, statuses, day, panel);
       return res.json({
-        ok: true, end_day: day, statuses,
+        ok: true, end_day: day, statuses, ...(panel ? { panel } : {}),
         seats: rows.map((r) => ({
           email: String(r.email || '').trim().toLowerCase(), order_id: r.order_id, status: r.status,
           start_date: r.start_date, end_date: r.end_date, days: r.days_remaining, renewal: !!r.renewed_from,
