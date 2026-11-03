@@ -247,6 +247,9 @@ const getMonthlyPrice = (userId = null) => cgbCycles.getMonthlyPrice(userId);
 // Both the customer bot and the admin panel now call the SAME cycle maths, so
 // the panel can never show one cycle while the bot quotes another.
 const calculateBestCycle = () => cgbCycles.calculateBestCycle();
+/** V167.3: the Binance Pay button follows the admin's ON/OFF switch. */
+const binPayOn = () => !!require('./config').binancePayEnabled;
+const binPayRow = () => [{ text: binPayOn() ? '💳 Pay with Binance Pay' : '🟡 Binance Pay — unavailable for now', callback_data: 'pay_binance' }];
 
 function calculateNextCycleStarts() {
   const cycles = queries.getBillingCycles();
@@ -637,7 +640,7 @@ async function showAfterWindowPayment(chatId, userId, sub, mode, lateReqId = nul
   if (Math.round(balance * 100) >= Math.round(q.price * 100)) rows.push([{ text: `👛 Pay with Balance ($${balance.toFixed(2)})`, callback_data: 'pay_balance' }]);
   else if (balance > 0) rows.push([{ text: `👛 Balance $${balance.toFixed(2)} — not enough`, callback_data: 'balance_short' }]);
   rows.push(
-    [{ text: '💳 Pay with Binance Pay', callback_data: 'pay_binance' }],
+    binPayRow(),
     [{ text: '💎 USDT BEP20', callback_data: 'pay_bep20' }, { text: '💎 USDT TRC20', callback_data: 'pay_trc20' }],
     [{ text: '🤖 CryptoBot', callback_data: 'pay_cryptobot' }],
   );
@@ -740,7 +743,7 @@ async function showLatePayment(chatId, userId, reqId) {
   if (Math.round(balance * 100) >= Math.round(lq.price * 100)) rows.push([{ text: `👛 Pay with Balance ($${balance.toFixed(2)})`, callback_data: 'pay_balance' }]);
   else if (balance > 0) rows.push([{ text: `👛 Balance $${balance.toFixed(2)} — not enough`, callback_data: 'balance_short' }]);
   rows.push(
-    [{ text: '💳 Pay with Binance Pay', callback_data: 'pay_binance' }],
+    binPayRow(),
     [{ text: '💎 USDT BEP20', callback_data: 'pay_bep20' }, { text: '💎 USDT TRC20', callback_data: 'pay_trc20' }],
     [{ text: '🤖 CryptoBot', callback_data: 'pay_cryptobot' }],
   );
@@ -842,7 +845,7 @@ async function showRenewPayment(chatId, userId, subId, months, messageId = null)
     rows.push([{ text: `👛 Balance $${balance.toFixed(2)} — not enough`, callback_data: 'balance_short' }]);
   }
   rows.push(
-    [{ text: '💳 Pay with Binance Pay', callback_data: 'pay_binance' }],
+    binPayRow(),
     [{ text: '💎 USDT BEP20', callback_data: 'pay_bep20' }, { text: '💎 USDT TRC20', callback_data: 'pay_trc20' }],
     [{ text: '🤖 CryptoBot', callback_data: 'pay_cryptobot' }],
     [{ text: '⬅️ Change duration', callback_data: `cgb_renewyes_${subId}` }],
@@ -2924,6 +2927,10 @@ bot.on('callback_query', async (q) => {
   }
 
   // Payment method buttons
+  if (data === 'pay_binance' && !binPayOn()) {
+    await bot.answerCallbackQuery(q.id, { text: '🟡 Binance Pay is temporarily unavailable. Please choose another payment method.', show_alert: true }).catch(() => {});
+    return;
+  }
   if (data === 'pay_binance' || data === 'pay_bep20' || data === 'pay_trc20' || data === 'pay_cryptobot') {
     const s = getSession(userId);
     if (!s || s.state !== 'CONFIRM_ORDER') {
@@ -3311,7 +3318,7 @@ bot.on('message', async (msg) => {
       rows.push([{ text: `👛 Balance $${balance.toFixed(2)} — not enough`, callback_data: 'balance_short' }]);
     }
     rows.push(
-      [{ text: '💳 Pay with Binance Pay', callback_data: 'pay_binance' }],
+      binPayRow(),
       [{ text: '💎 USDT BEP20', callback_data: 'pay_bep20' }, { text: '💎 USDT TRC20', callback_data: 'pay_trc20' }],
       [{ text: '🤖 CryptoBot', callback_data: 'pay_cryptobot' }],
       [{ text: '✏️ Change Email', callback_data: 'change_email' }],

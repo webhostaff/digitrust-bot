@@ -575,6 +575,7 @@ const adminProductEditFieldsKb = (productId) =>
     [btn('✏️ Title',          `admin_edit_field_${productId}_title`)],
     [btn('✏️ Description',    `admin_edit_field_${productId}_description`)],
     [btn('✏️ Price',          `admin_edit_field_${productId}_price`)],
+    [btn('➕ Add another duration (new price)', `admin_variant_${productId}`)],
     [btn('💸 Cost Price',     `admin_edit_field_${productId}_cost_price`)],
     [btn('✏️ Warranty',       `admin_edit_field_${productId}_warranty`)],
     [btn('📋 Instruction',    `admin_edit_field_${productId}_instruction`)],

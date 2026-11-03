@@ -207,6 +207,50 @@ function evaluateCycle(cycle, from, bh, bm) {
   return { cycle, endDate, startDate, periodStart, inGap, cycleLength, daysRemaining };
 }
 
+// ── V167.4: "start tomorrow's cycle TODAY", one time only ───────────────────────────────────────────
+// A record {key, date} in the setting cgb_early_start. While it is TODAY's record, new buyers are sold the
+// cycle that was about to open tomorrow, starting today; every other cycle (the panel running now) is not
+// offered. At midnight the record no longer matches the date and everything is back to the calendar by itself.
+const EARLY_KEY = 'cgb_early_start';
+const cycleKey = (c) => `${c.start_day}-${c.end_day}`;
+const ymdOf = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+function earlyRecordLocal(localFrom) {
+  try {
+    const r = JSON.parse(db.getSetting(EARLY_KEY, '') || 'null');
+    if (r && r.key && r.date === ymdOf(localFrom)) return r;
+  } catch (_) { /* none */ }
+  return null;
+}
+const earlyRecord = (from = new Date()) => earlyRecordLocal(localNow(from));
+
+/** The cycle that would be brought forward right now: the one still to open, soonest first. */
+function earlyCandidate(from = new Date()) {
+  const now = localNow(from);
+  const [bh, bm] = boundaryTime();
+  const gap = getCycles().map((c) => evaluateCycle(c, now, bh, bm)).filter((e) => e.inGap)
+    .sort((a, b) => a.periodStart - b.periodStart);
+  return gap[0] || null;
+}
+
+/** Is it on, and for which cycle. */
+function earlyStatus(from = new Date()) {
+  const r = earlyRecord(from);
+  if (!r) return { on: false, candidate: earlyCandidate(from) };
+  const now = localNow(from);
+  const [bh, bm] = boundaryTime();
+  const c = getCycles().find((x) => cycleKey(x) === r.key);
+  return { on: true, record: r, cycle: c || null, eval: c ? evaluateCycle(c, now, bh, bm) : null };
+}
+
+function setEarlyStart(on, from = new Date()) {
+  if (!on) { db.setSetting(EARLY_KEY, ''); return { ok: true, on: false }; }
+  const cand = earlyCandidate(from);
+  if (!cand) return { ok: false, reason: 'no_upcoming_cycle' };
+  db.setSetting(EARLY_KEY, JSON.stringify({ key: cycleKey(cand.cycle), date: ymdOf(localNow(from)) }));
+  return { ok: true, on: true, cycle: cand.cycle, periodStart: cand.periodStart, endDate: cand.endDate };
+}
+
 /**
  * The cycle a purchase made today would land in.
  *
@@ -226,6 +270,21 @@ function calculateBestCycle(from = new Date()) {
   const [bh, bm] = boundaryTime();
   const evaluated = getCycles().map((cycle) => evaluateCycle(cycle, from, bh, bm));
   if (!evaluated.length) return null;
+
+  // V167.4: today only, the cycle due to open tomorrow is sold from today; the running one is closed to new buyers.
+  const early = earlyRecordLocal(from);   // `from` is already the shop's local time here
+  if (early) {
+    const e = evaluated.find((x) => cycleKey(x.cycle) === early.key);
+    if (e) {
+      const today = new Date(from); today.setHours(0, 0, 0, 0);
+      const forced = {
+        ...e, inGap: false, early: true, startDate: today,
+        daysRemaining: Math.min(e.cycleLength, Math.max(1, Math.ceil((e.endDate - today) / DAY_MS))),
+      };
+      forced.all = evaluated;
+      return forced;
+    }
+  }
 
   // A cycle that is running today wins over one that has not started yet: a
   // buyer on the 25th joins the cycle already in progress (22 -> 20) from
@@ -532,4 +591,4 @@ function globalMonthlyPrice() {
   }
 }
 
-module.exports = { lateRenewalQuote, renewGraceDays, renewalPeriod, quoteRenewal, renewDiscountFor, recordStartTime, clearStartTime, startTimeOf, getCycles, calculateBestCycle, priceFor, pricePeriod, oneMoreCycle, getMonthlyPrice, manualCycle, nextCycleAfterCurrent, boundaryTime, localNow, tzOffsetMinutes };
+module.exports = { earlyStatus, setEarlyStart, earlyCandidate, lateRenewalQuote, renewGraceDays, renewalPeriod, quoteRenewal, renewDiscountFor, recordStartTime, clearStartTime, startTimeOf, getCycles, calculateBestCycle, priceFor, pricePeriod, oneMoreCycle, getMonthlyPrice, manualCycle, nextCycleAfterCurrent, boundaryTime, localNow, tzOffsetMinutes };

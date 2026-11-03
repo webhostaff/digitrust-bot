@@ -631,6 +631,46 @@ async function handleAdminText(bot, msg) {
     await askForInitialStock(bot, chatId, userId);
     return;
   }
+  // ── Add another duration: label then price ───────────────
+  if (s === 'ADMIN_VARIANT_LABEL') {
+    const label = String(text || '').trim().slice(0, 40);
+    if (!label) { await bot.sendMessage(chatId, '❌ Type a duration name, e.g. <code>3 months</code>', { parse_mode: 'HTML' }); return; }
+    session.set(userId, 'ADMIN_VARIANT_PRICE', { ...d, label });
+    await bot.sendMessage(chatId, `Step 2/2 — price for <b>${escapeHtml(label)}</b> (e.g. 29.99):`,
+      { parse_mode: 'HTML', reply_markup: adminBackKb() });
+    return;
+  }
+  if (s === 'ADMIN_VARIANT_PRICE') {
+    const price = parseFloat(String(text).replace('$', '').replace(',', '.'));
+    if (isNaN(price) || price <= 0) { await bot.sendMessage(chatId, '❌ Enter a valid price, e.g. <code>29.99</code>', { parse_mode: 'HTML' }); return; }
+    const { variantOf, label } = d;
+    session.clear(userId);
+    try {
+      const raw = require('../database/db');
+      const src = raw.prepare('SELECT * FROM products WHERE id = ?').get(variantOf);
+      if (!src) throw new Error('source product not found');
+      const skip = new Set(['id', 'created_at', 'stock_quantity', 'sold_count', 'sales_count', 'preorder_count', 'stock_count']);
+      const cols = raw.prepare('PRAGMA table_info(products)').all().map(c => c.name).filter(n => !skip.has(n));
+      const row = { ...src, title: `${src.title} — ${label}`, price };
+      const info = raw.prepare(
+        `INSERT INTO products (${cols.join(',')}, stock_quantity, sold_count, sales_count)
+         VALUES (${cols.map(c => '@' + c).join(',')}, 0, 0, 0)`
+      ).run(Object.fromEntries(cols.map(c => [c, row[c] ?? null])));
+      const newId = Number(info.lastInsertRowid);
+      logger.info(`Admin ${userId} added duration "${label}" ($${price}) for product ${variantOf} → #${newId}`);
+      await bot.sendMessage(chatId,
+        `✅ <b>Duration added</b>\n\n🆔 ID: ${newId}\n📦 ${escapeHtml(row.title)}\n💵 ${formatPrice(price)}\n` +
+        `📦 Stock: 0 — add its own items now.`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+          [{ text: '📦 Add stock to the new one', callback_data: `admin_edit_p_${newId}` }],
+          [{ text: '🔙 Back to original', callback_data: `admin_edit_p_${variantOf}` }],
+        ] } });
+    } catch (e) {
+      logger.error(`Add duration failed: ${e.message}`);
+      await bot.sendMessage(chatId, `❌ Could not add duration: ${e.message}`);
+    }
+    return;
+  }
   // ── Create new category ─────────────────────────────────
   if (s === 'ADMIN_CAT_NEW_NAME') {
     session.clear(userId);
@@ -3553,6 +3593,22 @@ async function handleAdminCallback(bot, query) {
       chat_id: chatId, message_id: msgId,
       parse_mode: 'HTML', reply_markup: adminProductsKb(products, 'delete'),
     });
+    return;
+  }
+
+  // ── Add another duration (same product, different price) ─────────
+  // A duration is a full copy of the product with its own title suffix, price
+  // and stock, so buying, wallet, API and reports need no change at all.
+  if (/^admin_variant_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product = db.getProduct(productId);
+    if (!product) { await bot.answerCallbackQuery(query.id, { text: 'Product not found', show_alert: true }); return; }
+    session.set(userId, 'ADMIN_VARIANT_LABEL', { variantOf: productId });
+    await bot.sendMessage(chatId,
+      `➕ <b>New duration for:</b> ${escapeHtml(product.title)}\n` +
+      `Current price: ${formatPrice(product.price)}\n\n` +
+      `Step 1/2 — type the duration name of the NEW option, e.g. <code>3 months</code> or <code>1 year</code>:`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: `admin_edit_p_${productId}` }]] } });
     return;
   }
 
@@ -7502,6 +7558,27 @@ async function handleAdminCallback(bot, query) {
     return;
   }
 
+  // ── V167.4: one button — tomorrow's cycle starts today, once; tap again to stop ──
+  if (data === 'admin_cgb_early') {
+    const es = cgbCycles.earlyStatus();
+    const fmtD = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    let alertTxt;
+    if (es.on) {
+      cgbCycles.setEarlyStart(false);
+      logger.info(`[CGB] early start turned OFF by ${userId}`);
+      alertTxt = '🔴 Stopped. The calendar cycles sell again, as before.';
+    } else {
+      const r = cgbCycles.setEarlyStart(true);
+      if (!r.ok) { await bot.answerCallbackQuery(query.id, { text: '❌ No cycle is waiting to open — nothing to bring forward.', show_alert: true }).catch(() => {}); return; }
+      logger.info(`[CGB] early start turned ON by ${userId}: cycle Day ${r.cycle.start_day} → ${r.cycle.end_day}`);
+      alertTxt = `🟢 ON — Day ${r.cycle.start_day} → ${r.cycle.end_day} sells from TODAY, ending ${fmtD(r.endDate)}.\n` +
+                 `The cycle running now is closed to NEW buyers. Existing seats and renewals are untouched.\n` +
+                 `It switches itself off at midnight. Tap again to stop sooner.`;
+    }
+    await bot.answerCallbackQuery(query.id, { text: alertTxt, show_alert: true }).catch(() => {});
+    return handleAdminCallback(bot, { ...query, data: 'admin_cgb_cycles' });
+  }
+
   // ── One button: close the current cycle, open the next ────────────
   if (data === 'admin_cgb_nextcycle') {
     const next = cgbCycles.nextCycleAfterCurrent();
@@ -8059,6 +8136,10 @@ async function handleAdminCallback(bot, query) {
       rows.push([c.start_time
         ? { text: `⏱ Day ${c.start_day} renews at ${c.start_time} · reset`, callback_data: `admin_cgb_ctclr_${c.id}` }
         : { text: `⏱ Day ${c.start_day}: press at billing time`, callback_data: `admin_cgb_ctrec_${c.id}` }]);
+    }
+    {
+      const es = cgbCycles.earlyStatus();
+      rows.push([{ text: es.on ? '⏩ Tomorrow\'s cycle starts TODAY: 🟢 ON — tap to stop' : '⏩ Start tomorrow\'s cycle TODAY (one time): 🔴 OFF', callback_data: 'admin_cgb_early' }]);
     }
     rows.push([{ text: '⏭ Start next cycle now', callback_data: 'admin_cgb_nextcycle' }]);
     rows.push([{ text: '🕒 Set exact end time', callback_data: 'admin_cgb_manual' }]);

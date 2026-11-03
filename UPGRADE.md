@@ -1,3 +1,17 @@
+# V167.5 — Add another duration (new price) to a product
+
+Edit Product → **➕ Add another duration (new price)**. Type the duration name (e.g. `3 months`) and its price. The bot copies the product (description, warranty, image, category, instruction, delivery/refund settings) as `Title — 3 months` with its own price and its own stock (starts at 0 — add items from its edit page). Buying, wallet, API and reports are untouched because it is a normal product.
+
+---
+
+## V167.4 — Start tomorrow's cycle TODAY (one time, one button)
+- Admin → ChatGPT Business → 📅 Cycles → "⏩ Start tomorrow's cycle TODAY (one time)". Tap = ON, tap again = OFF.
+- ON: the cycle due to open tomorrow is sold from TODAY to its normal end date, at its normal full-cycle price. The cycle running now is closed to NEW buyers (its panel receives no new seats).
+- Untouched: seats already sold, renewals, prices, panels, every other setting.
+- It switches itself off at midnight (the date it was turned on), so it can never stay on by mistake.
+- ChatGPT Business bot: the "Pay with Binance Pay" button now follows the same Binance Pay ON/OFF switch as the store bot.
+- Tested on a temporary database with simulated dates (cycles 26→24, 22→20, 2→30). Not tested on live Telegram.
+
 ## V167.3 — Binance Pay button (open / close)
 - Admin panel → "🟡 Binance Pay: ON/OFF": one tap opens or closes Binance Pay for customers (orders + wallet top-up). Closed = "unavailable for now".
 - The choice is saved in the database; `BINANCE_PAY_ENABLED` is only the starting value.
