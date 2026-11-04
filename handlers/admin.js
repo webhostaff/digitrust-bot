@@ -4398,12 +4398,31 @@ async function handleAdminCallback(bot, query) {
   }
 
   // ── Stock management ──────────────────────────────────────────────
-  if (data === 'admin_stock') {
-    const products = db.getAllActiveProducts();
-    await bot.editMessageText('📦 <b>Stock Management</b>\n\nSelect product:', {
-      chat_id: chatId, message_id: msgId,
-      parse_mode: 'HTML', reply_markup: adminProductsKb(products, 'stock_select'),
-    });
+  if (data === 'admin_stock' || /^admin_stock_pg_\d+$/.test(data)) {
+    // Paged: Telegram refuses a keyboard that is too big (100 buttons / ~10 KB
+    // of markup), and a refused edit looked like a dead button.
+    const PER = 20;
+    const all = db.getAllActiveProducts();
+    const pages = Math.max(1, Math.ceil(all.length / PER));
+    const pg = Math.min(pages - 1, data === 'admin_stock' ? 0 : parseInt(data.split('_').pop(), 10));
+    const kb = adminProductsKb(all.slice(pg * PER, pg * PER + PER), 'stock_select');
+    const nav = [];
+    if (pg > 0) nav.push({ text: '⬅️ Prev', callback_data: `admin_stock_pg_${pg - 1}` });
+    if (pg < pages - 1) nav.push({ text: 'Next ➡️', callback_data: `admin_stock_pg_${pg + 1}` });
+    if (nav.length) kb.inline_keyboard.splice(kb.inline_keyboard.length - 1, 0, nav);
+    const text = `📦 <b>Stock Management</b>${pages > 1 ? ` (page ${pg + 1}/${pages})` : ''}\n\nSelect product:`;
+    try {
+      await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: kb });
+    } catch (e) {
+      if (/not modified/i.test(e.message || '')) return;
+      logger.error(`[ADMIN] stock list edit failed: ${e.message}`);
+      try {
+        await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: kb });
+      } catch (e2) {
+        logger.error(`[ADMIN] stock list send failed: ${e2.message}`);
+        await bot.sendMessage(chatId, `❌ Could not open the stock list: ${e2.message}`).catch(() => {});
+      }
+    }
     return;
   }
   if (/^admin_stock_select_p_\d+$/.test(data)) {

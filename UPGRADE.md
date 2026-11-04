@@ -1,3 +1,9 @@
+# V167.5.1 — Stock list no longer looks dead
+
+The 📦 Stock product list is paged (20 per page) and, if Telegram refuses to edit the message, it is re-sent as a new message and the real Telegram error is logged as `[ADMIN] stock list edit failed: …`.
+
+---
+
 # V167.5 — Add another duration (new price) to a product
 
 Edit Product → **➕ Add another duration (new price)**. Type the duration name (e.g. `3 months`) and its price. The bot copies the product (description, warranty, image, category, instruction, delivery/refund settings) as `Title — 3 months` with its own price and its own stock (starts at 0 — add items from its edit page). Buying, wallet, API and reports are untouched because it is a normal product.
