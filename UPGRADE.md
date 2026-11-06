@@ -1,3 +1,9 @@
+# V167.5.2 — Edit / Delete / Stock product lists are paged
+
+✏️ Edit Product, 🗑 Delete Product and 📦 Stock now share one paged picker (20 products per page, Prev/Next). If Telegram refuses to edit the message the list is re-sent as a new message and the real Telegram error is logged as `[ADMIN] product list (…) edit failed: …`. Product titles are HTML-escaped on the edit and stock screens.
+
+---
+
 # V167.5.1 — Stock list no longer looks dead
 
 The 📦 Stock product list is paged (20 per page) and, if Telegram refuses to edit the message, it is re-sent as a new message and the real Telegram error is logged as `[ADMIN] stock list edit failed: …`.

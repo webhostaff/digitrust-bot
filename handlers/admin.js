@@ -2870,6 +2870,32 @@ async function runTxidTrace(bot, chatId, rawText) {
   
 }
 
+/** One page of the product list used by Edit / Delete / Stock. */
+async function showProductPicker(bot, chatId, msgId, action, title, pagePrefix, page) {
+  const PER = 20;
+  const all = db.getAllActiveProducts();
+  const pages = Math.max(1, Math.ceil(all.length / PER));
+  const pg = Math.max(0, Math.min(pages - 1, Number.isFinite(page) ? page : 0));
+  const kb = adminProductsKb(all.slice(pg * PER, pg * PER + PER), action);
+  const nav = [];
+  if (pg > 0) nav.push({ text: '⬅️ Prev', callback_data: `${pagePrefix}_${pg - 1}` });
+  if (pg < pages - 1) nav.push({ text: 'Next ➡️', callback_data: `${pagePrefix}_${pg + 1}` });
+  if (nav.length) kb.inline_keyboard.splice(kb.inline_keyboard.length - 1, 0, nav);
+  const text = `${title}${pages > 1 ? ` (page ${pg + 1}/${pages})` : ''}\n\nSelect product:`;
+  try {
+    await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: kb });
+  } catch (e) {
+    if (/not modified/i.test(e.message || '')) return;
+    logger.error(`[ADMIN] product list (${action}) edit failed: ${e.message}`);
+    try {
+      await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: kb });
+    } catch (e2) {
+      logger.error(`[ADMIN] product list (${action}) send failed: ${e2.message}`);
+      await bot.sendMessage(chatId, `❌ Could not open the product list: ${e2.message}`).catch(() => {});
+    }
+  }
+}
+
 async function handleAdminCallback(bot, query) {
   // ── Security: hard gate on every admin callback ───────────────────
   if (!isAdmin(query.from.id)) {
@@ -3579,21 +3605,13 @@ async function handleAdminCallback(bot, query) {
   }
 
   // ── Product lists ─────────────────────────────────────────────────
-  if (data === 'admin_edit_product') {
-    const products = db.getAllActiveProducts();
-    await bot.editMessageText('✏️ <b>Select product to edit:</b>', {
-      chat_id: chatId, message_id: msgId,
-      parse_mode: 'HTML', reply_markup: adminProductsKb(products, 'edit'),
-    });
-    return;
+  // Product pickers (edit / delete / stock) are paged: Telegram refuses a keyboard
+  // that is too big, and a refused edit looked like a dead button.
+  if (data === 'admin_edit_product' || /^admin_pgedit_\d+$/.test(data)) {
+    return showProductPicker(bot, chatId, msgId, 'edit', '✏️ <b>Select product to edit:</b>', 'admin_pgedit', data === 'admin_edit_product' ? 0 : parseInt(data.split('_').pop(), 10));
   }
-  if (data === 'admin_delete_product') {
-    const products = db.getAllActiveProducts();
-    await bot.editMessageText('🗑 <b>Select product to delete:</b>', {
-      chat_id: chatId, message_id: msgId,
-      parse_mode: 'HTML', reply_markup: adminProductsKb(products, 'delete'),
-    });
-    return;
+  if (data === 'admin_delete_product' || /^admin_pgdelete_\d+$/.test(data)) {
+    return showProductPicker(bot, chatId, msgId, 'delete', '🗑 <b>Select product to delete:</b>', 'admin_pgdelete', data === 'admin_delete_product' ? 0 : parseInt(data.split('_').pop(), 10));
   }
 
   // ── Add another duration (same product, different price) ─────────
@@ -3643,7 +3661,7 @@ async function handleAdminCallback(bot, query) {
         ? product.low_stock_threshold
         : db.getSetting('low_stock_threshold_default', '5') + ' (default)'}\n`;
     await bot.editMessageText(
-      `✏️ <b>Edit Product:</b> ${product?.title}\n` +
+      `✏️ <b>Edit Product:</b> ${escapeHtml(String(product?.title || ''))}\n` +
       `🆔 <b>Product ID:</b> <code>${productId}</code>\n\n` +
       `📦 <b>Stock qty:</b> ${stockQty}   📈 <b>Sales:</b> ${product?.sales_count || 0}\n` +
       bulkInfo + refundInfo + vipInfo + deliveryInfo + lowInfo +
@@ -4399,31 +4417,7 @@ async function handleAdminCallback(bot, query) {
 
   // ── Stock management ──────────────────────────────────────────────
   if (data === 'admin_stock' || /^admin_stock_pg_\d+$/.test(data)) {
-    // Paged: Telegram refuses a keyboard that is too big (100 buttons / ~10 KB
-    // of markup), and a refused edit looked like a dead button.
-    const PER = 20;
-    const all = db.getAllActiveProducts();
-    const pages = Math.max(1, Math.ceil(all.length / PER));
-    const pg = Math.min(pages - 1, data === 'admin_stock' ? 0 : parseInt(data.split('_').pop(), 10));
-    const kb = adminProductsKb(all.slice(pg * PER, pg * PER + PER), 'stock_select');
-    const nav = [];
-    if (pg > 0) nav.push({ text: '⬅️ Prev', callback_data: `admin_stock_pg_${pg - 1}` });
-    if (pg < pages - 1) nav.push({ text: 'Next ➡️', callback_data: `admin_stock_pg_${pg + 1}` });
-    if (nav.length) kb.inline_keyboard.splice(kb.inline_keyboard.length - 1, 0, nav);
-    const text = `📦 <b>Stock Management</b>${pages > 1 ? ` (page ${pg + 1}/${pages})` : ''}\n\nSelect product:`;
-    try {
-      await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: kb });
-    } catch (e) {
-      if (/not modified/i.test(e.message || '')) return;
-      logger.error(`[ADMIN] stock list edit failed: ${e.message}`);
-      try {
-        await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: kb });
-      } catch (e2) {
-        logger.error(`[ADMIN] stock list send failed: ${e2.message}`);
-        await bot.sendMessage(chatId, `❌ Could not open the stock list: ${e2.message}`).catch(() => {});
-      }
-    }
-    return;
+    return showProductPicker(bot, chatId, msgId, 'stock_select', '📦 <b>Stock Management</b>', 'admin_stock_pg', data === 'admin_stock' ? 0 : parseInt(data.split('_').pop(), 10));
   }
   if (/^admin_stock_select_p_\d+$/.test(data)) {
     const productId  = parseInt(data.split('_').pop(), 10);
@@ -4435,7 +4429,7 @@ async function handleAdminCallback(bot, query) {
       : '✅ <b>IN STOCK</b>';
 
     await bot.editMessageText(
-      `📦 <b>${product.title}</b>\n\n` +
+      `📦 <b>${escapeHtml(String(product.title || ''))}</b>\n\n` +
       `💵 Price: <b>${formatPrice(product.price)}</b>\n` +
       `${statusLine}\n` +
       `📊 Stock quantity: <b>${stockQty}</b>\n` +
