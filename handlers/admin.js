@@ -886,7 +886,7 @@ async function handleAdminText(bot, msg) {
     await bot.sendMessage(
       chatId,
       `✅ <b>${editField}</b> updated successfully!${priceDropNotif ? '\n\n📢 Price drop notification sent to channel.' : ''}${tierScaleNote}`,
-      { parse_mode: 'HTML', reply_markup: adminProductEditFieldsKb(editProductId) }
+      { parse_mode: 'HTML', reply_markup: adminProductEditFieldsKb(editProductId, Number(db.getProduct(editProductId)?.sales_paused) === 1) }
     );
     return;
   }
@@ -3614,6 +3614,18 @@ async function handleAdminCallback(bot, query) {
     return showProductPicker(bot, chatId, msgId, 'delete', '🗑 <b>Select product to delete:</b>', 'admin_pgdelete', data === 'admin_delete_product' ? 0 : parseInt(data.split('_').pop(), 10));
   }
 
+  // ── Pause / resume sales of one product (stock is kept) ──────────
+  if (/^admin_pause_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product = db.getProduct(productId);
+    if (!product) { await bot.answerCallbackQuery(query.id, { text: 'Product not found', show_alert: true }).catch(() => {}); return; }
+    const nowPaused = Number(product.sales_paused) === 1 ? 0 : 1;
+    db.updateProduct(productId, 'sales_paused', nowPaused);
+    logger.info(`Admin ${userId} ${nowPaused ? 'PAUSED' : 'resumed'} sales of product #${productId}`);
+    await bot.answerCallbackQuery(query.id, { text: nowPaused ? '⏸ Sales paused — stock kept' : '▶️ Sales resumed' }).catch(() => {});
+    return handleAdminCallback(bot, { ...query, data: `admin_edit_p_${productId}` });
+  }
+
   // ── Add another duration (same product, different price) ─────────
   // A duration is a full copy of the product with its own title suffix, price
   // and stock, so buying, wallet, API and reports need no change at all.
@@ -3635,7 +3647,8 @@ async function handleAdminCallback(bot, query) {
     const productId = parseInt(data.split('_').pop(), 10);
     const product   = db.getProduct(productId);
     const stockQty  = product?.stock_quantity || 0;
-    const statusLine = stockQty === 0 ? '❌ <b>OUT OF STOCK</b>' : '✅ <b>IN STOCK</b>';
+    const pausedNow  = Number(product?.sales_paused) === 1;
+    const statusLine = pausedNow ? '⏸ <b>SALES PAUSED</b> (stock kept: ' + stockQty + ')' : (stockQty === 0 ? '❌ <b>OUT OF STOCK</b>' : '✅ <b>IN STOCK</b>');
     // Both systems, or neither — the screens used to disagree because this one
     // only knew about the old percentage rule.
     const tierBits = tiersOf(product || {})
@@ -3667,7 +3680,7 @@ async function handleAdminCallback(bot, query) {
       bulkInfo + refundInfo + vipInfo + deliveryInfo + lowInfo +
       `${statusLine}\n\n` +
       `Select a field to edit or manage stock:`,
-      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminProductEditFieldsKb(productId) }
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: adminProductEditFieldsKb(productId, Number(product?.sales_paused) === 1) }
     );
     return;
   }

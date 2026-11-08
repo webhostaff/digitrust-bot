@@ -1,3 +1,9 @@
+# V167.6 — Pause sales of a product (stock is kept)
+
+Edit Product → **⏸ Pause sales (keep stock)** / **▶️ Resume sales**. While paused the product stays listed with `⏸ Paused`, its page says *Temporarily unavailable* and has no Buy button, and NOTHING is removed from stock. Blocked everywhere a new sale starts: Buy, order summary/confirm, wallet payment, Binance/USDT/CryptoBot payment start, pre-orders, API v2 purchase/quote and reseller API order (HTTP 409). A crypto transfer a customer already sent before the pause is still settled (never trap their money). New DB column `products.sales_paused` (migrated automatically).
+
+---
+
 # V167.5.2 — Edit / Delete / Stock product lists are paged
 
 ✏️ Edit Product, 🗑 Delete Product and 📦 Stock now share one paged picker (20 products per page, Prev/Next). If Telegram refuses to edit the message the list is re-sent as a new message and the real Telegram error is logged as `[ADMIN] product list (…) edit failed: …`. Product titles are HTML-escaped on the edit and stock screens.

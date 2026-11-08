@@ -293,9 +293,12 @@ async function showProductDetail(bot, chatId, productId, messageId = null, userI
 
   // Use stock_quantity for purchase eligibility
   const stockQty  = product.stock_quantity || 0;
-  const stockLine = stockQty > 0
-    ? `📦 <b>Stock:</b> ${stockQty}`
-    : '❌ <b>Out of Stock</b>';
+  const salesPaused = Number(product.sales_paused) === 1;
+  const stockLine = salesPaused
+    ? '⏸ <b>Temporarily unavailable</b> — sales are paused for a short while.'
+    : (stockQty > 0
+      ? `📦 <b>Stock:</b> ${stockQty}`
+      : '❌ <b>Out of Stock</b>');
 
   const { formatBulkTiersDisplay: _ftd } = require('../utils/format');
   const bulkLine = _ftd(product);
@@ -338,7 +341,7 @@ async function showProductDetail(bot, chatId, productId, messageId = null, userI
     enabled:   !!product.preorder_enabled,
     available: Math.max(0, (product.preorder_max || 0) - (product.preorder_count || 0)),
   };
-  const kb = productDetailKb(productId, stockQty > 0, preorderInfo);
+  const kb = productDetailKb(productId, stockQty > 0, preorderInfo, salesPaused);
 
   let photoSent = false;
   if (product.image_file_id) {

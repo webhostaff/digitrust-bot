@@ -291,6 +291,7 @@ router.post(['/purchase', '/order'], requireKey, async (req, res) => {
 
     const product = db.getProduct(productId);
     if (!product || !product.is_active) return fail(res, 404, 'Product not found');
+    if (Number(product.sales_paused) === 1) return fail(res, 409, 'This product is temporarily unavailable (sales paused)');
 
     if (product.sub_expired) {
       return fail(res, 409, 'This product\'s period has ended (or has too few days left to be sold)', {
@@ -467,6 +468,7 @@ router.get('/quote', requireKey, (req, res) => {
   if (!product || !product.is_active) {
     return fail(res, 404, 'Product not found');
   }
+  if (Number(product.sales_paused) === 1) return fail(res, 409, 'This product is temporarily unavailable (sales paused)');
 
   const pricing = db.resolveCustomerPricing(req.userId, product, quantity);
   const total = Number(Number(pricing.total).toFixed(6));

@@ -193,6 +193,7 @@ router.post('/order', requireApiKey, (req, res) => {
     const TL = require('./utils/timeLimited');
     const rawProduct = dbRaw.prepare(`SELECT * FROM products WHERE id = ? AND is_active = 1`).get(productId);
     if (!rawProduct) return err(res, 404, 'Product not found');
+    if (Number(rawProduct.sales_paused) === 1) return err(res, 409, 'Product temporarily unavailable (sales paused)');
     const product = TL.live(rawProduct);            // V153: today's price and days for "until a date" products
     if (product.sub_expired) return err(res, 409, "This product's period has ended (or has too few days left to be sold)");
 

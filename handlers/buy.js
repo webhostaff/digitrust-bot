@@ -23,6 +23,12 @@ const escapeHtml = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').rep
 
 // ── Initiate buy ──────────────────────────────────────────────────────────────
 
+const PAUSED_TEXT = '⏸ <b>This product is temporarily unavailable.</b>\n\nSales are paused for a short while. Please check back later.';
+/** True when the admin has paused sales of this product (stock is kept). */
+function salesPaused(productId) {
+  try { const p = db.getProduct(productId); return !!p && Number(p.sales_paused) === 1; } catch (_) { return false; }
+}
+
 async function initiateBuy(bot, chatId, userId, productId, callbackQueryId) {
   // Customer's language, so the whole purchase flow speaks it.
   const lang = db.getUserLanguage ? db.getUserLanguage(userId) : 'en';
@@ -30,6 +36,13 @@ async function initiateBuy(bot, chatId, userId, productId, callbackQueryId) {
   // A negotiated price for this customer replaces the public one, so the
   // quoted price and the charged price can never diverge.
   product = db.productForCustomer(userId, product);
+
+  if (product && Number(product.sales_paused) === 1) {
+    await bot.answerCallbackQuery(callbackQueryId, { text: '' }).catch(() => {});
+    await bot.sendMessage(chatId, PAUSED_TEXT, { parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: t(lang, 'buy_back_products'), callback_data: 'menu_products' }]] } });
+    return;
+  }
 
   // Use stock_quantity for purchase eligibility
   const stockQty = product?.stock_quantity || 0;
@@ -184,6 +197,11 @@ async function createAndShowSummary(bot, chatId, userId, email) {
   // A negotiated price for this customer replaces the public one, so the
   // quoted price and the charged price can never diverge.
   product = db.productForCustomer(userId, product, data.quantity || 1);
+  if (product && Number(product.sales_paused) === 1) {
+    session.clear(userId);
+    await bot.sendMessage(chatId, PAUSED_TEXT, { parse_mode: 'HTML' });
+    return;
+  }
 
   // 1) Cooldown check (skip for admin)
   if (!require('./admin').isAdmin(userId)) {
@@ -257,6 +275,11 @@ async function confirmOrder(bot, chatId, userId, messageId) {
 
   const data    = sess.data;
   let product = db.getProduct(data.productId);
+  if (product && Number(product.sales_paused) === 1) {
+    session.clear(userId);
+    await bot.editMessageText(PAUSED_TEXT, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' }).catch(() => {});
+    return;
+  }
   // A negotiated price for this customer replaces the public one, so the
   // quoted price and the charged price can never diverge.
   product = db.productForCustomer(userId, product, data.quantity || 1);
@@ -367,6 +390,10 @@ async function payWithWallet(bot, chatId, userId, orderId, messageId) {
 
     if (!order || order.status !== 'pending') {
       await bot.editMessageText(t(lang, 'buy_order_not_found'), { chat_id: chatId, message_id: messageId }).catch(() => {});
+      return;
+    }
+    if (salesPaused(order.product_id)) {   // nothing is charged; the order stays pending
+      await bot.editMessageText(PAUSED_TEXT, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' }).catch(() => {});
       return;
     }
 
@@ -570,6 +597,10 @@ async function startBinancePayForOrder(bot, chatId, userId, orderId, messageId) 
     });
     return;
   }
+  if (salesPaused(order.product_id)) {
+    await bot.editMessageText(PAUSED_TEXT, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' }).catch(() => {});
+    return;
+  }
   // Quick stock check — real guard is inside settleDirectPayment
   const _quickStock = require('../database/items').getAvailableCount(order.product_id);
   const _quickQty   = _quickStock > 0 ? _quickStock : (db.getProduct(order.product_id)?.stock_quantity || 0);
@@ -681,6 +712,10 @@ async function startUsdtPayForOrder(bot, chatId, userId, orderId, messageId) {
     await bot.editMessageText(t(lang, 'buy_order_not_found'), {
       chat_id: chatId, message_id: messageId, parse_mode: 'HTML',
     });
+    return;
+  }
+  if (salesPaused(order.product_id)) {
+    await bot.editMessageText(PAUSED_TEXT, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' }).catch(() => {});
     return;
   }
   const _quickStock2 = require('../database/items').getAvailableCount(order.product_id);
@@ -1218,6 +1253,10 @@ async function startCryptobotPayForOrder(bot, chatId, userId, orderId, messageId
   }
 
   // Quick stock check before creating CryptoBot invoice
+  if (salesPaused(order.product_id)) {
+    await bot.editMessageText(PAUSED_TEXT, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' }).catch(() => {});
+    return;
+  }
   const _qsC = require('../database/items').getAvailableCount(order.product_id);
   const _qqC = _qsC > 0 ? _qsC : (db.getProduct(order.product_id)?.stock_quantity || 0);
   if (_qqC < order.quantity) {
@@ -1498,6 +1537,10 @@ async function initiatePreorder(bot, chatId, userId, productId, messageId) {
   }
   if (!product.preorder_enabled) {
     await bot.sendMessage(chatId, '❌ Pre-Order is not available for this product.');
+    return;
+  }
+  if (Number(product.sales_paused) === 1) {
+    await bot.sendMessage(chatId, PAUSED_TEXT, { parse_mode: 'HTML' });
     return;
   }
   const remaining = (product.preorder_max || 0) - (product.preorder_count || 0);

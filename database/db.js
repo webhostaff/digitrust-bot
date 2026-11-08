@@ -1411,6 +1411,8 @@ try {
   if (!cols.includes('sub_min_days'))     db.exec('ALTER TABLE products ADD COLUMN sub_min_days INTEGER DEFAULT 3');
   // Stock that never runs out — for a subscription the shop can issue at will.
   if (!cols.includes('unlimited_stock'))  db.exec('ALTER TABLE products ADD COLUMN unlimited_stock INTEGER DEFAULT 0');
+  // V167.6 — sales paused: the product stays listed and keeps its stock, but cannot be bought.
+  if (!cols.includes('sales_paused'))     db.exec('ALTER TABLE products ADD COLUMN sales_paused INTEGER DEFAULT 0');
 } catch (e) {
   console.error('[MIGRATION V7] subscription columns:', e.message);
 }

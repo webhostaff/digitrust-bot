@@ -225,13 +225,14 @@ const productsKb = (products, page = 0) => {
   const rows = slice.map((p) => {
     const qty     = (typeof p.stock_quantity === 'number') ? p.stock_quantity : (p.stock_count || 0);
     const inStock = qty > 0;
-    const stock   = inStock ? `✅ ${qty}` : `❌ Out`;
+    const paused  = Number(p.sales_paused) === 1;
+    const stock   = paused ? `⏸ Paused` : (inStock ? `✅ ${qty}` : `❌ Out`);
 
     const title = cleanTitle(p.title || '').slice(0, 50);
     return [iconBtn(
       `${title} — ${formatPrice(p.price)} [${stock}]`,
       `product_${p.id}`,
-      { iconId: productIconId(p), inStock }
+      { iconId: productIconId(p), inStock: inStock && !paused }
     )];
   });
 
@@ -248,8 +249,14 @@ const productsKb = (products, page = 0) => {
   return mk(rows);
 };
 
-const productDetailKb = (productId, hasStock, preorderInfo = null) => {
+const productDetailKb = (productId, hasStock, preorderInfo = null, paused = false) => {
   // preorderInfo: { enabled: bool, available: int (remaining slots) }
+  if (paused) {
+    return mk([
+      [btn('⏸ Temporarily unavailable', 'noop')],
+      [btn('🔙 Back', 'menu_products')],
+    ]);
+  }
   if (hasStock) {
     return mk([
       [btn('🛒 Buy Now', `buy_${productId}`)],
@@ -569,7 +576,7 @@ const adminBulkPriceKb = (product) => {
   return mk(rows);
 };
 
-const adminProductEditFieldsKb = (productId) =>
+const adminProductEditFieldsKb = (productId, paused = false) =>
   mk([
     // ── Product fields ────────────────────────────────────────────────
     [btn('✏️ Title',          `admin_edit_field_${productId}_title`)],
@@ -591,6 +598,7 @@ const adminProductEditFieldsKb = (productId) =>
     [btn('🖼 Change Image',    `admin_edit_field_${productId}_image_file_id`)],
     [btn('✏️ Requires Email', `admin_edit_field_${productId}_requires_email`)],
     [btn('✏️ Active',         `admin_edit_field_${productId}_is_active`)],
+    [btn(paused ? '▶️ Resume sales (paused now)' : '⏸ Pause sales (keep stock)', `admin_pause_${productId}`)],
     [btn('✏️ Sales Count',    `admin_edit_field_${productId}_sales_count`)],
     // ── Bulk pricing (quantity tiers) ──────────────────────────────────
     [btn('📊 Bulk Pricing (by quantity)', `admin_bulkprice_${productId}`)],

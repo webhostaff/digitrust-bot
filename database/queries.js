@@ -2268,7 +2268,7 @@ module.exports = {
       'refund_enabled','delivery_type','low_stock_threshold',
       // V7 — time-limited products and unlimited stock
       'sub_end_date','sub_price_per_day','sub_min_price','sub_base_title',
-      'sub_min_days','unlimited_stock',
+      'sub_min_days','unlimited_stock','sales_paused',
     ];
     if (!allowed.includes(field)) throw new Error(`Field ${field} not allowed`);
     db.prepare(`UPDATE products SET ${field} = ? WHERE id = ?`).run(value, id);
