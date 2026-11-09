@@ -2406,3 +2406,20 @@ if (process.env.GUARD_SECRET) {
   }
 }
 
+// ── DigiPro activation bot (separate service) — wallet link, V167.7 ─────
+// The store keeps the wallet; DigiPro asks it to charge/refund. The routes do
+// not exist at all until DIGIPRO_SECRET is set.
+if (process.env.DIGIPRO_SECRET) {
+  require('./services/digiproLink').mount(app, {
+    secret: process.env.DIGIPRO_SECRET,
+    queries: db,
+    dbRaw: require('./database/db'),
+    logger,
+    maxCents: Number(process.env.DIGIPRO_MAX_CENTS) || 50000,
+    notifyAdmins: async (text) => {
+      for (const id of (config.adminIds || [])) await bot.sendMessage(id, text, { parse_mode: 'HTML' }).catch(() => {});
+    },
+  });
+  logger.info('DigiPro wallet link mounted at /internal/digipro/{balance,charge,refund}');
+}
+

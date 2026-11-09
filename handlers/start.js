@@ -155,6 +155,12 @@ async function handleStart(bot, msg, args) {
     }
   }
 
+  // /start wallet — the DigiPro bot sends customers here to top up (same wallet).
+  if (args === 'wallet') {
+    await require('./wallet').showWallet(bot, chatId, userId);
+    return;
+  }
+
   // Show VIP intro only on FIRST start (no orders yet, never seen intro)
   // VIP is gone. Nobody can earn it, so nobody is shown it — pitching a status
   // that cannot be reached is worse than saying nothing. Ranks replaced it.

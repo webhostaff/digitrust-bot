@@ -37,6 +37,10 @@ async function initiateBuy(bot, chatId, userId, productId, callbackQueryId) {
   // quoted price and the charged price can never diverge.
   product = db.productForCustomer(userId, product);
 
+  if (product && Number(product.is_digipro) === 1) {   // sold only inside the DigiPro bot
+    await bot.answerCallbackQuery(callbackQueryId, { text: '' }).catch(() => {});
+    return require('./products').showProductDetail(bot, chatId, productId, null, userId);
+  }
   if (product && Number(product.sales_paused) === 1) {
     await bot.answerCallbackQuery(callbackQueryId, { text: '' }).catch(() => {});
     await bot.sendMessage(chatId, PAUSED_TEXT, { parse_mode: 'HTML',

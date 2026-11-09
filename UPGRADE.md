@@ -1,3 +1,15 @@
+# V167.7 — DigiPro activation bot linked to the store wallet
+
+A product can now send the buyer to the DigiPro bot (like ChatGPT Business mode): Edit Product → **🔑 Toggle DigiPro Activation Mode**. The product page then shows "Open the activation bot" instead of Buy. The store keeps the WALLET; DigiPro sets the prices and asks the store to charge it.
+
+- New routes (exist only when `DIGIPRO_SECRET` is set): `POST /internal/digipro/{balance,charge,refund}`. HMAC-SHA256 signed (`X-Digipro-Ts`, `X-Digipro-Sign`, ±5 min), integer cents, max `DIGIPRO_MAX_CENTS` (default 50000) per charge, idempotent by `ref` (a retried charge never charges twice; a refund only for a matching charge, once).
+- Variables: `DIGIPRO_SECRET` (long random, same on DigiPro as `STORE_API_SECRET`), `DIGIPRO_BOT_USERNAME` (DigiPro bot, no @).
+- `/start wallet` opens the wallet (DigiPro's "Top up" button uses it — all payment methods incl. CryptoBot stay in the store).
+- Toggling DigiPro mode also sets unlimited stock (no "Out" label, no low-stock alerts); toggling off clears it.
+- New column `products.is_digipro` (migrated automatically). Sales appear in the wallet history as `DigiPro — <plan>` and the admins get a message per sale.
+
+---
+
 # V167.6 — Pause sales of a product (stock is kept)
 
 Edit Product → **⏸ Pause sales (keep stock)** / **▶️ Resume sales**. While paused the product stays listed with `⏸ Paused`, its page says *Temporarily unavailable* and has no Buy button, and NOTHING is removed from stock. Blocked everywhere a new sale starts: Buy, order summary/confirm, wallet payment, Binance/USDT/CryptoBot payment start, pre-orders, API v2 purchase/quote and reseller API order (HTTP 409). A crypto transfer a customer already sent before the pause is still settled (never trap their money). New DB column `products.sales_paused` (migrated automatically).

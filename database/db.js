@@ -353,6 +353,8 @@ if (!existingProductCols.includes('display_order')) db.exec('ALTER TABLE product
 if (!existingProductCols.includes('category_id'))   db.exec('ALTER TABLE products ADD COLUMN category_id INTEGER DEFAULT 0');
 if (!existingProductCols.includes('wholesale_price')) db.exec('ALTER TABLE products ADD COLUMN wholesale_price REAL DEFAULT 0');
 if (!existingProductCols.includes('is_chatgpt_business')) db.exec('ALTER TABLE products ADD COLUMN is_chatgpt_business INTEGER DEFAULT 0');
+// V167.7 — product that sends the buyer to the DigiPro activation bot (like ChatGPT Business mode).
+if (!existingProductCols.includes('is_digipro')) db.exec('ALTER TABLE products ADD COLUMN is_digipro INTEGER DEFAULT 0');
 if (!existingProductCols.includes('last_sold_at'))         db.exec('ALTER TABLE products ADD COLUMN last_sold_at TEXT DEFAULT NULL');
 if (!existingProductCols.includes('last_stale_reminder_at')) db.exec('ALTER TABLE products ADD COLUMN last_stale_reminder_at TEXT DEFAULT NULL');
 

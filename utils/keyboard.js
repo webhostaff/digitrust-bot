@@ -212,7 +212,7 @@ const productsKb = (products, page = 0) => {
     (typeof p.stock_quantity === 'number') ? p.stock_quantity : (p.stock_count || 0);
 
   const ordered = products
-    .map((p, i) => ({ p, i, avail: inStockQty(p) > 0 ? 0 : 1 }))
+    .map((p, i) => ({ p, i, avail: (inStockQty(p) > 0 || Number(p.is_digipro) === 1) ? 0 : 1 }))
     .sort((a, b) => (a.avail - b.avail) || (a.i - b.i))
     .map((x) => x.p);
 
@@ -226,13 +226,14 @@ const productsKb = (products, page = 0) => {
     const qty     = (typeof p.stock_quantity === 'number') ? p.stock_quantity : (p.stock_count || 0);
     const inStock = qty > 0;
     const paused  = Number(p.sales_paused) === 1;
-    const stock   = paused ? `⏸ Paused` : (inStock ? `✅ ${qty}` : `❌ Out`);
+    const digipro = Number(p.is_digipro) === 1;   // codes are sold inside the DigiPro bot
+    const stock   = paused ? `⏸ Paused` : (digipro ? `🔑 Instant` : (inStock ? `✅ ${qty}` : `❌ Out`));
 
     const title = cleanTitle(p.title || '').slice(0, 50);
     return [iconBtn(
       `${title} — ${formatPrice(p.price)} [${stock}]`,
       `product_${p.id}`,
-      { iconId: productIconId(p), inStock: inStock && !paused }
+      { iconId: productIconId(p), inStock: (inStock || digipro) && !paused }
     )];
   });
 
@@ -594,6 +595,7 @@ const adminProductEditFieldsKb = (productId, paused = false) =>
     [btn('🚚 Delivery Method',     `admin_toggle_delivery_${productId}`)],
     [btn('🔔 Low-Stock Threshold', `admin_lowstock_${productId}`)],
     [btn('🤖 Toggle ChatGPT Business Mode', `admin_toggle_cgb_${productId}`)],
+    [btn('🔑 Toggle DigiPro Activation Mode', `admin_toggle_digipro_${productId}`)],
     [btn('🏪 Wholesale Price', `admin_edit_field_${productId}_wholesale_price`)],
     [btn('🖼 Change Image',    `admin_edit_field_${productId}_image_file_id`)],
     [btn('✏️ Requires Email', `admin_edit_field_${productId}_requires_email`)],

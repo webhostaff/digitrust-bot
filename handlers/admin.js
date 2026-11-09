@@ -7479,6 +7479,18 @@ async function handleAdminCallback(bot, query) {
     return await handleAdminCallback(bot, { ...query, data: `admin_edit_p_${productId}` });
   }
 
+  // ── DigiPro activation mode: this product opens the DigiPro bot ──
+  if (/^admin_toggle_digipro_\d+$/.test(data)) {
+    const productId = parseInt(data.split('_').pop(), 10);
+    const product = db.getProduct(productId);
+    if (!product) { await answer('❌ Not found'); return; }
+    const newVal = Number(product.is_digipro) === 1 ? 0 : 1;
+    // Never runs out (codes are issued by the DigiPro bot) — so no low-stock alerts or "Out" label.
+    require('../database/db').prepare('UPDATE products SET is_digipro=?, unlimited_stock=? WHERE id=?').run(newVal, newVal, productId);
+    await answer(newVal ? '✅ DigiPro mode ON' : '❌ DigiPro mode OFF', true);
+    return await handleAdminCallback(bot, { ...query, data: `admin_edit_p_${productId}` });
+  }
+
   // ── ChatGPT Business main panel ──
   // Pause or resume ChatGPT Business sales. Stored as a flag rather than a
   // stock count: a seat is not taken off a shelf, either you can serve another

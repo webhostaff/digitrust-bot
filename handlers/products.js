@@ -260,6 +260,24 @@ async function showProductDetail(bot, chatId, productId, messageId = null, userI
     return;
   }
 
+  // ── DigiPro activation mode: redirect to the DigiPro bot ──
+  if (Number(product.is_digipro) === 1) {
+    const uname = String(process.env.DIGIPRO_BOT_USERNAME || '').replace(/^@/, '');
+    const text =
+      `<b>${expandPremiumEmojis(product.title)}</b>\n\n` +
+      `🔑 <b>Activation codes are sold in our activation bot.</b>\n\n` +
+      `${product.description ? product.description + '\n\n' : ''}` +
+      `Tap below to see the prices and buy. It uses <b>the same wallet</b> you have here — nothing to create or transfer.`;
+    const buttons = [];
+    if (uname) buttons.push([{ text: '🔑 Open the activation bot', url: `https://t.me/${uname}?start=store` }]);
+    else buttons.push([{ text: '⚠️ Activation bot not configured', callback_data: 'noop' }]);
+    buttons.push([{ text: '💰 My wallet / top up', callback_data: 'menu_wallet' }]);
+    buttons.push([{ text: '🔙 Back', callback_data: 'menu_products' }]);
+    if (messageId) await safeUpdateMessage(bot, chatId, messageId, text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } });
+    else await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } });
+    return;
+  }
+
   // ── ChatGPT Business Mode: redirect to secondary bot ──
   if (product.is_chatgpt_business) {
     const cgbBotUsername = process.env.CHATGPT_BOT_USERNAME || '';
