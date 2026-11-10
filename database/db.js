@@ -1454,4 +1454,20 @@ try {
   console.error('[MIGRATION V9] unit_cost:', e.message);
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// V10 — DIGIPRO ORDER MIRROR (V167.8)
+//
+// A DigiPro purchase only ever moved money in `transactions` — it never showed
+// up as an order, so the customer couldn't see it in "My Orders" and the admin
+// couldn't see it in Profit Reports. This maps DigiPro's own `ref` to the order
+// row services/digiproLink.js mirrors it into, so a later refund can find and
+// cancel that same order.
+// ══════════════════════════════════════════════════════════════════════════════
+db.exec(`
+  CREATE TABLE IF NOT EXISTS digipro_orders (
+    ref      TEXT PRIMARY KEY,
+    order_id INTEGER NOT NULL
+  );
+`);
+
 module.exports = db;

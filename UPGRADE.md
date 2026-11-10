@@ -1,3 +1,14 @@
+# V167.8 — DigiPro purchases now show up as real orders
+
+A DigiPro sale used to only move money (`transactions` — the wallet history). It never became an `orders` row, so the customer couldn't find it in **📦 My Orders** and the admin couldn't see it in **Profit Reports** or the Binance/detailed report. It's now mirrored as a normal, already-delivered order the moment the wallet charge succeeds — same product row (the one with 🔑 DigiPro Activation Mode on), `source = 'digipro'`, `payment_method = 'wallet'` — so every screen that already reads the `orders` table picks it up with no changes of its own.
+
+- On charge: creates one `orders` row (status `delivered`) and links it to DigiPro's own `ref` in a new `digipro_orders` table, so a later refund can find the exact order again.
+- On refund: cancels that same order (status → `cancelled`, with a note explaining the amount was returned to the wallet) — the customer's order list reflects the refund too, not just their wallet balance.
+- If no product has 🔑 DigiPro Activation Mode on (shouldn't normally happen), the charge still goes through — a warning is just logged — so mirroring can never block a real sale.
+- Covered by 5 new automated tests (charge → order created; duplicate ref → no second order; refund → order cancelled; missing product → charge still succeeds; refund of an unknown ref → clean failure, no crash). Not yet tested on the live bots.
+
+---
+
 # V167.7 — DigiPro activation bot linked to the store wallet
 
 A product can now send the buyer to the DigiPro bot (like ChatGPT Business mode): Edit Product → **🔑 Toggle DigiPro Activation Mode**. The product page then shows "Open the activation bot" instead of Buy. The store keeps the WALLET; DigiPro sets the prices and asks the store to charge it.

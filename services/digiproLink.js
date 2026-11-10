@@ -79,6 +79,19 @@ function makeHandler(action, { secret, queries, dbRaw, notifyAdmins, logger, max
         if (!r.ok) return res.json({ ok: false, reason: r.reason || 'insufficient', balance_cents: Math.round((Number(r.balance) || 0) * 100) });
         logger.info(`[digipro] charged user=${userId} $${amount.toFixed(2)} ref=${ref} (${title})`);
         Promise.resolve(notifyAdmins && notifyAdmins(`🔑 <b>DigiPro sale</b>\n👤 <code>${userId}</code>\n📦 ${title.replace(/[<>&]/g, '')}\n💵 $${amount.toFixed(2)}\n💰 Balance left: $${(Math.round((Number(r.balance) || 0) * 100) / 100).toFixed(2)}`)).catch(() => {});
+        // Mirror this as a normal, already-delivered order so the customer sees it
+        // in "My Orders" and the admin sees it in Profit Reports / the Binance
+        // report — without either screen needing any DigiPro-specific code.
+        try {
+          const digiproProduct = queries.getDigiProProduct();
+          if (digiproProduct) {
+            queries.createDigiProOrder({ userId, productId: digiproProduct.id, quantity: 1, totalPrice: amount, ref });
+          } else {
+            logger.warn('[digipro] charge succeeded but no is_digipro product exists — order was not mirrored');
+          }
+        } catch (mirrorErr) {
+          logger.error(`[digipro] failed to mirror order for ref=${ref}: ${mirrorErr.message}`);
+        }
         return res.json({ ok: true, balance_cents: Math.round((Number(r.balance) || 0) * 100) });
       }
 
@@ -92,6 +105,11 @@ function makeHandler(action, { secret, queries, dbRaw, notifyAdmins, logger, max
         }
         queries.refundWallet(userId, amount, { type: 'refund', description: 'DigiPro — code could not be issued', refId: refundKey });
         logger.info(`[digipro] refunded user=${userId} $${amount.toFixed(2)} ref=${ref}`);
+        try {
+          queries.cancelDigiProOrder(ref, 'Refunded — the activation bot could not issue a code; the amount was returned to your wallet.');
+        } catch (mirrorErr) {
+          logger.error(`[digipro] failed to cancel mirrored order for ref=${ref}: ${mirrorErr.message}`);
+        }
         return res.json({ ok: true, balance_cents: balCents() });
       }
       return res.status(404).json({ ok: false, reason: 'unknown_action' });

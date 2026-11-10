@@ -186,6 +186,48 @@ const completeOrder     = db.prepare(`
   WHERE id = ? AND status = 'pending'
 `);
 
+// ── DIGIPRO ORDER MIRROR (V167.8) ──────────────────────────────────────────────
+// DigiPro only ever moves wallet money (`transactions`); these mirror that
+// purchase into a normal, already-delivered order so it shows up for the
+// customer in "My Orders" and for the admin in Profit Reports — exactly like
+// any other product. `ref` is DigiPro's own purchase id, used to find and
+// cancel this same order if the code later turns out to be unissuable and the
+// charge is refunded.
+
+const getDigiProProduct = db.prepare(`
+  SELECT * FROM products WHERE is_digipro = 1 ORDER BY id LIMIT 1
+`);
+
+const _insertDigiProOrder = db.prepare(`
+  INSERT INTO orders (user_id, product_id, quantity, email, total_price, payment_method, status, delivered_content, source, paid_at)
+  VALUES (@userId, @productId, @quantity, '', @totalPrice, 'wallet', 'delivered', @note, 'digipro', datetime('now'))
+`);
+const _linkDigiProOrder = db.prepare('INSERT OR REPLACE INTO digipro_orders (ref, order_id) VALUES (?, ?)');
+
+/** Mirrors a completed DigiPro sale as a normal, delivered order. Returns the new order id. */
+function createDigiProOrder({ userId, productId, quantity, totalPrice, ref }) {
+  const note = 'Delivered via the activation bot — open it and use ORDER to view your code(s).';
+  const info = _insertDigiProOrder.run({ userId, productId, quantity, totalPrice, note });
+  const orderId = info.lastInsertRowid;
+  _linkDigiProOrder.run(ref, orderId);
+  incrementSalesCount.run(quantity, productId);
+  markProductSoldNow.run(productId);
+  return orderId;
+}
+
+const _digiProOrderIdForRef = db.prepare('SELECT order_id FROM digipro_orders WHERE ref = ?');
+const _cancelOrder = db.prepare(`
+  UPDATE orders SET status = 'cancelled', delivered_content = ? WHERE id = ? AND status != 'cancelled'
+`);
+
+/** Cancels the order mirrored for `ref` (its DigiPro purchase was refunded). True if one was found. */
+function cancelDigiProOrder(ref, note) {
+  const row = _digiProOrderIdForRef.get(ref);
+  if (!row) return false;
+  _cancelOrder.run(note || 'Refunded — the activation bot could not issue a code; the amount was returned to your wallet.', row.order_id);
+  return true;
+}
+
 // ── TRANSACTIONS ──────────────────────────────────────────────────────────────
 
 const insertTransaction  = db.prepare(`
@@ -2316,6 +2358,9 @@ module.exports = {
   getUserOrders:    (id) => getUserOrders.all(id),
   getAllOrders:      ()  => getAllOrders.all(),
   updateOrderStatus:(id, status) => updateOrderStatus.run(status, id),
+  getDigiProProduct: () => getDigiProProduct.get(),
+  createDigiProOrder,
+  cancelDigiProOrder,
   deliverOrder,
   deliverOrderAndChargeWallet,
   chargeWalletForPreorder,
