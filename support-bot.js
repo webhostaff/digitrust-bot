@@ -1,0 +1,2613 @@
+'use strict';
+
+/**
+ * Customer Support Bot (V4)
+ *
+ * What changed vs V3
+ * ------------------
+ * 1. The "✅ Your message has been sent" reply is gone. It used to fire after
+ *    EVERY customer message; the welcome text is now sent exactly once per
+ *    customer and that fact is persisted in `support_threads.welcomed`.
+ *
+ * 2. Delivery / read receipts. The customer sees a single status line under
+ *    their messages:
+ *        ✓  Sent   — stored by the system, support has not opened it yet
+ *        ✓✓ Read   — a staff member actually opened the conversation
+ *    The indicator's message id and state live in `support_threads`, and
+ *    per-message read state lives in `support_messages.is_read` / `read_at`,
+ *    so the marks are still correct after a restart.
+ *
+ * 3. Full conversation history with pagination, date separators and a clear
+ *    visual split between customer and support messages.
+ *
+ * 4. A dedicated "Manual Delivery Requests" section with status tabs, counters,
+ *    search and filters.
+ *
+ * The bot shares the main store database (via ./database/db) so it can read
+ * orders, products and manual-delivery tasks directly.
+ */
+
+const TelegramBot = require('node-telegram-bot-api');
+const logger      = require('./utils/logger');
+
+const SUPPORT_BOT_TOKEN = process.env.SUPPORT_BOT_TOKEN;
+
+if (!SUPPORT_BOT_TOKEN) {
+  logger.warn('Support bot disabled — SUPPORT_BOT_TOKEN missing');
+  module.exports = null;
+  return;
+}
+
+// Shared schema + connection: db.js has already run every migration by now.
+const rawDb   = require('./database/db');
+const queries = require('./database/queries');
+const { renderCustomerOrders } = require('./utils/customerOrders');
+const config  = require('./config');
+const manualDelivery = require('./handlers/manualDelivery');
+const { notifyAdmin } = require('./services/adminNotify');
+const { fixTypos } = require('./services/typoFix');   // V162
+const replyAssist = require('./services/replyAssist');   // V166: whole-sentence fix + intent + AI rewrite
+const compCalc = require('./services/compCalc');          // V166: compensation-links calculator
+
+/**
+ * Who counts as support staff.
+ * ADMIN_ID (single) is kept for backwards compatibility, and every id from
+ * ADMIN_IDS is accepted too, so panel admins can answer tickets as well.
+ */
+const SUPPORT_STAFF = (() => {
+  const ids = new Set();
+  const single = parseInt(process.env.ADMIN_ID || '0', 10);
+  if (single) ids.add(single);
+  for (const id of config.adminIds) if (id) ids.add(Number(id));
+  return ids;
+})();
+
+const isStaff = (userId) => SUPPORT_STAFF.has(Number(userId));
+
+if (SUPPORT_STAFF.size === 0) {
+  logger.warn('Support bot: no ADMIN_ID / ADMIN_IDS configured — staff features are unreachable');
+}
+
+// ── Prepared statements ──────────────────────────────────────────────────────
+
+const insertMsg = rawDb.prepare(`
+  INSERT INTO support_messages (user_id, username, first_name, direction, content, media_type, file_id)
+  VALUES (?, ?, ?, ?, ?, ?, ?)
+`);
+
+const getCustomers = rawDb.prepare(`
+  SELECT user_id,
+    MAX(username)   AS username,
+    MAX(first_name) AS first_name,
+    (SELECT content    FROM support_messages WHERE user_id = m.user_id ORDER BY id DESC LIMIT 1) AS last_msg,
+    (SELECT media_type FROM support_messages WHERE user_id = m.user_id ORDER BY id DESC LIMIT 1) AS last_media,
+    (SELECT direction  FROM support_messages WHERE user_id = m.user_id ORDER BY id DESC LIMIT 1) AS last_direction,
+    (SELECT created_at FROM support_messages WHERE user_id = m.user_id ORDER BY id DESC LIMIT 1) AS last_time,
+    COUNT(*) AS total_msgs,
+    COUNT(CASE WHEN direction = 'in' AND is_read = 0 THEN 1 END) AS unread
+  FROM support_messages m
+  GROUP BY user_id
+  -- Unread first, newest within that. Sorting purely by time buried a waiting
+  -- customer behind every conversation that had merely been touched more
+  -- recently, so answering them meant paging backwards to hunt for red dots.
+  ORDER BY (COUNT(CASE WHEN direction = 'in' AND is_read = 0 THEN 1 END) > 0) DESC,
+           last_time DESC
+`);
+
+/**
+ * Mark old unread messages as read.
+ *
+ * Unread state has accumulated since the bot was first created, so the badge
+ * counts conversations nobody will ever reply to now. A count that is always
+ * wrong is a count that stops being looked at — which defeats the point of
+ * having one.
+ */
+const markOldRead = rawDb.prepare(`
+  UPDATE support_messages
+  SET is_read = 1, read_at = datetime('now')
+  WHERE direction = 'in' AND is_read = 0
+    AND datetime(created_at) < datetime('now', '-' || ? || ' days')
+`);
+
+const countOldUnread = rawDb.prepare(`
+  SELECT COUNT(*) AS n FROM support_messages
+  WHERE direction = 'in' AND is_read = 0
+    AND datetime(created_at) < datetime('now', '-' || ? || ' days')
+`);
+
+// ── History cleanup ───────────────────────────────────────────────────────
+// Purge old conversation history from the bot's own database, keeping only
+// the most recent N days. This clears the stored transcript / inbox clutter,
+// NOT the Telegram chat itself (Telegram only lets a bot delete its own
+// messages within 48h). Incoming messages are never affected: a customer who
+// writes now is stored and delivered normally — only records whose created_at
+// is older than the chosen window are removed.
+const countOldMessages = rawDb.prepare(`
+  SELECT COUNT(*) AS n FROM support_messages
+  WHERE datetime(created_at) < datetime('now', '-' || ? || ' days')
+`);
+const deleteOldMessages = rawDb.prepare(`
+  DELETE FROM support_messages
+  WHERE datetime(created_at) < datetime('now', '-' || ? || ' days')
+`);
+
+const getMessagesPage = rawDb.prepare(`
+  SELECT * FROM support_messages WHERE user_id = ? ORDER BY id DESC LIMIT ? OFFSET ?
+`);
+const countMessages = rawDb.prepare('SELECT COUNT(*) AS n FROM support_messages WHERE user_id = ?');
+const getFirstMsg   = rawDb.prepare('SELECT * FROM support_messages WHERE user_id = ? ORDER BY id ASC LIMIT 1');
+const getFirstUnread = rawDb.prepare(`
+  SELECT id FROM support_messages
+  WHERE user_id = ? AND direction = 'in' AND is_read = 0
+  ORDER BY id ASC LIMIT 1
+`);
+
+const bot = new TelegramBot(SUPPORT_BOT_TOKEN, { polling: true });
+require('./utils/emojiLayer').installEmojiLayer(bot, 'support');
+logger.info('🎫 Support Bot V4 started (read receipts + history + manual delivery)');
+
+// Route every admin notification raised anywhere in the codebase into this
+// console, so there is a single place to watch.
+require('./services/adminNotify').setSupportBot(bot);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COMMAND MENU
+//
+// Telegram Desktop does not show a ReplyKeyboard the way phones do — it hides
+// it behind a small icon in the input field, and often not at all. The command
+// menu (the ☰ button beside the input) behaves identically on both, so it is
+// the reliable way in on desktop.
+//
+// Scoped deliberately: staff commands are registered per staff chat, so
+// customers writing to this same bot never see /inbox or /payments.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const STAFF_COMMANDS = [
+  { command: 'menu',     description: '🎛 Console — counts for every section' },
+  { command: 'inbox',    description: '📥 Conversations' },
+  { command: 'payments', description: '💳 Payments awaiting action' },
+  { command: 'manual',   description: '📦 Manual delivery requests' },
+  { command: 'refunds',  description: '🔄 Refund requests' },
+  { command: 'alerts',   description: '🔴 Products out of stock' },
+  { command: 'close',    description: '✅ Close the open conversation' },
+];
+
+const CUSTOMER_COMMANDS = [
+  { command: 'start', description: '💬 Contact support' },
+];
+
+async function registerCommands() {
+  try {
+    // Everyone else — just /start.
+    await bot.setMyCommands(CUSTOMER_COMMANDS);
+
+    // Each staff member gets the full list, in their own chat only.
+    for (const id of SUPPORT_STAFF) {
+      try {
+        await bot.setMyCommands(STAFF_COMMANDS, {
+          scope: { type: 'chat', chat_id: id },
+        });
+      } catch (e) {
+        // A staff member who has never opened the bot has no chat yet; the
+        // commands register the first time they do.
+        logger.warn(`Support commands for ${id}: ${e.message}`);
+      }
+    }
+    logger.info(`Support bot commands registered for ${SUPPORT_STAFF.size} staff member(s)`);
+  } catch (e) {
+    logger.warn(`Support command registration failed: ${e.message}`);
+  }
+}
+
+registerCommands();
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+const { plainDelivery } = require('./utils/format');
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+/** Parse a stored UTC timestamp into a Date. */
+function toDate(iso) {
+  if (!iso) return null;
+  const raw = String(iso).replace(' ', 'T');
+  const d = new Date(raw.endsWith('Z') ? raw : raw + 'Z');
+  return isNaN(d.getTime()) ? null : d;
+}
+
+/** "14:05" for today, "29 Jul" otherwise. */
+function formatTime(iso) {
+  const d = toDate(iso);
+  if (!d) return '';
+  const now = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  if (d.toDateString() === now.toDateString()) return `${p(d.getHours())}:${p(d.getMinutes())}`;
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return `${d.getDate()} ${months[d.getMonth()]}`;
+}
+
+/** "29/07/2026 14:05" — used inside the transcript. */
+function formatFull(iso) {
+  const d = toDate(iso);
+  if (!d) return '';
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getDate())}/${p(d.getMonth() + 1)}/${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/** Day header used to separate messages from different dates. */
+function dayKey(iso) {
+  const d = toDate(iso);
+  if (!d) return '';
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getDate())}/${p(d.getMonth() + 1)}/${d.getFullYear()}`;
+}
+
+function displayName(username, firstName, userId) {
+  if (username)  return `@${username}`;
+  if (firstName) return firstName;
+  return `User ${userId}`;
+}
+
+// Which customer each staff member is currently replying to.
+// Persisted in settings so a restart does not lose the reply context.
+function setActiveChat(staffChatId, targetUserId) {
+  queries.setSetting(`support_active_chat_${staffChatId}`, String(targetUserId || ''));
+}
+// V162: send a plain-text support reply to a customer (used by the spelling-fix buttons).
+async function sendSupportText(staffChatId, targetUserId, textToSend) {
+  try {
+    const sent = await bot.sendMessage(targetUserId, `📩 <b>Support</b>\n\n${escapeHtml(textToSend)}`, { parse_mode: 'HTML' });
+    const ins = insertMsg.run(targetUserId, null, null, 'out', textToSend, null, null);
+    if (sent && sent.message_id) rawDb.prepare('UPDATE support_messages SET tg_msg_id = ? WHERE id = ?').run(sent.message_id, ins.lastInsertRowid);   // V166: Recall works on improved replies too
+    await bot.sendMessage(staffChatId, '✅ Sent.').catch(() => {});
+  } catch (e) {
+    await bot.sendMessage(staffChatId, `⚠️ Could not send: ${e.message}`).catch(() => {});
+  }
+}
+
+function getActiveChat(staffChatId) {
+  const v = queries.getSetting(`support_active_chat_${staffChatId}`, '');
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+function clearActiveChat(staffChatId) {
+  queries.setSetting(`support_active_chat_${staffChatId}`, '');
+}
+
+/** Edit the message if possible, otherwise send a new one. */
+async function send(chatId, messageId, text, keyboard) {
+  const opts = { parse_mode: 'HTML', reply_markup: keyboard, disable_web_page_preview: true };
+  if (messageId) {
+    try {
+      await bot.editMessageText(text, { chat_id: chatId, message_id: messageId, ...opts });
+      return;
+    } catch (e) { /* fall through to a fresh message */ }
+  }
+  await bot.sendMessage(chatId, text, opts);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PERSISTENT STAFF KEYBOARD
+//
+// Inline keyboards live on one specific message. As soon as a few notification
+// messages arrive, the message carrying the buttons is scrolled away and there
+// is no way back to the inbox — which is exactly the "everything is tangled"
+// problem. A ReplyKeyboard sits at the bottom of the chat permanently, so every
+// section is one tap away no matter how many notifications land.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const BTN = {
+  INBOX:    '📥 Inbox',
+  PAYMENTS: '💳 Payments',
+  DELIVERY: '📦 Delivery',
+  STOCK:    '🔴 Out of Stock',
+  REFUNDS:  '🔄 Refunds',
+  REPL:     '♻️ Replacements',
+};
+
+/**
+ * Build the bar with live counts baked into the labels.
+ *
+ * Telegram cannot edit a ReplyKeyboard in place — the only way to refresh the
+ * numbers is to send a message carrying a new keyboard. So the bar is rebuilt
+ * and attached to every message the console sends to staff, which keeps the
+ * counts current without any extra chatter.
+ */
+function staffKeyboard() {
+  const n = {
+    inbox:    queries.getSupportUnreadThreads(),
+    payments: queries.countDepositReviews('pending') + queries.countPendingDeposits(),
+    delivery: queries.getManualDeliveryCounts().pending,
+    stock:    queries.countOutOfStockProducts(),
+    refunds:  queries.countPendingRefundRequests(),
+  };
+  const lbl = (base, count) => (count > 0 ? `${base} (${count})` : base);
+
+  return {
+    keyboard: [
+      [{ text: lbl(BTN.INBOX, n.inbox) },       { text: lbl(BTN.PAYMENTS, n.payments) }],
+      [{ text: lbl(BTN.DELIVERY, n.delivery) }, { text: lbl(BTN.STOCK, n.stock) }],
+      [{ text: lbl(BTN.REFUNDS, n.refunds) }, { text: lbl(BTN.REPL, (queries.replPendingCount ? queries.replPendingCount() : 0)) }],
+    ],
+    resize_keyboard: true,
+    is_persistent: true,
+  };
+}
+
+/**
+ * Which section a tap refers to.
+ *
+ * The labels now carry counts ("📥 Inbox (12)"), so an equality check against
+ * the bare label would no longer match and the tap would be forwarded to the
+ * customer as a literal message. Matching on the prefix keeps that from
+ * happening however the count changes.
+ */
+function matchBarButton(text) {
+  const t = String(text || '').trim();
+  for (const [key, base] of Object.entries(BTN)) {
+    if (t === base || t.startsWith(base + ' (')) return key;
+  }
+  return null;
+}
+
+/**
+ * Make sure this staff chat has its command list.
+ *
+ * Registration at startup fails for anyone who has never opened the bot —
+ * Telegram has no chat to scope to yet. Re-registering on first interaction
+ * closes that gap without a restart.
+ */
+const commandsDone = new Set();
+async function ensureStaffCommands(chatId) {
+  if (commandsDone.has(chatId)) return;
+  commandsDone.add(chatId);
+  try {
+    await bot.setMyCommands(STAFF_COMMANDS, { scope: { type: 'chat', chat_id: chatId } });
+  } catch (e) {
+    logger.warn(`ensureStaffCommands(${chatId}): ${e.message}`);
+  }
+}
+
+/** Show the bar and a short status line. Used on /start and after /close. */
+async function showStaffHome(chatId) {
+  await ensureStaffCommands(chatId);
+  const unread   = queries.getSupportUnreadThreads();
+  const md       = queries.getManualDeliveryCounts();
+  const payments = queries.countDepositReviews('pending') + queries.countPendingDeposits();
+  const stock    = queries.countOutOfStockProducts();
+  const refunds  = queries.countPendingRefundRequests();
+  const totalWork = unread + payments + md.pending + refunds;
+
+  await bot.sendMessage(
+    chatId,
+    `🎛 <b>Support Console</b>\n\n` +
+    (totalWork === 0 && stock === 0
+      ? `✅ <b>Nothing needs attention.</b>\n`
+      : `${unread   ? '🔴' : '✅'} Unread conversations: <b>${unread}</b>\n` +
+        `${payments ? '💳' : '✅'} Payments to handle: <b>${payments}</b>\n` +
+        `${md.pending ? '📦' : '✅'} Deliveries waiting: <b>${md.pending}</b>\n` +
+        `${refunds  ? '🔄' : '✅'} Refund requests: <b>${refunds}</b>\n` +
+        `${stock    ? '🔴' : '✅'} Out of stock: <b>${stock}</b>\n`) +
+    `\n✍️ Spelling auto-correct: <b>${queries.getSetting('support_autocorrect', '1') === '1' ? 'ON' : 'OFF'}</b>\n` +
+    `\n<i>The bar below stays put — tap any section at any time.</i>\n` +
+    `<i>Send /menu to refresh the numbers on it.</i>`,
+    { parse_mode: 'HTML', reply_markup: staffKeyboard() }
+  );
+  await bot.sendMessage(chatId, '✍️ When ON, I fix the whole sentence (spelling, punctuation, wording), understand what you mean and suggest a ready reply — you choose with one tap before it is sent.',
+    { reply_markup: { inline_keyboard: [
+      [{ text: queries.getSetting('support_autocorrect', '1') === '1' ? '✍️ Smart reply: ON (tap to turn OFF)' : '✍️ Smart reply: OFF (tap to turn ON)', callback_data: 'ac_toggle' }],
+      [{ text: queries.getSetting('support_suggest', '1') === '1' ? '💡 Ready-made suggestions: ON' : '💡 Ready-made suggestions: OFF', callback_data: 'ac_sug_toggle' }],
+    ] } }).catch(() => {});
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PENDING PAYMENTS
+//
+// Two different problems land here:
+//   • awaiting  — Binance sees the transfer but has not credited it (status 0).
+//                 Nothing to do but wait; the customer is told the same.
+//   • review    — the deposit could not be matched to a reservation and needs
+//                 a human decision before any money moves.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const PAY_TABS = { all: '📋 All', awaiting: '⏳ Awaiting Binance', review: '🛡 Needs review' };
+const PAY_PER_PAGE = 8;
+
+async function showPayments(chatId, messageId, tab = 'all', page = 0) {
+  const safeTab = Object.prototype.hasOwnProperty.call(PAY_TABS, tab) ? tab : 'all';
+
+  const awaiting = queries.listPendingDeposits().map((r) => ({ ...r, _kind: 'awaiting' }));
+  const review   = queries.listDepositReviews('pending', 200, 0).map((r) => ({ ...r, _kind: 'review' }));
+
+  let rows;
+  if (safeTab === 'awaiting')    rows = awaiting;
+  else if (safeTab === 'review') rows = review;
+  else                           rows = [...review, ...awaiting]; // decisions first
+
+  const pages = Math.max(1, Math.ceil(rows.length / PAY_PER_PAGE));
+  const pg    = Math.max(0, Math.min(page, pages - 1));
+  const slice = rows.slice(pg * PAY_PER_PAGE, (pg + 1) * PAY_PER_PAGE);
+
+  const txt =
+    `💳 <b>Payments</b>\n\n` +
+    `⏳ Awaiting Binance: <b>${awaiting.length}</b>\n` +
+    `🛡 Needs your decision: <b>${review.length}</b>\n\n` +
+    `<b>Showing:</b> ${PAY_TABS[safeTab]} — ${rows.length} item(s)` +
+    (rows.length ? '' : '\n\n<i>Nothing pending. </i>');
+
+  const kb = [Object.keys(PAY_TABS).map((k) => ({
+    text: (k === safeTab ? '✓ ' : '') + PAY_TABS[k],
+    callback_data: `pay_list_${k}_0`,
+  }))];
+
+  for (const r of slice) {
+    const who  = displayName(r.username, r.first_name, r.user_id);
+    const amt  = Number(r.amount || 0).toFixed(2);
+    const icon = r._kind === 'review' ? '🛡' : '⏳';
+    kb.push([{
+      text: `${icon} ${who.slice(0, 13)} · $${amt} ${r.network || ''}`,
+      callback_data: r._kind === 'review' ? `pay_review_${r.id}` : `pay_wait_${r.txid.slice(0, 40)}`,
+    }]);
+  }
+
+  if (pages > 1) {
+    const nav = [];
+    if (pg > 0)         nav.push({ text: '◀️ Prev', callback_data: `pay_list_${safeTab}_${pg - 1}` });
+    nav.push({ text: `${pg + 1}/${pages}`, callback_data: 'noop' });
+    if (pg < pages - 1) nav.push({ text: 'Next ▶️', callback_data: `pay_list_${safeTab}_${pg + 1}` });
+    kb.push(nav);
+  }
+  kb.push([{ text: '🔄 Refresh', callback_data: `pay_list_${safeTab}_${pg}` }]);
+
+  await send(chatId, messageId, txt, { inline_keyboard: kb });
+}
+
+async function showAwaitingDeposit(chatId, messageId, txidPrefix) {
+  const row = queries.listPendingDeposits().find((r) => r.txid.startsWith(txidPrefix));
+  if (!row) {
+    await bot.sendMessage(chatId, 'ℹ️ This deposit already cleared and was credited.');
+    return;
+  }
+  const who = displayName(row.username, row.first_name, row.user_id);
+  const waited = row.insert_time
+    ? Math.round((Date.now() - Number(row.insert_time)) / 60000) : null;
+
+  await send(chatId, messageId,
+    `⏳ <b>Awaiting Binance Confirmation</b>\n\n` +
+    `👤 ${escapeHtml(who)}\n` +
+    `🆔 <code>${row.user_id}</code>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `💵 <b>Amount:</b> ${Number(row.amount || 0).toFixed(6)} USDT\n` +
+    `🌐 <b>Network:</b> ${row.network || 'n/a'}\n` +
+    `🔗 <code>${escapeHtml(row.txid)}</code>\n` +
+    (waited !== null ? `⌛ <b>On chain:</b> ${waited} min ago\n` : '') +
+    `🔁 <b>Customer retries:</b> ${row.attempts}\n` +
+    `📅 <b>First seen:</b> ${formatFull(row.first_seen)}\n\n` +
+    `<i>Binance has not credited this yet. It clears on its own — the customer ` +
+    `just needs to resend the TxID once it does. Nothing to do here.</i>`,
+    { inline_keyboard: [
+      [{ text: '💬 Message customer', callback_data: `chat_${row.user_id}` }],
+      [{ text: '🔙 Payments', callback_data: 'pay_list_all_0' }],
+    ] });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CUSTOMER-FACING RECEIPT INDICATOR  (✓ / ✓✓)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const RECEIPT_SENT = (n) => `✓ <i>Sent${n > 1 ? ` · ${n} messages` : ''}</i>`;
+const RECEIPT_READ = (when) => `✓✓ <i>Read by support · ${when}</i>`;
+
+/**
+ * Refresh the single status line shown to the customer.
+ *
+ * Only ONE indicator exists per conversation. While support has not read
+ * anything it is edited in place, so ten customer messages still produce one
+ * indicator rather than ten. Once it flips to ✓✓, the next customer message
+ * starts a fresh indicator underneath.
+ */
+async function updateReceiptSent(userId) {
+  const thread = queries.ensureSupportThread(userId);
+  const pending = (thread.status_state === 'sent' ? (thread.pending_count || 0) : 0) + 1;
+
+  if (thread.status_state === 'sent' && thread.status_msg_id) {
+    try {
+      await bot.editMessageText(RECEIPT_SENT(pending), {
+        chat_id: userId,
+        message_id: thread.status_msg_id,
+        parse_mode: 'HTML',
+      });
+      queries.setSupportStatusMsg(userId, thread.status_msg_id, 'sent', pending);
+      return;
+    } catch (e) {
+      // Too old / identical / deleted — post a new indicator instead.
+    }
+  }
+
+  try {
+    const sent = await bot.sendMessage(userId, RECEIPT_SENT(pending), { parse_mode: 'HTML' });
+    queries.setSupportStatusMsg(userId, sent.message_id, 'sent', pending);
+  } catch (e) {
+    logger.warn(`updateReceiptSent: could not post indicator to ${userId}: ${e.message}`);
+  }
+}
+
+/**
+ * Flip the indicator to ✓✓ and persist the read state of every incoming
+ * message. Called ONLY when a staff member actually opens the conversation.
+ */
+async function markThreadRead(userId) {
+  const thread = queries.ensureSupportThread(userId);
+
+  const firstUnread = getFirstUnread.get(userId);
+  if (!firstUnread && thread.status_state === 'read') return; // nothing to do
+
+  queries.markSupportThreadRead(userId);
+
+  if (thread.status_msg_id && thread.status_state !== 'read') {
+    const p = (n) => String(n).padStart(2, '0');
+    const now = new Date();
+    try {
+      await bot.editMessageText(RECEIPT_READ(`${p(now.getHours())}:${p(now.getMinutes())}`), {
+        chat_id: userId,
+        message_id: thread.status_msg_id,
+        parse_mode: 'HTML',
+      });
+    } catch (e) {
+      // Indicator gone — harmless; the DB state is the source of truth.
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INBOX
+// ═══════════════════════════════════════════════════════════════════════════
+
+const INBOX_PER_PAGE = 8;
+
+async function showInbox(chatId, messageId = null, page = 0) {
+  const all = getCustomers.all();
+  const unreadThreads = all.filter((c) => c.unread > 0).length;
+  const mdCounts = queries.getManualDeliveryCounts();
+
+  if (!all.length) {
+    const text =
+      `📭 <b>Support Inbox</b>\n\n` +
+      `No customer messages yet.` +
+      (mdCounts.pending ? `\n\n📦 <b>${mdCounts.pending}</b> manual delivery request(s) waiting.` : '');
+    await send(chatId, messageId, text, { inline_keyboard: [
+      [{ text: `📦 Delivery (${mdCounts.pending})`, callback_data: 'md_list_pending_0' },
+       { text: `🔴 Out of Stock (${queries.countOutOfStockProducts()})`, callback_data: 'stock_list_all_0' }],
+      [{ text: `🔄 Refunds (${queries.countPendingRefundRequests()})`, callback_data: 'ref_list_0' }],
+      [{ text: '🔄 Refresh', callback_data: 'inbox' }],
+    ] });
+    return;
+  }
+
+  clearActiveChat(chatId);
+
+  const totalPages  = Math.max(1, Math.ceil(all.length / INBOX_PER_PAGE));
+  const currentPage = Math.max(0, Math.min(page, totalPages - 1));
+  const slice = all.slice(currentPage * INBOX_PER_PAGE, (currentPage + 1) * INBOX_PER_PAGE);
+
+  const staleCount = countOldUnread.get(14)?.n || 0;
+  const text =
+    require('./services/notices').banner('support') +
+    `📥 <b>Support Inbox</b>\n` +
+    (unreadThreads > 0 ? `🔴 <b>${unreadThreads}</b> conversation(s) unread\n` : '✅ All caught up\n') +
+    (staleCount ? `⏳ <i>${staleCount} of them are older than 2 weeks</i>\n` : '') +
+    `💬 ${all.length} conversation(s) total\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `Tap a customer to open their chat:`;
+
+  const rows = slice.map((c) => {
+    const name  = displayName(c.username, c.first_name, c.user_id);
+    const badge = c.unread > 0 ? `🔴${c.unread} ` : '';
+    const dir   = c.last_direction === 'out' ? '↩ ' : '';
+    return [{
+      text: `${badge}${dir}${name} · ${formatTime(c.last_time)}`,
+      callback_data: `chat_${c.user_id}`,
+    }];
+  });
+
+  // Old unread cleanup, offered only when there is something to clean.
+  const stale = countOldUnread.get(14)?.n || 0;
+  if (stale > 0) {
+    rows.push([{ text: `🧹 Mark ${stale} message(s) older than 2 weeks as read`, callback_data: 'inbox_clean_14' }]);
+  }
+
+  // Clear old conversation history, offered only when there is old history.
+  const purgeable = countOldMessages.get(3)?.n || 0;
+  if (purgeable > 0) {
+    rows.push([{ text: '🗑 Clear old conversation history…', callback_data: 'hist_menu' }]);
+  }
+
+  if (totalPages > 1) {
+    const nav = [];
+    if (currentPage > 0) nav.push({ text: '◀️ Prev', callback_data: `inbox_p_${currentPage - 1}` });
+    nav.push({ text: `${currentPage + 1}/${totalPages}`, callback_data: 'noop' });
+    if (currentPage < totalPages - 1) nav.push({ text: 'Next ▶️', callback_data: `inbox_p_${currentPage + 1}` });
+    rows.push(nav);
+  }
+
+  const oos      = queries.countOutOfStockProducts();
+  const refunds  = queries.countPendingRefundRequests();
+  const payments = queries.countDepositReviews('pending') + queries.countPendingDeposits();
+
+  // Every section carries its own live count, so the inbox alone tells you
+  // where the work is without opening anything.
+  rows.push([
+    { text: `💳 Payments${payments ? ` (${payments})` : ''}`, callback_data: 'pay_list_all_0' },
+    { text: `📦 Delivery${mdCounts.pending ? ` (${mdCounts.pending})` : ''}`, callback_data: 'md_list_pending_0' },
+  ]);
+  rows.push([
+    { text: `🔄 Refunds${refunds ? ` (${refunds})` : ''}`, callback_data: 'ref_list_0' },
+    { text: `🔴 Out of Stock${oos ? ` (${oos})` : ''}`, callback_data: 'stock_list_all_0' },
+  ]);
+  rows.push([
+    { text: '🔍 Search customer', callback_data: 'cust_search' },
+    { text: '🔄 Refresh', callback_data: 'inbox' },
+  ]);
+
+  await send(chatId, messageId, text, { inline_keyboard: rows });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONVERSATION VIEW
+// ═══════════════════════════════════════════════════════════════════════════
+
+const CHAT_PER_PAGE = 12;
+
+/**
+ * Render one page of the conversation as a readable transcript.
+ * Page 0 = newest messages; higher pages go further back in time.
+ */
+async function showChat(staffChatId, targetUserId, page = 0, messageId = null) {
+  const total = countMessages.get(targetUserId).n;
+  if (!total) {
+    await bot.sendMessage(staffChatId, '❌ No messages from this customer.');
+    return;
+  }
+
+  // Opening the conversation is what marks it read — never before this point.
+  await markThreadRead(targetUserId);
+  setActiveChat(staffChatId, targetUserId);
+
+  const totalPages  = Math.max(1, Math.ceil(total / CHAT_PER_PAGE));
+  const currentPage = Math.max(0, Math.min(page, totalPages - 1));
+
+  // DESC + offset gives the right slice; reverse it back to chronological order.
+  const rows = getMessagesPage
+    .all(targetUserId, CHAT_PER_PAGE, currentPage * CHAT_PER_PAGE)
+    .reverse();
+
+  const first = getFirstMsg.get(targetUserId);
+  const name  = displayName(first?.username, first?.first_name, targetUserId);
+  const user  = queries.getUser(targetUserId);
+
+  let header =
+    `💬 <b>${escapeHtml(name)}</b>\n` +
+    `🆔 <code>${targetUserId}</code>\n`;
+  if (user) {
+    const orders = queries.getUserOrdersAll(targetUserId);
+    header +=
+      `💰 Balance: <b>$${Number(user.balance || 0).toFixed(2)}</b>` +
+      `   📦 Orders: <b>${orders.length}</b>\n`;
+  }
+  header +=
+    `📜 ${total} message(s) · page ${currentPage + 1}/${totalPages}\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n`;
+
+  let body = '';
+  let lastDay = null;
+  const mediaCount = rows.filter((m) => m.media_type && m.file_id).length;
+
+  for (const m of rows) {
+    const day = dayKey(m.created_at);
+    if (day && day !== lastDay) {
+      body += `\n📅 <b>── ${day} ──</b>\n\n`;
+      lastDay = day;
+    }
+
+    const time = formatFull(m.created_at).slice(-5); // HH:MM
+    const mine = m.direction === 'out';
+    const who  = mine ? '📤 <b>Support</b>' : '📩 <b>Customer</b>';
+    const tick = !mine ? (m.is_read ? ' ✓✓' : ' ✓') : '';
+    // A recalled reply stays in the transcript, marked — support history should
+    // not quietly rewrite itself.
+    const gone = m.deleted_at ? ' 🗑' : '';
+
+    let line = `${who} · <i>${time}</i>${tick}${gone}\n`;
+    if (m.media_type) {
+      const icon = { photo: '🖼', video: '🎬', voice: '🎤', document: '📎' }[m.media_type] || '📁';
+      line += `${icon} <i>[${m.media_type}]</i>${m.content ? ' ' + escapeHtml(m.content) : ''}\n`;
+    } else if (m.deleted_at) {
+      line += `<s>${escapeHtml(String(m.content || '').slice(0, 60))}</s> <i>(recalled)</i>\n`;
+    } else {
+      line += `${m.content ? escapeHtml(m.content) : '<i>(empty)</i>'}\n`;
+    }
+    body += line + '\n';
+  }
+
+  const nav = [];
+  // "Older" is a HIGHER page index, because page 0 holds the newest slice.
+  if (currentPage < totalPages - 1) nav.push({ text: '⬆️ Older', callback_data: `chat_p_${targetUserId}_${currentPage + 1}` });
+  if (currentPage > 0)              nav.push({ text: '⬇️ Newer', callback_data: `chat_p_${targetUserId}_${currentPage - 1}` });
+
+  const kbRows = [];
+  if (nav.length) kbRows.push(nav);
+  if (mediaCount) {
+    kbRows.push([{ text: `📎 Show ${mediaCount} attachment(s)`, callback_data: `chat_media_${targetUserId}_${currentPage}` }]);
+  }
+  kbRows.push([
+    { text: '📋 Copy text',   callback_data: `cpy_list_${targetUserId}` },
+    { text: '🗑 Recall reply', callback_data: `del_list_${targetUserId}` },
+  ]);
+  kbRows.push([{ text: '📦 Their orders', callback_data: `cust_orders_${targetUserId}` },
+    { text: '♻️ Send replacement', callback_data: `rq_new_${targetUserId}` }]);
+  kbRows.push([
+    { text: '🔄 Refresh', callback_data: `chat_p_${targetUserId}_${currentPage}` },
+    { text: '🔙 Inbox',   callback_data: 'inbox' },
+  ]);
+
+  const footer =
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `✍️ <b>Type below to reply to ${escapeHtml(name)}.</b>`;
+
+  let full = header + body + footer;
+  if (full.length > 4000) {
+    full = header + '\n<i>…older lines trimmed, use ⬆️ Older…</i>\n' + body.slice(-3200) + footer;
+  }
+
+  await send(staffChatId, messageId, full, { inline_keyboard: kbRows });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RECALL A REPLY  /  COPY A CUSTOMER MESSAGE
+//
+// The conversation is rendered as one transcript message, so individual lines
+// carry no buttons. Both actions therefore work the same way: pick from a short
+// list, then act on the one you picked.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const PICK_LIMIT = 10;
+
+const recentOut = rawDb.prepare(`
+  SELECT * FROM support_messages
+  WHERE user_id = ? AND direction = 'out' AND deleted_at IS NULL AND tg_msg_id IS NOT NULL
+  ORDER BY id DESC LIMIT ?
+`);
+const recentIn = rawDb.prepare(`
+  SELECT * FROM support_messages
+  WHERE user_id = ? AND direction = 'in'
+  ORDER BY id DESC LIMIT ?
+`);
+const msgById = rawDb.prepare('SELECT * FROM support_messages WHERE id = ?');
+
+/** One-line label for a message in a picker. */
+function pickLabel(m) {
+  if (m.media_type) return `${{ photo: '🖼', video: '🎬', voice: '🎤', document: '📎' }[m.media_type] || '📁'} ${m.media_type}`;
+  const c = String(m.content || '').replace(/\s+/g, ' ').trim();
+  return c ? c.slice(0, 34) : '(empty)';
+}
+
+/** Pick which of your own replies to recall. */
+async function showDeletePicker(chatId, messageId, targetUserId) {
+  const rows = recentOut.all(targetUserId, PICK_LIMIT);
+  if (!rows.length) {
+    await bot.sendMessage(chatId, 'ℹ️ Nothing of yours left to recall in this chat.');
+    return;
+  }
+  const kb = rows.map((m) => [{
+    text: `🗑 ${formatTime(m.created_at)} · ${pickLabel(m)}`,
+    callback_data: `del_ask_${m.id}`,
+  }]);
+  kb.push([{ text: '🔙 Back to chat', callback_data: `chat_${targetUserId}` }]);
+
+  await send(chatId, messageId,
+    `🗑 <b>Recall a reply</b>\n\n` +
+    `Pick the message to remove. It disappears from the customer's chat as well ` +
+    `as yours.\n\n` +
+    `<i>Telegram only lets a bot delete its own messages for 48 hours. Anything ` +
+    `older can no longer be recalled — it will still be marked as withdrawn on ` +
+    `your side.</i>`,
+    { inline_keyboard: kb });
+}
+
+/** Pick a customer message to receive on its own, ready to copy. */
+async function showCopyPicker(chatId, messageId, targetUserId) {
+  const rows = recentIn.all(targetUserId, PICK_LIMIT).filter((m) => m.content);
+  if (!rows.length) {
+    await bot.sendMessage(chatId, 'ℹ️ This customer has not sent any text yet.');
+    return;
+  }
+  const kb = rows.map((m) => [{
+    text: `📋 ${formatTime(m.created_at)} · ${pickLabel(m)}`,
+    callback_data: `cpy_${m.id}`,
+  }]);
+  kb.push([{ text: '🔙 Back to chat', callback_data: `chat_${targetUserId}` }]);
+
+  await send(chatId, messageId,
+    `📋 <b>Copy a customer message</b>\n\n` +
+    `Pick one and it comes back on its own, as a code block — tap it to copy ` +
+    `just that text.\n\n` +
+    `<i>Useful for wallet addresses, emails and order numbers, which are awkward ` +
+    `to select out of the transcript.</i>`,
+    { inline_keyboard: kb });
+}
+
+/** Send one message's exact text, alone, so a tap copies only that. */
+async function sendCopyable(chatId, msgRowId) {
+  const m = msgById.get(msgRowId);
+  if (!m || !m.content) {
+    await bot.sendMessage(chatId, '❌ Nothing to copy here.');
+    return;
+  }
+  await bot.sendMessage(chatId,
+    `<code>${escapeHtml(m.content)}</code>`,
+    { parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [
+        [{ text: '📋 Pick another', callback_data: `cpy_list_${m.user_id}` }],
+        [{ text: '🔙 Back to chat', callback_data: `chat_${m.user_id}` }],
+      ] } });
+}
+
+/**
+ * Remove a reply from the customer's chat.
+ *
+ * The row is marked deleted rather than removed, so the transcript still shows
+ * that something was sent and withdrawn — support history should not quietly
+ * rewrite itself.
+ */
+async function recallReply(chatId, messageId, msgRowId) {
+  const m = msgById.get(msgRowId);
+  if (!m) {
+    await bot.sendMessage(chatId, '❌ Message not found.');
+    return;
+  }
+  if (m.deleted_at) {
+    await bot.sendMessage(chatId, 'ℹ️ Already recalled.');
+    return;
+  }
+
+  let gone = false, why = '';
+  try {
+    await bot.deleteMessage(m.user_id, m.tg_msg_id);
+    gone = true;
+  } catch (e) {
+    why = /too old|can't be deleted|message to delete not found/i.test(e.message)
+      ? 'Telegram will not delete messages older than 48 hours.'
+      : e.message;
+  }
+
+  rawDb.prepare("UPDATE support_messages SET deleted_at = datetime('now') WHERE id = ?")
+    .run(msgRowId);
+  logger.info(`Support recalled message #${msgRowId} for user ${m.user_id} (removed=${gone})`);
+
+  await send(chatId, messageId,
+    gone
+      ? `✅ <b>Recalled.</b>\n\nThe message is gone from the customer's chat.`
+      : `⚠️ <b>Could not remove it from their chat.</b>\n\n${escapeHtml(why)}\n\n` +
+        `<i>It is marked as withdrawn in your transcript, but the customer can still see it.</i>`,
+    { inline_keyboard: [
+      [{ text: '🗑 Recall another', callback_data: `del_list_${m.user_id}` }],
+      [{ text: '🔙 Back to chat', callback_data: `chat_${m.user_id}` }],
+    ] });
+}
+
+/** Replay the media attachments of one conversation page. */
+async function replayMedia(staffChatId, targetUserId, page) {
+  const rows = getMessagesPage
+    .all(targetUserId, CHAT_PER_PAGE, page * CHAT_PER_PAGE)
+    .reverse()
+    .filter((m) => m.media_type && m.file_id);
+
+  if (!rows.length) {
+    await bot.sendMessage(staffChatId, 'ℹ️ No attachments on this page.', { reply_markup: { inline_keyboard: [
+      [{ text: '🔙 Back to chat', callback_data: `chat_p_${targetUserId}_${page}` }],
+    ] } });
+    return;
+  }
+
+  // The way back rides on the LAST attachment. Sent with the transcript above
+  // it, the buttons ended up off-screen above the photos, and getting back
+  // meant scrolling up past every one of them.
+  const nav = { inline_keyboard: [
+    [{ text: '🔙 Back to chat', callback_data: `chat_p_${targetUserId}_${page}` },
+     { text: '📥 Inbox', callback_data: 'inbox' }],
+  ] };
+
+  for (let i = 0; i < rows.length; i++) {
+    const m = rows[i];
+    const cap = `${m.direction === 'in' ? '📩 Customer' : '📤 Support'} · ${formatFull(m.created_at)}` +
+                (rows.length > 1 ? ` · ${i + 1}/${rows.length}` : '') +
+                (m.content ? `\n${escapeHtml(m.content)}` : '');
+    const opts = { caption: cap, parse_mode: 'HTML' };
+    if (i === rows.length - 1) opts.reply_markup = nav;
+    try {
+      if (m.media_type === 'photo')         await bot.sendPhoto(staffChatId, m.file_id,    opts);
+      else if (m.media_type === 'video')    await bot.sendVideo(staffChatId, m.file_id,    opts);
+      else if (m.media_type === 'voice')    await bot.sendVoice(staffChatId, m.file_id,    opts);
+      else if (m.media_type === 'document') await bot.sendDocument(staffChatId, m.file_id, opts);
+      else if (i === rows.length - 1) await bot.sendMessage(staffChatId, cap, opts);
+    } catch (e) {
+      logger.warn(`replayMedia failed: ${e.message}`);
+      // A failed last item must not take the way back with it.
+      if (i === rows.length - 1) await bot.sendMessage(staffChatId, '⬇️', { reply_markup: nav }).catch(() => {});
+    }
+  }
+}
+
+/** Quick view of a customer's orders from inside the chat (paged: 20 per page, newest first). */
+async function showCustomerOrders(staffChatId, targetUserId, messageId = null, page = 0) {
+  const orders = queries.getUserOrdersAll(targetUserId);
+  const user   = queries.getUser(targetUserId);
+  const name   = user ? displayName(user.username, user.first_name, targetUserId) : `User ${targetUserId}`;
+  const view = renderCustomerOrders({ orders, name, targetUserId, page, formatDate: formatFull, escapeHtml });
+  await send(staffChatId, messageId, view.text, view.keyboard);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MANUAL DELIVERY REQUESTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+const MD_PER_PAGE = 8;
+const MD_TABS = {
+  pending:    '🕐 Waiting',
+  processing: '⚙️ In progress',
+  delivered:  '✅ Delivered',
+  cancelled:  '❌ Cancelled',
+  all:        '📋 All',
+};
+
+async function showManualList(chatId, messageId, status = 'pending', page = 0, searchTerm = '') {
+  const safeStatus = Object.prototype.hasOwnProperty.call(MD_TABS, status) ? status : 'pending';
+  const counts = queries.getManualDeliveryCounts();
+
+  // Already ordered newest-first by the query layer.
+  let rows = queries.getAllManualDeliveries();
+  if (safeStatus !== 'all') rows = rows.filter((r) => r.status === safeStatus);
+
+  if (searchTerm) {
+    const q = searchTerm.toLowerCase();
+    rows = rows.filter((r) =>
+      String(r.order_id).includes(q) ||
+      String(r.id).includes(q) ||
+      String(r.user_id).includes(q) ||
+      String(r.username || '').toLowerCase().includes(q) ||
+      String(r.first_name || '').toLowerCase().includes(q) ||
+      String(r.product_title || '').toLowerCase().includes(q) ||
+      String(r.email || '').toLowerCase().includes(q)
+    );
+  }
+
+  const totalPages  = Math.max(1, Math.ceil(rows.length / MD_PER_PAGE));
+  const currentPage = Math.max(0, Math.min(page, totalPages - 1));
+  const slice = rows.slice(currentPage * MD_PER_PAGE, (currentPage + 1) * MD_PER_PAGE);
+
+  const txt =
+    `📦 <b>Manual Delivery Requests</b>\n\n` +
+    `🕐 Waiting: <b>${counts.pending}</b>   ⚙️ In progress: <b>${counts.processing}</b>\n` +
+    `✅ Delivered: <b>${counts.delivered}</b>   ❌ Cancelled: <b>${counts.cancelled}</b>\n` +
+    (counts.unseen > 0 ? `\n🆕 <b>${counts.unseen}</b> new request(s) not yet reviewed\n` : '') +
+    `\n<b>Showing:</b> ${MD_TABS[safeStatus]}` +
+    (searchTerm ? ` · search “${escapeHtml(searchTerm)}”` : '') +
+    ` — ${rows.length} result(s)`;
+
+  const kb = [];
+
+  const tabKeys = Object.keys(MD_TABS);
+  const chip = (k) => ({
+    text: (k === safeStatus && !searchTerm ? '✓ ' : '') + MD_TABS[k],
+    callback_data: `md_list_${k}_0`,
+  });
+  kb.push(tabKeys.slice(0, 2).map(chip));
+  kb.push(tabKeys.slice(2, 4).map(chip));
+  kb.push([chip('all')]);
+
+  for (const r of slice) {
+    const isNew = (!r.seen_at && r.status === 'pending') ? '🆕 ' : '';
+    const who   = displayName(r.username, r.first_name, r.user_id);
+    const title = String(r.product_title || '').replace(/\[emoji:\d+\]/g, '').trim().slice(0, 18);
+    kb.push([{
+      text: `${isNew}#${r.id} · ${who.slice(0, 14)} · ${title} ×${r.quantity}`,
+      callback_data: `md_view_${r.id}`,
+    }]);
+  }
+
+  if (totalPages > 1) {
+    const nav = [];
+    const base = searchTerm ? 'md_srch' : `md_list_${safeStatus}`;
+    if (currentPage > 0)              nav.push({ text: '◀️ Prev', callback_data: `${base}_${currentPage - 1}` });
+    nav.push({ text: `${currentPage + 1}/${totalPages}`, callback_data: 'noop' });
+    if (currentPage < totalPages - 1) nav.push({ text: 'Next ▶️', callback_data: `${base}_${currentPage + 1}` });
+    kb.push(nav);
+  }
+
+  kb.push([
+    { text: '🔍 Search', callback_data: 'md_search' },
+    { text: '🔄 Refresh', callback_data: `md_list_${safeStatus}_${currentPage}` },
+  ]);
+  kb.push([{ text: '🔙 Inbox', callback_data: 'inbox' }]);
+
+  await send(chatId, messageId, txt, { inline_keyboard: kb });
+}
+
+async function showManualDetail(chatId, messageId, taskId) {
+  const t = queries.getManualDelivery(taskId);
+  if (!t) {
+    await bot.sendMessage(chatId, '❌ Request not found.');
+    return;
+  }
+
+  // Reviewing the task clears its "new" flag.
+  queries.markManualSeen(taskId);
+
+  const who   = displayName(t.username, t.first_name, t.user_id);
+  const user  = queries.getUser(t.user_id);
+  const order = queries.getOrder(t.order_id);
+
+  const txt =
+    `📦 <b>Manual Delivery #${t.id}</b>\n\n` +
+    `<b>Status:</b> ${manualDelivery.STATUS_LABEL[t.status] || t.status}\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `🆔 <b>Order:</b> #${t.order_id}\n` +
+    `🛒 <b>Product:</b> ${manualDelivery.cleanTitle(t.product_title)}\n` +
+    `🔢 <b>Quantity:</b> ${t.quantity}\n` +
+    (t.email ? `📧 <b>Email:</b> <code>${escapeHtml(t.email)}</code>\n` : '') +
+    `💵 <b>Paid:</b> $${Number(t.total_paid).toFixed(2)}\n` +
+    `💳 <b>Method:</b> ${escapeHtml(t.payment_method || 'n/a')}\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `👤 <b>Customer:</b> ${escapeHtml(who)}\n` +
+    `🆔 <code>${t.user_id}</code>\n` +
+    (user ? `💰 <b>Wallet:</b> $${Number(user.balance || 0).toFixed(2)}\n` : '') +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `📅 <b>Created:</b> ${formatFull(t.created_at)}\n` +
+    (order?.paid_at    ? `💳 <b>Paid at:</b> ${formatFull(order.paid_at)}\n` : '') +
+    (t.delivered_at    ? `✅ <b>Delivered:</b> ${formatFull(t.delivered_at)}\n` : '') +
+    (t.admin_note      ? `\n📝 <i>${escapeHtml(t.admin_note)}</i>\n` : '') +
+    (t.delivered_content
+      ? `\n🎁 <b>Delivered content:</b>\n<code>${escapeHtml(plainDelivery(t.delivered_content).slice(0, 500))}</code>\n`
+      : '');
+
+  const kb = [];
+  if (t.status === 'pending' || t.status === 'processing') {
+    if (t.status === 'pending') {
+      kb.push([{ text: '⚙️ Mark as in progress', callback_data: `md_proc_${t.id}` }]);
+    }
+    kb.push([{ text: '✅ Deliver now (send content)', callback_data: `md_deliver_${t.id}` }]);
+    const pa = require('./services/panelActivate').taskButton(t, '');
+    if (pa) kb.push([pa]);
+    kb.push([{ text: '☑️ Mark delivered (no content)', callback_data: `md_done_${t.id}` }]);
+    kb.push([{ text: '❌ Cancel & refund', callback_data: `md_cancel_${t.id}` }]);
+  }
+  if (t.status === 'delivered') {
+    kb.push([{ text: '🗑 Recall wrong delivery', callback_data: `md_recall_${t.id}` }]);
+  }
+  kb.push([{ text: '💬 Open customer chat', callback_data: `chat_${t.user_id}` }]);
+  kb.push([{ text: '🔙 Back to list', callback_data: `md_list_${t.status}_0` }]);
+
+  await send(chatId, messageId, txt, { inline_keyboard: kb });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STOCK ALERTS
+//
+// Reads the shared `admin_notifications` table, so an alert raised by the main
+// bot shows up here with the same read state — marking it read in one place
+// marks it read everywhere.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const STOCK_PER_PAGE = 10;
+
+/**
+ * Live out-of-stock list.
+ *
+ * Built straight from the products table, not from stored notifications, so it
+ * can never drift out of date: the instant stock is added the product stops
+ * matching the query and vanishes from this screen. Nothing to clean up.
+ */
+async function showStockAlerts(chatId, messageId, _tab = 'all', page = 0) {
+  const all   = queries.getOutOfStockProducts();
+  const pages = Math.max(1, Math.ceil(all.length / STOCK_PER_PAGE));
+  const pg    = Math.max(0, Math.min(page, pages - 1));
+  const rows  = all.slice(pg * STOCK_PER_PAGE, (pg + 1) * STOCK_PER_PAGE);
+
+  const txt = all.length
+    ? `🔴 <b>Out of Stock</b>\n\n` +
+      `📦 Products needing restock: <b>${all.length}</b>\n` +
+      `📄 Page ${pg + 1} of ${pages}\n\n` +
+      `<i>A product leaves this list the moment you add stock — nothing to clear.</i>`
+    : `🔴 <b>Out of Stock</b>\n\n` +
+      `✅ <b>Everything is in stock.</b>\n\n` +
+      `<i>Active products appear here the moment they run out.</i>`;
+
+  const kb = [];
+  for (const p of rows) {
+    const title = String(p.title || '').replace(/\[emoji:\d+\]/g, '').trim().slice(0, 32);
+    kb.push([{
+      text: `🔴 ${title} · $${Number(p.price || 0).toFixed(2)}`,
+      callback_data: `stock_prod_${p.id}`,
+    }]);
+  }
+
+  if (pages > 1) {
+    const nav = [];
+    if (pg > 0)         nav.push({ text: '◀️ Prev', callback_data: `stock_list_all_${pg - 1}` });
+    nav.push({ text: `${pg + 1}/${pages}`, callback_data: 'noop' });
+    if (pg < pages - 1) nav.push({ text: 'Next ▶️', callback_data: `stock_list_all_${pg + 1}` });
+    kb.push(nav);
+  }
+  kb.push([{ text: '🔄 Refresh', callback_data: `stock_list_all_${pg}` }]);
+
+  await send(chatId, messageId, txt, { inline_keyboard: kb });
+}
+
+async function showOutOfStockProduct(chatId, messageId, productId) {
+  const p = queries.getProduct(productId);
+  if (!p) { await bot.sendMessage(chatId, '❌ Product not found.'); return; }
+
+  const title = String(p.title || '').replace(/\[emoji:\d+\]/g, '').trim();
+  const inStock = Number(p.stock_quantity) > 0;
+
+  await send(chatId, messageId,
+    `${inStock ? '✅' : '🔴'} <b>${escapeHtml(title)}</b>\n\n` +
+    `🆔 <b>ID:</b> <code>${p.id}</code>\n` +
+    `💵 <b>Price:</b> $${Number(p.price || 0).toFixed(2)}\n` +
+    `📊 <b>Stock:</b> <b>${p.stock_quantity || 0}</b>\n` +
+    `📈 <b>Sold:</b> ${p.sales_count || 0}\n` +
+    (p.last_sold_at ? `🕒 <b>Last sold:</b> ${formatFull(p.last_sold_at)}\n` : '') +
+    (inStock
+      ? `\n✅ <i>This product is back in stock.</i>`
+      : `\n<i>Add stock from the main bot: /admin → Edit Product → Stock.</i>`),
+    { inline_keyboard: [[{ text: '🔙 Out of Stock', callback_data: 'stock_list_all_0' }]] });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// REFUND REQUESTS
+//
+// Read-only here on purpose. Approving a refund moves real money, so the
+// decision stays in the main admin panel; this screen is for triage.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const REF_PER_PAGE = 8;
+
+async function showRefunds(chatId, messageId, page = 0) {
+  const total = queries.countPendingRefundRequests();
+  const pages = Math.max(1, Math.ceil(total / REF_PER_PAGE));
+  const pg    = Math.max(0, Math.min(page, pages - 1));
+  const rows  = queries.listPendingRefundRequests(REF_PER_PAGE, pg * REF_PER_PAGE);
+
+  const txt = total
+    ? `🔄 <b>Refund Requests</b>\n\n` +
+      `⏳ Awaiting a decision: <b>${total}</b>\n` +
+      `📄 Page ${pg + 1} of ${pages}\n\n` +
+      `<i>Approve or reject from the main bot: /admin → 🔄 Refund Requests.</i>`
+    : `🔄 <b>Refund Requests</b>\n\n✅ <b>No pending requests.</b>`;
+
+  const kb = [];
+  for (const r of rows) {
+    const who = displayName(r.username, r.first_name, r.user_id);
+    kb.push([{
+      text: `🔄 #${r.order_id} · ${who.slice(0, 14)} · $${Number(r.amount || 0).toFixed(2)}`,
+      callback_data: `ref_view_${r.id}`,
+    }]);
+  }
+
+  if (pages > 1) {
+    const nav = [];
+    if (pg > 0)         nav.push({ text: '◀️ Prev', callback_data: `ref_list_${pg - 1}` });
+    nav.push({ text: `${pg + 1}/${pages}`, callback_data: 'noop' });
+    if (pg < pages - 1) nav.push({ text: 'Next ▶️', callback_data: `ref_list_${pg + 1}` });
+    kb.push(nav);
+  }
+  kb.push([{ text: '🔄 Refresh', callback_data: `ref_list_${pg}` }]);
+
+  await send(chatId, messageId, txt, { inline_keyboard: kb });
+}
+
+async function showRefund(chatId, messageId, id) {
+  const all = queries.listPendingRefundRequests(500, 0);
+  const r = all.find((x) => x.id === id);
+  if (!r) {
+    await bot.sendMessage(chatId, 'ℹ️ This request has already been handled.');
+    return;
+  }
+  const who = displayName(r.username, r.first_name, r.user_id);
+
+  await send(chatId, messageId,
+    `🔄 <b>Refund Request #${r.id}</b>\n\n` +
+    `👤 <b>Customer:</b> ${escapeHtml(who)}\n` +
+    `🆔 <code>${r.user_id}</code>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `📦 <b>Order:</b> #${r.order_id}\n` +
+    (r.product_title ? `🛒 ${escapeHtml(String(r.product_title).slice(0, 50))}\n` : '') +
+    `💵 <b>Amount:</b> $${Number(r.amount || 0).toFixed(2)}\n` +
+    `💳 <b>Method:</b> ${escapeHtml(r.method || 'n/a')}\n` +
+    `📅 <b>Requested:</b> ${formatFull(r.created_at)}\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `📝 <b>Reason:</b>\n${escapeHtml(r.reason || '(none given)')}\n\n` +
+    `<b>Refunding to the wallet moves real money.</b> Confirm on the next screen.`,
+    { inline_keyboard: [
+      [{ text: '✅ Approve → Wallet', callback_data: `ref_ok_w_${r.id}` }],
+      [{ text: '💸 Approve → USDT (manual)', callback_data: `ref_ok_u_${r.id}` }],
+      [{ text: '❌ Reject', callback_data: `ref_no_${r.id}` }],
+      [{ text: '💬 Message customer', callback_data: `chat_${r.user_id}` }],
+      [{ text: '🔙 Refunds', callback_data: 'ref_list_0' }],
+    ] });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COMMANDS
+// ═══════════════════════════════════════════════════════════════════════════
+
+bot.onText(/^\/start/, async (msg) => {
+  const userId = msg.from.id;
+
+  if (isStaff(userId)) {
+    await showStaffHome(msg.chat.id);
+    await showInbox(msg.chat.id);
+    return;
+  }
+
+  queries.ensureSupportThread(userId);
+  queries.markSupportWelcomed(userId);
+  await showCustomerMenu(msg.chat.id);
+});
+
+/** V161: the customer's home — one clear choice, easy on the eyes. */
+async function showCustomerMenu(chatId) {
+  await bot.sendMessage(chatId,
+    '👋 <b>Hi! How can we help?</b>\n\nJust type your message here and our team will reply as soon as possible.',
+    { parse_mode: 'HTML' }).catch(() => {});
+}
+
+bot.onText(/^\/inbox/, async (msg) => {
+  if (isStaff(msg.from.id)) await showInbox(msg.chat.id);
+});
+
+bot.onText(/^\/manual/, async (msg) => {
+  if (isStaff(msg.from.id)) await showManualList(msg.chat.id, null, 'pending', 0);
+});
+
+bot.onText(/^\/payments/, async (msg) => {
+  if (isStaff(msg.from.id)) await showPayments(msg.chat.id, null, 'all', 0);
+});
+
+bot.onText(/^\/menu/, async (msg) => {
+  if (isStaff(msg.from.id)) await showStaffHome(msg.chat.id);
+});
+
+bot.onText(/^\/refunds/, async (msg) => {
+  if (isStaff(msg.from.id)) await showRefunds(msg.chat.id, null, 0);
+});
+
+bot.onText(/^\/alerts/, async (msg) => {
+  if (isStaff(msg.from.id)) await showStockAlerts(msg.chat.id, null, 'all', 0);
+});
+
+bot.onText(/^\/close/, async (msg) => {
+  if (!isStaff(msg.from.id)) return;
+  clearActiveChat(msg.chat.id);
+  queries.setSetting(`support_state_${msg.chat.id}`, '');
+  await showStaffHome(msg.chat.id);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CALLBACKS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ════════════════════════════════════════════════════════════════════════════
+// V161: CUSTOMER REPLACEMENT FLOW — "Gemini link dead?" → record it → staff sends a spare
+// ════════════════════════════════════════════════════════════════════════════
+const KIND_LABEL = { gemini: 'Gemini' };
+function replState(userId) { return queries.getSetting(`repl_state_${userId}`, '') || ''; }
+function setReplState(userId, v) { queries.setSetting(`repl_state_${userId}`, v || ''); }
+
+async function handleCustomerReplacementCb(q, data) {
+  // Gemini replacement flow removed. Any leftover rc_* button (from an old
+  // message still in a customer's chat) now simply clears state and sends the
+  // customer straight into normal support, so nothing dead-ends or gets stuck.
+  const userId = q.from.id;
+  const chatId = q.message.chat.id;
+  setReplState(userId, '');
+  await bot.sendMessage(chatId, '💬 Go ahead — type your message here and our team will reply.').catch(() => {});
+}
+
+/** Gemini replacement flow removed. Customer messages are NEVER consumed here
+ *  anymore — every message a customer sends must reach the normal support inbox
+ *  and notify staff. We also clear any state left over from the old flow, which
+ *  used to swallow replies (a customer stuck in "send your Order ID" never had
+ *  their messages shown to staff). This function now always returns false. */
+async function handleCustomerReplacementText(msg) {
+  const userId = msg.from.id;
+  if (replState(userId)) setReplState(userId, '');
+  return false;
+}
+
+/** (dead) old replacement text flow — kept out of the path above. */
+async function _legacyReplacementText_UNUSED(msg) {
+  const userId = msg.from.id;
+  const chatId = msg.chat.id;
+  const state = replState(userId);
+  if (!state) return false;
+  const text = (msg.text || '').trim();
+
+  if (state.startsWith('AWAIT_ORDER:')) {
+    const kind = state.split(':')[1];
+    const orderId = parseInt(String(text).replace(/[^0-9]/g, ''), 10);
+    if (!orderId) {
+      await bot.sendMessage(chatId, '❌ Please send the Order ID — it is a number (e.g. <code>24819</code>).', { parse_mode: 'HTML' }).catch(() => {});
+      return true;
+    }
+    const chk = queries.replCheckOrder(orderId, userId, 24);
+    if (!chk.ok) {
+      if (chk.reason === 'not_found') {
+        await bot.sendMessage(chatId, '❌ We could not find an order with that number. Please check it and send again.').catch(() => {});
+      } else if (chk.reason === 'not_yours') {
+        await bot.sendMessage(chatId, '❌ That order is not on your account. Please send the Order ID of your own purchase.').catch(() => {});
+      } else if (chk.reason === 'expired') {
+        setReplState(userId, '');
+        await bot.sendMessage(chatId,
+          `⌛ <b>Order #${orderId} is outside the 24-hour warranty.</b>\n\n` +
+          `It was bought ${chk.hours}h ago, so an automatic replacement is not available. ` +
+          `If you believe there is still a problem, tap 💬 and our team will look into it.`,
+          { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '💬 Talk to support', callback_data: 'rc_talk' }]] } }).catch(() => {});
+      }
+      return true;
+    }
+    setReplState(userId, `AWAIT_BAD_LINK:${kind}:${orderId}`);
+    await bot.sendMessage(chatId,
+      `✅ Order #${orderId} is in warranty (about ${chk.hoursLeft}h left).\n\n` +
+      '🔗 Now paste the <b>link that is not working</b>. It must start with <code>https://</code>.',
+      { parse_mode: 'HTML' }).catch(() => {});
+    return true;
+  }
+  if (state.startsWith('AWAIT_BAD_LINK:')) {
+    const parts = state.split(':');       // AWAIT_BAD_LINK : kind : orderId
+    const kind = parts[1];
+    const orderId = parseInt(parts[2], 10) || null;
+    if (!text || !/^https:\/\//i.test(text.trim())) {
+      await bot.sendMessage(chatId, '❌ The link must start with <b>https://</b>. Please paste the full link.', { parse_mode: 'HTML' }).catch(() => {});
+      return true;
+    }
+    setReplState(userId, '');
+    const link = text.trim();
+    const existing = queries.replOpenRequestForUser(userId, kind);
+    let reqId;
+    if (existing) {
+      queries.replSetRequest(existing.id, { bad_link: link, reason: 'link_dead', order_id: orderId });
+      reqId = existing.id;
+    } else {
+      reqId = queries.replCreateRequest(userId, msg.from.username, kind, link, 'link_dead', null);
+      if (orderId) queries.replSetRequest(reqId, { order_id: orderId });
+    }
+    await bot.sendMessage(chatId,
+      '✅ <b>Got it — thank you.</b>\n\nWe are checking your link now. As soon as it is confirmed, we will send you a fresh working link right here. 🙏',
+      { parse_mode: 'HTML' }).catch(() => {});
+    // V165: it shows in the chat/inbox as a message FROM the customer
+    insertMsg.run(userId, msg.from.username, msg.from.first_name, 'in',
+      `♻️ Replacement request #${reqId}${orderId ? ` · order #${orderId}` : ''}\nMy ${KIND_LABEL[kind] || kind} link does not work:\n${link}`, null, null);
+    await updateReceiptSent(userId).catch(() => {});
+    await notifyReplacementStaff(reqId);
+    return true;
+  }
+  if (state.startsWith('AWAIT_OTHER_DETAIL:')) {
+    const kind = state.split(':')[1];
+    setReplState(userId, '');
+    const otherId = queries.replCreateRequest(userId, msg.from.username, kind, null, 'other', text);
+    await bot.sendMessage(chatId, '✅ Thank you — your message reached our team. We will reply here shortly.').catch(() => {});
+    // also drop it into the normal support thread so staff see it in the inbox
+    insertMsg.run(userId, msg.from.username, msg.from.first_name, 'in', `♻️ Replacement request #${otherId} · ${text}`, null, null);
+    await updateReceiptSent(userId).catch(() => {});
+    await notifyReplacementStaff(otherId);
+    return true;
+  }
+  return false;
+}
+
+async function notifyReplacementStaff(reqId) {
+  const r = queries.replGetRequest(reqId);
+  if (!r) return;
+  const avail = queries.replAvailableCount(r.kind);
+  const who = r.username ? '@' + escapeHtml(r.username) : `<code>${r.user_id}</code>`;
+  const said = r.reason === 'link_dead'
+    ? `"My ${KIND_LABEL[r.kind] || r.kind} link does not work"`
+    : `"${escapeHtml(r.detail || '')}"`;
+  await notifyAdmin(bot, {
+    type: 'support_message',
+    title: `Replacement request #${r.id}`,
+    body:
+      `💬 <b>Message from customer</b> · ♻️ replacement #${r.id}\n` +
+      `👤 ${who} <code>${r.user_id}</code>\n` +
+      (r.order_id ? `🧾 Order #${r.order_id}\n` : '') +
+      `\n${said}\n` +
+      (r.bad_link ? `🔗 <code>${escapeHtml(r.bad_link)}</code>\n` : '') +
+      `\n📦 Spare links ready: <b>${avail}</b>`,
+    dedupeKey: `replacement_request:${r.id}`,
+    refType: 'replacement_request',
+    refId: r.id,
+    buttons: [
+      [{ text: '✅ Handle the replacement', callback_data: `rq_open_${r.id}` }],
+      [{ text: '💬 Open chat', callback_data: `chat_${r.user_id}` }],
+    ],
+  }).catch(() => {});
+}
+
+bot.on('callback_query', async (q) => {
+  // ── V161: customer-side replacement flow (runs for non-staff) ──────────
+  if (!isStaff(q.from.id)) {
+    const d = q.data || '';
+    if (/^rc_/.test(d)) {
+      await bot.answerCallbackQuery(q.id).catch(() => {});
+      try { await handleCustomerReplacementCb(q, d); }
+      catch (e) { logger.warn(`[repl] customer cb ${d}: ${e.message}`); }
+      return;
+    }
+    await bot.answerCallbackQuery(q.id, { text: 'Not authorized', show_alert: true }).catch(() => {});
+    return;
+  }
+  await bot.answerCallbackQuery(q.id).catch(() => {});
+
+  const data   = q.data || '';
+  const chatId = q.message.chat.id;
+  const msgId  = q.message.message_id;
+  ensureStaffCommands(chatId);   // fire and forget
+
+  try {
+    if (data === 'noop') return;
+
+    // ── V161: replacements (staff) ──────────────────────────────────────
+    // V162: spelling-fix choice
+    {
+      const m = /^ac_(fix|raw|alt0|alt1)_([a-z0-9]{8})$/.exec(data);
+      if (m) {
+        const saved = queries.getSetting(`ac_${m[2]}`, '');
+        queries.setSetting(`ac_${m[2]}`, '');
+        if (!saved) { await bot.answerCallbackQuery(q.id, { text: 'Expired — type it again.' }).catch(() => {}); return; }
+        let obj; try { obj = JSON.parse(saved); } catch (_) { return; }
+        await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msgId }).catch(() => {});
+        const pick = m[1] === 'fix' ? obj.fixed : m[1] === 'raw' ? obj.orig : (obj.alts || [])[Number(m[1][3])];
+        await sendSupportText(chatId, obj.u, pick || obj.orig);
+        return;
+      }
+      if (data === 'ac_sug_toggle') {
+        const on = queries.getSetting('support_suggest', '1') === '1';
+        queries.setSetting('support_suggest', on ? '0' : '1');
+        await bot.answerCallbackQuery(q.id, { text: on ? 'Suggestions off' : 'Suggestions on' }).catch(() => {});
+        await showStaffHome(chatId).catch(() => {});
+        return;
+      }
+      if (data === 'ac_toggle') {
+        const on = queries.getSetting('support_autocorrect', '1') === '1';
+        queries.setSetting('support_autocorrect', on ? '0' : '1');
+        await bot.answerCallbackQuery(q.id, { text: on ? 'Auto-correct off' : 'Auto-correct on' }).catch(() => {});
+        await showStaffHome(chatId).catch(() => {});
+        return;
+      }
+    }
+
+    {
+      const mc = /^rq_calc_(today|d7|d30|reset|all|x)$/.exec(data);
+      if (mc) {
+        if (mc[1] === 'x') {
+          queries.setSetting(`support_state_${chatId}`, 'AWAIT_CALC');
+          await bot.sendMessage(chatId, compCalc.PROMPT, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Calculator', callback_data: 'rq_calc_reset' }]] } });
+          return;
+        }
+        queries.setSetting(`support_state_${chatId}`, '');
+        const v = compCalc.view(mc[1], { cb: 'rq_calc', back: 'rq_home', backText: '🔙 Replacements' });
+        const o = { parse_mode: 'HTML', reply_markup: { inline_keyboard: v.kb } };
+        await bot.editMessageText(v.text, { chat_id: chatId, message_id: msgId, ...o }).catch(() => bot.sendMessage(chatId, v.text, o));
+        return;
+      }
+    }
+    if (data === 'rq_home')  { await showReplacementsHome(chatId, msgId); return; }
+    if (data === 'rq_stock') { await showReplStock(chatId, msgId); return; }
+    if (data === 'rq_addstock') {
+      if (!(await replRequirePrice(chatId))) return;
+      queries.setSetting(`support_state_${chatId}`, 'AWAIT_REPL_STOCK');
+      await bot.sendMessage(chatId, `➕ Send the working links now — one per line.\n💲 They will be recorded as a new stock at <b>${replMoney(queries.replUnitPrice(REPL_KIND))}</b> per link.`, { parse_mode: 'HTML' });
+      return;
+    }
+    if (data === 'rq_fill') {
+      const avail = queries.productAvailableCount(replProductId());
+      if (!avail) { await bot.sendMessage(chatId, `⚠️ The sale stock of product #${replProductId()} is empty. Upload stock first, or add links by hand.`); return; }
+      queries.setSetting(`support_state_${chatId}`, 'AWAIT_REPL_FILL');
+      await bot.sendMessage(chatId, `⤵️ How many links to move from the sale stock into the spare pool?\n\nThere are <b>${avail}</b> available. Send a number (e.g. <code>10</code>).\n💲 Each link takes the <b>COST</b> you typed when you uploaded it to the sale stock.`, { parse_mode: 'HTML' });
+      return;
+    }
+    if (data === 'rq_reset') {
+      const c = queries.replStockCounts().find((x) => x.kind === REPL_KIND) || {};
+      const bd = queries.replUsedBreakdown(REPL_KIND);
+      await bot.sendMessage(chatId,
+        `🔄 <b>Reset the count?</b>\n\nThis will be written down:\n` +
+        `🔗 <b>${c.used || 0}</b> link${c.used === 1 ? '' : 's'} = <b>${replMoney(c.used_amount)}</b>\n` + replBreakdownText(bd) +
+        `\nThen the counter starts again from 0. Nothing is deleted — the record is kept in the main bot (Admin → ♻️ Replacement cost → 🧾 Reset history). Spare links still ready stay as they are.` +
+        ((c.unclaimed || 0) ? `\n\n⚠️ <b>${c.unclaimed}</b> used link(s) were not claimed from the supplier yet — claim them first if you still want to.` : ''),
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+          [{ text: '✅ Yes, record & reset', callback_data: 'rq_reset_y' }, { text: '❌ No', callback_data: 'rq_home' }]] } });
+      return;
+    }
+    if (data === 'rq_reset_y') {
+      const r = queries.replResetAccount(REPL_KIND, q.from.id);
+      logger.info(`Staff ${q.from.id} reset the ${REPL_KIND} replacement count (used ${r.used}, unclaimed ${r.unclaimed}, ${r.amount})`);
+      await bot.answerCallbackQuery(q.id, { text: '✅ Reset' }).catch(() => {});
+      await bot.sendMessage(chatId, `✅ <b>Recorded and reset.</b>\n🔗 ${r.used} link${r.used === 1 ? '' : 's'} = <b>${replMoney(r.amount)}</b>\n` + replBreakdownText(r.breakdown) + `\nCounting again from 0.`, { parse_mode: 'HTML' });
+      await showReplacementsHome(chatId, null);
+      return;
+    }
+    if (data === 'rq_claim') {
+      const n = queries.replClaimAll(REPL_KIND);
+      await bot.answerCallbackQuery(q.id, { text: `✅ ${n} marked as claimed` }).catch(() => {});
+      await showReplacementsHome(chatId, msgId);
+      return;
+    }
+    let mrq = /^rq_new_(\d+)$/.exec(data);
+    if (mrq) {
+      const uid = parseInt(mrq[1], 10);
+      let req = queries.replOpenRequestForUser(uid, REPL_KIND);
+      if (!req) {
+        const u = queries.getUser(uid);
+        const id = queries.replCreateRequest(uid, u?.username, REPL_KIND, null, 'link_dead', 'opened by staff from chat');
+        req = queries.replGetRequest(id);
+      }
+      await showReplacementRequest(chatId, msgId, req.id);
+      return;
+    }
+    mrq = /^rq_open_(\d+)$/.exec(data);
+    if (mrq) { await showReplacementRequest(chatId, msgId, parseInt(mrq[1], 10)); return; }
+    mrq = /^rq_send_(\d+)$/.exec(data);
+    if (mrq) { await sendReplacement(chatId, msgId, parseInt(mrq[1], 10), q.from.id, null); return; }
+    mrq = /^rq_reject_(\d+)$/.exec(data);
+    if (mrq) {
+      const id = parseInt(mrq[1], 10);
+      const r = queries.replGetRequest(id);
+      if (r && r.status === 'pending') {
+        queries.replSetRequest(id, { status: 'rejected', handled_by: q.from.id, handled_at: new Date().toISOString() });
+        await bot.sendMessage(r.user_id, 'ℹ️ We checked your link and it appears to be working. If you still have trouble, reply here with a screenshot and we will help.', { parse_mode: 'HTML' }).catch(() => {});
+      }
+      await bot.answerCallbackQuery(q.id, { text: 'Rejected — customer told' }).catch(() => {});
+      await showReplacementsHome(chatId, msgId);
+      return;
+    }
+    mrq = /^rq_manual_(\d+)$/.exec(data);
+    if (mrq) {
+      queries.setSetting(`support_state_${chatId}`, `AWAIT_REPL_MANUAL:${mrq[1]}`);
+      await bot.sendMessage(chatId, '🔗 Paste the working link to send to this customer.');
+      return;
+    }
+
+    if (data === 'inbox')           { await showInbox(chatId, msgId); return; }
+
+    // Clear the backlog that has built up since the bot was created.
+    if (/^inbox_clean_\d+$/.test(data)) {
+      const days = parseInt(data.split('_').pop(), 10);
+      const n = markOldRead.run(days).changes;
+      logger.info(`[SUPPORT] ${n} unread message(s) older than ${days} days marked read`);
+      await bot.answerCallbackQuery(q.id, { text: `✅ ${n} marked as read` }).catch(() => {});
+      await showInbox(chatId, msgId);
+      return;
+    }
+
+    // ── Clear old conversation history (keep last N days) ─────────────────
+    // Step 1: choose how many recent days to keep. Each option shows how many
+    // messages would be deleted, so the choice is informed.
+    if (data === 'hist_menu') {
+      const rows = [];
+      for (const days of [3, 5, 7]) {
+        const n = countOldMessages.get(days)?.n || 0;
+        rows.push([{
+          text: n > 0
+            ? `🗑 Keep last ${days} days — delete ${n} older message(s)`
+            : `✅ Keep last ${days} days — nothing older`,
+          callback_data: n > 0 ? `hist_ask_${days}` : 'noop',
+        }]);
+      }
+      rows.push([{ text: '🔙 Back to inbox', callback_data: 'inbox' }]);
+      await send(chatId, msgId,
+        '🗑 <b>Clear old conversation history</b>\n\n' +
+        'This permanently removes stored messages older than the window you pick, ' +
+        'keeping the most recent days. It only cleans the bot\'s saved history — ' +
+        'it does not touch the Telegram chats.\n\n' +
+        '<b>New messages are never affected:</b> any customer who writes is still ' +
+        'stored and delivered to you normally.\n\n' +
+        'Keep the last…',
+        { inline_keyboard: rows });
+      return;
+    }
+    // Step 2: confirm before deleting.
+    if (/^hist_ask_\d+$/.test(data)) {
+      const days = parseInt(data.split('_').pop(), 10);
+      const n = countOldMessages.get(days)?.n || 0;
+      await send(chatId, msgId,
+        '⚠️ <b>Confirm history cleanup</b>\n\n' +
+        `This will <b>permanently delete ${n} message(s)</b> older than ${days} day(s). ` +
+        'This cannot be undone.\n\n' +
+        'Conversations from the last ' + days + ' day(s), and every future message, stay intact.',
+        { inline_keyboard: [
+          [{ text: `✅ Yes, delete ${n} old message(s)`, callback_data: `hist_go_${days}` }],
+          [{ text: '🔙 Cancel', callback_data: 'hist_menu' }],
+        ] });
+      return;
+    }
+    // Step 3: execute.
+    if (/^hist_go_\d+$/.test(data)) {
+      const days = parseInt(data.split('_').pop(), 10);
+      const n = deleteOldMessages.run(days).changes;
+      logger.info(`[SUPPORT] history cleanup: ${n} message(s) older than ${days} days permanently deleted`);
+      await bot.answerCallbackQuery(q.id, { text: `✅ Deleted ${n} old message(s)` }).catch(() => {});
+      await showInbox(chatId, msgId);
+      return;
+    }
+    if (/^inbox_p_\d+$/.test(data)) { await showInbox(chatId, msgId, parseInt(data.split('_').pop(), 10)); return; }
+
+    // ── Conversation ──────────────────────────────────────────────────────
+    if (/^chat_\d+$/.test(data)) {
+      await showChat(chatId, parseInt(data.split('_')[1], 10), 0, msgId);
+      return;
+    }
+    if (/^chat_p_\d+_\d+$/.test(data)) {
+      const parts = data.split('_');
+      await showChat(chatId, parseInt(parts[2], 10), parseInt(parts[3], 10), msgId);
+      return;
+    }
+    if (/^chat_media_\d+_\d+$/.test(data)) {
+      const parts = data.split('_');
+      await replayMedia(chatId, parseInt(parts[2], 10), parseInt(parts[3], 10));
+      return;
+    }
+    // ── Recall a reply / copy a customer message ─────────────────────────
+    if (/^cpy_list_\d+$/.test(data)) {
+      await showCopyPicker(chatId, msgId, parseInt(data.split('_').pop(), 10));
+      return;
+    }
+    if (/^cpy_\d+$/.test(data)) {
+      await sendCopyable(chatId, parseInt(data.split('_').pop(), 10));
+      return;
+    }
+    if (/^del_list_\d+$/.test(data)) {
+      await showDeletePicker(chatId, msgId, parseInt(data.split('_').pop(), 10));
+      return;
+    }
+    if (/^del_ask_\d+$/.test(data)) {
+      const id = parseInt(data.split('_').pop(), 10);
+      const m = msgById.get(id);
+      if (!m) { await bot.sendMessage(chatId, '❌ Not found.'); return; }
+      await send(chatId, msgId,
+        `⚠️ <b>Recall this reply?</b>\n\n` +
+        `<i>${formatFull(m.created_at)}</i>\n\n` +
+        `${m.content ? escapeHtml(String(m.content).slice(0, 300)) : `[${m.media_type}]`}\n\n` +
+        `It will be removed from the customer's chat. This cannot be undone.`,
+        { inline_keyboard: [
+          [{ text: '🗑 Yes, recall it', callback_data: `del_go_${id}` }],
+          [{ text: '↩️ Cancel', callback_data: `del_list_${m.user_id}` }],
+        ] });
+      return;
+    }
+    if (/^del_go_\d+$/.test(data)) {
+      await recallReply(chatId, msgId, parseInt(data.split('_').pop(), 10));
+      return;
+    }
+
+    if (/^cust_orders_\d+$/.test(data)) {
+      await showCustomerOrders(chatId, parseInt(data.split('_').pop(), 10), msgId);
+      return;
+    }
+    // cust_orders_p_{userId}_{page}: the older / newer pages of that list
+    if (/^cust_orders_p_\d+_\d+$/.test(data)) {
+      const [, , , uid, pg] = data.split('_');
+      await showCustomerOrders(chatId, parseInt(uid, 10), msgId, parseInt(pg, 10));
+      return;
+    }
+    if (data === 'cust_search') {
+      queries.setSetting(`support_state_${chatId}`, 'AWAIT_CUSTOMER_SEARCH');
+      await bot.sendMessage(chatId, '🔍 Send a user ID, @username or name to search for:');
+      return;
+    }
+
+    // ── Payments ──────────────────────────────────────────────────────────
+    if (/^pay_list_[a-z]+_\d+$/.test(data)) {
+      const parts = data.split('_');
+      const page  = parseInt(parts.pop(), 10);
+      await showPayments(chatId, msgId, parts.slice(2).join('_'), page);
+      return;
+    }
+    if (/^pay_wait_/.test(data)) {
+      await showAwaitingDeposit(chatId, msgId, data.replace('pay_wait_', ''));
+      return;
+    }
+    if (/^pay_review_\d+$/.test(data)) {
+      const r = queries.getDepositReview(parseInt(data.split('_').pop(), 10));
+      if (!r) { await bot.sendMessage(chatId, '❌ Not found.'); return; }
+      const u = queries.getUser(r.user_id);
+      const who = displayName(u?.username, u?.first_name, r.user_id);
+      const REASONS = {
+        no_matching_reservation: 'No reservation matched this amount',
+        predates_reservation:    'Transfer is older than the reservation',
+        expired_window:          'Submitted after the claim window closed',
+      };
+      const ageMin = r.insert_time
+        ? Math.round((Date.now() - Number(r.insert_time)) / 60000) : null;
+
+      await send(chatId, msgId,
+        `🛡 <b>Deposit Review #${r.id}</b>\n\n` +
+        `<b>Status:</b> ${String(r.status).toUpperCase()}\n` +
+        `⚠️ <b>Reason:</b> ${REASONS[r.reason] || r.reason || 'n/a'}\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n` +
+        `💵 <b>Amount:</b> ${Number(r.amount).toFixed(6)} USDT\n` +
+        `🌐 <b>Network:</b> ${r.network || 'n/a'}\n` +
+        `🔗 <code>${escapeHtml(r.txid)}</code>\n` +
+        (ageMin !== null ? `⌛ <b>On chain:</b> ${ageMin} min ago\n` : '') +
+        `━━━━━━━━━━━━━━━━━━━━\n` +
+        `👤 <b>Claimed by:</b> ${escapeHtml(who)}\n` +
+        `🆔 <code>${r.user_id}</code>\n` +
+        (u ? `💰 <b>Balance:</b> $${Number(u.balance || 0).toFixed(2)}\n` : '') +
+        `\n<b>Approve only if this transfer really belongs to this customer.</b>`,
+        { inline_keyboard: r.status === 'pending' ? [
+            [{ text: '✅ Approve & credit', callback_data: `pay_ok_${r.id}` }],
+            [{ text: '❌ Reject', callback_data: `pay_no_${r.id}` }],
+            [{ text: '💬 Message customer', callback_data: `chat_${r.user_id}` }],
+            [{ text: '🔙 Payments', callback_data: 'pay_list_all_0' }],
+          ] : [
+            [{ text: '💬 Message customer', callback_data: `chat_${r.user_id}` }],
+            [{ text: '🔙 Payments', callback_data: 'pay_list_all_0' }],
+          ] });
+      return;
+    }
+
+    // Confirmation — crediting a deposit hands out real money.
+    if (/^pay_(ok|no)_\d+$/.test(data)) {
+      const id = parseInt(data.split('_').pop(), 10);
+      const approve = data.startsWith('pay_ok_');
+      const r = queries.getDepositReview(id);
+      if (!r || r.status !== 'pending') {
+        await bot.sendMessage(chatId, 'ℹ️ Already handled.');
+        await showPayments(chatId, msgId, 'all', 0);
+        return;
+      }
+      await send(chatId, msgId,
+        `⚠️ <b>Confirm</b>\n\n` +
+        (approve
+          ? `✅ Credit <b>${Number(r.amount).toFixed(6)} USDT</b> to <code>${r.user_id}</code>`
+          : `❌ Reject deposit review #${id}`) + `\n\n` +
+        `🔗 <code>${escapeHtml(r.txid)}</code>\n\n` +
+        `<i>This cannot be undone.</i>`,
+        { inline_keyboard: [
+          [{ text: '✔️ Yes, do it', callback_data: `pay_${approve ? 'ok' : 'no'}go_${id}` }],
+          [{ text: '↩️ Cancel', callback_data: `pay_review_${id}` }],
+        ] });
+      return;
+    }
+
+    if (/^pay_(ok|no)go_\d+$/.test(data)) {
+      const id = parseInt(data.split('_').pop(), 10);
+      const approve = data.startsWith('pay_okgo_');
+      const r = queries.getDepositReview(id);
+      if (!r || r.status !== 'pending') {
+        await bot.sendMessage(chatId, 'ℹ️ Already handled.');
+        await showPayments(chatId, msgId, 'all', 0);
+        return;
+      }
+
+      if (!approve) {
+        queries.resolveDepositReview(id, 'rejected', `Rejected by support ${q.from.id}`, q.from.id);
+        logger.info(`Support ${q.from.id} REJECTED deposit review #${id}`);
+        await send(chatId, msgId, `❌ Deposit review #${id} rejected.`,
+          { inline_keyboard: [[{ text: '🔙 Payments', callback_data: 'pay_list_all_0' }]] });
+        return;
+      }
+
+      // saveUsedTxid throws on a duplicate — that is the replay guard, and it
+      // must run BEFORE any money moves.
+      try {
+        queries.saveUsedTxid({
+          txid: r.txid, userId: r.user_id, amount: r.amount,
+          network: r.network, asset: 'USDT', address: r.address || null,
+        });
+      } catch (e) {
+        queries.resolveDepositReview(id, 'rejected', 'TxID already credited', q.from.id);
+        await send(chatId, msgId,
+          `❌ <b>Already credited.</b>\n\nThis TxID was used before, so nothing was added.`,
+          { inline_keyboard: [[{ text: '🔙 Payments', callback_data: 'pay_list_all_0' }]] });
+        return;
+      }
+
+      queries.updateBalance(r.user_id, Number(r.amount));
+      queries.addTransaction({
+        userId: r.user_id, type: 'deposit', amount: Number(r.amount),
+        description: `USDT ${r.network} top-up (approved in support)`,
+        refId: r.txid, orderId: null,
+      });
+      queries.resolveDepositReview(id, 'approved', `Approved by support ${q.from.id}`, q.from.id);
+      queries.clearPendingDeposit(r.txid);
+      logger.info(`Support ${q.from.id} APPROVED deposit review #${id} — ${r.amount} to ${r.user_id}`);
+
+      try {
+        const fresh = queries.getUser(r.user_id);
+        await bot.sendMessage(r.user_id,
+          `✅ <b>Deposit Credited</b>\n\n` +
+          `💵 <b>${Number(r.amount).toFixed(6)} USDT</b> has been added to your wallet after review.\n` +
+          `💰 <b>New balance:</b> $${Number(fresh?.balance || 0).toFixed(2)}`,
+          { parse_mode: 'HTML' });
+      } catch (e) { /* customer may have blocked the bot */ }
+
+      await send(chatId, msgId,
+        `✅ Credited <b>${Number(r.amount).toFixed(6)} USDT</b> to <code>${r.user_id}</code>.`,
+        { inline_keyboard: [[{ text: '🔙 Payments', callback_data: 'pay_list_all_0' }]] });
+      return;
+    }
+
+    // ── Stock alerts ──────────────────────────────────────────────────────
+    if (/^stock_prod_\d+$/.test(data)) {
+      await showOutOfStockProduct(chatId, msgId, parseInt(data.split('_').pop(), 10));
+      return;
+    }
+    if (/^ref_list_\d+$/.test(data)) {
+      await showRefunds(chatId, msgId, parseInt(data.split('_').pop(), 10));
+      return;
+    }
+    if (/^ref_view_\d+$/.test(data)) {
+      await showRefund(chatId, msgId, parseInt(data.split('_').pop(), 10));
+      return;
+    }
+
+    // Confirmation step — these actions move money, so never one tap.
+    if (/^ref_(ok_w|ok_u|no)_\d+$/.test(data)) {
+      const id = parseInt(data.split('_').pop(), 10);
+      const action = data.replace(/_\d+$/, '');
+      const r = queries.getRefundRequestById(id);
+      if (!r || r.status !== 'pending') {
+        await bot.sendMessage(chatId, 'ℹ️ This request has already been handled.');
+        await showRefunds(chatId, msgId, 0);
+        return;
+      }
+      const amount = Number(r.total_price) || 0;
+      const label = { ref_ok_w: `✅ Refund ${'$' + amount.toFixed(2)} to their WALLET`,
+                      ref_ok_u: '💸 Approve for MANUAL USDT transfer',
+                      ref_no:   '❌ Reject this request' }[action];
+      await send(chatId, msgId,
+        `⚠️ <b>Confirm</b>\n\n${label}\n\n` +
+        `🆔 Refund #${r.id} · Order #${r.order_id}\n` +
+        `👤 <code>${r.user_id}</code>\n\n` +
+        `<i>The customer is notified either way. This cannot be undone.</i>`,
+        { inline_keyboard: [
+          [{ text: '✔️ Yes, do it', callback_data: `${action}go_${id}` }],
+          [{ text: '↩️ Cancel', callback_data: `ref_view_${id}` }],
+        ] });
+      return;
+    }
+
+    if (/^ref_(ok_w|ok_u|no)go_\d+$/.test(data)) {
+      const id = parseInt(data.split('_').pop(), 10);
+      const action = data.replace(/go_\d+$/, '');
+      const r = queries.getRefundRequestById(id);
+      if (!r || r.status !== 'pending') {
+        await bot.sendMessage(chatId, 'ℹ️ Already handled.');
+        await showRefunds(chatId, msgId, 0);
+        return;
+      }
+      const amount = Number(r.total_price) || 0;
+      let done = '', note = '';
+
+      if (action === 'ref_ok_w') {
+        queries.updateBalance(r.user_id, amount);
+        queries.addTransaction({
+          userId: r.user_id, type: 'refund', amount,
+          description: `Refund for order #${r.order_id}`,
+          refId: `refund_${id}`, orderId: r.order_id,
+        });
+        queries.updateRefundRequest(id, 'approved', `Refunded to wallet: ${amount}$ (support)`, amount, 'wallet');
+        done = `✅ Refund #${id} approved — ${'$' + amount.toFixed(2)} credited to their wallet.`;
+        note =
+          `✅ <b>Your Refund Has Been Approved!</b>\n\n` +
+          `🆔 Refund #${id}\n📦 Order #${r.order_id}\n` +
+          `💵 Refunded: <b>$${amount.toFixed(2)}</b>\n💳 Method: Wallet\n\n` +
+          `Your wallet balance has been updated.`;
+      } else if (action === 'ref_ok_u') {
+        queries.updateRefundRequest(id, 'approved', `Approved for USDT transfer (support)`, amount, 'usdt');
+        done = `✅ Refund #${id} approved for manual USDT transfer.\n\n` +
+               `📝 Contact the customer for their USDT address.`;
+        note =
+          `✅ <b>Your Refund Has Been Approved!</b>\n\n` +
+          `🆔 Refund #${id}\n📦 Order #${r.order_id}\n` +
+          `💵 Amount: <b>$${amount.toFixed(2)}</b>\n💳 Method: USDT (manual)\n\n` +
+          `Our team will contact you for your USDT address.`;
+      } else {
+        queries.updateRefundRequest(id, 'rejected', 'Rejected by support', 0, null);
+        done = `❌ Refund #${id} rejected. The customer has been notified.`;
+        note =
+          `❌ <b>Refund Request Rejected</b>\n\n` +
+          `🆔 Refund #${id}\n📦 Order #${r.order_id}\n\n` +
+          `If you believe this is a mistake, please contact support.`;
+      }
+
+      try { await bot.sendMessage(r.user_id, note, { parse_mode: 'HTML' }); }
+      catch (e) { logger.warn(`Refund notice to ${r.user_id} failed: ${e.message}`); }
+
+      logger.info(`Support ${q.from.id} resolved refund #${id} via ${action}`);
+      await send(chatId, msgId, done, {
+        inline_keyboard: [[{ text: '🔙 Refunds', callback_data: 'ref_list_0' }]],
+      });
+      return;
+    }
+    if (/^stock_list_[a-z_]+_\d+$/.test(data)) {
+      const parts = data.split('_');
+      const page  = parseInt(parts.pop(), 10);
+      const tab   = parts.slice(2).join('_');
+      await showStockAlerts(chatId, msgId, tab, page);
+      return;
+    }
+
+    // ── Manual delivery ───────────────────────────────────────────────────
+    if (/^md_list_[a-z]+_\d+$/.test(data)) {
+      const parts  = data.split('_');
+      const page   = parseInt(parts.pop(), 10);
+      const status = parts.slice(2).join('_');
+      await showManualList(chatId, msgId, status, page);
+      return;
+    }
+    if (/^md_view_\d+$/.test(data)) {
+      await showManualDetail(chatId, msgId, parseInt(data.split('_').pop(), 10));
+      return;
+    }
+    if (data === 'md_search') {
+      queries.setSetting(`support_state_${chatId}`, 'AWAIT_MD_SEARCH');
+      await bot.sendMessage(chatId,
+        '🔍 Send an order number, task id, customer name or product to search for:');
+      return;
+    }
+    if (/^md_srch_\d+$/.test(data)) {
+      const term = queries.getSetting(`support_md_term_${chatId}`, '');
+      await showManualList(chatId, msgId, 'all', parseInt(data.split('_').pop(), 10), term);
+      return;
+    }
+    // V152: 🎟 activate a manual order in an invite-bot panel.
+    if (/^mdpk_\d+$/.test(data) || /^mdp[cy]:\d+:[A-Za-z0-9._-]+$/.test(data)) {
+      const pa = require('./services/panelActivate');
+      let view;
+      if (data.startsWith('mdpk_')) view = await pa.pickerView(parseInt(data.split('_').pop(), 10), '');
+      else {
+        const [, tid, pid] = data.split(':');
+        if (data.startsWith('mdpc:')) view = await pa.confirmView(parseInt(tid, 10), pid, '');
+        else {
+          const r = await pa.activate(bot, parseInt(tid, 10), pid);
+          view = { text: r.text, kb: [[{ text: '📦 Open task', callback_data: `md_view_${tid}` }]] };
+        }
+      }
+      await send(chatId, msgId, view.text, { inline_keyboard: view.kb });
+      return;
+    }
+    if (/^md_proc_\d+$/.test(data)) {
+      const id = parseInt(data.split('_').pop(), 10);
+      queries.setManualDeliveryStatus(id, 'processing', 'Marked in progress');
+      await showManualDetail(chatId, msgId, id);
+      return;
+    }
+    if (/^md_deliver_\d+$/.test(data)) {
+      const id = parseInt(data.split('_').pop(), 10);
+      queries.setSetting(`support_state_${chatId}`, `AWAIT_MD_CONTENT:${id}`);
+      await sendFastCard(chatId, queries.getManualDelivery(id), false);
+      return;
+    }
+    if (/^md_force_\d+$/.test(data)) {
+      const id = parseInt(data.split('_').pop(), 10);
+      const held = safeJson(queries.getSetting(`support_md_held_${chatId}`, ''));
+      queries.setSetting(`support_md_held_${chatId}`, '');
+      if (!held || held.taskId !== id) { await bot.sendMessage(chatId, '⚠️ Nothing held for this task — paste it again.'); return; }
+      await deliverFast(chatId, id, held.content, true);
+      return;
+    }
+    if (/^md_skip_\d+$/.test(data)) {
+      const id = parseInt(data.split('_').pop(), 10);
+      const cur = queries.getManualDelivery(id);
+      const nxt = mdFast.nextTask(id, cur && cur.product_id);
+      if (!nxt || nxt.id === id) { queries.setSetting(`support_state_${chatId}`, ''); await bot.sendMessage(chatId, '✅ No other task waiting.'); return; }
+      await sendFastCard(chatId, nxt, true);
+      return;
+    }
+    if (data === 'md_stop') {
+      queries.setSetting(`support_state_${chatId}`, '');
+      await bot.sendMessage(chatId, `⏹ Stopped. ${mdFast.pendingCount()} task(s) still waiting.`,
+        { reply_markup: { inline_keyboard: [[{ text: '📦 Manual list', callback_data: 'md_list_pending_0' }]] } });
+      return;
+    }
+    if (/^md_done_\d+$/.test(data)) {
+      const id = parseInt(data.split('_').pop(), 10);
+      const res = await manualDelivery.completeManualDelivery(bot, id, null);
+      await bot.sendMessage(chatId, res.ok
+        ? `✅ Task #${id} marked delivered.${res.notified ? '' : '\n⚠️ Customer could not be messaged.'}`
+        : `⚠️ Could not complete: ${res.reason}`);
+      await showManualDetail(chatId, msgId, id);
+      return;
+    }
+    if (/^md_recall_\d+$/.test(data)) {
+      const id = parseInt(data.split('_').pop(), 10);
+      await send(chatId, msgId,
+        `⚠️ <b>Recall delivery #${id}?</b>\n\n• Deletes the delivery message from the customer's chat\n` +
+        `• Erases the delivered info from their order\n• Reopens the task so you can deliver the right item`,
+        { inline_keyboard: [
+          [{ text: '🗑 Yes, recall it', callback_data: `md_recall_y_${id}` }],
+          [{ text: '🔙 No, keep it', callback_data: `md_view_${id}` }],
+        ] });
+      return;
+    }
+    if (/^md_recall_y_\d+$/.test(data)) {
+      const id = parseInt(data.split('_').pop(), 10);
+      const res = await manualDelivery.recallManualDelivery(bot, id);
+      await bot.sendMessage(chatId, !res.ok ? `⚠️ Could not recall: ${res.reason}`
+        : (res.removed ? `✅ Recalled #${id}: message deleted from the customer's chat, order info erased, task reopened.`
+          : `⚠️ Recalled #${id}: order info erased and task reopened, but the message could NOT be deleted from the chat (${res.why}).`));
+      await showManualDetail(chatId, msgId, id);
+      return;
+    }
+    if (/^md_cancel_\d+$/.test(data)) {
+      const id = parseInt(data.split('_').pop(), 10);
+      const res = await manualDelivery.cancelManualDelivery(bot, id, 'Cancelled by support');
+      await bot.sendMessage(chatId, res.ok
+        ? `❌ Task #${id} cancelled and the customer was refunded.`
+        : `⚠️ Could not cancel: ${res.reason}`);
+      await showManualDetail(chatId, msgId, id);
+      return;
+    }
+  } catch (e) {
+    logger.error(`Support callback "${data}" failed: ${e.message}`);
+    await bot.sendMessage(chatId, `⚠️ Error: ${e.message}`).catch(() => {});
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MANUAL DELIVERY — FAST LANE (services/mdFast.js)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const mdFast = require('./services/mdFast');
+
+/**
+ * /mdlink <productId> <url> [must-contain]
+ * The work page a task card opens for that product, and what a valid delivery
+ * must contain. Canva products get both by default; this is for the others.
+ *   /mdlink 12 https://admin.example.com/invite invite.example.com/join
+ *   /mdlink 12 off
+ */
+bot.onText(/^\/mdlink(?:\s+(\d+))?(?:\s+(\S+))?(?:\s+(\S+))?$/i, async (msg, m) => {
+  if (!isStaff(msg.from.id)) return;
+  const [, pid, url, expect] = m;
+  if (!pid) {
+    await bot.sendMessage(msg.chat.id,
+      '🔗 <b>Work link for a manual product</b>\n\n<code>/mdlink &lt;productId&gt; &lt;url&gt; [must-contain]</code>\n' +
+      '<code>/mdlink &lt;productId&gt; off</code>\n\n<i>Canva products are set up automatically.</i>', { parse_mode: 'HTML' });
+    return;
+  }
+  if (/^off$/i.test(url || '')) {
+    queries.setSetting(`md_link_${pid}`, ''); queries.setSetting(`md_expect_${pid}`, '');
+    await bot.sendMessage(msg.chat.id, `✅ Work link removed for product #${pid}.`); return;
+  }
+  if (!/^https?:\/\//.test(url || '')) { await bot.sendMessage(msg.chat.id, '❌ The link must start with https://'); return; }
+  queries.setSetting(`md_link_${pid}`, url); queries.setSetting(`md_expect_${pid}`, expect || '');
+  await bot.sendMessage(msg.chat.id, `✅ Product #${pid}: cards open ${url}` + (expect ? `, deliveries must contain “${expect}”.` : '.'));
+});
+function safeJson(s) { try { return JSON.parse(s); } catch (_) { return null; } }
+
+/** One task, ready to paste: copy email, open the work page, skip, stop. */
+async function sendFastCard(chatId, t, isNext) {
+  if (!t) return;
+  queries.setSetting(`support_state_${chatId}`, `AWAIT_MD_CONTENT:${t.id}`);
+  const left = mdFast.pendingCount();
+  const prof = mdFast.profileFor(t.product_id, t.product_title);
+  await bot.sendMessage(chatId,
+    `${isNext ? '⏭ <b>Next</b>' : '✍️ <b>Deliver</b>'} — task <b>#${t.id}</b>` +
+    `${left > 1 ? ` <i>(${left} waiting)</i>` : ''}\n\n` +
+    `👤 ${escapeHtml(displayName(t.username, t.first_name, t.user_id))}\n` +
+    `📦 ${manualDelivery.cleanTitle(t.product_title)} ×${t.quantity}\n` +
+    (t.email ? `📧 <code>${escapeHtml(t.email)}</code>\n` : '') +
+    `\n<i>${prof.expect ? 'Invite the email, copy the link, paste it here.' : 'Paste the content here.'} ` +
+    `/cancel to stop.</i>`,
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+      ...(mdFast.taskButtons(t).slice(0, 1).filter((r) => !r.some((b) => b.callback_data))),
+      [{ text: '⏭ Skip', callback_data: `md_skip_${t.id}` }, { text: '⏹ Stop', callback_data: 'md_stop' }],
+    ] } });
+}
+
+/** Check, deliver, and bring up the next task. */
+async function deliverFast(chatId, taskId, content, force) {
+  const task = queries.getManualDelivery(taskId);
+  if (!task) { await bot.sendMessage(chatId, `❌ Task #${taskId} not found.`); return; }
+  if (task.status === 'delivered') {
+    await bot.sendMessage(chatId, `ℹ️ Task #${taskId} was already delivered — nothing sent.`);
+    return;
+  }
+  const problem = force ? null : mdFast.checkContent(task, content);
+  if (problem) {
+    // Held, not sent: the customer never sees a pasted email or a wrong link.
+    queries.setSetting(`support_md_held_${chatId}`, JSON.stringify({ taskId, content }));
+    await bot.sendMessage(chatId,
+      `⚠️ <b>Not sent</b> — ${escapeHtml(problem)}.\n\n<code>${escapeHtml(String(content).slice(0, 200))}</code>\n\n` +
+      `<i>Paste the right one, or send this anyway.</i>`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+        [{ text: '📤 Send anyway', callback_data: `md_force_${taskId}` }],
+      ] } });
+    return;
+  }
+  queries.setSetting(`support_state_${chatId}`, '');
+  const res = await manualDelivery.completeManualDelivery(bot, taskId, content);
+  if (!res.ok) { await bot.sendMessage(chatId, `⚠️ Could not deliver #${taskId}: ${res.reason}`); return; }
+  const nxt = mdFast.nextTask(taskId, task.product_id);
+  await bot.sendMessage(chatId,
+    `✅ <b>#${taskId} delivered</b>${res.notified ? '' : ' — ⚠️ customer could not be messaged, content saved'}` +
+    `${nxt ? '' : '\n🎉 No more tasks waiting.'}`, { parse_mode: 'HTML' });
+  if (nxt) await sendFastCard(chatId, nxt, true);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MESSAGES
+// ═══════════════════════════════════════════════════════════════════════════
+
+bot.on('message', async (msg) => {
+  const userId = msg.from.id;
+  const chatId = msg.chat.id;
+
+  if (msg.text && /^\/cancel/.test(msg.text) && isStaff(userId)) {
+    queries.setSetting(`support_state_${chatId}`, '');
+    await bot.sendMessage(chatId, '✅ Cancelled.');
+    return;
+  }
+  if (msg.text && /^\//.test(msg.text)) return;
+
+  // ── STAFF SIDE ────────────────────────────────────────────────────────────
+  if (isStaff(userId)) {
+    const state = queries.getSetting(`support_state_${chatId}`, '');
+    const text  = (msg.text || '').trim();
+
+    // ── Navigation bar taps come in as ordinary text ──────────────────────
+    // They MUST be handled before anything else. Without this, tapping
+    // "📥 Inbox" while a conversation is open would send the literal words
+    // "📥 Inbox" to the customer. Any half-finished input is abandoned, which
+    // is what a person expects when they tap a navigation button.
+    const barKey = matchBarButton(text);
+    if (barKey) {
+      queries.setSetting(`support_state_${chatId}`, '');
+      if (barKey === 'INBOX') {
+        clearActiveChat(chatId);
+        await showInbox(chatId);
+      } else if (barKey === 'PAYMENTS') {
+        await showPayments(chatId, null, 'all', 0);
+      } else if (barKey === 'DELIVERY') {
+        await showManualList(chatId, null, 'pending', 0);
+      } else if (barKey === 'STOCK') {
+        await showStockAlerts(chatId, null, 'all', 0);
+      } else if (barKey === 'REFUNDS') {
+        await showRefunds(chatId, null, 0);
+      } else {
+        await showReplacementsHome(chatId, null);
+      }
+      return;
+    }
+
+    // ── V161: replacement stock / manual link (staff text) ────────────────
+    if (state === 'AWAIT_REPL_FILL') {
+      queries.setSetting(`support_state_${chatId}`, '');
+      const n = parseInt(text.replace(/[^0-9]/g, ''), 10);
+      if (!n || n < 1) { await bot.sendMessage(chatId, '❌ Send a number, e.g. 10.'); return; }
+      const avail = queries.productAvailableCount(replProductId());
+      const want = Math.min(n, avail);
+      const r = queries.replFillFromProduct(replProductId(), REPL_KIND, want, userId);
+      if (r.noPrice) {
+        await bot.sendMessage(chatId, `🔒 These links were uploaded <b>without a cost</b>, so I cannot price them.\nSet the price first in the main bot (Admin → ♻️ Replacement cost), or upload stock with <code>COST 0.25</code>.`, { parse_mode: 'HTML' });
+        return;
+      }
+      await bot.sendMessage(chatId,
+        `✅ Moved <b>${r.moved}</b> link(s) from sale stock → spare pool.\n` +
+        r.batches.map((x) => `🏷 Batch #${x.batchId} · ${replMoney(x.price)} per link (the cost you typed when uploading)`).join('\n') + `\n` +
+        (r.skipped ? `⚠️ ${r.skipped} link(s) had no cost and were left in the sale stock.\n` : '') +
+        (n > avail ? `⚠️ You asked for ${n} but only ${avail} were in sale stock.\n` : '') +
+        `🛒 Sale stock now: <b>${queries.productAvailableCount(replProductId())}</b> · 📦 Spare pool: <b>${queries.replAvailableCount(REPL_KIND)}</b>`,
+        { parse_mode: 'HTML' });
+      await showReplStock(chatId, null);
+      return;
+    }
+    if (state === 'AWAIT_CALC') {
+      const r = compCalc.calc(text);
+      if (!r) { await bot.sendMessage(chatId, '❌ I could not read that.\n\n' + compCalc.PROMPT, { parse_mode: 'HTML' }); return; }
+      await bot.sendMessage(chatId, `🧮 <b>Calculation</b>\n━━━━━━━━━━━━━━━━━━\n${r.text}`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+        [{ text: '➕ Another calculation', callback_data: 'rq_calc_x' }], [{ text: '🔙 Calculator', callback_data: 'rq_calc_reset' }]] } });
+      return;
+    }
+    if (state === 'AWAIT_REPL_STOCK') {
+      queries.setSetting(`support_state_${chatId}`, '');
+      const links = text.split(/\r?\n/).map((x) => x.trim()).filter((x) => x && /https?:\/\/|\./.test(x));
+      const add = queries.replAddLinks(REPL_KIND, links, userId);
+      if (add.noPrice) { await replRequirePrice(chatId); return; }
+      const n = add.added;
+      await bot.sendMessage(chatId, n ? `✅ Added ${n} spare ${KIND_LABEL[REPL_KIND]} link(s) as <b>Batch #${add.batchId}</b> at ${replMoney(add.price)} each.` : '❌ No valid link found. Send one link per line.', { parse_mode: 'HTML' });
+      if (n) await showReplStock(chatId, null);
+      return;
+    }
+    if (state.startsWith('AWAIT_REPL_MANUAL:')) {
+      const reqId = parseInt(state.split(':')[1], 10);
+      queries.setSetting(`support_state_${chatId}`, '');
+      if (!text || !/https?:\/\/|\./.test(text)) { await bot.sendMessage(chatId, '❌ That is not a link.'); return; }
+      await sendReplacement(chatId, null, reqId, userId, text);
+      return;
+    }
+
+    // Replying to a task card delivers to that task — no Deliver button needed.
+    const replied = msg.reply_to_message && (msg.reply_to_message.text || msg.reply_to_message.caption || '');
+    const repliedTask = replied && (replied.match(/Task:\s*#(\d+)/) || replied.match(/task\s*#(\d+)/i));
+    if (repliedTask && text) {
+      await deliverFast(chatId, parseInt(repliedTask[1], 10), text, false);
+      return;
+    }
+
+    // Content for a manual-delivery task
+    if (state.startsWith('AWAIT_MD_CONTENT:')) {
+      const taskId = parseInt(state.split(':')[1], 10);
+      if (!text) {
+        await bot.sendMessage(chatId, '❌ Content cannot be empty.');
+        return;
+      }
+      await deliverFast(chatId, taskId, text, false);
+      return;
+    }
+
+    // Manual-delivery search
+    if (state === 'AWAIT_MD_SEARCH') {
+      queries.setSetting(`support_state_${chatId}`, '');
+      queries.setSetting(`support_md_term_${chatId}`, text);
+      await showManualList(chatId, null, 'all', 0, text);
+      return;
+    }
+
+    // Customer search
+    if (state === 'AWAIT_CUSTOMER_SEARCH') {
+      queries.setSetting(`support_state_${chatId}`, '');
+      const q = text.replace(/^@/, '').toLowerCase();
+      const found = getCustomers.all().filter((c) =>
+        String(c.user_id).includes(q) ||
+        String(c.username || '').toLowerCase().includes(q) ||
+        String(c.first_name || '').toLowerCase().includes(q)
+      );
+      if (!found.length) {
+        await bot.sendMessage(chatId, `🔍 No customer matches “${escapeHtml(text)}”.`, { parse_mode: 'HTML' });
+        return;
+      }
+      const rows = found.slice(0, 15).map((c) => [{
+        text: `${c.unread ? '🔴 ' : ''}${displayName(c.username, c.first_name, c.user_id)} · ${formatTime(c.last_time)}`,
+        callback_data: `chat_${c.user_id}`,
+      }]);
+      rows.push([{ text: '🔙 Inbox', callback_data: 'inbox' }]);
+      await bot.sendMessage(chatId, `🔍 <b>${found.length} match(es)</b>`, {
+        parse_mode: 'HTML', reply_markup: { inline_keyboard: rows },
+      });
+      return;
+    }
+
+    // ── Normal reply to the active conversation ────────────────────────────
+    const targetUserId = getActiveChat(chatId);
+    if (!targetUserId) {
+      await bot.sendMessage(chatId, 'ℹ️ Open a conversation first — use /inbox.');
+      return;
+    }
+
+    let mediaType = null, fileId = null;
+    const contentText = msg.text || msg.caption || '';
+
+    // V166: smart reply — fixes the whole sentence, understands what it is about, offers ready wording, optional AI
+    // rewrite. Staff only; nothing leaves without a tap; links / e-mails / numbers are never changed.
+    if (msg.text && !msg.text.startsWith('/') && queries.getSetting('support_autocorrect', '1') === '1') {
+      try {
+        bot.sendChatAction(chatId, 'typing').catch(() => {});
+        const last = rawDb.prepare("SELECT content FROM support_messages WHERE user_id = ? AND direction = 'in' AND content IS NOT NULL AND content != '' ORDER BY id DESC LIMIT 1").get(targetUserId);
+        const a = await replyAssist.analyze(msg.text, { customerText: last ? last.content : '' });
+        const changed = a.fixed.trim() !== msg.text.trim();
+        const wantSug = queries.getSetting('support_suggest', '1') === '1' && a.suggestions.length && msg.text.split(/\s+/).length >= 2;
+        if (changed || wantSug) {
+          const token = Math.random().toString(36).slice(2, 10);
+          const alts = (wantSug ? a.suggestions : []).slice(0, 2);
+          queries.setSetting(`ac_${token}`, JSON.stringify({ u: targetUserId, orig: msg.text, fixed: a.fixed, alts }));
+          const head = `✍️ <b>Smart reply</b>${a.intent ? ` · <i>${escapeHtml(a.intent.label)}</i>` : ''}${a.ai ? ' · 🤖' : ''}`;
+          let txt = head + '\n━━━━━━━━━━━━━━━━━━\n';
+          if (changed) txt += `<b>Improved</b>\n${escapeHtml(a.fixed)}\n`;
+          else txt += `<i>Your wording is fine.</i>\n`;
+          alts.forEach((x, i) => { txt += `\n<b>💡 Option ${i + 1}</b>\n${escapeHtml(x)}\n`; });
+          const rows = [];
+          if (changed) rows.push([{ text: '✅ Send improved', callback_data: `ac_fix_${token}` }]);
+          alts.forEach((x, i) => rows.push([{ text: `💡 Send option ${i + 1}`, callback_data: `ac_alt${i}_${token}` }]));
+          rows.push([{ text: '📤 Send as I wrote', callback_data: `ac_raw_${token}` }]);
+          await bot.sendMessage(chatId, txt.slice(0, 4000), { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
+          return;
+        }
+      } catch (e) {
+        logger.warn(`[replyAssist] skipped: ${e.message}`);   // never block a reply
+      }
+    }
+
+    try {
+      // Keep the id Telegram assigns in the CUSTOMER's chat — recalling a reply
+      // later is impossible without it.
+      let sent;
+      if (msg.text) {
+        sent = await bot.sendMessage(targetUserId,
+          `📩 <b>Support</b>\n\n${escapeHtml(msg.text)}`, { parse_mode: 'HTML' });
+      } else if (msg.photo && msg.photo.length) {
+        fileId = msg.photo[msg.photo.length - 1].file_id; mediaType = 'photo';
+        sent = await bot.sendPhoto(targetUserId, fileId, {
+          caption: msg.caption ? `📩 ${escapeHtml(msg.caption)}` : '📩 From Support',
+          parse_mode: 'HTML',
+        });
+      } else if (msg.document) {
+        fileId = msg.document.file_id; mediaType = 'document';
+        sent = await bot.sendDocument(targetUserId, fileId, { caption: '📩 From Support' });
+      } else if (msg.voice) {
+        fileId = msg.voice.file_id; mediaType = 'voice';
+        sent = await bot.sendVoice(targetUserId, fileId, { caption: '📩 From Support' });
+      } else if (msg.video) {
+        fileId = msg.video.file_id; mediaType = 'video';
+        sent = await bot.sendVideo(targetUserId, fileId, {
+          caption: msg.caption ? `📩 ${escapeHtml(msg.caption)}` : '📩 From Support',
+          parse_mode: 'HTML',
+        });
+      } else {
+        await bot.sendMessage(chatId, '⚠️ Unsupported message type.');
+        return;
+      }
+
+      const ins = insertMsg.run(targetUserId, null, null, 'out', contentText, mediaType, fileId);
+      if (sent && sent.message_id) {
+        rawDb.prepare('UPDATE support_messages SET tg_msg_id = ? WHERE id = ?')
+          .run(sent.message_id, ins.lastInsertRowid);
+      }
+      const rcpt = queries.getUser(targetUserId);
+      const rcptName = displayName(rcpt?.username, rcpt?.first_name, targetUserId);
+      await bot.sendMessage(chatId, `✅ Sent to <b>${escapeHtml(rcptName)}</b>`, {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[
+          { text: '💬 Open chat', callback_data: `chat_${targetUserId}` },
+          { text: '🔙 Inbox',     callback_data: 'inbox' },
+        ]] },
+      });
+    } catch (e) {
+      logger.error(`Support reply to ${targetUserId} failed: ${e.message}`);
+      await bot.sendMessage(chatId, `❌ Failed: ${e.message}`);
+    }
+    return;
+  }
+
+  // ── CUSTOMER SIDE ─────────────────────────────────────────────────────────
+  const username    = msg.from.username   || null;
+  const firstName   = msg.from.first_name || null;
+  const contentText = msg.text || msg.caption || '';
+  let mediaType = null, fileId = null;
+
+  if (msg.photo && msg.photo.length) { fileId = msg.photo[msg.photo.length - 1].file_id; mediaType = 'photo'; }
+  else if (msg.document) { fileId = msg.document.file_id; mediaType = 'document'; }
+  else if (msg.voice)    { fileId = msg.voice.file_id;    mediaType = 'voice'; }
+  else if (msg.video)    { fileId = msg.video.file_id;    mediaType = 'video'; }
+
+  // V161: if the customer is mid-replacement-flow, consume the text here.
+  try { if (await handleCustomerReplacementText(msg)) return; }
+  catch (e) { logger.warn(`[repl] text: ${e.message}`); }
+
+  // (Gemini replacement nudge removed — every customer message now goes
+  //  straight to the normal support inbox below.)
+
+  const thread = queries.ensureSupportThread(userId);
+
+  // One-time welcome — this replaces the old per-message auto-reply.
+  if (!thread.welcomed) {
+    const welcome = queries.getSetting(
+      'support_welcome_message',
+      '👋 Welcome to Customer Support!\n\nOur team will reply as soon as possible.'
+    );
+    await bot.sendMessage(chatId, welcome, { parse_mode: 'HTML' }).catch(() => {});
+    queries.markSupportWelcomed(userId);
+  }
+
+  insertMsg.run(userId, username, firstName, 'in', contentText, mediaType, fileId);
+
+  // ✓ indicator — one per conversation, edited in place
+  await updateReceiptSent(userId);
+
+  // ── Alert staff, but only once per unread batch ───────────────────────────
+  const name    = displayName(username, firstName, userId);
+  const preview = contentText ? contentText.slice(0, 120) : `[${mediaType || 'message'}]`;
+  const firstUnread = getFirstUnread.get(userId);
+
+  try {
+    await notifyAdmin(bot, {
+      type:  'support_message',
+      title: `New support message from ${name}`,
+      body:
+        `👤 <b>Customer:</b> ${escapeHtml(name)}\n` +
+        `🆔 <code>${userId}</code>\n\n` +
+        `💬 ${escapeHtml(preview)}`,
+      // Keyed on the FIRST unread message of the batch, so follow-up messages
+      // in the same batch reuse the key and are suppressed.
+      dedupeKey: `support_message:${userId}:${firstUnread ? firstUnread.id : 'x'}`,
+      refType: 'support_thread',
+      refId:   userId,
+      buttons: [[{ text: '💬 Open chat', callback_data: `chat_${userId}` }]],
+    });
+  } catch (e) {
+    logger.warn(`Support staff alert failed: ${e.message}`);
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// V161: STAFF — replacement requests + spare-link stock
+// ════════════════════════════════════════════════════════════════════════════
+const REPL_KIND = 'gemini';   // the one family for now; easy to extend
+const replMoney = (n) => { const v = Number(n) || 0; const d = (String(+v.toFixed(4)).split('.')[1] || '').length; return '$' + v.toFixed(Math.max(2, d)); };
+/** Lines "3 × $2.50 (batch #4) = $7.50" for a reset / the pending reset. */
+function replBreakdownText(bd) {
+  if (!bd || !bd.length) return '';
+  return bd.map((g) => `   • ${g.count} × ${replMoney(g.price)} ${g.batch ? `(batch #${g.batch})` : '(earlier stock)'} = ${replMoney(g.amount)}`).join('\n') + '\n';
+}
+/** Mandatory price: stock can only be added when the price for it was set in the MAIN bot. */
+async function replRequirePrice(chatId) {
+  const pr = queries.replPriceState(REPL_KIND);
+  if (pr.ready) return true;
+  await bot.sendMessage(chatId,
+    `🔒 <b>Set the price first</b>\n\nBefore adding stock, set what ONE link costs you in the main bot:\n` +
+    `<b>Admin → ♻️ Replacement cost → 💲 Set the price of the next stock</b>\n\n` +
+    (pr.price ? `Last price: <b>${replMoney(pr.price)}</b> (there is a one-tap "Same price" button there).\n\n` : '') +
+    `Then come back here and add the stock. The price is stamped on every link of it, so the cost of each replacement is always known.`,
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 Replacements', callback_data: 'rq_home' }]] } });
+  return false;
+}
+/** The money lines of the replacement screens: what was used since the last reset and what it is worth. */
+function replMoneyLines(c) {
+  let t = `💵 Cost of links given since the last reset: <b>${replMoney(c.used_amount)}</b>` +
+          ((c.unclaimed || 0) ? ` · 🟠 to claim: <b>${replMoney(c.unclaimed_amount)}</b>` : '') + `\n`;
+  const bd = queries.replUsedBreakdown(REPL_KIND);
+  if (bd.length) t += replBreakdownText(bd);
+  t += `📊 All time: <b>${c.total_used || 0}</b> link${c.total_used === 1 ? '' : 's'} replaced = <b>${replMoney(c.total_amount)}</b>\n`;
+  return t;
+}
+function replProductId() { return parseInt(queries.getSetting('repl_source_product_id', '10'), 10) || 10; }
+
+async function showReplacementsHome(chatId, messageId) {
+  const pending = queries.replPendingRequests(20);
+  const counts = queries.replStockCounts().find((c) => c.kind === REPL_KIND) || { available: 0, used: 0, unclaimed: 0 };
+  let txt = `♻️ <b>Replacements</b>\n━━━━━━━━━━━━━━━━━━\n` +
+    `📦 Ready to send: <b>${counts.available || 0}</b> link${counts.available === 1 ? '' : 's'}\n` +
+    `✅ Given since the last reset: <b>${counts.used || 0}</b>` + ((counts.unclaimed || 0) ? ` · 🟠 <b>${counts.unclaimed}</b> to claim back from supplier` : '') + `\n` +
+    replMoneyLines(counts) +
+    (() => { const b = queries.replBatches(REPL_KIND, 1)[0]; return b ? `🏷 Current stock: ${b.id ? 'Batch #' + b.id : 'earlier stock'} · ${replMoney(b.price)}/link\n` : ''; })() + `\n`;
+  const rows = [];
+  if (pending.length) {
+    txt += `🔴 <b>${pending.length} waiting:</b>\n`;
+    for (const r of pending.slice(0, 10)) {
+      txt += `• #${r.id} ${r.username ? '@' + escapeHtml(r.username) : r.user_id} — ${r.reason === 'link_dead' ? 'dead link' : 'other'}\n`;
+      rows.push([{ text: `♻️ #${r.id} ${r.username ? '@' + r.username : r.user_id}`.slice(0, 40), callback_data: `rq_open_${r.id}` }]);
+    }
+  } else {
+    txt += `✅ No replacement waiting.\n`;
+  }
+  rows.push([{ text: `📦 Spare links (${counts.available || 0})`, callback_data: 'rq_stock' }]);
+  if ((counts.unclaimed || 0) > 0) rows.push([{ text: `📥 Claim ${counts.unclaimed} back (${replMoney(counts.unclaimed_amount)})`, callback_data: 'rq_claim' }]);
+  rows.push([{ text: '🧮 Compensation calculator', callback_data: 'rq_calc_reset' }]);
+  rows.push([{ text: '🔄 Record & reset the count', callback_data: 'rq_reset' }]);
+  const opts = { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } };
+  if (messageId) await bot.editMessageText(txt, { chat_id: chatId, message_id: messageId, ...opts }).catch(() => bot.sendMessage(chatId, txt, opts));
+  else await bot.sendMessage(chatId, txt, opts);
+}
+
+async function showReplacementRequest(chatId, messageId, reqId) {
+  const r = queries.replGetRequest(reqId);
+  if (!r) { await bot.sendMessage(chatId, '❌ Request not found.'); return; }
+  const avail = queries.replAvailableCount(r.kind);
+  const done = r.status !== 'pending';
+  let warr = '';
+  if (r.order_id) {
+    const chk = queries.replCheckOrder(r.order_id, r.user_id, 24);
+    warr = chk.ok ? ` · 🛡 in warranty (~${chk.hoursLeft}h left)` : (chk.reason === 'expired' ? ` · ⌛ warranty passed (${chk.hours}h)` : '');
+  }
+  let txt = `♻️ <b>Replacement #${r.id}</b> · ${KIND_LABEL[r.kind] || r.kind}\n━━━━━━━━━━━━━━━━━━\n` +
+    `👤 ${r.username ? '@' + escapeHtml(r.username) : ''} <code>${r.user_id}</code>\n` +
+    (r.order_id ? `🧾 Order #${r.order_id}${warr}\n` : '') +
+    `📋 Reason: ${r.reason === 'link_dead' ? '🚫 link does not work' : '❓ ' + escapeHtml(r.detail || 'other')}\n`;
+  if (r.bad_link) txt += `\n🔗 <b>The link they say is dead</b> (check it):\n<code>${escapeHtml(r.bad_link)}</code>\n`;
+  txt += `\n📦 Spare ${KIND_LABEL[r.kind] || r.kind} links ready: <b>${avail}</b>\n`;
+  if (r.stock_id) {
+    const st = rawDb.prepare('SELECT batch_id, cost FROM replacement_stock WHERE id=?').get(r.stock_id);
+    if (st) txt += `🏷 Given from ${st.batch_id ? 'Batch #' + st.batch_id : 'earlier stock'} · cost ${replMoney(st.cost)}\n`;
+  }
+  if (done) txt += `\n<b>Status:</b> ${r.status === 'replaced' ? '✅ replaced' : r.status === 'rejected' ? '❌ rejected' : r.status}\n` + (r.sent_link ? `Sent: <code>${escapeHtml(r.sent_link)}</code>` : '');
+  const rows = [];
+  if (!done) {
+    if (avail > 0) rows.push([{ text: '✅ Send a working link now', callback_data: `rq_send_${r.id}` }]);
+    else rows.push([{ text: '⚠️ No spare link — add stock first', callback_data: 'rq_stock' }]);
+    rows.push([{ text: '🔗 Send a link I paste', callback_data: `rq_manual_${r.id}` }, { text: '❌ Reject', callback_data: `rq_reject_${r.id}` }]);
+    rows.push([{ text: '💬 Open chat', callback_data: `chat_${r.user_id}` }]);
+  }
+  rows.push([{ text: '🔙 Replacements', callback_data: 'rq_home' }]);
+  const opts = { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } };
+  if (messageId) await bot.editMessageText(txt, { chat_id: chatId, message_id: messageId, ...opts }).catch(() => bot.sendMessage(chatId, txt, opts));
+  else await bot.sendMessage(chatId, txt, opts);
+}
+
+/** Give the customer a working link: from stock, or one the staff pastes. */
+async function sendReplacement(chatId, messageId, reqId, staffId, manualLink) {
+  const r = queries.replGetRequest(reqId);
+  if (!r || r.status !== 'pending') { await bot.sendMessage(chatId, 'ℹ️ Already handled.'); return; }
+  let link = manualLink, stockId = null, takenBatch = null, takenCost = 0;
+  if (!link) {
+    const row = queries.replTakeOne(r.kind, r.id);
+    if (!row) { await bot.sendMessage(chatId, '⚠️ No spare link left — add stock first (📦 Spare links).'); return; }
+    link = row.link; stockId = row.id; takenBatch = row.batch_id; takenCost = row.cost;
+  }
+  queries.replSetRequest(r.id, { status: 'replaced', stock_id: stockId, sent_link: link, handled_by: staffId, handled_at: new Date().toISOString() });
+  // deliver to the customer in their support chat
+  try {
+    const sent = await bot.sendMessage(r.user_id,
+      `✅ <b>Here is your new working ${KIND_LABEL[r.kind] || r.kind} link</b> 🎉\n\n<code>${escapeHtml(link)}</code>\n\nSorry for the trouble — enjoy!`,
+      { parse_mode: 'HTML' });
+    insertMsg.run(r.user_id, null, null, 'out', `[Replacement sent] ${link}`, null, null);
+    if (sent && sent.message_id) rawDb.prepare('UPDATE support_messages SET tg_msg_id = ? WHERE id = ?').run(sent.message_id, rawDb.prepare('SELECT last_insert_rowid() AS id').get().id);
+  } catch (e) {
+    await bot.sendMessage(chatId, `⚠️ Saved, but could not message the customer: ${e.message}`);
+  }
+  await bot.sendMessage(chatId,
+    `✅ Sent a working link to ${r.username ? '@' + escapeHtml(r.username) : r.user_id}.` +
+    (stockId ? `\n🏷 ${takenBatch ? 'Batch #' + takenBatch : 'Earlier stock'} · cost ${replMoney(takenCost)}` : '\n<i>A link you pasted — not counted in the cost.</i>'),
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+      [{ text: '💬 Back to this chat', callback_data: `chat_${r.user_id}` }],
+      [{ text: '♻️ Replacements', callback_data: 'rq_home' }, { text: '📥 Inbox', callback_data: 'inbox' }],
+    ] } });
+}
+
+async function showReplStock(chatId, messageId) {
+  const avail = queries.replListStock(REPL_KIND, 'available', 20);
+  const counts = queries.replStockCounts().find((c) => c.kind === REPL_KIND) || { available: 0, used: 0, unclaimed: 0 };
+  let txt = `📦 <b>Spare ${KIND_LABEL[REPL_KIND]} links</b>\n━━━━━━━━━━━━━━━━━━\n` +
+    `Ready: <b>${counts.available || 0}</b> · Used: <b>${counts.used || 0}</b>` + ((counts.unclaimed || 0) ? ` · 🟠 ${counts.unclaimed} to claim` : '') + `\n` +
+    replMoneyLines(counts) + `\n` +
+    `\n<b>Stocks</b> (price is set in the main bot)\n` +
+    (queries.replBatches(REPL_KIND, 5).map((b) => `• ${b.id ? 'Batch #' + b.id : 'Earlier stock'} · ${replMoney(b.price)}/link · ${b.available || 0} left of ${b.qty}`).join('\n') || '<i>none yet</i>') + `\n\n`;
+  if (avail.length) txt += `<b>Next links to be sent:</b>\n` + avail.slice(0, 5).map((x) => `• <code>${escapeHtml(x.link.slice(0, 50))}</code> · ${x.batch_id ? 'batch #' + x.batch_id : 'earlier'}`).join('\n');
+  const saleStock = queries.productAvailableCount(replProductId());
+  txt += `\n\n🛒 In the sale stock of product #${replProductId()}: <b>${saleStock}</b> link(s).`;
+  const rows = [
+    [{ text: `⤵️ Take from sale stock (${saleStock} available)`, callback_data: 'rq_fill' }],
+    [{ text: '➕ Add links by hand', callback_data: 'rq_addstock' }],
+  ];
+  if ((counts.unclaimed || 0) > 0) rows.push([{ text: `📥 Claim ${counts.unclaimed} back from supplier`, callback_data: 'rq_claim' }]);
+  rows.push([{ text: '🔙 Replacements', callback_data: 'rq_home' }]);
+  const opts = { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } };
+  if (messageId) await bot.editMessageText(txt, { chat_id: chatId, message_id: messageId, ...opts }).catch(() => bot.sendMessage(chatId, txt, opts));
+  else await bot.sendMessage(chatId, txt, opts);
+}
+
+bot.on('polling_error', (err) => {
+  logger.warn(`Support bot polling error: ${err.message}`);
+});
+
+// ── Used by Yamen's app ("💬 الدعم" section) ────────────────────────────────
+// The SAME path as a staff reply typed in this bot: same "📩 Support" header,
+// stored as 'out' with its Telegram id (so recall/delete keep working), and
+// the thread marked read — the customer sees exactly what they always see.
+bot.deskMarkRead = (userId) => markThreadRead(Number(userId));
+bot.deskReply = async (userId, text) => {
+  const uid = Number(userId);
+  const body = String(text || '').trim();
+  if (!uid || !body) return { ok: false, error: 'user and text are required' };
+  try {
+    const sent = await bot.sendMessage(uid, `📩 <b>Support</b>\n\n${escapeHtml(body)}`, { parse_mode: 'HTML' });
+    const ins = insertMsg.run(uid, null, null, 'out', body, null, null);
+    if (sent && sent.message_id) {
+      rawDb.prepare('UPDATE support_messages SET tg_msg_id = ? WHERE id = ?').run(sent.message_id, ins.lastInsertRowid);
+    }
+    try { await markThreadRead(uid); } catch (_) {}
+    return { ok: true };
+  } catch (e) {
+    logger.error(`Support reply (app) to ${uid} failed: ${e.message}`);
+    return { ok: false, error: e.message };
+  }
+};
+
+module.exports = bot;

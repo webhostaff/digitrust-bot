@@ -1,0 +1,594 @@
+'use strict';
+
+/**
+ * Billing-cycle maths for ChatGPT Business.
+ *
+ * Extracted so the admin panel and the customer bot compute the cycle from the
+ * SAME code. They previously each had their own idea of it, which is why the
+ * panel could show a freshly added cycle while the bot went on quoting a
+ * different one — nothing was stale, they were simply answering different
+ * questions and neither said so.
+ */
+
+const db = require('../database/queries');
+const raw = require('../database/db');
+
+/**
+ * The time of day a cycle boundary falls on, as [hours, minutes].
+ *
+ * Day-based cycles used to end at 00:00 — the START of the end day — while the
+ * "start next cycle" button used 23:59, its END. So the same calendar day meant
+ * two different moments depending on which code asked, and a seat bought on the
+ * 25th could be sold either a full day or none at all.
+ *
+ * One setting now decides it for both. Default 23:59 means "day N is included",
+ * which is what a customer assumes when told their seat runs until the 25th.
+ */
+/**
+ * Minutes to shift the clock by, so "today" means the shop owner's today.
+ *
+ * The server runs on UTC. A shop in UTC+1 that starts a cycle on the 5th finds
+ * the bot still on the 4th for the first hour of every day — the owner looks at
+ * their phone, sees the 5th, and the bot disagrees. The offset moves the bot's
+ * idea of the current moment onto the owner's calendar.
+ */
+function tzOffsetMinutes() {
+  try {
+    const v = parseFloat(String(db.getSetting('cgb_timezone_offset', '0') || '0'));
+    return Number.isFinite(v) ? Math.round(v * 60) : 0;
+  } catch (e) {
+    return 0;
+  }
+}
+
+/** `from`, expressed in the shop's local time. */
+/**
+ * `from` as a Date whose LOCAL getters read the shop's wall clock.
+ *
+ * The server's own timezone is taken out first. On a UTC server (Railway's
+ * default) this is the same shift as before; on a server with TZ set, the old
+ * version shifted twice — a renewal pressed at 14:32 was recorded as 15:32.
+ */
+function localNow(from = new Date()) {
+  const off = tzOffsetMinutes();
+  const serverOff = -new Date(from).getTimezoneOffset();
+  return new Date(from.getTime() + (off - serverOff) * 60000);
+}
+
+function boundaryTime() {
+  let raw = '23:59';
+  try {
+    raw = String(db.getSetting('cgb_cycle_end_time', '23:59') || '23:59').trim();
+  } catch (e) { /* settings unavailable */ }
+
+  const m = raw.match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return [23, 59];
+  const h = Math.min(23, Math.max(0, parseInt(m[1], 10)));
+  const min = Math.min(59, Math.max(0, parseInt(m[2], 10)));
+  return [h, min];
+}
+
+/** Configured cycles, or the historical defaults when none are set. */
+function getCycles() {
+  const cycles = db.getBillingCycles();
+  if (cycles.length) return cycles;
+  return [
+    { id: null, start_day: 26, end_day: 25, is_default: true },
+    { id: null, start_day: 16, end_day: 15, is_default: true },
+  ];
+}
+
+/**
+ * An explicitly set cycle end, chosen by the shop owner.
+ *
+ * Day-of-month cycles answer "when does the month roll over"; they cannot
+ * answer "end the current cycle at 8pm tonight because that is when I actually
+ * rotate the workspace". When a manual end is set it overrides everything —
+ * it is the only case where the owner has stated a fact rather than a rule.
+ *
+ * A manual end in the past is ignored rather than obeyed: it means the moment
+ * has already passed, and quoting a negative period would sell nothing for
+ * money. The day-based cycles resume automatically, so a forgotten override
+ * cannot silently break the shop.
+ */
+function manualCycleLocal(localFrom) {
+  let raw;
+  try {
+    raw = db.getSetting('cgb_manual_cycle_end', '');
+  } catch (e) {
+    return null;
+  }
+  if (!raw) return null;
+
+  const end = new Date(String(raw).replace(' ', 'T'));
+  if (isNaN(end.getTime()) || end <= localFrom) return null;
+
+  return {
+    cycle: { id: null, start_day: null, end_day: null, manual: true, ends_at: raw },
+    endDate: end,
+    // Hours matter here, but a subscription is still sold in whole days, so a
+    // part-day is rounded up — never down, which would short the customer.
+    daysRemaining: Math.max(1, Math.ceil((end - localFrom) / 86400000)),
+    startDate: new Date(new Date(localFrom).setHours(0, 0, 0, 0)),
+    inGap: false,
+    cycleLength: 30,
+  };
+}
+
+/** Public form: converts to shop-local time first. */
+function manualCycle(from = new Date()) {
+  return manualCycleLocal(localNow(from));
+}
+
+/**
+ * A calendar day, clamped to the month's last day.
+ *
+ * A cycle on day 31 has no 31st in September; JavaScript would silently roll
+ * that over to October 1st and quote a period a day off. Clamping keeps it on
+ * the last day of the month, which is what "day 31" means to a person.
+ */
+function dayIn(y, m, d, h = 0, min = 0) {
+  const last = new Date(y, m + 1, 0).getDate();
+  return new Date(y, m, Math.min(d, last), h, min, 0, 0);
+}
+
+const DAY_MS = 86400000;
+
+/** A cycle's recorded renewal time as [h, m]; [0, 0] when none was recorded. */
+function startTimeOf(cycle) {
+  const m = String(cycle && cycle.start_time || '').match(/^(\d{1,2}):(\d{2})$/);
+  return m ? [Math.min(23, +m[1]), Math.min(59, +m[2])] : [0, 0];
+}
+
+/**
+ * Record NOW as the renewal time of a cycle — the admin's one press on the
+ * cycle's start day, at the moment the workspace was billed.
+ *
+ * Refused on any other day: the time only means something if it was taken on
+ * the start day itself, and a press on the wrong day would silently move the
+ * boundary of every future cycle.
+ */
+function recordStartTime(cycleId, at = new Date()) {
+  const cycle = db.getBillingCycleById(cycleId);
+  if (!cycle) return { ok: false, reason: 'not_found' };
+  const now = localNow(at);
+  const lastDay = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+  const startDayThisMonth = Math.min(cycle.start_day, lastDay);
+  if (now.getDate() !== startDayThisMonth) {
+    return { ok: false, reason: 'wrong_day', start_day: startDayThisMonth, today: now.getDate() };
+  }
+  const t = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+  db.setBillingCycleStartTime(cycleId, t);
+  return { ok: true, time: t, cycle };
+}
+
+function clearStartTime(cycleId) {
+  db.setBillingCycleStartTime(cycleId, null);
+}
+
+/**
+ * The period a purchase made at `from` belongs to, for one cycle.
+ *
+ * Both ends of the cycle are used. The old code read only end_day, so a cycle
+ * of 26 -> 24 was treated as "ends on the 24th" and a buyer on the 25th — a day
+ * that belongs to no cycle — was sold a period starting that same day. Now:
+ *
+ *   - inside a cycle: the period runs from today to the cycle end;
+ *   - in the gap between two cycles: it starts on the next start day, and the
+ *     customer gets (and pays for) the whole cycle.
+ *
+ * cycleLength is the real length of THIS cycle (29 days for 26 Sep -> 24 Oct),
+ * so the price is the monthly rate split over the days the cycle actually has,
+ * not over a fixed 30.
+ */
+function evaluateCycle(cycle, from, bh, bm) {
+  const today = new Date(from);
+  today.setHours(0, 0, 0, 0);
+
+  // Next boundary at or after `from`. Compared against `from`, not midnight: on
+  // the boundary day itself the cycle is open until the chosen time.
+  let endDate = dayIn(today.getFullYear(), today.getMonth(), cycle.end_day, bh, bm);
+  if (endDate < from) endDate = dayIn(today.getFullYear(), today.getMonth() + 1, cycle.end_day, bh, bm);
+
+  // The start of the period that end closes: the latest start day before it,
+  // at the cycle's own renewal time when one was recorded.
+  const [sh, sm] = startTimeOf(cycle);
+  let periodStart = dayIn(endDate.getFullYear(), endDate.getMonth(), cycle.start_day, sh, sm);
+  if (periodStart >= endDate) periodStart = dayIn(endDate.getFullYear(), endDate.getMonth() - 1, cycle.start_day, sh, sm);
+
+  // Compared with the moment, not the day: on the 26th at 10:00 a cycle that
+  // renews at 14:30 has not opened yet, and the buyer joins the running one.
+  const inGap = periodStart > from;
+  const startDate = inGap ? new Date(new Date(periodStart).setHours(0, 0, 0, 0)) : today;
+
+  const cycleLength = Math.max(1, Math.ceil((endDate - periodStart) / DAY_MS));
+  const daysRemaining = Math.min(cycleLength, Math.max(1, Math.ceil((endDate - (inGap ? periodStart : startDate)) / DAY_MS)));
+
+  return { cycle, endDate, startDate, periodStart, inGap, cycleLength, daysRemaining };
+}
+
+// ── V167.4: "start tomorrow's cycle TODAY", one time only ───────────────────────────────────────────
+// A record {key, date} in the setting cgb_early_start. While it is TODAY's record, new buyers are sold the
+// cycle that was about to open tomorrow, starting today; every other cycle (the panel running now) is not
+// offered. At midnight the record no longer matches the date and everything is back to the calendar by itself.
+const EARLY_KEY = 'cgb_early_start';
+const cycleKey = (c) => `${c.start_day}-${c.end_day}`;
+const ymdOf = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+function earlyRecordLocal(localFrom) {
+  try {
+    const r = JSON.parse(db.getSetting(EARLY_KEY, '') || 'null');
+    if (r && r.key && r.date === ymdOf(localFrom)) return r;
+  } catch (_) { /* none */ }
+  return null;
+}
+const earlyRecord = (from = new Date()) => earlyRecordLocal(localNow(from));
+
+/** The cycle that would be brought forward right now: the one still to open, soonest first. */
+function earlyCandidate(from = new Date()) {
+  const now = localNow(from);
+  const [bh, bm] = boundaryTime();
+  const gap = getCycles().map((c) => evaluateCycle(c, now, bh, bm)).filter((e) => e.inGap)
+    .sort((a, b) => a.periodStart - b.periodStart);
+  return gap[0] || null;
+}
+
+/** Is it on, and for which cycle. */
+function earlyStatus(from = new Date()) {
+  const r = earlyRecord(from);
+  if (!r) return { on: false, candidate: earlyCandidate(from) };
+  const now = localNow(from);
+  const [bh, bm] = boundaryTime();
+  const c = getCycles().find((x) => cycleKey(x) === r.key);
+  return { on: true, record: r, cycle: c || null, eval: c ? evaluateCycle(c, now, bh, bm) : null };
+}
+
+function setEarlyStart(on, from = new Date()) {
+  if (!on) { db.setSetting(EARLY_KEY, ''); return { ok: true, on: false }; }
+  const cand = earlyCandidate(from);
+  if (!cand) return { ok: false, reason: 'no_upcoming_cycle' };
+  db.setSetting(EARLY_KEY, JSON.stringify({ key: cycleKey(cand.cycle), date: ymdOf(localNow(from)) }));
+  return { ok: true, on: true, cycle: cand.cycle, periodStart: cand.periodStart, endDate: cand.endDate };
+}
+
+/**
+ * The cycle a purchase made today would land in.
+ *
+ * "Best" means the one giving the customer the MOST days — which is the part
+ * that surprises admins: adding a cycle does not replace the existing ones, and
+ * an older cycle keeps winning whenever it happens to run longer. Every cycle is
+ * returned alongside the winner so a panel can show why.
+ */
+function calculateBestCycle(from = new Date()) {
+  from = localNow(from);
+  const manual = manualCycleLocal(from);
+  if (manual) {
+    manual.all = [manual];
+    return manual;
+  }
+
+  const [bh, bm] = boundaryTime();
+  const evaluated = getCycles().map((cycle) => evaluateCycle(cycle, from, bh, bm));
+  if (!evaluated.length) return null;
+
+  // V167.4: today only, the cycle due to open tomorrow is sold from today; the running one is closed to new buyers.
+  const early = earlyRecordLocal(from);   // `from` is already the shop's local time here
+  if (early) {
+    const e = evaluated.find((x) => cycleKey(x.cycle) === early.key);
+    if (e) {
+      const today = new Date(from); today.setHours(0, 0, 0, 0);
+      const forced = {
+        ...e, inGap: false, early: true, startDate: today,
+        daysRemaining: Math.min(e.cycleLength, Math.max(1, Math.ceil((e.endDate - today) / DAY_MS))),
+      };
+      forced.all = evaluated;
+      return forced;
+    }
+  }
+
+  // A cycle that is running today wins over one that has not started yet: a
+  // buyer on the 25th joins the cycle already in progress (22 -> 20) from
+  // today, rather than waiting for the one that opens tomorrow. A cycle that
+  // has not started is used only when no cycle is running at all.
+  const running = evaluated.filter((e) => !e.inGap);
+  const pool = running.length ? running : evaluated;
+  let best = pool[0];
+  for (const e of pool) if (e.daysRemaining > best.daysRemaining) best = e;
+
+  best.all = evaluated;
+  return best;
+}
+
+/**
+ * What `days` of this period cost at a monthly rate.
+ *
+ * The rate is split over the cycle's real length, so a full cycle always costs
+ * exactly the monthly price whether that cycle has 28, 29, 30 or 31 days.
+ * Periods with no cycle behind them (a manual end) fall back to 30.
+ */
+function priceFor(days, cycleLength, monthly) {
+  const len = cycleLength > 0 ? cycleLength : 30;
+  return Number(((days / len) * monthly).toFixed(2));
+}
+
+/** Price of the period `best` describes. */
+function pricePeriod(best, monthly) {
+  if (!best) return 0;
+  return priceFor(best.daysRemaining, best.cycleLength, monthly);
+}
+
+/**
+ * One more whole cycle after `endDate` — the "Add a full month" option.
+ *
+ * Lands on the cycle's own end day a month later rather than adding a flat 30
+ * days, which drifted off the cycle and left the seat ending mid-cycle.
+ */
+function oneMoreCycle(best) {
+  const [bh, bm] = boundaryTime();
+  if (best.cycle && best.cycle.end_day && best.cycle.start_day) {
+    // The cycle that follows, measured on its own days — a gap day between the
+    // two cycles belongs to neither and is not counted as sold.
+    const next = evaluateCycle(best.cycle, new Date(best.endDate.getTime() + 60000), bh, bm);
+    return { endDate: next.endDate, days: next.cycleLength };
+  }
+  return { endDate: new Date(best.endDate.getTime() + 30 * DAY_MS), days: 30 };
+}
+
+/**
+ * The cycle AFTER the one currently in force.
+ *
+ * Used by "start next cycle now": the shop rotates the workspace before the
+ * calendar says to, so new customers must be sold the following period rather
+ * than the few remaining days of one that is already closed.
+ *
+ * Built from the winning cycle's end date plus a month rather than from a
+ * second pass over the cycle list, so it always follows whatever cycle is
+ * actually in force — including a manual override.
+ */
+function nextCycleAfterCurrent(from = new Date()) {
+  // calculateBestCycle converts to local time itself; converting here as well
+  // would shift the clock twice and push every date an hour out.
+  const current = calculateBestCycle(from);
+  if (!current) return null;
+
+  const [bh, bm] = boundaryTime();
+  const end = new Date(current.endDate);
+  const next = new Date(end);
+  next.setMonth(next.getMonth() + 1);
+  next.setHours(bh, bm, 0, 0);
+
+  const now = localNow(from);
+  return {
+    endDate: next,
+    daysRemaining: Math.max(1, Math.ceil((next - now) / 86400000)),
+    cycleLength: Math.max(1, Math.round((next - end) / 86400000)),
+    replaces: current,
+  };
+}
+
+/**
+ * Where a RENEWAL runs, and what it costs (V144).
+ *
+ * The old renewal took its end day from calculateBestCycle() — the cycle that gives a NEW buyer
+ * the most days TODAY. That answer changes whenever a cycle is added or deleted, so deleting one
+ * cycle sent EVERY renewal to the end day of whichever cycle happened to win (a seat ending on
+ * the 9th was renewed to the 30th: 25 days for a full month). A renewing customer is in a cycle
+ * already; the renewal follows the cycle's own boundaries:
+ *
+ *   own   The seat ends exactly on a cycle's end day. The renewal runs to that cycle's NEXT end:
+ *         a whole cycle, the monthly price.
+ *   stub  No cycle ends there (its cycle was deleted and the seat was moved to another cycle's
+ *         panel). The renewal first covers the few days up to the NEAREST cycle end after the
+ *         seat's end — priced for those days only, pro-rata over that cycle's real length — and
+ *         then the whole month(s) asked for: a seat ending 5 Oct, moved to the cycle that ends on
+ *         the 9th, renews 5 Oct → 9 Nov (the 4 days + one cycle). After that it is an ordinary
+ *         "own" seat and everything is normal again.
+ *   window (V156.9)  Renewal is open from ONE DAY BEFORE the seat's last day until ONE day AFTER its
+ *         cycle's start date (setting cgb_renew_grace_days) — cycle 11 → 9: days 8 to 12. Before:
+ *         "notyet". After: "closed" — the customer can ask the admin for a late renewal of the same
+ *         email (lateRenewalQuote: the remaining days only). Inside it, an ended seat renews exactly as
+ *         if it had not ended.
+ *   All renewals start the day AFTER the seat's last day: a seat ending 9 Oct renews 10 Oct → 9 Nov.
+ *   manual / fallback   As before (like a new buyer today; the monthly price).
+ *
+ * @param {string} endDateStr  the seat's current end, 'YYYY-MM-DD'
+ * @param {number} months      whole cycles to buy (1..12); in a stub they come AFTER the extra days
+ * @returns {{from:Date,to:Date,days:number,cycle:?object,kind:string,stub:?{days:number,cycleLength:number}}}
+ */
+/** Days the renewal stays open after the cycle's start date (setting cgb_renew_grace_days, default 4 — V157.8). */
+function renewGraceDays() {
+  try {
+    const v = parseInt(String(raw.prepare("SELECT value FROM settings WHERE key='cgb_renew_grace_days'").get()?.value ?? '4'), 10);
+    return Number.isFinite(v) && v >= 0 && v <= 25 ? v : 4;
+  } catch (_) { return 4; }
+}
+
+/**
+ * A LATE renewal (V156.9), after the window closed and the admin agreed: the same email in its own cycle,
+ * from today (or the cycle's start when between two periods) to that cycle's current end, priced for the
+ * remaining days only — the price a new buyer of that cycle pays today.
+ */
+function lateRenewalQuote(sub, now = new Date()) {
+  const local = localNow(now);
+  const today = new Date(local); today.setHours(0, 0, 0, 0);
+  const [bh, bm] = boundaryTime();
+  const cycles = getCycles().filter((c) => c.start_day && c.end_day);
+  if (!cycles.length) return null;
+  const seatEnd = new Date(`${sub.end_date}T00:00:00`); seatEnd.setHours(bh, bm, 0, 0);
+  let cyc = cycles.find((c) => dayIn(seatEnd.getFullYear(), seatEnd.getMonth(), c.end_day).getDate() === seatEnd.getDate());
+  if (!cyc) {
+    let near = null;
+    for (const c of cycles) { const ev = evaluateCycle(c, seatEnd, bh, bm); if (!near || ev.endDate < near.endDate) near = { ...ev, cycle: c }; }
+    cyc = near.cycle;
+  }
+  const ev = evaluateCycle(cyc, local, bh, bm);
+  const monthly = getMonthlyPrice(sub.user_id);
+  return { from: ev.inGap ? ev.startDate : today, to: ev.endDate, days: ev.daysRemaining, cycleLength: ev.cycleLength,
+           price: pricePeriod(ev, monthly), monthly, cycle: cyc };
+}
+
+function renewalPeriod(endDateStr, months = 1, now = new Date(), { ignoreWindow = false } = {}) {
+  const local = localNow(now);
+  const today = new Date(local); today.setHours(0, 0, 0, 0);
+  const [bh, bm] = boundaryTime();
+  const seatEnd = new Date(`${endDateStr}T00:00:00`); seatEnd.setHours(bh, bm, 0, 0);
+  const expired = !(seatEnd > today);
+
+  // The boundary `months` cycle-ends after `from`, STRICTLY later than it (a seat's own end is
+  // already paid for, so landing on it again would sell nothing).
+  const endAfter = (from, endDay) => {
+    let end = dayIn(from.getFullYear(), from.getMonth(), endDay, bh, bm);
+    while (end <= from) end = dayIn(end.getFullYear(), end.getMonth() + 1, endDay, bh, bm);
+    if (months > 1) end = dayIn(end.getFullYear(), end.getMonth() + (months - 1), endDay, bh, bm);
+    return end;
+  };
+  const done = (from, to, cycle, kind, stub = null) => ({
+    from, to, cycle, kind, stub,
+    days: Math.max(1, Math.round((to - from) / DAY_MS)),
+  });
+
+  const cycles = getCycles().filter((c) => c.start_day && c.end_day);
+
+  // V156.6: the renewal starts the day AFTER the seat's last day (a seat ending 9 Oct renews 10 Oct → 9 Nov).
+  const nextDay = new Date(seatEnd.getTime() + DAY_MS);
+  const ownOf = () => cycles.find((c) => dayIn(seatEnd.getFullYear(), seatEnd.getMonth(), c.end_day).getDate() === seatEnd.getDate());
+  const nearestOf = () => {
+    let near = null;
+    for (const c of cycles) {
+      const ev = evaluateCycle(c, seatEnd, bh, bm);
+      if (!near || ev.endDate < near.ev.endDate) near = { cycle: c, ev };
+    }
+    return near;
+  };
+
+  // V156.7: the RENEWAL WINDOW, the same for every cycle and panel: it opens ONE DAY BEFORE the seat's
+  // last day and stays open until its cycle's START date (inclusive) — for cycle 11 → 9 a seat ending on
+  // the 9th can be renewed on the 8th, 9th, 10th and 11th. Before: "not open yet". After: "closed".
+  if (!ignoreWindow && cycles.length && !manualCycleLocal(local)) {
+    const own = ownOf();
+    const cyc = own || nearestOf().cycle;
+    const seatDay = new Date(seatEnd); seatDay.setHours(0, 0, 0, 0);
+    const opens = new Date(seatDay); opens.setDate(opens.getDate() - 1);
+    let start = dayIn(seatDay.getFullYear(), seatDay.getMonth(), cyc.start_day);
+    while (start <= seatDay) start = dayIn(start.getFullYear(), start.getMonth() + 1, cyc.start_day);
+    // still open for `cgb_renew_grace_days` days AFTER the cycle's start (default 4: 11 → 15).
+    const lastDay = new Date(start); lastDay.setDate(lastDay.getDate() + renewGraceDays()); lastDay.setHours(23, 59, 59, 999);
+    if (local < opens || local > lastDay) {
+      const r = done(today, today, cyc, local < opens ? 'notyet' : 'closed');
+      r.opensOn = opens; r.closedOn = new Date(lastDay.getFullYear(), lastDay.getMonth(), lastDay.getDate()); r.cycleStart = start;
+      return r;
+    }
+  }
+
+  // No cycle of their own to follow: renewed like a new buyer today, at the monthly price.
+  if (!cycles.length || manualCycleLocal(local)) {
+    const from = expired ? today : seatEnd;
+    const best = calculateBestCycle(now);
+    const endDay = best && best.cycle && best.cycle.end_day;
+    if (!endDay) {
+      const to = new Date(from);
+      to.setMonth(to.getMonth() + months);
+      to.setHours(bh, bm, 0, 0);
+      return done(from, to, best ? best.cycle : null, expired ? 'expired' : (manualCycleLocal(local) ? 'manual' : 'fallback'));
+    }
+    return done(from, endAfter(from, endDay), best.cycle, expired ? 'expired' : 'fallback');
+  }
+
+  // own: the seat ends exactly where one of the cycles ends.
+  const own = ownOf();
+  // days = what is really covered: from the end of the old seat to the new end (shown as starting the next day)
+  const cover = (r) => { r.days = Math.max(1, Math.round((r.to - seatEnd) / DAY_MS)); return r; };
+  if (own) return cover(done(nextDay, endAfter(seatEnd, own.end_day), own, 'own'));
+
+  // stub: the nearest cycle end after the seat's end.
+  let near = null;
+  for (const c of cycles) {
+    const ev = evaluateCycle(c, seatEnd, bh, bm);
+    if (!near || ev.endDate < near.ev.endDate) near = { cycle: c, ev };
+  }
+  const first = near.ev.endDate;                              // the first cycle end: where the extra days stop
+  const stub = { days: Math.max(1, Math.round((first - seatEnd) / DAY_MS)), cycleLength: near.ev.cycleLength, end: first };
+  // …then `months` whole cycles of that same cycle, each ending on its own end day.
+  const to = dayIn(first.getFullYear(), first.getMonth() + months, near.cycle.end_day, bh, bm);
+  return cover(done(nextDay, to, near.cycle, 'stub', stub));
+}
+
+/**
+ * Bulk discount for a duration, editable from the admin panel (setting "cgb_renew_discounts").
+ *
+ * Read as THRESHOLDS, not exact matches: "3:5,6:10,12:15" means 3 months or more gets 5%, 6 or
+ * more gets 10%, 12 gets 15%. Exact matching would give 7 months a 0% discount while 6 months
+ * got 10% — making the longer commitment cost more, which no customer would accept.
+ */
+function renewDiscountFor(months) {
+  try {
+    const row = raw.prepare(`SELECT value FROM settings WHERE key='cgb_renew_discounts'`).get();
+    const tiers = [];
+    for (const pair of String(row?.value || '').split(',')) {
+      const [m, p] = pair.split(':').map((x) => parseFloat(String(x).trim()));
+      if (Number.isFinite(m) && Number.isFinite(p)) tiers.push({ m, p });
+    }
+    tiers.sort((a, b) => a.m - b.m);
+    let pct = 0;
+    for (const t of tiers) if (months >= t.m) pct = t.p;
+    return pct;
+  } catch (e) {
+    return 0;
+  }
+}
+
+/**
+ * The full quote of a renewal: dates, days and price. One function for the customer's screens
+ * and for the owner's checks, so they can never disagree.
+ *
+ * The extra days of a stub are priced for those days only (pro-rata over that cycle's real
+ * length, the same rule a new buyer mid-cycle pays); every whole cycle is the monthly price.
+ *
+ * @param {{user_id:*, end_date:string}} sub  the seat being renewed
+ */
+function quoteRenewal(sub, months, now = new Date(), opts = {}) {
+  const monthly = getMonthlyPrice(sub.user_id);
+  const bulk = renewDiscountFor(months);
+  const p = renewalPeriod(sub.end_date, months, now, opts);
+  if (p.kind === 'closed' || p.kind === 'notyet') {                  // V156.7: outside the renewal window
+    return { months, monthly, gross: 0, bulk: 0, price: 0, from: p.from, to: p.to, days: 0, kind: p.kind, cycle: p.cycle, stub: null,
+             opensOn: p.opensOn, closedOn: p.closedOn };
+  }
+  const gross = p.stub
+    ? priceFor(p.stub.days, p.stub.cycleLength, monthly) + months * monthly
+    : monthly * months;
+  const price = Number((gross * (1 - bulk / 100)).toFixed(2));
+  return { months, monthly, gross: Number(gross.toFixed(2)), bulk, price, from: p.from, to: p.to,
+           days: p.days, kind: p.kind, cycle: p.cycle, stub: p.stub };
+}
+
+/**
+ * The monthly rate — for a specific customer when one is given.
+ *
+ * A per-customer override beats the shop rate. Resellers and long-standing
+ * buyers get negotiated numbers, and the alternative is the shop owner
+ * remembering to hand-adjust every invoice, which is how a discount promised
+ * once quietly stops being honoured.
+ */
+function getMonthlyPrice(userId = null) {
+  if (userId) {
+    try {
+      const row = raw.prepare('SELECT monthly_price FROM cgb_user_prices WHERE user_id = ?').get(userId);
+      const v = Number(row?.monthly_price);
+      // 0 is a valid price (a free seat), so only a missing row falls through.
+      if (row && Number.isFinite(v) && v >= 0) return v;
+    } catch (e) { /* table may not exist yet */ }
+  }
+  return globalMonthlyPrice();
+}
+
+function globalMonthlyPrice() {
+  try {
+    const row = raw.prepare(`SELECT value FROM settings WHERE key='chatgpt_monthly_price'`).get();
+    return parseFloat(row?.value || '50') || 50;
+  } catch (e) {
+    return 50;
+  }
+}
+
+module.exports = { earlyStatus, setEarlyStart, earlyCandidate, lateRenewalQuote, renewGraceDays, renewalPeriod, quoteRenewal, renewDiscountFor, recordStartTime, clearStartTime, startTimeOf, getCycles, calculateBestCycle, priceFor, pricePeriod, oneMoreCycle, getMonthlyPrice, manualCycle, nextCycleAfterCurrent, boundaryTime, localNow, tzOffsetMinutes };

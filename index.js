@@ -1,0 +1,2483 @@
+'use strict';
+
+require('dotenv').config();
+
+const TelegramBot = require('node-telegram-bot-api');
+const express     = require('express');
+const config      = require('./config');
+const logger      = require('./utils/logger');
+
+if (!config.botToken) {
+  logger.error('BOT_TOKEN is required. Copy .env.example to .env and fill it in.');
+  process.exit(1);
+}
+
+// ── Init bot ──────────────────────────────────────────────────────────────────
+const bot = new TelegramBot(config.botToken, { polling: true });
+// Every outgoing message renders [emoji:ID] markers as real premium emoji.
+// Installed here rather than at each call site so no message can be missed.
+require('./utils/emojiLayer').installEmojiLayer(bot, 'store');
+logger.info('Telegram bot polling started.');
+
+// ── Handlers ──────────────────────────────────────────────────────────────────
+const { handleStart, sendMainMenu, handleReferralMenu, showLanguagePicker } = require('./handlers/start');
+const { showProducts, showProductDetail, showPreorderProducts, showPreorderProductDetail } = require('./handlers/products');
+const buyHandler     = require('./handlers/buy');
+const walletHandler  = require('./handlers/wallet');
+const { showOrders, showOrderDetail }                   = require('./handlers/orders');
+const supportHandler = require('./handlers/support');
+const productsHandler = require('./handlers/products');
+const ordersHandler   = require('./handlers/orders');
+const adminHandler   = require('./handlers/admin');
+const session        = require('./handlers/session');
+const { States }     = require('./handlers/session');
+const { ensureUser, checkJoinGate, isMember } = require('./middlewares/auth');
+const { mainMenuKb, backKb, persistentMenuKb, matchNavButton } = require('./utils/keyboard');
+const { escapeHtml, formatPrice } = require('./utils/format');
+const { notifyAdmin } = require('./services/adminNotify');
+const db = require('./database/queries');
+
+// ── V167.19: one-time sweep so products that were already out of stock BEFORE
+// this feature get moved into the "Out of Stock" category (and any wrongly
+// parked but back in stock get restored). Idempotent — safe on every boot.
+try {
+  const sweep = db.syncAllStockCategories();
+  logger.info(`[stock-category] startup sweep: ${sweep.parked} parked, ${sweep.restored} restored of ${sweep.scanned} products`);
+} catch (e) {
+  logger.warn(`[stock-category] startup sweep failed: ${e.message}`);
+}
+
+// ── Seed demo products: DISABLED ──────────────────────────────────────────────
+// Demo products are no longer auto-seeded on first boot.
+// Add your products via the admin panel.
+
+// ── Auth helper ───────────────────────────────────────────────────────────────
+async function withAuth(msg, handler) {
+  const ok = await ensureUser(bot, msg);
+  if (!ok) return;
+  const passed = await checkJoinGate(bot, msg.from.id, msg.chat.id);
+  if (!passed) return;
+  return handler();
+}
+
+// ── /start ────────────────────────────────────────────────────────────────────
+bot.onText(/\/start(.*)/, async (msg, match) => {
+  // Maintenance check
+  if (!adminHandler.isAdmin(msg.from.id)) {
+    const maintenance = db.getSetting('maintenance_mode', '0') === '1';
+    if (maintenance) {
+      const maintMsg = db.getSetting('maintenance_message', 'The bot is currently under maintenance. Please try again later.');
+      await bot.sendMessage(msg.chat.id, `🚧 <b>Maintenance Mode</b>\n\n${maintMsg}`, { parse_mode: 'HTML' });
+      return;
+    }
+  }
+  const ok = await ensureUser(bot, msg);
+  if (!ok) return;
+  const args = (match[1] || '').trim();
+
+  // Always record referral deep-link first (even before gate)
+  if (args && args.startsWith('ref_')) {
+    const referrerId = parseInt(args.split('_')[1], 10);
+    if (!isNaN(referrerId) && referrerId !== msg.from.id) {
+      db.recordReferral(referrerId, msg.from.id);
+    }
+  }
+
+  // Check Join Required BEFORE showing the main menu
+  const passed = await checkJoinGate(bot, msg.from.id, msg.chat.id);
+  if (!passed) return;
+
+  await handleStart(bot, msg, args);
+});
+
+// ── /admin ────────────────────────────────────────────────────────────────────
+bot.onText(/\/emojis/, async (msg) => {
+  const ok = await ensureUser(bot, msg);
+  if (!ok) return;
+  if (!adminHandler.isAdmin(msg.from.id)) {
+    await bot.sendMessage(msg.chat.id, '❌ Admin only command.');
+    return;
+  }
+  const emojis = db.getAllEmojis();
+  if (!emojis.length) {
+    await bot.sendMessage(msg.chat.id,
+      '📭 <b>Emoji Library is empty</b>\n\nAdd emojis from <code>/admin → 🎨 Emoji Library</code>',
+      { parse_mode: 'HTML' });
+    return;
+  }
+  let txt = '🎨 <b>Your Emoji Library</b>\n\nLong-press to copy, then paste anywhere:\n\n';
+  for (const e of emojis) {
+    txt += `<code>[emoji:${e.emoji_id}]${e.fallback}</code> — <tg-emoji emoji-id="${e.emoji_id}">${e.fallback}</tg-emoji> <b>${e.name}</b>\n\n`;
+  }
+  await bot.sendMessage(msg.chat.id, txt, { parse_mode: 'HTML' });
+});
+
+// /emoji_id — Premium Emoji ID Extractor
+// Debug command to see what's stored in DB
+// Full diagnostic: test premium emoji rendering step-by-step
+// Test: Use getCustomEmojiStickers to fetch the emoji as a real sticker
+// Test ReplyKeyboard vs InlineKeyboard for premium emoji rendering
+bot.onText(/\/test_keyboard/, async (msg) => {
+  if (!adminHandler.isAdmin(msg.from.id)) return;
+  const chatId = msg.chat.id;
+
+  // Test 1: Inline Keyboard (current — no premium emoji support)
+  await bot.sendMessage(chatId, 'TEST 1: Inline Keyboard\n(buttons under message)', {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '⭐ Premium Test 1', callback_data: 'noop' }],
+        [{ text: '🥚 Item with emoji', callback_data: 'noop' }],
+      ]
+    }
+  });
+
+  // Test 2: Reply Keyboard (different type — might support more)
+  await bot.sendMessage(chatId, 'TEST 2: Reply Keyboard\n(buttons replace keyboard)', {
+    reply_markup: {
+      keyboard: [
+        ['⭐ Premium Test 2', '🥚 Item'],
+        ['🔥 Hot Items', '💎 Diamond'],
+        ['🔙 Hide keyboard'],
+      ],
+      resize_keyboard: true,
+      one_time_keyboard: false,
+    }
+  });
+
+  // Test 3: With entity attempt (some clients render this differently)
+  const buttonText = '🥚 Premium';
+  await bot.sendMessage(chatId, `TEST 3: Inline with entity attempt`, {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: buttonText, callback_data: 'noop' }],
+      ]
+    }
+  });
+
+  await bot.sendMessage(chatId,
+    `📊 <b>What to look for:</b>\n\n` +
+    `Test 1 (Inline): Should show plain emoji\n` +
+    `Test 2 (Reply): Might show premium animated\n` +
+    `Test 3: Same as Test 1\n\n` +
+    `Send /hide to remove the reply keyboard.`,
+    { parse_mode: 'HTML' });
+});
+
+bot.onText(/\/hide/, async (msg) => {
+  await bot.sendMessage(msg.chat.id, 'Keyboard hidden', {
+    reply_markup: { remove_keyboard: true }
+  });
+});
+
+bot.onText(/\/test_sticker\s+(\d+)/, async (msg, match) => {
+  if (!adminHandler.isAdmin(msg.from.id)) return;
+  const chatId = msg.chat.id;
+  const emojiId = match[1];
+
+  try {
+    // Call Telegram's getCustomEmojiStickers method
+    const stickers = await bot._request('getCustomEmojiStickers', {
+      qs: { custom_emoji_ids: JSON.stringify([emojiId]) }
+    });
+    if (!stickers || !stickers.length) {
+      await bot.sendMessage(chatId, `❌ No sticker found for ID ${emojiId}`);
+      return;
+    }
+    const sticker = stickers[0];
+    await bot.sendMessage(chatId,
+      `🔬 <b>Custom Emoji Info</b>\n\n` +
+      `📦 file_id: <code>${sticker.file_id}</code>\n` +
+      `🆔 file_unique_id: <code>${sticker.file_unique_id}</code>\n` +
+      `📐 width × height: ${sticker.width || '?'}×${sticker.height || '?'}\n` +
+      `🎬 is_animated: ${sticker.is_animated}\n` +
+      `🎥 is_video: ${sticker.is_video}\n` +
+      `📝 type: ${sticker.type}\n` +
+      `🎨 emoji: ${sticker.emoji || 'none'}`,
+      { parse_mode: 'HTML' });
+
+    // Try sending it as a sticker
+    try {
+      await bot.sendSticker(chatId, sticker.file_id);
+      await bot.sendMessage(chatId, '✅ Above is the sticker rendered. Does it look like the premium emoji?');
+    } catch (e) {
+      await bot.sendMessage(chatId, `❌ Send sticker failed: ${e.message}`);
+    }
+
+    // Also try sendDocument with the thumbnail
+    if (sticker.thumbnail && sticker.thumbnail.file_id) {
+      try {
+        await bot.sendPhoto(chatId, sticker.thumbnail.file_id,
+          { caption: '📸 Thumbnail of the emoji (static)' });
+      } catch (e) {}
+    }
+  } catch (e) {
+    await bot.sendMessage(chatId, `❌ getCustomEmojiStickers failed: ${e.message}`);
+  }
+});
+
+bot.onText(/\/diag_emoji/, async (msg) => {
+  const ok = await ensureUser(bot, msg);
+  if (!ok) return;
+  if (!adminHandler.isAdmin(msg.from.id)) return;
+  const chatId = msg.chat.id;
+
+  // Use a well-known premium emoji ID for testing (Telegram's default animated emojis)
+  // 5368324170671202286 is a Telegram premium animated emoji
+  const TEST_IDS = [
+    '5368324170671202286',  // Common animated
+    '5364105043988309566',  // Another common one
+    '5424818078704282406',
+  ];
+
+  await bot.sendMessage(chatId, `🔬 <b>Premium Emoji Diagnostic</b>\n\nRunning 5 tests...`, { parse_mode: 'HTML' });
+
+  // ── Test 1: HTML tg-emoji tag ──────────────────────────────
+  try {
+    await bot.sendMessage(chatId,
+      `<b>Test 1:</b> HTML tg-emoji tag\nUsing parse_mode HTML:\n<tg-emoji emoji-id="${TEST_IDS[0]}">🎁</tg-emoji>`,
+      { parse_mode: 'HTML' });
+  } catch (e) {
+    await bot.sendMessage(chatId, `❌ Test 1 failed: ${e.message}`);
+  }
+
+  // ── Test 2: entities array (the "correct" way) ─────────────
+  try {
+    await bot.sendMessage(chatId,
+      `Test 2: entities array\n🎁`,
+      {
+        entities: [
+          { type: 'custom_emoji', offset: 23, length: 2, custom_emoji_id: TEST_IDS[0] }
+        ]
+      });
+  } catch (e) {
+    await bot.sendMessage(chatId, `❌ Test 2 failed: ${e.message}`);
+  }
+
+  // ── Test 3: Show what entities object looks like in next message ──────
+  await bot.sendMessage(chatId,
+    `<b>Test 3:</b> Type or paste ANY premium emoji in next message.\n` +
+    `I'll show the entity Telegram receives.`,
+    { parse_mode: 'HTML' });
+  session.set(msg.from.id, 'AWAIT_DIAG_EMOJI', {});
+});
+
+// Capture for diagnostic
+// ═══════════════════════════════════════════════════════════════════════════
+// COMMAND MENU
+//
+// The persistent bar is a ReplyKeyboard, which Telegram Desktop hides behind a
+// small icon rather than showing outright. The ☰ command menu behaves the same
+// on desktop and phone, so it is the dependable route in on a computer.
+//
+// Admin commands are scoped to admin chats only — customers never see /admin.
+// ═══════════════════════════════════════════════════════════════════════════
+(async () => {
+  try {
+    await bot.setMyCommands([
+      { command: 'start',    description: '🏠 Main menu' },
+      { command: 'products', description: '🛍 Browse products' },
+      { command: 'wallet',   description: '💰 Wallet and top up' },
+      { command: 'orders',   description: '📦 My orders' },
+      { command: 'support',  description: '💬 Contact support' },
+    ]);
+
+    for (const id of config.adminIds) {
+      try {
+        await bot.setMyCommands([
+          { command: 'admin',    description: '🔧 Admin panel' },
+          { command: 'start',    description: '🏠 Main menu' },
+          { command: 'products', description: '🛍 Browse products' },
+          { command: 'wallet',   description: '💰 Wallet and top up' },
+          { command: 'orders',   description: '📦 My orders' },
+          { command: 'support',  description: '💬 Contact support' },
+        ], { scope: { type: 'chat', chat_id: id } });
+      } catch (e) {
+        logger.warn(`Admin commands for ${id}: ${e.message}`);
+      }
+    }
+    logger.info('Bot command menu registered');
+  } catch (e) {
+    logger.warn(`Command registration failed: ${e.message}`);
+  }
+})();
+
+// Shortcuts for the commands above — the same screens the bar opens.
+bot.onText(/^\/products$/, async (msg) => {
+  if (msg.chat.type !== 'private') return;
+  session.clear(msg.from.id);
+  await productsHandler.showProducts(bot, msg.chat.id, null, 0);
+});
+bot.onText(/^\/wallet$/, async (msg) => {
+  if (msg.chat.type !== 'private') return;
+  session.clear(msg.from.id);
+  await walletHandler.showWallet(bot, msg.chat.id, msg.from.id, null);
+});
+bot.onText(/^\/orders$/, async (msg) => {
+  if (msg.chat.type !== 'private') return;
+  session.clear(msg.from.id);
+  await ordersHandler.showOrders(bot, msg.chat.id, msg.from.id, null, 'all', 0);
+});
+bot.onText(/^\/support$/, async (msg) => {
+  if (msg.chat.type !== 'private') return;
+  session.clear(msg.from.id);
+  await supportHandler.showSupport(bot, msg.chat.id, null);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PERSISTENT BAR — tap interception
+//
+// Registered FIRST, on purpose. Bar taps arrive as ordinary text, so if this
+// ran after the state handlers a tap on "🛍 Products" during the quantity step
+// would be parsed as a quantity, and during a top-up as a TxID. Handling it
+// here and returning means a nav button always navigates.
+//
+// A tap also abandons whatever half-finished input was in progress, which is
+// what a person expects from a navigation button.
+// ═══════════════════════════════════════════════════════════════════════════
+bot.on('message', async (msg) => {
+  try {
+    if (!msg.from || msg.chat.type !== 'private' || !msg.text) return;
+    const navKey = matchNavButton(msg.text);
+    if (!navKey) return;
+
+    const userId = msg.from.id;
+    const chatId = msg.chat.id;
+    session.clear(userId);
+
+    // Signatures differ between these modules — taken from the source, not
+    // assumed: showProducts and showSupport do not take a userId.
+    if (navKey === 'btn_products') {
+      await productsHandler.showProducts(bot, chatId, null, 0);
+    } else if (navKey === 'btn_preorders') {
+      await productsHandler.showPreorderProducts(bot, chatId, null);
+    } else if (navKey === 'btn_wallet') {
+      await walletHandler.showWallet(bot, chatId, userId, null);
+    } else if (navKey === 'btn_orders') {
+      await ordersHandler.showOrders(bot, chatId, userId, null, 'all', 0);
+    } else if (navKey === 'btn_support') {
+      await supportHandler.showSupport(bot, chatId, null);
+    } else if (navKey === 'btn_refunds' || navKey === 'btn_api') {
+      // These two screens live in the callback router, not in a handler module.
+      // Rather than duplicate them here — where the copy would drift the first
+      // time either screen changed — the tap is replayed as the callback the
+      // inline button would have sent.
+      // message_id is deliberately absent. It used to carry the CUSTOMER's own
+      // message id, and every screen that opens with editMessageText then tried
+      // to edit a message the bot does not own — which always fails. The
+      // handlers fall back to sending a fresh message when there is nothing to
+      // edit, which is the correct behaviour for a bar tap anyway.
+      const fake = {
+        id: `nav_${Date.now()}`,
+        from: msg.from,
+        message: { chat: { id: chatId } },
+        data: navKey === 'btn_refunds' ? 'refund_request_start' : 'menu_api',
+      };
+      await handleCallbackQuery(fake);
+    }
+  } catch (e) {
+    logger.error(`Nav bar tap failed: ${e.message}`);
+  }
+});
+
+bot.on('message', async (msg) => {
+  if (msg.from && session.get(msg.from.id).state === 'AWAIT_DIAG_EMOJI') {
+    const text = msg.text || msg.caption || '';
+    const entities = msg.entities || msg.caption_entities || [];
+    const customEmojis = entities.filter(e => e.type === 'custom_emoji');
+
+    let report = `🔬 <b>Diagnostic Report</b>\n\n`;
+    report += `<b>Text received:</b>\n<code>${text.replace(/</g, '&lt;')}</code>\n\n`;
+    report += `<b>Text length:</b> ${text.length}\n`;
+    report += `<b>Total entities:</b> ${entities.length}\n`;
+    report += `<b>Premium emojis:</b> ${customEmojis.length}\n\n`;
+
+    if (customEmojis.length === 0) {
+      report += `❌ <b>NO PREMIUM EMOJI DETECTED</b>\n\n`;
+      report += `This means Telegram considers your input as regular emoji.\n`;
+      report += `Possible causes:\n`;
+      report += `• You sent a regular (free) emoji\n`;
+      report += `• Your Telegram client doesn't recognize the emoji as premium\n`;
+      report += `• You're using Telegram Web (limited support)`;
+    } else {
+      report += `✅ <b>PREMIUM EMOJI DETECTED!</b>\n\n`;
+      for (const e of customEmojis) {
+        report += `📦 <b>Entity:</b>\n`;
+        report += `   • type: ${e.type}\n`;
+        report += `   • offset: ${e.offset}\n`;
+        report += `   • length: ${e.length}\n`;
+        report += `   • custom_emoji_id: <code>${e.custom_emoji_id}</code>\n\n`;
+      }
+
+      // Now send back using entities — should render premium
+      report += `\n<b>Echo test (with entities):</b>`;
+      session.clear(msg.from.id);
+      await bot.sendMessage(msg.chat.id, report, { parse_mode: 'HTML' });
+
+      // Send echo with rebuilt entities
+      try {
+        await bot.sendMessage(msg.chat.id, `Echo → ${text}`, {
+          entities: customEmojis.map(e => ({
+            type: 'custom_emoji',
+            offset: e.offset + 7, // "Echo → " is 7 chars
+            length: e.length,
+            custom_emoji_id: e.custom_emoji_id,
+          })),
+        });
+        await bot.sendMessage(msg.chat.id,
+          `\n✅ If the echo above shows the emoji ANIMATED, entities work!\n` +
+          `❌ If it shows plain emoji, your account/client doesn't render this pack.`,
+          { parse_mode: 'HTML' });
+      } catch (e) {
+        await bot.sendMessage(msg.chat.id, `❌ Echo failed: ${e.message}`);
+      }
+      return;
+    }
+    await bot.sendMessage(msg.chat.id, report, { parse_mode: 'HTML' });
+    session.clear(msg.from.id);
+    return;
+  }
+});
+
+bot.onText(/\/debug_title\s+(\d+)/, async (msg, match) => {
+  const ok = await ensureUser(bot, msg);
+  if (!ok) return;
+  if (!adminHandler.isAdmin(msg.from.id)) return;
+  const productId = parseInt(match[1], 10);
+  const p = db.getProduct(productId);
+  if (!p) { await bot.sendMessage(msg.chat.id, '❌ Product not found'); return; }
+
+  // Show raw bytes
+  const title = p.title || '';
+  const hex = Array.from(title).slice(0, 50).map(c => {
+    const code = c.codePointAt(0);
+    return `${c} = U+${code.toString(16).toUpperCase().padStart(4, '0')}`;
+  }).join('\n');
+
+  await bot.sendMessage(msg.chat.id,
+    `🔍 <b>Product #${productId} Title Debug</b>\n\n` +
+    `<b>Raw stored:</b>\n<code>${title.replace(/</g, '&lt;')}</code>\n\n` +
+    `<b>Length:</b> ${title.length} chars\n\n` +
+    `<b>Premium emoji ID field:</b> <code>${p.premium_emoji_id || 'NULL'}</code>\n\n` +
+    `<b>Each character (first 50):</b>\n<code>${hex}</code>`,
+    { parse_mode: 'HTML' });
+});
+
+bot.onText(/\/emoji_id/, async (msg) => {
+  const ok = await ensureUser(bot, msg);
+  if (!ok) return;
+  if (!adminHandler.isAdmin(msg.from.id)) {
+    await bot.sendMessage(msg.chat.id, '❌ Admin only command.');
+    return;
+  }
+  // Set state to await emoji message
+  session.set(msg.from.id, 'AWAIT_PREMIUM_EMOJI', {});
+  await bot.sendMessage(msg.chat.id,
+    `🎨 <b>Custom Emoji ID Extractor</b>\n\n` +
+    `Send me a <b>Telegram Premium custom emoji</b> in your next message and I'll reply with its ID.\n\n` +
+    `<i>Tip: type the emoji from any premium pack (ChatGPT, Gemini, Netflix logos, etc.) and send it here.</i>\n\n` +
+    `Send /cancel to exit.`,
+    { parse_mode: 'HTML' });
+});
+
+bot.onText(/\/cancel/, async (msg) => {
+  if (session.get(msg.from.id).state === 'AWAIT_PREMIUM_EMOJI') {
+    session.clear(msg.from.id);
+    await bot.sendMessage(msg.chat.id, '✅ Cancelled.');
+  }
+});
+
+bot.onText(/\/admin/, async (msg) => {
+  const ok = await ensureUser(bot, msg);
+  if (!ok) return;
+  // Server-side admin check — ONLY admin IDs get the panel
+  if (!adminHandler.isAdmin(msg.from.id)) {
+    await bot.sendMessage(msg.chat.id, '❌ You are not authorized to use this section.');
+    return;
+  }
+  await adminHandler.showAdminPanel(bot, msg.chat.id);
+});
+
+/**
+ * Trace a payment by id, as a command.
+ *
+ * Deliberately a command and not only a session flow. The button version has to
+ * survive: the callback setting the state, the state persisting, the dispatcher
+ * routing it, and the handler branch matching — four links, and a break in any
+ * one of them looks identical from the outside (nothing happens, nothing is
+ * logged). A command bypasses all four, so it either works or reports why.
+ */
+bot.onText(/^\/(?:txid|trace)(?:\s+(.+))?$/i, async (msg, match) => {
+  if (!adminHandler.isAdmin(msg.from.id)) return;
+  const chatId = msg.chat.id;
+  const needle = String((match && match[1]) || '').trim();
+
+  if (!needle) {
+    await bot.sendMessage(chatId,
+      '🔎 <b>Trace a payment</b>\n\nUsage: <code>/txid &lt;id&gt;</code>\n\n' +
+      'Example: <code>/txid 281d2c11fbbe</code>\n\n' +
+      '<i>Works with a TxID, a Binance transfer id, an invoice id, or any part of one.</i>',
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  logger.info(`[TXID] admin ${msg.from.id} tracing "${needle.slice(0, 24)}"`);
+  try {
+    await adminHandler.runTxidTrace(bot, chatId, needle);
+  } catch (e) {
+    logger.error(`[TXID] trace failed: ${e.stack || e.message}`);
+    await bot.sendMessage(chatId, `❌ Trace failed: ${e.message}`);
+  }
+});
+
+/**
+ * The shop's public address, from the first source that has one.
+ *
+ * A manual setting wins over the platform variable: a shop that moves to its own
+ * domain must not keep advertising the railway.app address it no longer uses.
+ *
+ * A placeholder here is not harmless — Telegram rejects a button whose URL is
+ * not a real address, and it rejects the WHOLE message with it, so an unset
+ * domain used to make the entire API screen vanish rather than show a dead link.
+ */
+/** Scheme + host only: every caller appends its own path (/api/v2, /agent). */
+function originOnly(v) {
+  const t = String(v || '').trim();
+  if (!t) return '';
+  try { return new URL(t).origin; } catch (_) { return t.replace(/\/+$/, ''); }
+}
+
+function resolveApiBase() {
+  const manual = originOnly(db.getSetting('api_base_url', ''));
+  if (manual) return manual;
+
+  // Railway exposes the generated domain here. RAILWAY_STATIC_URL is the older
+  // name and is still set on some projects, so both are checked.
+  const railway = process.env.RAILWAY_PUBLIC_DOMAIN || process.env.RAILWAY_STATIC_URL || '';
+  if (railway) return railway.startsWith('http') ? railway.replace(/\/+$/, '') : `https://${railway}`;
+
+  return String(config.publicBaseUrl || '').trim().replace(/\/+$/, '');
+}
+
+/** Real enough for Telegram to accept as a URL — needs a dot in the host. */
+function isRealBase(v) {
+  return /^https?:\/\/[^\s/]+\.[^\s/]+/.test(String(v || ''));
+}
+
+/**
+ * Admin: what the shop's public address resolves to, and whether it answers.
+ *
+ * Fetches its own /docs page rather than only printing the URL. "Configured"
+ * and "reachable" are different claims, and only the second one matters to a
+ * customer trying to call the API.
+ */
+bot.onText(/^\/apicheck$/i, async (msg) => {
+  if (!adminHandler.isAdmin(msg.from.id)) return;
+  const chatId = msg.chat.id;
+  const base = resolveApiBase();
+
+  if (!isRealBase(base)) {
+    await bot.sendMessage(chatId,
+      `🔌 <b>API address</b>\n\n❌ <b>Not configured.</b>\n\n` +
+      `The API cannot be reached from outside, and customers have no working ` +
+      `base URL in their API screen.\n\n` +
+      `<b>Fix:</b> Railway → Settings → Networking → <b>Generate Domain</b>, then redeploy.\n` +
+      `Or set it by hand: <code>/apibase https://your-domain.com</code>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  const source = db.getSetting('api_base_url', '')
+    ? 'set by hand (api_base_url)'
+    : (process.env.RAILWAY_PUBLIC_DOMAIN || process.env.RAILWAY_STATIC_URL ? 'Railway domain' : 'config');
+
+  let live = '';
+  try {
+    const res = await fetch(`${base}/api/v2/docs`, { method: 'GET' });
+    const body = await res.text();
+    live = res.ok
+      ? `🟢 <b>Reachable</b> — HTTP ${res.status}, ${body.length} bytes`
+      : `🔴 <b>Responded ${res.status}</b> — the domain works but the docs route did not answer`;
+  } catch (e) {
+    live = `🔴 <b>Unreachable</b> — ${escapeHtml(e.message)}\n<i>The domain may still be starting up, or the deploy has not finished.</i>`;
+  }
+
+  await bot.sendMessage(chatId,
+    `🔌 <b>API address</b>\n\n` +
+    `<code>${escapeHtml(base)}</code>\n` +
+    `<i>Source: ${escapeHtml(source)}</i>\n\n${live}\n\n` +
+    `📖 Docs: ${escapeHtml(base)}/api/v2/docs`,
+    { parse_mode: 'HTML', disable_web_page_preview: true });
+});
+
+/** Set the public address by hand, for a custom domain. */
+bot.onText(/^\/apibase(?:\s+(\S+))?$/i, async (msg, match) => {
+  if (!adminHandler.isAdmin(msg.from.id)) return;
+  const v = String((match && match[1]) || '').trim();
+
+  if (!v) {
+    await bot.sendMessage(msg.chat.id,
+      `Usage: <code>/apibase https://your-domain.com</code>\n` +
+      `Send <code>/apibase clear</code> to fall back to the Railway domain.`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+  if (/^clear$/i.test(v)) {
+    db.setSetting('api_base_url', '');
+    await bot.sendMessage(msg.chat.id, `✅ Cleared. Now using: <code>${escapeHtml(resolveApiBase() || 'nothing')}</code>`, { parse_mode: 'HTML' });
+    return;
+  }
+  if (!isRealBase(v)) {
+    await bot.sendMessage(msg.chat.id, '❌ Must start with https:// and contain a real domain.');
+    return;
+  }
+  // Paths are dropped: the API and the assistant add their own, and a saved
+  // /api/v2 turned the assistant link into /api/v2/agent — a "Not found".
+  const clean = originOnly(v);
+  db.setSetting('api_base_url', clean);
+  await bot.sendMessage(msg.chat.id,
+    `✅ Set to <code>${escapeHtml(clean)}</code>` +
+    (clean !== v.replace(/\/+$/, '') ? `\n<i>(path removed — only the domain is needed)</i>` : '') +
+    `\n\nRun /apicheck to test it.`, { parse_mode: 'HTML' });
+});
+
+/**
+ * Why are the premium icons off right now?
+ *
+ * The layer silences custom emoji by itself when Telegram refuses them, which
+ * is correct — but the reason lives in memory and never reached the admin, so
+ * the icons simply vanished and came back with no explanation.
+ */
+bot.onText(/^\/emojistatus$/i, async (msg) => {
+  if (!adminHandler.isAdmin(msg.from.id)) return;
+  const layer = require('./utils/emojiLayer');
+  const st = layer.emojiStatus();
+
+  let txt = `🎨 <b>Premium emoji status</b>\n\n`;
+
+  if (!st.icons_enabled) {
+    txt += `🔴 <b>Button icons are switched OFF</b> in settings.\n` +
+           `<i>Nothing will show premium icons until this is turned back on.</i>\n\n`;
+  }
+
+  if (st.account_blocked) {
+    txt += `🔴 <b>All custom emoji are paused</b> for ${st.account_minutes_left} more minute(s).\n\n` +
+           `<i>Telegram refused emoji that all exist, which means the bot owner's ` +
+           `Telegram Premium is not active. Icons return by themselves once it is, ` +
+           `or immediately with /emojireset.</i>\n\n`;
+  }
+
+  if (st.quarantined.length) {
+    txt += `🟡 <b>${st.quarantined.length} emoji id(s) quarantined</b>\n` +
+           st.quarantined.slice(0, 10).map((q) =>
+             `• <code>${q.id}</code> — ${q.minutes_left} min left`).join('\n') +
+           `\n<i>These specific ids were rejected by Telegram. Every other icon ` +
+           `still works. They are retried automatically.</i>\n\n`;
+  }
+
+  if (st.incidents && st.incidents.length) {
+    const label = { paused_15min: '⛔ paused all icons', refused: '⚠️ refused', plain_retry: '↩️ one message sent plain',
+      boot_ok: '🚀 boot check OK', boot_missing: '🚀 boot: icons missing', boot_error: '🚀 boot check failed' };
+    txt += `🕓 <b>Last events</b>\n` + st.incidents.map((i) =>
+      `• ${escapeHtml(i.at.slice(5, 10))} ${escapeHtml(i.at.slice(11, 16))} UTC — ${label[i.kind] || i.kind} · <code>${escapeHtml(i.method)}</code>\n` +
+      `  <i>${escapeHtml(i.reason.slice(0, 120))}</i>`).join('\n') + `\n\n`;
+  }
+
+  if (st.icons_enabled && !st.account_blocked && !st.quarantined.length) {
+    txt += `✅ <b>Everything is working.</b>\n` +
+           `<i>If icons still look plain, the sender account has no active ` +
+           `Telegram Premium — run /emojicheck in the admin panel to confirm.</i>`;
+  }
+
+  await bot.sendMessage(msg.chat.id, txt, { parse_mode: 'HTML' });
+});
+
+bot.onText(/^\/canva$/i, async (msg) => {
+  if (!adminHandler.isAdmin(msg.from.id)) return;
+  await showCanvaScreen(msg.chat.id);
+});
+
+/** V158.1: the Canva screen — opened by 🎨 Canva (admin menu) or /canva. Buttons only. */
+async function showCanvaScreen(chatId) {
+  const canva = require('./services/canvaBot');
+  const st = await canva.status();
+  const msg = { chat: { id: chatId } };
+  if (!st.available) {
+    await bot.sendMessage(msg.chat.id,
+      `🎨 <b>Canva automation is OFF.</b>\n\nTo turn it on: set <code>CANVA_AUTOMATION=1</code> in Railway → Variables ` +
+      `and redeploy. Then run /canva again to log in.\n\n<i>While off, Canva orders use the manual fast lane as before.</i>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+  const { text: panelsTxt, rows } = canvaPanelsView(st);
+  await bot.sendMessage(msg.chat.id,
+    `🎨 <b>Canva automation</b>\n\n` +
+    panelsTxt +
+    `${st.logged_in ? `✅ Active: <b>${escapeHtml(st.active_name)}</b> — invites are automatic.` : `🔴 <b>${escapeHtml(st.active_name)}</b> is not logged in — Canva orders fall back to manual.`}\n` +
+    (st.last_login ? `🕒 Last login: ${escapeHtml(String(st.last_login).slice(0, 16).replace('T', ' '))} UTC\n` : '') +
+    // Where the session lives: a /tmp folder is wiped by every deploy, so say so.
+    `💾 Session: <code>${escapeHtml(String(st.data_dir))}</code> ${st.persistent ? `(volume ✅${st.mount ? ' ' + escapeHtml(st.mount) : ''} — survives deploys)` : '(⚠️ not on a volume — lost on every deploy; put DB_PATH on a Railway volume)'}\n` +
+    (st.env_session ? `🔑 CANVA_SESSION: ${escapeHtml(String(st.env_session))}\n` : '') +
+    `\n<i>Team full? Tap <b>🔐 Log in a NEW Canva account</b> — once you are in, invites go out from it by themselves.</i>`,
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
+}
+
+/** V158: the Canva panels (a team holds 50 people) — which is active, logged in, full — and their buttons. */
+function canvaPanelsView(st) {
+  const url = agentChat.canvaLoginUrl ? agentChat.canvaLoginUrl() : '';
+  const lines = ['<b>Panels</b> (a Canva team holds 50 people):'];
+  const rows = [];
+  if (url) rows.push([{ text: '🔐 Log in a NEW Canva account', callback_data: 'canva_newacct' }]);
+  for (const p of st.panels || []) {
+    lines.push(`${p.active ? '✅' : '▫️'} <b>${escapeHtml(p.name)}</b> · ${p.logged_in ? '🔐 logged in' : '🔴 not logged in'}` +
+      `${p.count != null ? ` · ${p.count}/50` : ''}${p.full ? ' · ⛔ <b>full</b>' : ''}${p.active ? ' · <i>invites go here</i>' : ''}`);
+    const r = [];
+    if (!p.active && p.logged_in) r.push({ text: `✅ Use ${p.name}`.slice(0, 40), callback_data: `canva_use_${p.id}` });
+    if (url && p.active) r.push({ text: `🔁 Re-login ${p.name}`.slice(0, 40), callback_data: `canva_login_${p.id}` });
+    if (p.full) r.push({ text: '✔ Not full', callback_data: `canva_unfull_${p.id}` });
+    if (!p.active && p.id !== 'main') r.push({ text: '🗑', callback_data: `canva_del_${p.id}` });
+    if (r.length) rows.push(r);
+  }
+  lines.push('<i>Team full → 🔐 Log in a NEW Canva account. Once logged in, it is used by itself.</i>', '');
+  rows.push([{ text: '🍪 Paste session (no IP shown)', callback_data: 'canva_paste' }]);
+  const prox = require('./services/canvaBot').getProxy ? require('./services/canvaBot').getProxy() : '';
+  rows.push([{ text: prox ? '🌐 Proxy: on' : '🌐 Proxy (hide IP)', callback_data: 'canva_proxy' }]);
+  rows.push([{ text: '🔄 Check login', callback_data: 'canva_check' }, { text: '🔄 Refresh', callback_data: 'canva_menu' }]);
+  rows.push([{ text: '🧪 Test browser', callback_data: 'canva_test' }, ...(st.logged_in ? [{ text: '🗑 Forget session', callback_data: 'canva_forget' }] : [])]);
+  return { text: lines.join('\n') + '\n', rows };
+}
+
+// /canvaadd <name> · /canvarename <old name> = <new name> · /canvaremove <name>
+bot.onText(/^\/canva(add|rename|remove)(?:\s+(.+))?$/i, async (msg, m) => {
+  if (!adminHandler.isAdmin(msg.from.id)) return;
+  const canva = require('./services/canvaBot');
+  const arg = String(m[2] || '').trim();
+  const find = (n) => canva.panelList().find((p) => p.name.toLowerCase() === String(n).trim().toLowerCase() || p.id === String(n).trim());
+  let out;
+  if (m[1].toLowerCase() === 'add') {
+    const r = canva.addPanel(arg);
+    out = r.ok ? `➕ Panel <b>${escapeHtml(r.name)}</b> added. Next: /canva → 🔐 Log in ${escapeHtml(r.name)} (with that Canva account), then ✅ Use it when you want.` : `❌ ${escapeHtml(r.reason)} — e.g. <code>/canvaadd Panel 2</code>`;
+  } else if (m[1].toLowerCase() === 'rename') {
+    const [a, b] = arg.split('=').map((x) => (x || '').trim());
+    const p = find(a);
+    const r = p ? canva.renamePanel(p.id, b) : { ok: false, reason: 'no such panel' };
+    out = r.ok ? `✏️ Renamed to <b>${escapeHtml(r.name)}</b>.` : `❌ ${escapeHtml(r.reason)} — e.g. <code>/canvarename Panel 1 = Team A</code>`;
+  } else {
+    const p = find(arg);
+    const r = p ? canva.removePanel(p.id) : { ok: false, reason: 'no such panel' };
+    out = r.ok ? `🗑 Panel removed (its session file too).` : `❌ ${escapeHtml(r.reason)}`;
+  }
+  await bot.sendMessage(msg.chat.id, out, { parse_mode: 'HTML' });
+});
+
+bot.on('callback_query', async (q) => {
+  if (!adminHandler.isAdmin(q.from.id)) return;
+  if (!/^canva_/.test(q.data || '')) return;
+  const canva = require('./services/canvaBot');
+  const chatId = q.message.chat.id;
+  // V158: the panels
+  let pm = /^canva_(use|login|unfull)_([a-z0-9]+)$/.exec(q.data || '');
+  if (pm) {
+    const name = canva.panelName(pm[2]);
+    if (pm[1] === 'use') {
+      canva.setActive(pm[2]);
+      await bot.sendMessage(chatId, `✅ Canva invites now go out from <b>${escapeHtml(name)}</b>.${canva.isFull(pm[2]) ? '\n⚠️ It is marked full — tap ✔ Not full in /canva if you freed seats.' : ''}`, { parse_mode: 'HTML' }).catch(() => {});
+    } else if (pm[1] === 'unfull') {
+      canva.setFull(pm[2], false);
+      await bot.sendMessage(chatId, `✔ <b>${escapeHtml(name)}</b> is usable again.`, { parse_mode: 'HTML' }).catch(() => {});
+    } else {
+      canva.setLoginTarget(pm[2]);
+      const url = agentChat.canvaLoginUrl ? agentChat.canvaLoginUrl() : '';
+      await bot.sendMessage(chatId, `🔐 The login page now logs in <b>${escapeHtml(name)}</b>.\nLog in with THAT Canva account, then tap "Done" on the page.`,
+        { parse_mode: 'HTML', reply_markup: url ? { inline_keyboard: [[{ text: `🔐 Log in ${name}`.slice(0, 40), url }]] } : undefined }).catch(() => {});
+    }
+    return;
+  }
+  if (q.data === 'canva_menu') { await showCanvaScreen(chatId); return; }
+  if (q.data === 'canva_paste') {
+    session.set(q.from.id, 'AWAIT_CANVA_SESSION', { panel: canva.loginTarget ? canva.loginTarget() : (canva.activeId ? canva.activeId() : 'main') });
+    await bot.sendMessage(chatId,
+      '🍪 <b>Paste the Canva session</b> (this never shows your IP, and nothing clicks around):\n\n' +
+      '1️⃣ In your Chrome on <b>canva.com/settings/people</b> (members list visible).\n' +
+      '2️⃣ Cookie-Editor → <b>Export</b> → <b>JSON</b>.\n' +
+      '3️⃣ If it is short, paste it here. If it is long, send it as a <b>file</b> (📎 → File) — a paste can get cut.\n\n' +
+      '<i>Your message is deleted at once. /cancel to stop.</i>', { parse_mode: 'HTML' });
+    return;
+  }
+  if (q.data === 'canva_proxy') {
+    session.set(q.from.id, 'AWAIT_CANVA_PROXY', {});
+    await bot.sendMessage(chatId,
+      '🌐 <b>Canva proxy</b> — send <code>http://user:pass@host:port</code> to route Canva through another IP, ' +
+      'or <code>off</code> to remove it.\n\n<i>Use it if Canva ever blocks the server address. /cancel to stop.</i>',
+      { parse_mode: 'HTML' });
+    return;
+  }
+  if (q.data === 'canva_newacct') {
+    const r = canva.newAccountForLogin();
+    const url = agentChat.canvaLoginUrl ? agentChat.canvaLoginUrl() : '';
+    await bot.sendMessage(chatId, r.ok
+      ? `🔐 <b>${escapeHtml(r.name)}</b> — log in with the NEW Canva account on the page, then tap "Done" there.\n\nOnce you are in, Canva invites go out from <b>${escapeHtml(r.name)}</b> by themselves.`
+      : `❌ ${escapeHtml(r.reason)}`,
+      { parse_mode: 'HTML', reply_markup: (r.ok && url) ? { inline_keyboard: [[{ text: `🔐 Open the login page`, url }]] } : undefined }).catch(() => {});
+    return;
+  }
+  const dm = /^canva_del(ok)?_([a-z0-9]+)$/.exec(q.data || '');
+  if (dm) {
+    if (!dm[1]) {
+      await bot.sendMessage(chatId, `🗑 Remove <b>${escapeHtml(canva.panelName(dm[2]))}</b> and its session?`, { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🗑 Yes, remove', callback_data: `canva_delok_${dm[2]}` }, { text: 'Cancel', callback_data: 'canva_menu' }]] } }).catch(() => {});
+    } else {
+      const r = canva.removePanel(dm[2]);
+      await bot.sendMessage(chatId, r.ok ? '🗑 Removed.' : `❌ ${escapeHtml(r.reason)}`, { parse_mode: 'HTML' }).catch(() => {});
+      await showCanvaScreen(chatId);
+    }
+    return;
+  }
+  // WHY results go in MESSAGES, never in the tap popup: the main callback
+  // router (handleCallbackQuery) also receives this tap and answers it with an
+  // empty reply straight away. Telegram accepts ONE answer per tap, so a popup
+  // sent after a 10–20 s Canva check was silently dropped — the button "did
+  // nothing". A message always arrives, however long the check takes.
+  if (q.data === 'canva_check') {
+    const wait = await bot.sendMessage(chatId, '⏳ Checking Canva from the server… (10–30 s)').catch(() => null);
+    const st = await canva.checkLogin();
+    const txt = st.ok
+      ? '✅ <b>Canva accepted the session.</b> Invites will run automatically.\n\nNext: place one test order with a second email of yours.'
+      : `🔴 <b>Canva check failed:</b> ${escapeHtml(String(st.reason || '?'))}` +
+        (st.url ? `\n🌐 <code>${escapeHtml(String(st.url).slice(0, 120))}</code>` : '') +
+        '\n\n<i>The picture shows what the server sees.</i>';
+    if (wait) bot.deleteMessage(chatId, wait.message_id).catch(() => {});
+    if (st.shot) {
+      await bot.sendPhoto(chatId, st.shot, { caption: txt, parse_mode: 'HTML' },
+        { filename: 'canva.jpg', contentType: 'image/jpeg' })
+        .catch(() => bot.sendMessage(chatId, txt, { parse_mode: 'HTML' }).catch(() => {}));
+    } else {
+      await bot.sendMessage(chatId, txt, { parse_mode: 'HTML' }).catch(() => {});
+    }
+  } else if (q.data === 'canva_test') {
+    const r = await canva.selfTest();
+    await bot.sendMessage(chatId, r.ok
+      ? `✅ <b>Browser works.</b>\n🌐 Chromium: <code>${escapeHtml(String(r.chromium))}</code>\nLoaded a test page fine. You can log in now.`
+      : `🔴 <b>Browser test failed</b>\n\n<code>${escapeHtml(String(r.error))}</code>\n\n<i>Usually means Railway did not build with the Dockerfile. Check Settings → Build → Builder = Dockerfile, then redeploy.</i>`,
+      { parse_mode: 'HTML' }).catch(() => {});
+  } else if (q.data === 'canva_forget') {
+    canva.forgetSession();
+    await bot.sendMessage(chatId, '🗑 Session cleared. Paste a fresh CANVA_SESSION (or log in) to turn invites back on.').catch(() => {});
+  }
+});
+
+bot.onText(/^\/emojireset$/i, async (msg) => {
+  if (!adminHandler.isAdmin(msg.from.id)) return;
+  const n = require('./utils/emojiLayer').resetEmojiState();
+  await bot.sendMessage(msg.chat.id,
+    `♻️ Cleared the pause and ${n} quarantined id(s). Icons will be tried again on the next message.`);
+});
+
+/** Admin: inspect, re-save or force-restore the premium icons. */
+bot.onText(/^\/emoji(backup|restore|list)?$/i, async (msg, match) => {
+  if (!adminHandler.isAdmin(msg.from.id)) return;
+  const eb = require('./utils/emojiBackup');
+  const action = String((match && match[1]) || 'list').toLowerCase();
+  const chatId = msg.chat.id;
+
+  if (action === 'backup') {
+    const n = eb.backupAll();
+    await bot.sendMessage(chatId,
+      `💾 <b>${n}</b> product icon(s) saved.\n\n<i>They will be put back automatically if anything strips them.</i>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (action === 'restore') {
+    const done = eb.restoreMissing();
+    await bot.sendMessage(chatId,
+      done.length
+        ? `♻️ Restored icons on <b>${done.length}</b> product(s).\n<code>${done.join(', ')}</code>`
+        : `✅ Nothing to restore — every backed-up product still has its icon.`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  const rows = eb.list();
+  if (!rows.length) {
+    await bot.sendMessage(chatId,
+      `🎨 <b>Icon backup is empty.</b>\n\nSet an icon on a product, or run <code>/emojibackup</code> to save the ones already in place.`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+  const missing = rows.filter((r) => r.current_title && !/\[emoji:\d+\]/.test(r.current_title));
+  await bot.sendMessage(chatId,
+    `🎨 <b>Icon backup</b> — ${rows.length} product(s)\n` +
+    (missing.length ? `⚠️ <b>${missing.length}</b> currently missing their icon — run <code>/emojirestore</code>\n` : `✅ All present\n`) +
+    `\n` + rows.slice(0, 20).map((r) =>
+      `• <code>${r.product_id}</code> ${r.fallback || ''} ${escapeHtml(String(r.title_seen || '').replace(/\[emoji:\d+\]/g, '').trim().slice(0, 28))}`
+    ).join('\n'),
+    { parse_mode: 'HTML' });
+});
+
+/**
+ * Which build is actually running, and is TON wired up.
+ *
+ * Exists because a deploy that silently did not happen looks exactly like a fix
+ * that did not work, and the two need completely different responses.
+ */
+bot.onText(/^\/version$/i, async (msg) => {
+  if (!adminHandler.isAdmin(msg.from.id)) return;
+  let version = 'unknown';
+  try { version = require('./package.json').version; } catch (_) {}
+
+  // The marker below only exists in builds that carry the TON fix.
+  let tonFix = false;
+  try {
+    const src = require('fs').readFileSync(require('path').join(__dirname, 'services/binance.js'), 'utf8');
+    tonFix = src.includes('sameTxid(d.txId, txid)');
+  } catch (_) {}
+
+  const addr = {
+    TRC20: config.usdtTrc20Address,
+    BEP20: config.usdtBep20Address,
+    ERC20: config.usdtErc20Address,
+    SOL:   config.usdtSolAddress,
+    TON:   config.usdtTonAddress,
+  };
+
+  await bot.sendMessage(msg.chat.id,
+    `🏷 <b>Build v${escapeHtml(version)}</b>\n\n` +
+    `${tonFix ? '✅' : '❌'} TON hash matching (hex ⇄ base64)\n` +
+    `${resolveApiBase() ? '✅' : '❌'} Public API domain\n` +
+    `${(() => { try { return require('./services/canvaBot').available() ? '✅ Canva automation ON' : '⚪️ Canva automation off'; } catch (_) { return '❌ Canva module missing (old build)'; } })()}\n\n` +
+    `<b>Deposit addresses</b>\n` +
+    Object.entries(addr).map(([k, v]) =>
+      `${v ? '✅' : '⚪️'} ${k}: ${v ? `<code>${escapeHtml(String(v).slice(0, 18))}…</code>` : '<i>not set</i>'}`
+    ).join('\n') +
+    (tonFix ? '' : `\n\n⚠️ <b>This build predates the TON fix.</b> The deployment did not pick up the new files.`),
+    { parse_mode: 'HTML' });
+});
+
+/**
+ * Show the last deposits Binance has, unfiltered.
+ *
+ * The decisive test when a customer insists they paid: either their transfer is
+ * in this list or it is not, and the two answers lead in opposite directions.
+ */
+bot.onText(/^\/deposits(?:\s+(.+))?$/i, async (msg, match) => {
+  if (!adminHandler.isAdmin(msg.from.id)) return;
+  const chatId = msg.chat.id;
+  const dep = require('./services/depositsAdmin');
+  // No arguments: the buttons (V156). With arguments ("/deposits 30 TON", "/deposits 1.180591"): as before.
+  if (!String((match && match[1]) || '').trim()) {
+    await bot.sendMessage(chatId, dep.MENU_TEXT, { parse_mode: 'HTML', reply_markup: dep.menuKb() });
+    return;
+  }
+  const a = dep.parseArgs(match[1]);
+  await bot.sendMessage(chatId,
+    `⏳ Asking Binance for ${a.days} day(s)${a.network ? ` · network ${escapeHtml(a.network)}` : ''}${a.amount !== null ? ` · amount ${a.amount}` : ''}…`,
+    { parse_mode: 'HTML' });
+  await bot.sendMessage(chatId, await dep.render(a), { parse_mode: 'HTML', reply_markup: dep.quickKb() });
+});
+
+// ── Text messages ─────────────────────────────────────────────────────────────
+bot.on('message', async (msg) => {
+  // ── V159: Canva pasted session / proxy ──────────────────────────────
+  try {
+    const fromId = msg.from && msg.from.id;
+    const stt = fromId && session.get(fromId).state;
+    if (fromId && (stt === 'AWAIT_CANVA_SESSION' || stt === 'AWAIT_CANVA_PROXY') && adminHandler.isAdmin(fromId)) {
+      const canva = require('./services/canvaBot');
+      if (stt === 'AWAIT_CANVA_PROXY') {
+        session.clear(fromId);
+        const v = (msg.text || '').trim();
+        if (/^off$/i.test(v)) { canva.setProxy(''); await bot.sendMessage(msg.chat.id, '🌐 Canva proxy removed.'); }
+        else if (/^https?:\/\//i.test(v)) { canva.setProxy(v); await bot.sendMessage(msg.chat.id, '🌐 Canva proxy set. It is used from the next login/invite.'); }
+        else { await bot.sendMessage(msg.chat.id, '❌ Send http://user:pass@host:port or off.'); }
+        return;
+      }
+      // AWAIT_CANVA_SESSION — accept a pasted text OR a .json/.txt file
+      const data = session.get(fromId).data || {};
+      const panel = data.panel || (canva.activeId ? canva.activeId() : 'main');
+      let raw = msg.text || '';
+      if (msg.document) {
+        try {
+          const f = await bot.getFile(msg.document.file_id);
+          const url = `https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${f.file_path}`;
+          raw = await (await fetch(url)).text();
+        } catch (e) { await bot.sendMessage(msg.chat.id, '❌ Could not read the file.'); return; }
+      }
+      if (!raw || (!raw.trim().startsWith('[') && !raw.trim().startsWith('{') && !raw.includes('name'))) {
+        await bot.sendMessage(msg.chat.id, 'Send the Cookie-Editor JSON export (paste or file), or /cancel.');
+        return;
+      }
+      session.clear(fromId);
+      try { await bot.deleteMessage(msg.chat.id, msg.message_id); } catch (_) {}
+      const status = await bot.sendMessage(msg.chat.id, '⏳ Loading the Canva session…');
+      const r = await canva.importPastedSession(raw, panel);
+      await bot.editMessageText(
+        r.ok ? `✅ Canva session saved (${r.cookies} cookies) for <b>${canva.panelName(panel)}</b> — invites can go out from it.`
+             : `❌ ${r.error}${r.cookies ? ` (${r.cookies} cookies read)` : ''}`,
+        { chat_id: msg.chat.id, message_id: status.message_id, parse_mode: 'HTML' }).catch(() => {});
+      return;
+    }
+  } catch (e) { logger.warn(`[canva paste] ${e.message}`); }
+
+  // ── /emoji_id capture handler ──────────────────────────────────────
+  try {
+    const fromId = msg.from && msg.from.id;
+    if (fromId && session.get(fromId).state === 'AWAIT_PREMIUM_EMOJI') {
+      // Look for custom_emoji entities
+      const entities = msg.entities || msg.caption_entities || [];
+      const customEmojis = entities.filter(e => e.type === 'custom_emoji' && e.custom_emoji_id);
+      if (!customEmojis.length) {
+        await bot.sendMessage(msg.chat.id,
+          `⚠️ No premium emoji found in your message.\n\n` +
+          `Make sure to use a real Telegram <b>premium</b> emoji (not a regular one).\n\n` +
+          `Try again or /cancel to exit.`,
+          { parse_mode: 'HTML' });
+        return;
+      }
+      session.clear(fromId);
+      const text = msg.text || msg.caption || '';
+      let reply = `✅ <b>Custom emoji captured</b>\nTap an ID below to copy it.\n\n`;
+      for (const e of customEmojis) {
+        const offset = e.offset || 0;
+        const length = e.length || 2;
+        const fallback = text.substring(offset, offset + length) || '🎁';
+        reply += `<tg-emoji emoji-id="${e.custom_emoji_id}">${fallback}</tg-emoji>\n`;
+        reply += `<b>ID:</b> <code>${e.custom_emoji_id}</code>\n\n`;
+      }
+      reply += `<i>Paste this ID into the product's "Premium Emoji ID" field in /admin.</i>`;
+      // Send as TWO messages: first the IDs, then a live preview to confirm it renders
+      await bot.sendMessage(msg.chat.id, reply, { parse_mode: 'HTML' });
+
+      // Test preview — confirms the emoji ACTUALLY works on this bot's premium account
+      try {
+        for (const e of customEmojis) {
+          const text = msg.text || msg.caption || '';
+          const offset = e.offset || 0;
+          const length = e.length || 2;
+          const fallback = text.substring(offset, offset + length) || '🎁';
+          await bot.sendMessage(msg.chat.id,
+            `🧪 <b>Live test:</b> <tg-emoji emoji-id="${e.custom_emoji_id}">${fallback}</tg-emoji>\n\n` +
+            `If you see the emoji above, the ID works perfectly!\n` +
+            `If you see only ${fallback}, the bot's account doesn't have access to this emoji pack.`,
+            { parse_mode: 'HTML' });
+        }
+      } catch (e) {
+        await bot.sendMessage(msg.chat.id,
+          `⚠️ Preview test failed: ${e.message}\n\nThe ID was captured but cannot be rendered.`,
+          { parse_mode: 'HTML' });
+      }
+      return;
+    }
+  } catch (e) {
+    // Continue with normal flow
+  }
+
+  // ── Maintenance check ─────────────────────────────────────────
+  if (msg.from && !adminHandler.isAdmin(msg.from.id)) {
+    const maintenance = db.getSetting('maintenance_mode', '0') === '1';
+    if (maintenance) {
+      const maintMsg = db.getSetting('maintenance_message', 'The bot is currently under maintenance. Please try again later.');
+      // Only reply if it's a text message (not commands like /start which were already handled)
+      if (msg.text && !msg.text.startsWith('/')) {
+        await bot.sendMessage(msg.chat.id,
+          `🚧 <b>Maintenance Mode</b>\n\n${escapeHtml(maintMsg)}`,
+          { parse_mode: 'HTML' }
+        ).catch(() => {});
+      }
+      return;
+    }
+  }
+
+  // ── Quick command: /emojis works even inside any session ───
+  if (msg.text && /^\/emojis(\s|$)/.test(msg.text.trim())) {
+    if (!adminHandler.isAdmin(msg.from.id)) {
+      // silent ignore for non-admin
+      return;
+    }
+    const emojis = db.getAllEmojis();
+    if (!emojis.length) {
+      await bot.sendMessage(msg.chat.id,
+        '📭 <b>Emoji Library is empty</b>\n\nAdd emojis from <code>/admin → 🎨 Emoji Library</code>',
+        { parse_mode: 'HTML' });
+      return;
+    }
+    let txt = '🎨 <b>Your Emoji Library</b>\n\nLong-press a line to copy & paste:\n\n';
+    for (const e of emojis) {
+      txt += `<tg-emoji emoji-id="${e.emoji_id}">${e.fallback}</tg-emoji> <b>${e.name}</b>\n` +
+             `<code>[emoji:${e.emoji_id}]${e.fallback}</code>\n\n`;
+    }
+    await bot.sendMessage(msg.chat.id, txt, { parse_mode: 'HTML' });
+    return;
+  }
+
+  // V138 — stock as a .txt FILE. Telegram Desktop turns a long paste into
+  // "message.txt" (owner, 01-10: 164 KB of Gemini links), which this handler
+  // used to ignore (no msg.text). In the stock-upload states the file is read
+  // and handled exactly like pasted text: AYMEN-separated if it contains
+  // AYMEN, otherwise ONE ITEM PER LINE.
+  if (msg.document && !msg.text && msg.from && msg.chat && msg.chat.type === 'private'
+      && adminHandler.isAdmin(msg.from.id)
+      && ['ADMIN_STOCK_BATCH', 'ADMIN_STOCK_DATA', 'ADMIN_ADD_STOCK'].includes(session.get(msg.from.id).state)) {
+    const doc = msg.document;
+    const name = String(doc.file_name || 'file');
+    try {
+      if (doc.file_size && doc.file_size > 20 * 1024 * 1024) {
+        await bot.sendMessage(msg.chat.id, '❌ File too large (Telegram lets bots read up to 20 MB). Split it into smaller files.');
+        return;
+      }
+      if (!/\.(txt|csv|text|list)$/i.test(name) && !/^text\//.test(doc.mime_type || '')) {
+        await bot.sendMessage(msg.chat.id, '❌ Send a <b>.txt</b> file (one item per line, or separated with AYMEN).', { parse_mode: 'HTML' });
+        return;
+      }
+      const link = await bot.getFileLink(doc.file_id);
+      const res = await fetch(link, { signal: AbortSignal.timeout(60000) });
+      if (!res.ok) throw new Error(`download HTTP ${res.status}`);
+      let raw = (await res.text()).replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+      const usesAymen = raw.includes('AYMEN');
+      const items = usesAymen
+        ? raw.split('AYMEN').map((x) => x.trim()).filter(Boolean)
+        : raw.split('\n').map((x) => x.trim()).filter(Boolean);
+      if (!items.length) {
+        await bot.sendMessage(msg.chat.id, '⚠️ The file is empty — no items found.');
+        return;
+      }
+      logger.info(`[STOCK FILE] ${msg.from.id} ${name}: ${items.length} item(s) (${usesAymen ? 'AYMEN' : 'one per line'})`);
+      await bot.sendMessage(msg.chat.id,
+        `📄 <b>${name.replace(/[<>&]/g, '')}</b> read: <b>${items.length}</b> item(s) ` +
+        `(${usesAymen ? 'separated by AYMEN' : 'one per line'}).\n` +
+        `First: <code>${items[0].slice(0, 80).replace(/[<>&]/g, '')}${items[0].length > 80 ? '…' : ''}</code>`,
+        { parse_mode: 'HTML' });
+      await adminHandler.handleAdminText(bot, { ...msg, text: items.join('AYMEN'), document: undefined, entities: [] });
+    } catch (e) {
+      logger.warn(`[STOCK FILE] ${name}: ${e.message}`);
+      await bot.sendMessage(msg.chat.id, `❌ Could not read the file: ${String(e.message).slice(0, 150)}`);
+    }
+    return;
+  }
+
+  if (!msg.text || msg.text.startsWith('/')) return;
+
+  const userId = msg.from.id;
+  const chatId = msg.chat.id;
+  const ok     = await ensureUser(bot, msg);
+  if (!ok) return;
+
+  // V154: the customer tapped /start or a menu button after opening a payment, then sent the Order ID / TxID.
+  // The session was cleared, so pick their last payment prompt back up instead of ignoring the payment.
+  try {
+    const resumed = session.resumePayment(userId, msg.text);
+    if (resumed) logger.info(`[PAY RESUME] ${userId}: ${resumed} picked back up for "${String(msg.text).trim().slice(0, 24)}"`);
+  } catch (e) { logger.warn(`[PAY RESUME] ${userId}: ${e.message}`); }
+
+  const sess  = session.get(userId);
+  const state = sess.state;
+
+  // Admin states — all guarded inside handleAdminText.
+  //
+  // This used to be a hand-maintained whitelist of ~50 state names, kept in
+  // this file while the states themselves live in session.js and are handled in
+  // admin.js. Every new admin flow needed a matching entry here or its typed
+  // input was silently dropped — no error, no log, nothing. That had already
+  // happened at least twice (ADMIN_REFUND_AMOUNT, and the ranks and TxID
+  // states), so the list is replaced by the rule it was always approximating:
+  // every ADMIN_* state belongs to the admin handler.
+  //
+  // Verified against the code below: no state beginning with ADMIN_ is handled
+  // anywhere else in this dispatcher.
+  if (adminHandler.isAdmin(userId) && typeof state === 'string' && state.startsWith('ADMIN_')) {
+    // Logged because the previous failure mode was total silence: a state with
+    // no matching branch produced no reply and no error, so there was no way to
+    // tell "never routed" from "routed and ignored".
+    logger.info(`[ADMIN TEXT] ${userId} state=${state}`);
+    await adminHandler.handleAdminText(bot, msg);
+    return;
+  }
+
+  // ── Refund: look up an older order by number ──────────────────────
+  if (state === States.REFUND_SEARCH) {
+    const dbq = require('./database/queries');
+    const wanted = parseInt(String(msg.text || '').replace(/[^0-9]/g, ''), 10);
+    if (!Number.isFinite(wanted)) {
+      await bot.sendMessage(chatId, '❌ Send just the order number, for example 8535.');
+      return;
+    }
+
+    session.clear(userId);
+    const order = dbq.getOrder(wanted);
+
+    // Ownership is checked before anything is revealed: order numbers are
+    // sequential, so without this any customer could probe for other people's
+    // purchases simply by counting.
+    if (!order || String(order.user_id) !== String(userId)) {
+      await bot.sendMessage(chatId,
+        `❌ <b>Order #${wanted} not found on your account.</b>\n\n` +
+        `Check the number in 📦 My Orders.`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+          [{ text: '📦 My Orders', callback_data: 'menu_orders' }],
+          [{ text: '🔎 Try again', callback_data: 'refund_search' }],
+        ] } });
+      return;
+    }
+
+    // Each reason is stated plainly rather than lumped into one refusal — a
+    // customer who is told "not eligible" writes to support; one who is told
+    // the product is non-refundable does not.
+    const product = dbq.getProduct(order.product_id);
+    let problem = null;
+    if (order.status !== 'delivered') {
+      problem = `This order is <b>${escapeHtml(order.status)}</b>, not delivered. Only delivered orders can be refunded.`;
+    } else if (product && product.refund_enabled !== 1) {
+      problem = `<b>${escapeHtml(String(product.title || 'This product').replace(/\[emoji:\d+\]/g, ''))}</b> does not support refunds.`;
+    } else {
+      const existing = (dbq.getUserRefundRequests ? dbq.getUserRefundRequests(userId) : [])
+        .find((r) => String(r.order_id) === String(order.id) && r.status !== 'rejected');
+      if (existing) problem = `You already have a request for this order — status: <b>${escapeHtml(existing.status)}</b>.`;
+    }
+
+    if (problem) {
+      await bot.sendMessage(chatId, `🔎 <b>Order #${order.id}</b>\n\n${problem}`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+          [{ text: '💬 Contact support', callback_data: 'menu_support' }],
+          [{ text: '🔙 Back', callback_data: 'refund_request_start' }],
+        ] } });
+      return;
+    }
+
+    await bot.sendMessage(chatId,
+      `✅ <b>Order #${order.id} found</b>\n\n` +
+      `📦 ${escapeHtml(String(product?.title || '').replace(/\[emoji:\d+\]/g, '').trim())}\n` +
+      `💵 ${formatPrice(order.total_price)}\n` +
+      `📅 ${escapeHtml(String(order.created_at || '').slice(0, 16))}\n\n` +
+      `Tap below to request a refund for it.`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
+        [{ text: '🔄 Request refund for this order', callback_data: `refund_req_${order.id}` }],
+        [{ text: '🔙 Back', callback_data: 'refund_request_start' }],
+      ] } });
+    return;
+  }
+
+  // User states
+  if      (state === States.BUY_QUANTITY)          await buyHandler.handleQuantity(bot, msg);
+  else if (state === States.BUY_EMAIL)             await buyHandler.handleEmail(bot, msg);
+  else if (state === States.BUY_PREORDER_QTY)      await buyHandler.handlePreorderQty(bot, msg);
+  else if (state === States.BUY_PREORDER_EMAIL)    await buyHandler.handlePreorderEmail(bot, msg);
+  else if (state === States.BUY_BINANCE_ORDER_ID)  await buyHandler.handleBinanceOrderId(bot, msg);
+  else if (state === States.BUY_USDT_TXID)         await buyHandler.handleUsdtTxIdForOrder(bot, msg);
+  else if (state === States.WALLET_TOPUP_USDT_AMOUNT)      await walletHandler.handleUsdtAmount(bot, msg);
+  else if (state === States.WALLET_TOPUP_USDT_TX)          await walletHandler.handleUsdtTxId(bot, msg);
+  else if (state === States.WALLET_TOPUP_BINANCE_ID)        await walletHandler.handleBinancePayOrderId(bot, msg);
+  else if (state === States.WALLET_TOPUP_CRYPTOBOT_AMOUNT)  await walletHandler.handleCryptobotAmount(bot, msg);
+  else if (state === States.SUPPORT_MESSAGE)       await supportHandler.handleSupportMessage(bot, msg);
+  else if (state === States.REFUND_REASON) {
+    const reason = (msg.text || '').trim().slice(0, 500);
+    if (reason.length < 5) {
+      await bot.sendMessage(chatId, '❌ Please provide a clear reason (at least 5 characters).');
+      return;
+    }
+    session.update(userId, { refundReason: reason });
+    session.set(userId, States.REFUND_ACCOUNT, sess.data);
+    await bot.sendMessage(chatId,
+      `📝 <b>Step 2/4 — Affected Account</b>\n\n` +
+      `Please send the <b>email/login or account details</b> of the affected account.\n\n` +
+      `<i>This helps us identify the problem.</i>`,
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+  else if (state === States.REFUND_ACCOUNT) {
+    const account = (msg.text || '').trim().slice(0, 300);
+    if (account.length < 3) {
+      await bot.sendMessage(chatId, '❌ Please send the affected account details.');
+      return;
+    }
+    session.update(userId, { refundAccount: account });
+    session.set(userId, States.REFUND_PHOTO, sess.data);
+    await bot.sendMessage(chatId,
+      `📸 <b>Step 3/4 — Screenshot</b>\n\n` +
+      `Please send a <b>screenshot</b> showing the problem.\n\n` +
+      `<i>Send a photo, or type <code>skip</code> to skip.</i>`,
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+  else if (state === States.REFUND_PHOTO) {
+    let photoFileId = null;
+    if (msg.photo && msg.photo.length) {
+      photoFileId = msg.photo[msg.photo.length - 1].file_id;
+    } else if (msg.text && msg.text.toLowerCase().trim() === 'skip') {
+      photoFileId = null;
+    } else {
+      await bot.sendMessage(chatId, '❌ Please send a photo or type "skip".');
+      return;
+    }
+    session.update(userId, { refundPhoto: photoFileId });
+    session.set(userId, States.REFUND_METHOD, sess.data);
+    await bot.sendMessage(chatId,
+      `💳 <b>Step 4/4 — Refund Method</b>\n\n` +
+      `How would you like to receive the refund?`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: '💰 Wallet (instant)', callback_data: 'refund_method_wallet' }],
+          [{ text: '🟡 Binance Pay', callback_data: 'refund_method_binance' }],
+          [{ text: '💎 Crypto (USDT)', callback_data: 'refund_method_crypto' }],
+        ] } }
+    );
+    return;
+  }
+  else if (state === States.REFUND_ADDRESS) {
+    const address = (msg.text || '').trim();
+    const method  = session.get(userId).data.refundMethod;
+
+    // One length rule was applied to two very different things. A Binance Pay
+    // ID is a 8–12 digit number; the check demanded 10+ characters, so a valid
+    // 9-digit ID was rejected with "invalid wallet address" — a message about a
+    // wallet, on a screen that had just asked for a Pay ID. The customer has no
+    // way to satisfy it and simply retypes the same correct number.
+    let problem = null;
+    if (method === 'binance') {
+      if (!/^\d{6,20}$/.test(address)) {
+        problem = '❌ A Binance Pay ID is numbers only, usually 8–12 digits.\n\n' +
+                  'Example: <code>263344433</code>\n\n' +
+                  'Find it in Binance under <b>Pay → Profile</b>.';
+      }
+    } else if (address.length < 10 || /\s/.test(address)) {
+      // TON addresses start with UQ/EQ and are 48 characters, so the generic
+      // "looks like an address" rule is widened rather than a TON one bolted on.
+      problem = '❌ That does not look like a wallet address.\n\n' +
+                'Paste the full address — BEP20 starts with <code>0x</code>, ' +
+                'TRC20 starts with <code>T</code>, TON starts with ' +
+                '<code>UQ</code> or <code>EQ</code>.';
+    }
+
+    if (problem) {
+      await bot.sendMessage(chatId, problem, { parse_mode: 'HTML' });
+      return;
+    }
+    session.update(userId, { refundAddress: address });
+    // Now submit
+    const d = session.get(userId).data;
+    const order = db.getOrder(d.refundOrderId);
+    if (!order || order.user_id !== userId) {
+      await bot.sendMessage(chatId, '❌ Order not found.');
+      session.clear(userId);
+      return;
+    }
+    // Final eligibility re-check: the admin may have disabled refunds for this
+    // product while the customer was filling in the form.
+    const finalCheck = db.isOrderRefundable(d.refundOrderId);
+    if (!finalCheck.ok) {
+      session.clear(userId);
+      await bot.sendMessage(chatId,
+        '🚫 <b>Not Eligible for Refund</b>\n\n' +
+        'This product does not support refund requests. Please contact support if you need help.',
+        { parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '🔙 My Orders', callback_data: 'menu_orders' }]] } });
+      return;
+    }
+    db.addRefundRequest({
+      userId,
+      orderId: d.refundOrderId,
+      reason: d.refundReason,
+      amount: 0,
+      affectedAccount: d.refundAccount,
+      photoFileId: d.refundPhoto,
+      refundMethod: d.refundMethod,
+      cryptoNetwork: d.refundNetwork || null,
+      walletAddress: address,
+    });
+    session.clear(userId);
+    await bot.sendMessage(chatId,
+      `✅ <b>Refund Request Submitted!</b>\n\n` +
+      `🆔 Order #${d.refundOrderId}\n` +
+      `💵 Amount: ${order.total_price}$\n` +
+      `💳 Method: ${d.refundMethod}${d.refundNetwork ? ' (' + d.refundNetwork + ')' : ''}\n` +
+      `📍 Address: <code>${address.slice(0, 50)}...</code>\n\n` +
+      `⏳ Our team will review your request.`,
+      { parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Orders', callback_data: 'menu_orders' }]] } }
+    );
+    // Notify admin through the notification centre (stored + pushed, deduped)
+    try {
+      const pending = db.getPendingRefundForOrder(d.refundOrderId);
+      await notifyAdmin(bot, {
+        type:  'refund_request',
+        title: 'New refund request',
+        body:
+          `🆔 <b>Order:</b> #${d.refundOrderId}\n` +
+          `👤 <b>User:</b> <code>${userId}</code>\n` +
+          `💵 <b>Order total:</b> ${order.total_price}$\n` +
+          `💳 <b>Method:</b> ${escapeHtml(d.refundMethod || 'n/a')}` +
+          (d.refundNetwork ? ` (${escapeHtml(d.refundNetwork)})` : ''),
+        dedupeKey: `refund_request:${pending ? pending.id : d.refundOrderId}`,
+        refType: 'refund_request',
+        refId:   pending ? pending.id : d.refundOrderId,
+        buttons: pending ? [[{ text: '🔄 Review request', callback_data: `admin_refund_view_${pending.id}` }]] : null,
+        supportButtons: [[{ text: '🔄 Refund list', callback_data: 'ref_list_0' }]],
+      });
+    } catch (e) { logger.warn(`refund notify failed: ${e.message}`); }
+  }
+});
+
+// ── Photos ────────────────────────────────────────────────────────────────────
+bot.on('photo', async (msg) => {
+  if (!adminHandler.isAdmin(msg.from.id)) return;
+  await adminHandler.handleAdminPhoto(bot, msg);
+});
+
+// ── Callback queries ──────────────────────────────────────────────────────────
+// Named so the nav bar can replay a tap through the very same code path an
+// inline button would take, instead of keeping a second copy of those screens.
+async function handleCallbackQuery(query) {
+  const data   = query.data || '';
+  const userId = query.from.id;
+  const chatId = query.message.chat.id;
+  const msgId  = query.message.message_id;
+  const answer = (text = '') => bot.answerCallbackQuery(query.id, { text }).catch(() => {});
+
+  // Always register/update user
+  const fakeMsg = { from: query.from, chat: query.message.chat };
+  const ok = await ensureUser(bot, fakeMsg);
+  if (!ok) return answer();
+
+  // ── Join gate ────────────────────────────────────────────────────
+  if (data === 'check_membership') {
+    const groupId   = db.getSetting('required_group_id',   '');
+    const channelId = db.getSetting('required_channel_id', '');
+    const [inG, inC] = await Promise.all([
+      isMember(bot, userId, groupId),
+      isMember(bot, userId, channelId),
+    ]);
+    if (inG && inC) {
+      await answer('✅ Access granted!');
+      await sendMainMenu(bot, chatId, query.from.first_name || '');
+    } else {
+      await answer('❌ Not joined yet. Please join both communities.', true);
+    }
+    return;
+  }
+
+  // ── noop ─────────────────────────────────────────────────────────
+  if (data === 'noop') { await bot.answerCallbackQuery(query.id).catch(() => {}); return; }
+
+  // ── MAINTENANCE MODE CHECK ─────────────────────────────────────
+  // If maintenance is ON, block all customer actions (admin still works)
+  const maintenance = db.getSetting('maintenance_mode', '0') === '1';
+  if (maintenance && !adminHandler.isAdmin(userId)) {
+    const maintMsg = db.getSetting('maintenance_message', 'The bot is currently under maintenance. Please try again later.');
+    await answer('🚧 Maintenance mode', true);
+    // Replace the message with maintenance notice
+    try {
+      await bot.editMessageText(
+        `🚧 <b>Bot Under Maintenance</b>\n\n${maintMsg}\n\n⏰ Please try again later.`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML' }
+      );
+    } catch (e) {
+      await bot.sendMessage(chatId,
+        `🚧 <b>Bot Under Maintenance</b>\n\n${maintMsg}`,
+        { parse_mode: 'HTML' }
+      ).catch(() => {});
+    }
+    return;
+  }
+
+  // ── Clear any in-progress FSM state when user navigates ──────────
+  // Any top-level navigation callback resets the user's session so
+  // stale states (e.g. WALLET_BEP20_TX waiting for input) don't
+  // intercept the next message.
+  const navCallbacks = new Set([
+    'back_main', 'menu_refresh', 'refresh_products', 'menu_products', 'menu_preorders', 'menu_wallet', 'menu_orders', 'menu_language', 'set_lang_en', 'set_lang_ar', 'set_lang_vi', 'set_lang_es',
+    'menu_support', 'menu_referral', 'wallet_transactions', 'menu_notifications', 'menu_api',
+    'admin_panel',
+  ]);
+  if (navCallbacks.has(data)) {
+    session.clear(userId);
+  }
+
+  // ── Navigation ───────────────────────────────────────────────────
+  if (data === 'refresh_products') {
+    await bot.answerCallbackQuery(query.id, { text: '🔄 Refreshed!' }).catch(() => {});
+    try { await bot.deleteMessage(chatId, msgId).catch(() => {}); } catch (e) {}
+    await showProducts(bot, chatId);
+    return;
+  }
+
+  if (data === 'menu_refresh') {
+    await bot.answerCallbackQuery(query.id, { text: '🔄 Refreshed!' }).catch(() => {});
+    const userLang = db.getUserLanguage(userId);
+    try {
+      await bot.deleteMessage(chatId, msgId).catch(() => {});
+    } catch (e) {}
+    await sendMainMenu(bot, chatId, query.from.first_name || '', userId);
+    return;
+  }
+
+  if (data === 'back_main') {
+    const passed = await checkJoinGate(bot, userId, chatId);
+    if (!passed) return;
+    await answer();
+    const userLang = db.getUserLanguage(userId);
+    try {
+      await bot.editMessageText('🛍 <b>Main Menu</b>', {
+        chat_id: chatId, message_id: msgId,
+        parse_mode: 'HTML', reply_markup: mainMenuKb(userLang),
+      });
+    } catch (e) {
+      // Was a photo message — delete and resend
+      try { await bot.deleteMessage(chatId, msgId); } catch (e2) {}
+      await sendMainMenu(bot, chatId, query.from.first_name || '', userId);
+    }
+    return;
+  }
+  // Category list — show products of category
+  if (/^cat_\d+$/.test(data)) {
+    const categoryId = parseInt(data.split('_').pop(), 10);
+    const productsHandler = require('./handlers/products');
+    await productsHandler.showProductsByCategory(bot, chatId, msgId, categoryId, 0);
+    await bot.answerCallbackQuery(query.id).catch(() => {});
+    return;
+  }
+  // Category pagination
+  if (/^cat_page_\d+_\d+$/.test(data)) {
+    const parts = data.split('_');
+    const categoryId = parseInt(parts[2], 10);
+    const page = parseInt(parts[3], 10);
+    const productsHandler = require('./handlers/products');
+    await productsHandler.showProductsByCategory(bot, chatId, msgId, categoryId, page);
+    await bot.answerCallbackQuery(query.id).catch(() => {});
+    return;
+  }
+
+    if (/^products_page_\d+$/.test(data)) {
+    const page = parseInt(data.split('_').pop(), 10);
+    const productsHandler = require('./handlers/products');
+    await productsHandler.showProducts(bot, chatId, msgId, page);
+    await bot.answerCallbackQuery(query.id).catch(() => {});
+    return;
+  }
+
+    if (data === 'menu_products') {
+    await answer();
+    await showProducts(bot, chatId, msgId);
+    return;
+  }
+  if (data === 'menu_preorders') {
+    await answer();
+    await showPreorderProducts(bot, chatId, msgId);
+    return;
+  }
+
+  // ── Language picker ──────────────────────────────────────────
+  if (data === 'menu_language') {
+    await answer();
+    await showLanguagePicker(bot, chatId, msgId);
+    return;
+  }
+  if (/^set_lang_(en|ar|vi|es)$/.test(data)) {
+    const lang = data.split('_').pop();
+    await answer();
+    db.setUserLanguage(userId, lang);
+    const t = require('./utils/i18n').t;
+    await bot.editMessageText(t(lang, 'language_set'), {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML'
+    });
+    // Then show main menu in their new language
+    setTimeout(async () => {
+      try {
+        await sendMainMenu(bot, chatId, query.from.first_name || '', userId);
+      } catch (e) {}
+    }, 600);
+    return;
+  }
+  if (/^preorder_view_\d+$/.test(data)) {
+    await answer();
+    await showPreorderProductDetail(bot, chatId, parseInt(data.split('_').pop(), 10), msgId);
+    return;
+  }
+  if (/^product_\d+$/.test(data)) {
+    await answer();
+    await showProductDetail(bot, chatId, parseInt(data.split('_')[1], 10), msgId);
+    return;
+  }
+  if (/^buy_\d+$/.test(data)) {
+    await buyHandler.initiateBuy(bot, chatId, userId, parseInt(data.split('_')[1], 10), query.id);
+    return;
+  }
+
+  // ── Back-in-stock subscription ────────────────────────────────────
+  if (/^notify_back_\d+$/.test(data)) {
+    await answer();
+    const productId = parseInt(data.split('_').pop(), 10);
+    await buyHandler.handleNotifyBackInStock(bot, chatId, userId, productId);
+    return;
+  }
+
+  if (data === 'confirm_session') {
+    await answer();
+    await buyHandler.confirmOrder(bot, chatId, userId, msgId);
+    return;
+  }
+  if (data === 'cancel_session') {
+    await answer();
+    await buyHandler.cancelOrder(bot, chatId, 0, userId, msgId);
+    return;
+  }
+  if (/^confirm_order_\d+$/.test(data)) {
+    // Legacy: confirm after order was already created (payment method screen back button)
+    await answer();
+    const legacyOrderId = parseInt(data.split('_').pop(), 10);
+    const legacyOrder = require('./database/queries').getOrder(legacyOrderId);
+    if (legacyOrder && legacyOrder.status === 'pending') {
+      const { paymentMethodKb } = require('./utils/keyboard');
+      await bot.editMessageText(
+        `💳 <b>Select Payment Method</b>\n\nOrder #${legacyOrderId} — ${formatPrice(legacyOrder.total_price)}`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: paymentMethodKb(legacyOrderId) }
+      );
+    } else {
+      await bot.editMessageText('❌ Order is no longer valid.', { chat_id: chatId, message_id: msgId });
+    }
+    return;
+  }
+  if (/^cancel_order_\d+$/.test(data)) {
+    await answer();
+    await buyHandler.cancelOrder(bot, chatId, parseInt(data.split('_').pop(), 10), userId, msgId);
+    return;
+  }
+  if (/^pay_wallet_\d+$/.test(data)) {
+    await answer();
+    await buyHandler.payWithWallet(bot, chatId, userId, parseInt(data.split('_').pop(), 10), msgId);
+    return;
+  }
+  if (/^pay_binance_\d+$/.test(data)) {
+    await answer();
+    await buyHandler.startBinancePayForOrder(bot, chatId, userId, parseInt(data.split('_').pop(), 10), msgId);
+    return;
+  }
+  if (/^pay_usdt_\d+$/.test(data)) {
+    await answer();
+    await buyHandler.startUsdtPayForOrder(bot, chatId, userId, parseInt(data.split('_').pop(), 10), msgId);
+    return;
+  }
+  if (/^pay_cryptobot_\d+$/.test(data)) {
+    await answer();
+    await buyHandler.startCryptobotPayForOrder(bot, chatId, userId, parseInt(data.split('_').pop(), 10), msgId);
+    return;
+  }
+
+  // ── Wallet ───────────────────────────────────────────────────────
+  if (data === 'menu_wallet')          { await answer(); await walletHandler.showWallet(bot, chatId, userId, msgId); return; }
+  if (data === 'wallet_topup')         { await answer(); await walletHandler.showTopupMethods(bot, chatId, userId, msgId); return; }
+  // ── V3: USDT network choice + reservation cancel ──────────────────
+  if (/^topup_net_(TRC20|BEP20|ERC20|SOL|TON)$/.test(data)) {
+    await answer();
+    await walletHandler.startUsdtAmount(bot, chatId, userId, msgId, data.split('_').pop());
+    return;
+  }
+  if (/^topup_cancel_\d+$/.test(data)) {
+    await answer('Reservation cancelled');
+    db.cancelDepositIntent(parseInt(data.split('_').pop(), 10));
+    session.clear(userId);
+    await walletHandler.showWallet(bot, chatId, userId, msgId);
+    return;
+  }
+  if (data === 'wallet_topup_usdt')    { await answer(); await walletHandler.startUsdtTopup(bot, chatId, userId, msgId); return; }
+  if (data === 'wallet_topup_binance') { await answer(); await walletHandler.startBinancePayTopup(bot, chatId, userId, msgId); return; }
+  if (data === 'wallet_topup_cryptobot'){ await answer(); await walletHandler.startCryptobotTopup(bot, chatId, userId, msgId); return; }
+  if (data === 'wallet_transactions')  { await answer(); await walletHandler.showTransactions(bot, chatId, userId, msgId); return; }
+
+  // ── API access (self-service, no application needed) ─────────────
+  // ── API documentation, inside the bot ─────────────────────────────
+  if (data === 'api_docs') {
+    await answer();
+    // getOrCreateApiKey, so the examples carry the reader's real key rather
+    // than a placeholder they have to go and substitute.
+    let key = 'YOUR_API_KEY';
+    try { key = db.getOrCreateApiKey(userId)?.api_key || key; } catch (_) {}
+    const b = resolveApiBase() || 'https://your-shop-domain';
+
+    const text =
+      `📖 <b>API — how to use it</b>\n\n` +
+      `Every call needs your key in the <code>X-API-Key</code> header. ` +
+      `Purchases are charged to your wallet balance.\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `<b>1. List products</b>\n` +
+      `<pre>GET ${escapeHtml(b)}/api/v2/products</pre>\n` +
+      `Returns each product with <code>price</code>, <code>stock</code> and ` +
+      `<code>bulk_pricing</code> — the quantity discounts.\n\n` +
+      `<b>2. Check a price before buying</b>\n` +
+      `<pre>GET ${escapeHtml(b)}/api/v2/quote?product_id=1&amp;quantity=50</pre>\n` +
+      `Tells you the unit price at that quantity, the total, and whether your ` +
+      `balance covers it.\n\n` +
+      `<b>3. Buy</b>\n` +
+      `<pre>POST ${escapeHtml(b)}/api/v2/purchase\n` +
+      `{"product_id": 1, "quantity": 50}</pre>\n` +
+      `Returns the delivered items immediately.\n\n` +
+      `<b>4. Your balance</b>\n` +
+      `<pre>GET ${escapeHtml(b)}/api/v2/balance</pre>\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `<b>Full example</b>\n` +
+      `<pre>curl -H "X-API-Key: ${escapeHtml(key)}" \\\n` +
+      `  "${escapeHtml(b)}/api/v2/quote?product_id=1&amp;quantity=50"</pre>\n\n` +
+      `⚠️ <b>Top up your wallet first</b> — the API spends your balance and ` +
+      `cannot take payments.\n` +
+      `🔑 Keep your key private. If it leaks, regenerate it from the API screen.`;
+
+    const kb = { inline_keyboard: [
+      [{ text: '🔙 Back', callback_data: 'menu_api' }],
+    ] };
+    try {
+      await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', reply_markup: kb });
+    } catch (e) {
+      await bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: kb });
+    }
+    return;
+  }
+
+  if (data === 'menu_api' || data === 'api_regen_confirm' || data === 'api_regen_do') {
+    await answer();
+
+    if (data === 'api_regen_confirm') {
+      await bot.editMessageText(
+        `⚠️ <b>Generate a new key?</b>\n\n` +
+        `Your current key stops working immediately. Anything using it will ` +
+        `start getting <code>401 Invalid API key</code> until you update it.\n\n` +
+        `Only do this if you think your key leaked.`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [
+            [{ text: '🔁 Yes, generate a new key', callback_data: 'api_regen_do' }],
+            [{ text: '↩️ Cancel', callback_data: 'menu_api' }],
+          ] } }
+      ).catch(() => {});
+      return;
+    }
+
+    const row = data === 'api_regen_do'
+      ? db.regenerateApiKey(userId)
+      : db.getOrCreateApiKey(userId);
+
+    const me = await bot.getMe().catch(() => ({ username: '' }));
+    const base = resolveApiBase();
+    const hasBase = isRealBase(base);
+    const user = db.getUser(userId);
+
+    // Built once, used by both the edit and the send below. Keeping two copies
+    // is how the fallback ended up with no buttons.
+    const apiScreenText =
+      `🔌 <b>API Access</b>\n\n` +
+      `Buy from the shop straight from your own code.\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `🔑 <b>Your API key</b> (tap to copy):\n<code>${escapeHtml(row.api_key)}</code>\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `💰 <b>Wallet balance:</b> ${formatPrice(user?.balance || 0)}\n` +
+      `📊 <b>Requests made:</b> ${row.requests || 0}\n\n` +
+      (hasBase ? '' :
+        `⚠️ <i>The shop's public address is not set, so the documentation link ` +
+        `is hidden. Your key below works — ask support for the base URL.</i>\n\n`) +
+      `<b>Base URL</b>\n<code>${escapeHtml(base || 'https://your-shop-domain')}/api/v2</code>\n\n` +
+      `<b>Quick start</b>\n` +
+      `<pre>curl -H "X-API-Key: ${escapeHtml(row.api_key)}" \\\n  ${escapeHtml(base || 'https://your-shop-domain')}/api/v2/products</pre>\n` +
+      `<b>Buy</b>\n` +
+      `<pre>curl -X POST ${escapeHtml(base || 'https://your-shop-domain')}/api/v2/purchase \\\n` +
+      `  -H "X-API-Key: ${escapeHtml(row.api_key)}" \\\n` +
+      `  -H "Content-Type: application/json" \\\n` +
+      `  -d '{"product_id":1,"quantity":1}'</pre>\n` +
+      `⚠️ <b>Top up your wallet first</b> — the API spends your balance, it cannot take payments.\n\n` +
+      `🔒 <i>Treat this key like a password. Anyone holding it can spend your balance.</i>`;
+
+    const apiScreenButtons = [
+          // Only offered when the URL is real. A button is better missing than
+          // taking the message down with it.
+          // In-bot docs always work. The web page needs a public domain, and
+          // tying the only documentation to that meant a shop without one had
+          // an API nobody could learn to use.
+          [{ text: '📖 How to use the API', callback_data: 'api_docs' }],
+          ...(hasBase ? [[{ text: '🌐 Full web documentation', url: `${base}/api/v2/docs` }]] : []),
+          [{ text: '💰 Top Up Wallet', callback_data: 'wallet_topup' }],
+          [{ text: '🔁 Generate new key', callback_data: 'api_regen_confirm' }],
+          [{ text: '🔙 Back', callback_data: 'back_main' }],];
+
+    await bot.editMessageText(apiScreenText,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: apiScreenButtons } }
+    ).catch(async (err) => {
+      // The edit fails whenever there is no previous bot message to edit —
+      // which is exactly what happens when the screen is opened from the
+      // persistent bar rather than from an inline button. The fallback used to
+      // send the bare key with NO buttons at all, so the documentation the
+      // customer came for disappeared precisely on the most common route in.
+      logger.warn(`[API] edit failed, sending fresh: ${err.message}`);
+      await bot.sendMessage(chatId, apiScreenText, {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: apiScreenButtons },
+      }).catch(async (e2) => {
+        // Only if even a plain send fails — bad HTML in a title, say — do we
+        // fall back to the key alone, and the buttons still come with it.
+        logger.error(`[API] send failed too: ${e2.message}`);
+        await bot.sendMessage(chatId,
+          `🔑 <b>Your API key</b>\n<code>${escapeHtml(row.api_key)}</code>`,
+          { parse_mode: 'HTML', reply_markup: { inline_keyboard: apiScreenButtons } });
+      });
+    });
+    return;
+  }
+
+  // ── Orders ───────────────────────────────────────────────────────
+  if (data === 'menu_orders') {
+    await answer();
+    await showOrders(bot, chatId, userId, msgId, 'all', 0);
+    return;
+  }
+  // orders_f_<filter>_<page>  — date filter + pagination
+  if (/^orders_f_[a-z_0-9]+_\d+$/.test(data)) {
+    await answer();
+    const parts  = data.split('_');
+    const page   = parseInt(parts.pop(), 10) || 0;
+    const filter = parts.slice(2).join('_');
+    await showOrders(bot, chatId, userId, msgId, filter, page);
+    return;
+  }
+  if (/^order_detail_\d+$/.test(data)) {
+    await answer();
+    await showOrderDetail(bot, chatId, userId, parseInt(data.split('_').pop(), 10), msgId, query.id);
+    return;
+  }
+
+  // ── Support ──────────────────────────────────────────────────────
+  // ── Customer Refund Request ──────────────────────────────────────
+  // ── Refund Request entry: list eligible orders + existing requests ───
+  if (data === 'refund_request_start') {
+    const db = require('./database/queries');
+    const userId = query.from.id;
+    // Server-side eligibility: getRefundableUserOrders joins products and
+    // filters on p.refund_enabled = 1, so a product the admin marked as
+    // non-refundable can never appear in this list.
+    const eligibleOrders = db.getRefundableUserOrders(userId);
+    const allDelivered   = (db.getUserOrdersAll(userId) || []).filter(o => o.status === 'delivered');
+    const blockedCount   = Math.max(0, allDelivered.length - eligibleOrders.length);
+    const userRefunds = db.getUserRefundRequests ? db.getUserRefundRequests(userId) : [];
+
+    let txt = `🔄 <b>Refund Request</b>\n\n`;
+    if (userRefunds.length > 0) {
+      txt += `📋 <b>Your existing requests:</b>\n`;
+      for (const r of userRefunds.slice(0, 5)) {
+        const emoji = r.status === 'approved' ? '✅' : r.status === 'rejected' ? '❌' : r.status === 'processing' ? '⏳' : '🕐';
+        txt += `${emoji} Order #${r.order_id} — ${r.status}\n`;
+      }
+      txt += `\n`;
+    }
+    if (eligibleOrders.length === 0) {
+      txt += blockedCount > 0
+        ? `📭 None of your orders are eligible for a refund.\n\n` +
+          `<i>${blockedCount} delivered order(s) are for products that do not ` +
+          `support refunds. Contact support if you need help.</i>`
+        : `📭 You have no delivered orders to refund.`;
+    } else {
+      txt += `📦 <b>Select an order to refund:</b>`;
+      if (blockedCount > 0) {
+        txt += `\n\n<i>ℹ️ ${blockedCount} of your order(s) are for non-refundable products and are not listed.</i>`;
+      }
+    }
+
+    const rows = eligibleOrders.slice(0, 10).map(o => {
+      const title = (o.product_title || 'Product').slice(0, 25);
+      return [{ text: `#${o.id} — ${title} — $${(o.total_price||0).toFixed(2)}`, callback_data: `refund_req_${o.id}` }];
+    });
+
+    // Older orders are cut off by the slice above. Without a way to reach them,
+    // a customer whose two-month-old account died simply could not file a
+    // request — the order was eligible, just off the end of the list.
+    if (eligibleOrders.length > 10) {
+      txt += `\n\n<i>Showing your 10 most recent. You have ${eligibleOrders.length} ` +
+             `refundable orders — use search for older ones.</i>`;
+    }
+    rows.push([{ text: '🔎 Search by order number', callback_data: 'refund_search' }]);
+    rows.push([{ text: '🔙 Back', callback_data: 'back_main' }]);
+
+    try {
+      await bot.editMessageText(txt, {
+        chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: rows },
+      });
+    } catch (e) {
+      await bot.sendMessage(chatId, txt, {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: rows },
+      });
+    }
+    await bot.answerCallbackQuery(query.id).catch(() => {});
+    return;
+  }
+
+  // ── Find an older order by its number ──────────────────────────────
+  if (data === 'refund_search') {
+    await bot.answerCallbackQuery(query.id).catch(() => {});
+    session.set(userId, States.REFUND_SEARCH, {});
+    await bot.sendMessage(chatId,
+      `🔎 <b>Find your order</b>\n\n` +
+      `Send the order number — for example <code>8535</code> or <code>#8535</code>.\n\n` +
+      `<i>You can find it in 📦 My Orders, or in the message you received when ` +
+      `the product was delivered.</i>`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+    // ── Customer cancel their own pending order ──────────────
+  if (/^cancel_my_order_\d+$/.test(data)) {
+    const db = require('./database/queries');
+    const dbRaw = require('./database/db');
+    const orderId = parseInt(data.split('_').pop(), 10);
+    const userId = query.from.id;
+    const order = db.getOrder(orderId);
+
+    if (!order || order.user_id !== userId) {
+      await bot.answerCallbackQuery(query.id, { text: '❌ Order not found', show_alert: true }).catch(() => {});
+      return;
+    }
+    if (order.status !== 'pending') {
+      await bot.answerCallbackQuery(query.id, { text: '❌ Only pending orders can be cancelled', show_alert: true }).catch(() => {});
+      return;
+    }
+
+    // Mark as cancelled
+    try {
+      dbRaw.prepare(`UPDATE orders SET status='cancelled' WHERE id=?`).run(orderId);
+    } catch (e) {}
+
+    await bot.editMessageText(
+      `❌ <b>Order #${orderId} cancelled.</b>\n\n` +
+      `You can now create a new order.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 My Orders', callback_data: 'menu_orders' }]] } }
+    ).catch(() => {});
+    await bot.answerCallbackQuery(query.id, { text: '✅ Cancelled' }).catch(() => {});
+    return;
+  }
+
+    if (/^refund_req_\d+$/.test(data)) {
+    const orderId = parseInt(data.split('_').pop(), 10);
+    const order = db.getOrder(orderId);
+    if (!order || order.user_id !== userId) {
+      await answer('❌ Order not found');
+      return;
+    }
+    // ── SERVER-SIDE ELIGIBILITY GATE ──────────────────────────────────────
+    // Re-checked here, not just when building the list, so a hand-crafted
+    // callback for a non-refundable product is rejected.
+    const eligibility = db.isOrderRefundable(orderId);
+    if (!eligibility.ok) {
+      const msg = {
+        not_found:     '❌ Order not found.',
+        not_delivered: '❌ Only delivered orders can be refunded.',
+        not_eligible:  '🚫 This product is not eligible for refunds.',
+      }[eligibility.reason] || '❌ This order cannot be refunded.';
+      await bot.answerCallbackQuery(query.id, { text: msg, show_alert: true }).catch(() => {});
+      return;
+    }
+    if (db.getPendingRefundForOrder(orderId)) {
+      await answer('⏳ You already have a pending refund request for this order');
+      return;
+    }
+    await answer();
+    session.set(userId, States.REFUND_REASON, { refundOrderId: orderId });
+    await bot.editMessageText(
+      `🔄 <b>Request Refund — Order #${orderId}</b>\n\n` +
+      `📦 Product: ${order.product_title}\n` +
+      `💵 Amount: ${order.total_price}$\n\n` +
+      `📝 <b>Please explain the reason for your refund:</b>\n` +
+      `<i>(e.g., account not working, wrong product, etc.)</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: `order_detail_${orderId}` }]] } }
+    );
+    return;
+  }
+
+  // ── Customer: View All My Refunds ─────────────────────────────────
+  // ── Refund Method Selection ───────────────────────────────────────
+  if (data === 'refund_method_wallet') {
+    await answer();
+    // Wallet refund — no address needed
+    const d = session.get(userId).data;
+    const order = db.getOrder(d.refundOrderId);
+    if (!order) { await bot.sendMessage(chatId, '❌ Order not found.'); session.clear(userId); return; }
+    const walletCheck = db.isOrderRefundable(d.refundOrderId);
+    if (!walletCheck.ok) {
+      session.clear(userId);
+      await bot.sendMessage(chatId,
+        '🚫 <b>Not Eligible for Refund</b>\n\n' +
+        'This product does not support refund requests. Please contact support if you need help.',
+        { parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '🔙 My Orders', callback_data: 'menu_orders' }]] } });
+      return;
+    }
+    db.addRefundRequest({
+      userId, orderId: d.refundOrderId, reason: d.refundReason, amount: 0,
+      affectedAccount: d.refundAccount, photoFileId: d.refundPhoto,
+      refundMethod: 'wallet', cryptoNetwork: null, walletAddress: null,
+    });
+    session.clear(userId);
+    await bot.editMessageText(
+      `✅ <b>Refund Request Submitted!</b>\n\n` +
+      `🆔 Order #${d.refundOrderId}\n` +
+      `💵 Amount: ${order.total_price}$\n` +
+      `💳 Method: Wallet\n\n` +
+      `⏳ Our team will review your request.`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Orders', callback_data: 'menu_orders' }]] } }
+    );
+    try {
+      const pendingW = db.getPendingRefundForOrder(d.refundOrderId);
+      await notifyAdmin(bot, {
+        type:  'refund_request',
+        title: 'New refund request',
+        body:
+          `🆔 <b>Order:</b> #${d.refundOrderId}\n` +
+          `👤 <b>User:</b> <code>${userId}</code>\n` +
+          `💵 <b>Order total:</b> ${order.total_price}$\n` +
+          `💳 <b>Method:</b> Wallet`,
+        dedupeKey: `refund_request:${pendingW ? pendingW.id : d.refundOrderId}`,
+        refType: 'refund_request',
+        refId:   pendingW ? pendingW.id : d.refundOrderId,
+        buttons: pendingW ? [[{ text: '🔄 Review request', callback_data: `admin_refund_view_${pendingW.id}` }]] : null,
+        supportButtons: [[{ text: '🔄 Refund list', callback_data: 'ref_list_0' }]],
+      });
+    } catch (e) { logger.warn(`refund notify failed: ${e.message}`); }
+    return;
+  }
+  if (data === 'refund_method_binance') {
+    await answer();
+    session.update(userId, { refundMethod: 'binance' });
+    session.set(userId, States.REFUND_ADDRESS, session.get(userId).data);
+    await bot.editMessageText(
+      `🟡 <b>Binance Pay Refund</b>\n\n` +
+      `Please send your <b>Binance Pay ID</b> (numeric).\n\n` +
+      `<i>Example: 263344433</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML' }
+    );
+    return;
+  }
+  if (data === 'refund_method_crypto') {
+    await answer();
+    session.update(userId, { refundMethod: 'crypto' });
+    await bot.editMessageText(
+      `💎 <b>Choose Network</b>\n\n` +
+      `Which network for the USDT refund?`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [
+          [{ text: 'TRC20 (Tron)',  callback_data: 'refund_net_TRC20' }],
+          [{ text: 'BEP20 (BSC)',   callback_data: 'refund_net_BEP20' }],
+          [{ text: 'TON',           callback_data: 'refund_net_TON' }],
+          [{ text: 'ERC20 (ETH)',   callback_data: 'refund_net_ERC20' }],
+          [{ text: 'Polygon',       callback_data: 'refund_net_POLYGON' }],
+        ] } }
+    );
+    return;
+  }
+  if (/^refund_net_(TRC20|BEP20|TON|ERC20|POLYGON)$/.test(data)) {
+    const network = data.split('_').pop();
+    await answer();
+    session.update(userId, { refundNetwork: network });
+    session.set(userId, States.REFUND_ADDRESS, session.get(userId).data);
+    await bot.editMessageText(
+      `💎 <b>${network} USDT Refund</b>\n\n` +
+      `Please send your <b>${network} wallet address</b>:\n\n` +
+      `<i>Make sure the address is correct — refunds cannot be reversed.</i>`,
+      { chat_id: chatId, message_id: msgId, parse_mode: 'HTML' }
+    );
+    return;
+  }
+
+  if (data === 'my_refunds') {
+    await answer();
+    const refunds = db.getUserRefundRequests(userId);
+    if (!refunds.length) {
+      await bot.editMessageText(
+        `🔄 <b>My Refund Requests</b>\n\nNo refund requests yet.`,
+        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu_orders' }]] } }
+      );
+      return;
+    }
+    let txt = `🔄 <b>My Refund Requests</b>\n\n`;
+    const statusEmoji = { pending: '⏳', approved: '✅', rejected: '❌' };
+    for (const r of refunds) {
+      const emoji = statusEmoji[r.status] || '🔄';
+      txt += `${emoji} <b>#${r.id}</b> · Order #${r.order_id}\n`;
+      txt += `📦 ${r.product_title || 'Unknown'}\n`;
+      txt += `💵 ${r.total_price || 0}$\n`;
+      txt += `📊 Status: <b>${r.status.toUpperCase()}</b>\n`;
+      txt += `📅 ${(r.created_at || '').slice(0, 16)}\n`;
+      if (r.admin_note) txt += `📝 <i>Admin: ${r.admin_note.slice(0, 100)}</i>\n`;
+      txt += `\n`;
+    }
+    await bot.editMessageText(txt, {
+      chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu_orders' }]] }
+    });
+    return;
+  }
+
+  // ── VIP Status / Invite ──────────────────────────────────────────
+  // VIP has been retired. Anything still pointing at it — an old message, a
+  // saved keyboard — lands on Ranks, which is the live loyalty system.
+  if (data === 'menu_vip' || data === 'vip_show' ||
+      data === 'vip_intro_become' || data === 'vip_intro_skip') {
+    return handleCallbackQuery({ ...query, data: 'menu_ranks' });
+  }
+
+  // First-time VIP intro (after /start for new users)
+  if (data === 'menu_support') { await answer(); await supportHandler.showSupport(bot, chatId, msgId); return; }
+  if (data === 'support_send') { await answer(); await supportHandler.startSupportMessage(bot, chatId, userId, msgId); return; }
+
+  // ── Referral ─────────────────────────────────────────────────────
+  if (data === 'menu_referral') { await answer(); await handleReferralMenu(bot, chatId, userId); return; }
+
+  // ── Admin panel (security checked inside handleAdminCallback) ─────
+  if (data === 'admin_panel') {
+    if (!adminHandler.isAdmin(userId)) {
+      return bot.answerCallbackQuery(query.id, {
+        text: '❌ You are not authorized to use this section.',
+        show_alert: true,
+      }).catch(() => {});
+    }
+    await answer();
+    await adminHandler.showAdminPanel(bot, chatId, msgId);
+    return;
+  }
+  if (data === 'admin_add_product') {
+    if (!adminHandler.isAdmin(userId)) {
+      return bot.answerCallbackQuery(query.id, {
+        text: '❌ You are not authorized to use this section.',
+        show_alert: true,
+      }).catch(() => {});
+    }
+    await answer();
+    await adminHandler.startAddProduct(bot, chatId, userId, msgId);
+    return;
+  }
+
+  // All other admin/* and req_email/notif_/ann_/item_type_ callbacks — security inside handleAdminCallback
+  if (data.startsWith('admin_') || /^(req_email|notif_|ann_|item_type_)/.test(data)) {
+    await adminHandler.handleAdminCallback(bot, query);
+    return;
+  }
+
+  // ── Delete single stock item ─────────────────────────────────────
+  if (/^admin_del_stock_item_[is]_\d+$/.test(data)) {
+    await adminHandler.handleAdminCallback(bot, query);
+    return;
+  }
+
+  // ── Pre-Order customer-facing buttons ────────────────────────────
+  if (/^preorder_\d+$/.test(data)) {
+    await answer();
+    await buyHandler.initiatePreorder(bot, chatId, userId, parseInt(data.split('_').pop(), 10), msgId);
+    return;
+  }
+  if (/^confirm_preorder_\d+$/.test(data)) {
+    await answer();
+    await buyHandler.confirmPreorder(bot, chatId, userId, parseInt(data.split('_').pop(), 10), msgId);
+    return;
+  }
+  if (/^cancel_preorder_\d+$/.test(data)) {
+    await answer();
+    await buyHandler.cancelPreorder(bot, chatId, userId, parseInt(data.split('_').pop(), 10), msgId);
+    return;
+  }
+
+  logger.warn(`Unhandled callback: ${data}`);
+  await answer();
+}
+
+// ── Error handlers ────────────────────────────────────────────────────────────
+
+// /recover_items USERID PRODUCTID — recover stolen items from a customer's order
+bot.onText(/\/recover_items\s+(\d+)\s+(\d+)/, async (msg, match) => {
+  if (!adminHandler.isAdmin(msg.from.id)) return;
+  const targetUserId = parseInt(match[1], 10);
+  const productId = parseInt(match[2], 10);
+  await adminHandler.recoverDeliveredItems(bot, msg.chat.id, msg.from.id, targetUserId, productId);
+});
+
+bot.on('polling_error', (err) => logger.error(`Polling error: ${err.message}`));
+bot.on('error',         (err) => logger.error(`Bot error: ${err.message}`));
+process.on('unhandledRejection', (err) => {
+  // These Telegram errors are races, not bugs: the user tapped a button twice,
+  // or the message was already gone. They were flooding the production logs.
+  const m = String((err && err.message) || err || '');
+  if (m.includes('message is not modified') ||
+      m.includes('message to edit not found') ||
+      m.includes('query is too old')) {
+    return;
+  }
+  logger.error(`Unhandled rejection: ${m}`);
+});
+
+// ── Express health server ─────────────────────────────────────────────────────
+// Keeps Railway happy (HTTP port) and exposes /health + /cryptobot/webhook.
+const app           = express();
+// Railway terminates TLS at its edge and forwards over plain HTTP. Without
+// this, req.protocol reports "http" and every URL printed in the API docs is
+// wrong — resellers would copy links that do not work.
+app.set('trust proxy', true);
+const webhookRouter = require('./handlers/webhook')(bot);
+const resellerApi   = require('./api-reseller'); // ← new: read-only addition, no bot code touched
+
+app.use('/', webhookRouter);
+app.use(express.json());
+app.use('/api/v1', resellerApi); // legacy reseller API (separate balances)
+
+// Public customer API: self-service keys, wallet-funded, same pricing and the
+// same atomic purchase path as the bot itself.
+app.set('bot', bot);   // manual-delivery notifications need a bot instance
+app.set('storeBot', bot); // stays the store bot even after 'bot' is swapped for the support bot
+app.use('/api/v2', require('./api-public'));
+
+// Owner's assistant. Read-only tools, guarded by a token only the owner has.
+const agentChat = require('./services/agentChat');
+app.use('/agent', agentChat.router);
+// Support replies must go out from the support bot, the one the customer is
+// actually talking to — sending from the store bot would arrive in the wrong
+// chat and look like a different person answering.
+try {
+  const supportBot = require('./support-bot');
+  if (supportBot && typeof supportBot.sendMessage === 'function') app.set('bot', supportBot);
+} catch (e) { logger.warn(`agent: support bot unavailable: ${e.message}`); }
+
+app.listen(config.webhookPort, config.webhookHost, () => {
+  logger.info(`HTTP server: http://${config.webhookHost}:${config.webhookPort}/`);
+  logger.info(`Health:      http://${config.webhookHost}:${config.webhookPort}/health`);
+  logger.info(`Reseller API: http://${config.webhookHost}:${config.webhookPort}/api/v1/docs`);
+  {
+    const apiBase = resolveApiBase();
+    logger.info(`Customer API docs (local):  http://${config.webhookHost}:${config.webhookPort}/api/v2/docs`);
+    if (isRealBase(apiBase)) {
+      logger.info(`Customer API docs (PUBLIC): ${apiBase}/api/v2/docs`);
+    } else {
+      // Stated loudly: without this the API cannot be called by anyone, and the
+      // only symptom is customers quietly having no working base URL.
+      logger.warn('No public domain configured — the API is unreachable from outside.');
+      logger.warn('Fix: Railway → Settings → Networking → Generate Domain, or set api_base_url.');
+    }
+  }
+  if (config.cryptobotToken) {
+    logger.info(`CryptoBot:   http://${config.webhookHost}:${config.webhookPort}/cryptobot/webhook`);
+  }
+});
+
+// Log join-gate status for diagnostics
+const joinGateEnabled = db.getSetting('join_required_enabled', '0') === '1';
+const dbGroupId       = db.getSetting('required_group_id',   '');
+const dbChannelId     = db.getSetting('required_channel_id', '');
+
+logger.info('─────────────────────────────────────────────────');
+logger.info(`Admins:  [${config.adminIds.join(', ')}]`);
+logger.info(`DB:      ${config.dbPath}`);
+logger.info(`Referral reward: $${config.referralReward}`);
+logger.info(`Join Required: ${joinGateEnabled ? '✅ ENABLED' : '❌ disabled'}`);
+if (joinGateEnabled) {
+  logger.info(`  Group  ID: ${dbGroupId   || '(not set)'}`);
+  logger.info(`  Channel ID: ${dbChannelId || '(not set)'}`);
+}
+logger.info('─────────────────────────────────────────────────');
+
+// ── Auto VIP Broadcast (every 30 minutes if enabled) ─────────────────
+const { publishToChannel, publishToGroup } = require('./services/notifications');
+async function autoVipBroadcast() {
+  try {
+    const enabled = db.getSetting('vip_auto_broadcast', '0') === '1';
+    if (!enabled) return;
+
+    const totalVips = db.countVIPs();
+    const VIP_LIMIT = parseInt(db.getSetting('vip_limit', '1000'), 10);
+    const slotsLeft = Math.max(0, VIP_LIMIT - totalVips);
+    const botUser = await bot.getMe().catch(() => ({ username: 'YourBot' }));
+
+    const text =
+      `👑 <b>VIP FOR LIFE</b> 👑\n\n` +
+      `🚨 <b>Important:</b> ⏳ VIP closes at <b>${VIP_LIMIT} customers</b>\n` +
+      `📊 Only <b>${slotsLeft} slots remaining</b>\n\n` +
+      `Invite only <b>3 friends</b> and unlock VIP <b>forever</b>!\n\n` +
+      `🎁 <b>VIP Benefits:</b>\n` +
+      `💸 5% discount on every purchase for life\n` +
+      `🤝 Earn rewards from your team's purchases\n` +
+      `🚀 Early access to new and rare products\n` +
+      `⚡️ Priority support and faster replies\n\n` +
+      `🔥 Invite <b>3 friends</b> today and secure your VIP status forever.`;
+
+    const kb = { inline_keyboard: [
+      [{ text: '🚀 Open Bot & Invite Friends', url: `https://t.me/${botUser.username}?start=vip` }],
+      [{ text: '👑 Become VIP Now', url: `https://t.me/${botUser.username}?start=vip` }],
+    ] };
+
+    const vipImg = db.getSetting('vip_image_file_id', '');
+    if (vipImg) {
+      const channelId = require('./database/queries').getSetting('required_channel_id', '');
+      const groupId   = require('./database/queries').getSetting('required_group_id', '');
+      if (channelId) {
+        try { await bot.sendPhoto(channelId, vipImg, { caption: text, parse_mode: 'HTML', reply_markup: kb }); } catch (e) {}
+      }
+      if (groupId) {
+        try { await bot.sendPhoto(groupId, vipImg, { caption: text, parse_mode: 'HTML', reply_markup: kb }); } catch (e) {}
+      }
+    } else {
+      await publishToChannel(bot, text, kb).catch(() => {});
+      await publishToGroup(bot, text, kb).catch(() => {});
+    }
+  } catch (e) {
+    logger.warn(`Auto VIP broadcast failed: ${e.message}`);
+  }
+}
+// Dynamic interval — uses 'vip_broadcast_interval_min' setting (default 30 min)
+let vipBroadcastTimer = null;
+function scheduleVipBroadcast() {
+  if (vipBroadcastTimer) clearTimeout(vipBroadcastTimer);
+  const minutes = parseInt(db.getSetting('vip_broadcast_interval_min', '30'), 10);
+  const ms = Math.max(1, minutes) * 60 * 1000;
+  vipBroadcastTimer = setTimeout(async () => {
+    await autoVipBroadcast();
+    scheduleVipBroadcast(); // reschedule with current interval (could have changed)
+  }, ms);
+  logger.info(`VIP broadcast scheduled in ${minutes} minute(s)`);
+}
+// NOT started. The VIP programme is closed, so advertising "invite 3 friends
+// and unlock VIP forever" to the channel every half hour would be promising
+// something nobody can receive — the fastest way to lose the trust the channel
+// exists to build. The function is kept so the code reads honestly rather than
+// leaving a dangling reference in the admin handler.
+global._scheduleVipBroadcast = () => {
+  logger.info('[VIP] broadcast not scheduled — the VIP programme is closed');
+};
+
+// ── Stale Product Reminders (checked every 6 hours; settings control on/off + threshold) ──
+const { checkAndSendStaleProductReminders } = require('./services/notifications');
+const STALE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
+async function runStaleProductCheck() {
+  try {
+    await checkAndSendStaleProductReminders(bot, db);
+  } catch (e) {
+    logger.warn(`Stale product reminder check failed: ${e.message}`);
+  }
+}
+setInterval(runStaleProductCheck, STALE_CHECK_INTERVAL_MS);
+
+// V132 — real-time deposit sync: credits a reserved amount as soon as Binance
+// has it, without the customer sending a TxID (TON, off-chain transfers).
+try { require('./handlers/wallet').startDepositWatcher(bot); }
+catch (e) { logger.warn(`Deposit watcher not started: ${e.message}`); }
+// Run once shortly after boot too, so a freshly-enabled setting doesn't wait 6 hours
+setTimeout(runStaleProductCheck, 60 * 1000);
+
+bot.on('callback_query', handleCallbackQuery);
+
+// Sahbi's watcher: follow-up alerts, patterns, ideas and daily briefs,
+// pushed to the admins through the store bot.
+try { require('./services/agentWatch').start(bot); } catch (e) { logger.warn(`sahbi watcher: ${e.message}`); }
+
+// Premium product icons: snapshot what is there, restore anything that has been
+// lost. Runs before the first customer message so nobody sees a stripped title.
+try {
+  require('./utils/emojiBackup').syncOnBoot();
+  setTimeout(() => require('./utils/emojiLayer').bootCheck(bot, 'store').catch(() => {}), 20000);
+} catch (e) {
+  logger.error(`emoji backup sync: ${e.message}`);
+}
+
+// ── Start Support Bot ─────────────────────────────────────────────────
+require('./support-bot');
+// Telegram Business: the owner's personal private chats, when he connects
+// this bot (Settings → Telegram Business → Chatbots). See services/businessInbox.js.
+try {
+  const bi = require('./services/businessInbox');
+  bi.attach(bot, 'store');                                      // works if the owner picks the store bot…
+  // Remember the store bot's real @username so Yamen can link to it in
+  // private chats (he always promotes the shop bot — never an invented link).
+  bot.getMe().then((me) => { if (me && me.username) require('./services/agentMemory').setState('store_bot_username', me.username); }).catch(() => {});
+  bi.startDedicated(TelegramBot, process.env.BUSINESS_BOT_TOKEN); // …or, better, a separate bot just for this
+} catch (e) { logger.warn('businessInbox: ' + e.message); }
+let chatgptBotModule = null;
+try { chatgptBotModule = require('./chatgpt-bot'); } catch (e) { logger.warn('chatgpt-bot load: ' + e.message); }
+
+// ── ChatGPT Business Guard integration (separate bot/service) ──────────
+// Inbound: the guard bot reports back whether an invite it sent was
+// verified in Pending invites, so a seat can be activated automatically
+// instead of the admin needing to notice and tap the button by hand.
+// Mounted only when GUARD_SECRET is configured, so the route doesn't
+// exist at all (rather than existing but always 401) until set up.
+if (process.env.GUARD_SECRET) {
+  if (chatgptBotModule && chatgptBotModule.activateAndNotifySeat) {
+    const { makeGuardWebhookHandler } = require('./services/cgbGuard');
+    const { notifyAdmin } = require('./services/adminNotify');
+    app.post('/webhook/cgb-guard-status', makeGuardWebhookHandler({
+      queries: db, logger, bot, notifyAdmin,
+      activateAndNotifySeat: chatgptBotModule.activateAndNotifySeat,
+    }));
+    logger.info('ChatGPT Business Guard callback route mounted at /webhook/cgb-guard-status');
+    // V151: each panel's invite bot asks for the seats of its cycle here.
+    app.get('/webhook/cgb-seats', require('./services/cgbGuard').makeSeatsHandler({ db: require('./database/db') }));
+    logger.info('ChatGPT Business seats route mounted at /webhook/cgb-seats');
+  } else {
+    logger.warn('GUARD_SECRET is set but the ChatGPT Business bot did not load — /webhook/cgb-guard-status not mounted.');
+  }
+}
+
+// ── DigiPro activation bot (separate service) — wallet link, V167.7 ─────
+// The store keeps the wallet; DigiPro asks it to charge/refund. The routes do
+// not exist at all until DIGIPRO_SECRET is set.
+if (process.env.DIGIPRO_SECRET) {
+  require('./services/digiproLink').mount(app, {
+    secret: process.env.DIGIPRO_SECRET,
+    queries: db,
+    dbRaw: require('./database/db'),
+    logger,
+    maxCents: Number(process.env.DIGIPRO_MAX_CENTS) || 50000,
+    notifyAdmins: async (text) => {
+      for (const id of (config.adminIds || [])) await bot.sendMessage(id, text, { parse_mode: 'HTML' }).catch(() => {});
+    },
+  });
+  logger.info('DigiPro wallet link mounted at /internal/digipro/{balance,charge,refund}');
+}
+
+// ── Verif bot SHARED WALLET link (V167.36) ──────────────────────────────────
+// The Verif bot uses THIS wallet, so the balance is shared. Mounted only when
+// VERIF_WALLET_SECRET is set.
+if (process.env.VERIF_WALLET_SECRET) {
+  require('./services/verifLink').mount(app, {
+    secret: process.env.VERIF_WALLET_SECRET,
+    queries: db,
+    dbRaw: require('./database/db'),
+    config,
+    logger,
+    maxCents: Number(process.env.VERIF_MAX_CENTS) || 50000,
+    notifyAdmins: async (text) => {
+      for (const id of (config.adminIds || [])) await bot.sendMessage(id, text, { parse_mode: 'HTML' }).catch(() => {});
+    },
+  });
+  logger.info('Verif shared-wallet link mounted at /internal/verif/{balance,charge,refund,deposit}');
+}
+
+// ── Verif bot → record its orders in the customer's history here (V167.35) ──
+// The Verif bot POSTs each order so it shows in the customer's "My Orders".
+// Secret-protected (BRIDGE_SECRET) and idempotent per the verif order ref.
+if (process.env.BRIDGE_SECRET) {
+  app.post('/webhook/verif-order', express.json(), (req, res) => {
+    try {
+      if ((req.get('x-bridge-secret') || '') !== process.env.BRIDGE_SECRET) {
+        return res.status(401).json({ ok: false, error: 'unauthorized' });
+      }
+      const b = req.body || {};
+      const uid = Number(b.uid);
+      const productId = Number(b.product_id) || Number(process.env.VERIF_PRODUCT_ID) || 0;
+      if (!uid || !productId) return res.status(400).json({ ok: false, error: 'missing uid/product' });
+      const result = db.createVerifOrder({
+        userId: uid, productId, email: b.email || '',
+        totalPrice: Number(b.amount) || 0, title: b.title || 'Verif order',
+        status: b.status || 'delivered', ref: `verif:${b.ref}`,
+      });
+      if (!result.ok) return res.status(400).json(result);
+      return res.json({ ok: true, order_id: result.orderId, duplicate: !!result.duplicate });
+    } catch (e) {
+      logger.warn(`[verif-order] ${e.message}`);
+      return res.status(500).json({ ok: false, error: 'server_error' });
+    }
+  });
+  logger.info('Verif order mirror mounted at /webhook/verif-order');
+}
+

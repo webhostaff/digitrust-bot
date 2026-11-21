@@ -1,0 +1,437 @@
+'use strict';
+
+/**
+ * Manual delivery.
+ *
+ * Products flagged `delivery_type = 'manual'` are paid for normally but are NOT
+ * handed over automatically — no `product_items` row is consumed. Instead the
+ * order moves to status `awaiting_delivery` and a row is opened in
+ * `manual_deliveries` for a human to fulfil.
+ *
+ * Guarantees required by the spec, and where they come from:
+ *   • never created before payment succeeds  → callers only invoke this after
+ *     the atomic charge/settle transaction returns 'ok'
+ *   • never duplicated for one order         → UNIQUE(order_id) + INSERT OR IGNORE
+ *   • never disappears before it is done     → the task is a persistent row and
+ *     the panel's default tab shows every non-final task
+ *   • no repeated admin pings                → notifyAdmin() dedupe key is the
+ *     task id, and `notified_at` latches the first push
+ */
+
+const db     = require('../database/queries');
+const logger = require('../utils/logger');
+const config = require('../config');
+const { notifyAdmin, escapeHtml, stamp } = require('../services/adminNotify');
+const { formatPrice } = require('../utils/format');
+
+const STATUS_LABEL = {
+  pending:    '🕐 Awaiting delivery',
+  processing: '⚙️ In progress',
+  delivered:  '✅ Delivered',
+  cancelled:  '❌ Cancelled',
+};
+
+/** Clean a stored product title for display (drops [emoji:ID] markers). */
+function cleanTitle(t) {
+  return escapeHtml(String(t || '').replace(/\[emoji:\d+\]/g, '').trim());
+}
+
+/**
+ * Open a manual-delivery task for an already-paid order and notify everyone.
+ *
+ * @param {TelegramBot} bot
+ * @param {object} order   full order row (must already be paid)
+ * @param {string} paymentMethod human label, e.g. 'wallet' / 'USDT TRC20'
+ * @returns {Promise<object|null>} the manual delivery row
+ */
+async function openManualDelivery(bot, order, paymentMethod) {
+  const product = db.getProduct(order.product_id);
+
+  // Idempotent: a second call for the same order returns the existing task
+  // and pushes nothing, which is what makes webhook retries harmless.
+  const { created, row } = db.createManualDelivery({
+    orderId:       order.id,
+    userId:        order.user_id,
+    productId:     order.product_id,
+    quantity:      order.quantity,
+    email:         order.email || null,
+    totalPaid:     order.total_price,
+    paymentMethod: paymentMethod || order.payment_method || null,
+  });
+
+  if (!row) {
+    logger.error(`openManualDelivery: task row missing for order #${order.id}`);
+    return null;
+  }
+  if (!created) {
+    logger.info(`openManualDelivery: task already exists for order #${order.id} — skipping notifications`);
+    return row;
+  }
+
+  // ── Try the Canva auto-invite before troubling a human ────────────────────
+  // Only for Canva products, only when automation is on and logged in. Any
+  // failure falls straight through to the normal manual task below — the order
+  // is never left half-done, and a human sees it just as before.
+  try {
+    const canva = require('../services/canvaBot');
+    const isCanva = /canva/i.test(product?.title || order.product_title || '');
+    if (isCanva && order.email && canva.available()) {
+      const r = await canva.inviteEmail(order.email);
+      if (r.ok && r.link) {
+        const done = await completeManualDelivery(bot, row.id, r.link);
+        if (done.ok) {
+          logger.info(`[canva] auto-delivered order #${order.id} to ${order.email}`);
+          try {
+            const { notifyAdmin } = require('../services/adminNotify');
+            await notifyAdmin(bot, {
+              type: 'manual_delivery',
+              title: '🤖 Canva invite sent automatically',
+              body: `🆔 Task #${row.id} · Order #${order.id}\n📧 <code>${escapeHtml(order.email)}</code>\n` +
+                    (r.panelName ? `🎨 Panel: <b>${escapeHtml(r.panelName)}</b>\n` : '') +
+                    ((r.switched || []).length ? r.switched.map((x) => `🔀 ${escapeHtml(canva.panelName(x.from))} → ${escapeHtml(canva.panelName(x.to))} (${escapeHtml(x.why)})`).join('\n') + '\n' : '') +
+                    `✅ Invited and delivered to the customer — no action needed.`,
+              dedupeKey: `canva_auto:${row.id}`, refType: 'manual_delivery', refId: row.id,
+            });
+          } catch (_) {}
+          return db.getManualDelivery(row.id);
+        }
+      } else if (r.invited === true && !r.link && !r.teamFull) {
+        // V165.3: Canva CONFIRMED the invite (its email went to the customer) but the personal link could not be
+        // copied. The customer does not need the link — Canva's own email has the Accept button — so deliver anyway
+        // instead of leaving the customer waiting for a manual task.
+        const note = `Canva has sent an invitation to ${order.email}. Open that email (check Spam / Promotions) and press "Accept invitation".`;
+        const done = await completeManualDelivery(bot, row.id, note, { panelName: r.panelName || '' });
+        if (done.ok) {
+          logger.info(`[canva] invite confirmed for #${order.id} (no link copied) — delivered with the email instruction`);
+          try {
+            const { notifyAdmin } = require('../services/adminNotify');
+            await notifyAdmin(bot, {
+              type: 'manual_delivery', title: '🤖 Canva invite sent (email only)',
+              body: `🆔 Task #${row.id} · Order #${order.id}\n📧 <code>${escapeHtml(order.email)}</code>\n` +
+                    (r.panelName ? `🎨 Panel: <b>${escapeHtml(r.panelName)}</b>\n` : '') +
+                    `✅ Invited. The link could not be copied, so the customer was told to accept from Canva's email. No action needed.`,
+              dedupeKey: `canva_auto:${row.id}`, refType: 'manual_delivery', refId: row.id,
+            });
+          } catch (_) {}
+          return db.getManualDelivery(row.id);
+        }
+      } else if (r.alreadyMember && !r.link) {
+        // V167.13: the customer is ALREADY on the Canva team — the invite
+        // arrived and was accepted at some point, so the order is already
+        // fulfilled. No new email is sent (inviting again would be pointless),
+        // and no personal link is needed. Deliver with a plain confirmation
+        // instead of opening a manual task for an account the customer has.
+        const note = `This email is already on our Canva team, so you already have access. Open canva.com and sign in with ${order.email} — the team is there. If you do not see it, check the Canva invitation email you accepted earlier.`;
+        const done = await completeManualDelivery(bot, row.id, note, { panelName: r.panelName || '' });
+        if (done.ok) {
+          logger.info(`[canva] #${order.id} already a team member — delivered as confirmed (no link, no re-invite)`);
+          try {
+            const { notifyAdmin } = require('../services/adminNotify');
+            await notifyAdmin(bot, {
+              type: 'manual_delivery', title: '🤖 Canva: already a member (confirmed)',
+              body: `🆔 Task #${row.id} · Order #${order.id}\n📧 <code>${escapeHtml(order.email)}</code>\n` +
+                    (r.panelName ? `🎨 Panel: <b>${escapeHtml(r.panelName)}</b>\n` : '') +
+                    `✅ Already on the team — delivered as confirmed. No link was sent and no second invite was made. No action needed.`,
+              dedupeKey: `canva_auto:${row.id}`, refType: 'manual_delivery', refId: row.id,
+            });
+          } catch (_) {}
+          return db.getManualDelivery(row.id);
+        }
+      } else {
+        logger.warn(`[canva] auto-invite failed for #${order.id}: ${r.reason}` +
+          (r.needLogin ? ' (needs re-login)' : '') + ' — handing to manual');
+        // Tell the owner WHY, in Telegram. This used to require('./canvaAlert'),
+        // a file that never existed — the throw was swallowed, so a failed
+        // auto-invite left no trace except the server log.
+        try {
+          await notifyAdmin(bot, {
+            type: 'manual_delivery',
+            title: '⚠️ Canva auto-invite failed → manual',
+            body: `🆔 Order #${order.id}\n📧 <code>${escapeHtml(order.email)}</code>\n` +
+                  `❌ ${escapeHtml(String(r.reason || 'unknown'))}` +
+                  (r.panelName ? `\n🎨 Panel: <b>${escapeHtml(r.panelName)}</b>` : '') +
+                  (r.teamFull ? '\n⛔ <b>The Canva team is full (50).</b> Tap 🔐 Log in a NEW Canva account below.' : '') +
+                  (r.needLogin ? '\n🔑 Session expired — paste a fresh CANVA_SESSION.' : '') +
+                  // The invite may already be in Canva: inviting again would
+                  // send the customer a second email. Say so loudly.
+                  (r.invited === true ? '\n\n⚠️ <b>Already invited in Canva — do NOT invite again.</b> People → search this email → <b>Copy link</b>.'
+                    : r.invited === 'maybe' ? '\n\n🔎 <b>May already be invited</b> — search this email in People first; invite only if it is not there.'
+                    : '\n\n➕ <b>Not invited yet</b> — invite this email as usual.') +
+                  `\n\n<i>The manual task below is ready as usual.</i>`,
+            dedupeKey: `canva_fail:${row.id}`, refType: 'manual_delivery', refId: row.id,
+            ...(r.teamFull ? { buttons: [[{ text: '🔐 Log in a NEW Canva account', callback_data: 'canva_newacct' }], [{ text: '🎨 Canva', callback_data: 'canva_menu' }]] } : {}),
+          });
+        } catch (_) {}
+        // What the bot saw (screenshot + buttons + masked links), so the next
+        // fix is based on Canva's real page, not guesses.
+        if (r.debug) {
+          const d = r.debug;
+          const cap = `🔍 <b>Canva page after the invite</b> (order #${order.id})\n` +
+            (d.url ? `🌐 <code>${escapeHtml(String(d.url).slice(0, 100))}</code>\n` : '') +
+            `🔗 team links: ${d.links?.team?.length || 0} · after invite: ${d.links?.after_invite?.length || 0}\n` +
+            (d.buttons?.length ? `🔘 ${escapeHtml(d.buttons.slice(0, 25).join(' · ')).slice(0, 700)}` : '');
+          // ADMIN_IDS plus the legacy single ADMIN_ID, deduped.
+          const admins = [...new Set([...(config.adminIds || []), Number(process.env.ADMIN_ID) || 0].filter(Boolean))];
+          for (const adminId of admins) {
+            try {
+              if (d.shot) await bot.sendPhoto(adminId, d.shot, { caption: cap.slice(0, 1020), parse_mode: 'HTML' }, { filename: 'canva.jpg', contentType: 'image/jpeg' });
+              else await bot.sendMessage(adminId, cap, { parse_mode: 'HTML' });
+            } catch (_) {}
+          }
+          try { require('../services/agentMemory').setState('canva_last_failure', JSON.stringify({ at: new Date().toISOString(), order: order.id, reason: r.reason, url: d.url, buttons: d.buttons, links: d.links })); } catch (_) {}
+        }
+        try {
+          require('../services/agentMemory')
+            .logChat('event', `⚠️ Canva أوتوماتيك ما نجّمش (${r.reason}) — الطلب #${order.id} ولّى يدوي` +
+              (r.needLogin ? '. لازم تسجّل الدخول من جديد.' : ''));
+        } catch (_) {}
+      }
+    }
+  } catch (e) {
+    logger.warn(`[canva] auto path error for #${order.id}: ${e.message}`);
+  }
+
+  // ── Tell the customer their order is queued, not lost ─────────────────────
+  try {
+    await bot.sendMessage(
+      order.user_id,
+      `✅ <b>Payment Received</b>\n\n` +
+      `📦 <b>Product:</b> ${cleanTitle(product?.title || order.product_title)}\n` +
+      `🔢 <b>Quantity:</b> ${order.quantity}\n` +
+      (order.email ? `📧 <b>Email:</b> <code>${escapeHtml(order.email)}</code>\n` : '') +
+      `💵 <b>Paid:</b> ${formatPrice(order.total_price)}\n` +
+      `🆔 <b>Order:</b> #${order.id}\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `🖐 <b>This product is delivered manually.</b>\n\n` +
+      `Our team has been notified and will prepare your order shortly. ` +
+      `You will receive another message here the moment it is ready.\n\n` +
+      `<i>You can follow the status any time from 📦 My Orders.</i>`,
+      {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '📦 My Orders', callback_data: 'menu_orders' }]] },
+      }
+    );
+  } catch (e) {
+    logger.warn(`openManualDelivery: could not notify customer ${order.user_id}: ${e.message}`);
+  }
+
+  // ── Tell the admin there is work to do ────────────────────────────────────
+  const buyer     = db.getUser(order.user_id);
+  const buyerName = buyer?.username ? `@${buyer.username}` : (buyer?.first_name || `User ${order.user_id}`);
+
+  await notifyAdmin(bot, {
+    type:  'manual_delivery',
+    title: 'New manual delivery request',
+    body:
+      `🆔 <b>Task:</b> #${row.id}   <b>Order:</b> #${order.id}\n` +
+      `📦 <b>Product:</b> ${cleanTitle(product?.title || order.product_title)}\n` +
+      `🔢 <b>Quantity:</b> ${order.quantity}\n` +
+      (order.email ? `📧 <b>Email:</b> <code>${escapeHtml(order.email)}</code>\n` : '') +
+      `💵 <b>Paid:</b> ${formatPrice(order.total_price)}\n` +
+      `💳 <b>Method:</b> ${escapeHtml(paymentMethod || 'n/a')}\n\n` +
+      `👤 <b>Customer:</b> ${escapeHtml(buyerName)}\n` +
+      `🆔 <b>User ID:</b> <code>${order.user_id}</code>\n` +
+      `🕒 <b>Placed:</b> ${stamp()}\n\n` +
+    `<i>↩️ Reply to this message with the invite link / content to deliver it.</i>`,
+    dedupeKey: `manual_delivery:${row.id}`,
+    refType:   'manual_delivery',
+    refId:     row.id,
+    buttons: [
+      [{ text: '📦 Open task', callback_data: `admin_md_view_${row.id}` }],
+      [{ text: '✅ Mark delivered', callback_data: `admin_md_deliver_${row.id}` }],
+      ...(order.email ? [[{ text: '🎟 Activate in a panel', callback_data: `admin_mdpk_${row.id}` }]] : []),
+    ],
+    // Fast lane: copy the email, open the work page, or simply reply to this
+    // card with the content (services/mdFast.js).
+    supportButtons: require('../services/mdFast').taskButtons(
+      { ...row, product_title: product?.title || order.product_title, email: order.email || row.email },
+      [[{ text: '📦 Open task', callback_data: `md_view_${row.id}` }],
+       ...(order.email ? [[{ text: '🎟 Activate in a panel', callback_data: `mdpk_${row.id}` }]] : [])]),
+  });
+
+  db.markManualNotified(row.id);
+  return row;
+}
+
+/**
+ * Complete a task: notify the customer, close the order, store any content.
+ *
+ * @returns {Promise<{ok: boolean, reason?: string}>}
+ */
+function rememberDeliveryMsg(bot, taskId, m) {
+  try {
+    if (m && m.message_id) db.setManualDeliveryMsg(taskId, m.message_id, String(bot.token || '').split(':')[0] || null);
+  } catch (_) {}
+}
+
+/**
+ * Take back a wrong delivery: delete the message from the customer's chat,
+ * erase the content from their order, reopen the task. The Telegram delete
+ * works only within 48h and only with the bot that sent it.
+ */
+async function recallManualDelivery(bot, taskId) {
+  const task = db.getManualDelivery(taskId);
+  if (!task) return { ok: false, reason: 'not_found' };
+  if (task.status !== 'delivered') return { ok: false, reason: 'not_delivered' };
+  let removed = false, why = '';
+  if (!task.delivery_msg_id) {
+    why = 'message id was not recorded (delivered before this update)';
+  } else {
+    const tokens = [bot.token, process.env.BOT_TOKEN, process.env.SUPPORT_BOT_TOKEN].filter(Boolean);
+    const tok = tokens.find((t) => String(t).split(':')[0] === String(task.delivery_bot_id));
+    try {
+      if (tok === bot.token || !tok) await bot.deleteMessage(task.user_id, task.delivery_msg_id);
+      else {
+        const r = await fetch(`https://api.telegram.org/bot${tok}/deleteMessage`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ chat_id: task.user_id, message_id: task.delivery_msg_id }),
+        });
+        const j = await r.json();
+        if (!j.ok) throw new Error(j.description || 'delete failed');
+      }
+      removed = true;
+    } catch (e) {
+      why = /too old|can't be deleted|not found/i.test(e.message) ? 'older than 48h or already deleted' : e.message;
+    }
+  }
+  const done = db.recallManualDelivery(taskId);
+  if (!done) return { ok: false, reason: 'not_delivered' };
+  logger.info(`Manual delivery #${taskId} recalled (message removed=${removed})`);
+  return { ok: true, removed, why };
+}
+
+async function completeManualDelivery(bot, taskId, content = null, { panelName = '', expiresOn = null } = {}) {
+  const task = db.getManualDelivery(taskId);
+  if (!task) return { ok: false, reason: 'not_found' };
+  if (task.status === 'delivered') return { ok: false, reason: 'already_delivered' };
+
+  const changed = db.markManualDelivered(taskId, content);
+  if (!changed) return { ok: false, reason: 'already_delivered' };
+
+  // Close the underlying order so it stops looking pending everywhere else.
+  try {
+    db.db.prepare(`
+      UPDATE orders
+      SET status = 'delivered', delivered_content = COALESCE(?, delivered_content)
+      WHERE id = ?
+    `).run(content, task.order_id);
+  } catch (e) {
+    logger.error(`completeManualDelivery: order update failed: ${e.message}`);
+  }
+
+  const product = db.getProduct(task.product_id);
+  const instr = product?.instruction
+    ? `\n━━━━━━━━━━━━━━━━━━━━\n📌 <b>Instructions:</b>\n${escapeHtml(product.instruction)}\n`
+    : '';
+
+  const body =
+    `🎉 <b>Your Order Is Ready!</b>\n\n` +
+    `🆔 <b>Order:</b> #${task.order_id}\n` +
+    `📦 <b>Product:</b> ${cleanTitle(task.product_title)}\n` +
+    `🔢 <b>Quantity:</b> ${task.quantity}\n` +
+    (task.email ? `📧 ${escapeHtml(task.email)}\n` : '') +
+    (panelName ? `🖥 <b>Workspace:</b> ${escapeHtml(panelName)}\n` : '') +
+    (expiresOn ? `⏳ <b>Valid until:</b> ${escapeHtml(expiresOn)}\n` : '') +
+    `💵 ${formatPrice(task.total_paid)}\n` +
+    `📅 <b>Delivered:</b> ${stamp()}\n` +
+    (content
+      ? `\n━━━━━━━━━━━━━━━━━━━━\n🎁 <b>Your Product:</b>\n\n<code>${escapeHtml(content)}</code>\n━━━━━━━━━━━━━━━━━━━━` +
+        (/^https?:\/\/\S+$/.test(String(content).trim()) && task.email
+          ? `\n👉 Tap the button below and sign in with <b>${escapeHtml(task.email)}</b> to accept.`
+          : '')
+      : '') +
+    instr +
+    `\n✨ Thank you for your purchase!`;
+
+  // A lone link (a Canva invite) becomes a big button the customer taps,
+  // instead of a long URL to copy.
+  const linkBtn = content ? require('../services/mdFast').customerButton(task, content) : null;
+  const kbRows = [[{ text: '📦 My Orders', callback_data: 'menu_orders' }]];
+  if (linkBtn) kbRows.unshift([linkBtn]);
+
+  let sent = false;
+  try {
+    // Manually delivered goods get the same protection as automatic ones.
+    const m1 = await bot.sendMessage(task.user_id, body, {
+      plain_emoji: true,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      reply_markup: { inline_keyboard: kbRows },
+    });
+    sent = true;
+    rememberDeliveryMsg(bot, taskId, m1);
+  } catch (e) {
+    // HTML can fail on odd content — retry as plain text before giving up.
+    try {
+      const m2 = await bot.sendMessage(task.user_id, body.replace(/<\/?[^>]+>/g, ''));
+      sent = true;
+      rememberDeliveryMsg(bot, taskId, m2);
+    } catch (e2) {
+      logger.error(`completeManualDelivery: customer ${task.user_id} unreachable: ${e2.message}`);
+    }
+  }
+
+  // 🗂 Panels (V167.24): a manual product is delivered NOW, so record its email
+  // under the product's panel (with expiry). Best-effort — never blocks.
+  try {
+    require('./panels').recordIfPanelProduct(
+      { id: task.order_id, product_id: task.product_id, email: task.email },
+      task.user_id
+    );
+  } catch (_) {}
+
+  return { ok: true, notified: sent, task: db.getManualDelivery(taskId) };
+}
+
+/**
+ * Cancel a task and refund the customer's wallet.
+ */
+async function cancelManualDelivery(bot, taskId, reason = '') {
+  const task = db.getManualDelivery(taskId);
+  if (!task) return { ok: false, reason: 'not_found' };
+  if (task.status === 'delivered') return { ok: false, reason: 'already_delivered' };
+  if (task.status === 'cancelled') return { ok: false, reason: 'already_cancelled' };
+
+  db.setManualDeliveryStatus(taskId, 'cancelled', reason || 'Cancelled by admin');
+
+  // Money back to the wallet — the customer paid but receives nothing.
+  const amount = Number(task.total_paid) || 0;
+  if (amount > 0) {
+    db.updateBalance(task.user_id, amount);
+    db.addTransaction({
+      userId:      task.user_id,
+      type:        'refund',
+      amount,
+      description: `Manual delivery cancelled — order #${task.order_id}`,
+      refId:       `manual_cancel_${taskId}`,
+      orderId:     task.order_id,
+    });
+  }
+
+  try {
+    db.db.prepare("UPDATE orders SET status='cancelled' WHERE id = ?").run(task.order_id);
+  } catch (e) { /* non-fatal */ }
+
+  try {
+    await bot.sendMessage(
+      task.user_id,
+      `❌ <b>Order #${task.order_id} Cancelled</b>\n\n` +
+      `📦 ${cleanTitle(task.product_title)}\n` +
+      (reason ? `📝 <i>${escapeHtml(reason)}</i>\n` : '') +
+      (amount > 0 ? `\n💰 <b>${formatPrice(amount)}</b> has been refunded to your wallet.\n` : '') +
+      `\nPlease contact support if you have any questions.`,
+      { parse_mode: 'HTML' }
+    );
+  } catch (e) { /* customer may have blocked the bot */ }
+
+  return { ok: true };
+}
+
+module.exports = {
+  recallManualDelivery,
+  openManualDelivery,
+  completeManualDelivery,
+  cancelManualDelivery,
+  STATUS_LABEL,
+  cleanTitle,
+};

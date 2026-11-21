@@ -1,0 +1,3899 @@
+'use strict';
+
+const db = require('./db');
+const { normalizeTxidInput, txidAlternates } = require('../utils/txid');
+const subPricing = require('../utils/subscriptionPricing');
+const { TIER_COLUMNS } = require('../utils/bulkTiers');
+
+// ── USERS ─────────────────────────────────────────────────────────────────────
+
+const upsertUser = db.prepare(`
+  INSERT INTO users (telegram_id, username, first_name, last_name)
+  VALUES (@telegramId, @username, @firstName, @lastName)
+  ON CONFLICT(telegram_id) DO UPDATE SET
+    username   = excluded.username,
+    first_name = excluded.first_name,
+    last_name  = excluded.last_name,
+    last_seen  = datetime('now')
+`);
+const getUser         = db.prepare('SELECT * FROM users WHERE telegram_id = ?');
+const getUserByUsername = db.prepare("SELECT * FROM users WHERE LOWER(username) = LOWER(?)");
+const getAllUsers      = db.prepare('SELECT * FROM users ORDER BY created_at DESC');
+const searchUsers      = db.prepare(`
+  SELECT * FROM users
+  WHERE
+    CAST(telegram_id AS TEXT) LIKE ?
+    OR LOWER(username)    LIKE ?
+    OR LOWER(first_name)  LIKE ?
+    OR LOWER(last_name)   LIKE ?
+  ORDER BY created_at DESC
+  LIMIT 20
+`);
+const updateBalance   = db.prepare('UPDATE users SET balance = MAX(0, balance + ?) WHERE telegram_id = ?');
+const banUser         = db.prepare('UPDATE users SET is_banned = ? WHERE telegram_id = ?');
+
+// ── PRODUCTS ──────────────────────────────────────────────────────────────────
+
+const getAllActiveProducts = db.prepare(`
+  SELECT p.*,
+    (SELECT COUNT(*) FROM stock WHERE product_id = p.id AND is_sold = 0) AS stock_count
+  FROM products p
+  WHERE p.is_active = 1
+  ORDER BY p.display_order ASC, p.id ASC
+`);
+
+// Stale products eligible for a reminder broadcast:
+//  - active + in stock (no point advertising something unavailable)
+//  - "last activity" = last_sold_at if it was ever sold, otherwise created_at
+//    (whichever is more recent/relevant — a never-sold product is judged by
+//    its creation date, a previously-sold product by its last sale date)
+//  - that last-activity date is older than the threshold (days)
+//  - it hasn't already been reminded within the cooldown window (hours),
+//    so the same product isn't re-announced on every check cycle
+const getStaleProducts = db.prepare(`
+  SELECT *,
+    COALESCE(last_sold_at, created_at) AS last_activity_at
+  FROM products
+  WHERE is_active = 1
+    AND stock_quantity > 0
+    AND COALESCE(last_sold_at, created_at) < datetime('now', '-' || ? || ' days')
+    AND (last_stale_reminder_at IS NULL OR last_stale_reminder_at < datetime('now', '-' || ? || ' hours'))
+  ORDER BY COALESCE(last_sold_at, created_at) ASC
+`);
+
+const markStaleReminderSent = db.prepare(`
+  UPDATE products SET last_stale_reminder_at = datetime('now') WHERE id = ?
+`);
+
+// The sorting screen mirrors what the customer sees, so it carries the same
+// facts the customer list shows: price, stock and sales. Without them the admin
+// is reordering bare titles and has to leave the screen to check anything.
+const getAllProductsForSorting = db.prepare(`
+  SELECT id, title, display_order, is_active,
+         price, stock_quantity, sales_count, premium_emoji_id
+  FROM products
+  ORDER BY display_order ASC, id ASC
+`);
+
+// ── Scoped ordering ──────────────────────────────────────────────────────────
+// The customer never sees one flat list: categories are their own screens and
+// everything without a category falls under "📦 Other Products". Ordering has to
+// work the same way, or the admin is dragging rows around a list that exists
+// nowhere in the shop.
+//
+// is_active = 0 is excluded on purpose. A deleted product is a soft-delete —
+// still in the table, invisible to customers — so listing it among the things
+// being arranged is noise about a product that cannot be bought.
+const SORT_COLS = `id, title, display_order, is_active,
+                   price, stock_quantity, sales_count, premium_emoji_id, category_id`;
+
+const getUncategorizedForSorting = db.prepare(`
+  SELECT ${SORT_COLS} FROM products
+  WHERE is_active = 1 AND (category_id IS NULL OR category_id = 0)
+  ORDER BY display_order ASC, id ASC
+`);
+
+const getCategoryForSorting = db.prepare(`
+  SELECT ${SORT_COLS} FROM products
+  WHERE is_active = 1 AND category_id = ?
+  ORDER BY display_order ASC, id ASC
+`);
+
+const updateDisplayOrder = db.prepare(`
+  UPDATE products SET display_order = ? WHERE id = ?
+`);
+
+const getProduct = db.prepare(`
+  SELECT p.*,
+    (SELECT COUNT(*) FROM stock WHERE product_id = p.id AND is_sold = 0) AS stock_count
+  FROM products p WHERE p.id = ?
+`);
+
+const insertProduct = db.prepare(`
+  INSERT INTO products
+    (title, description, warranty, price, requires_email, image_file_id,
+     stock_quantity, sales_count)
+  VALUES
+    (@title, @description, @warranty, @price, @requiresEmail, @imageFileId,
+     @stockQuantity, @salesCount)
+`);
+
+const softDeleteProduct = db.prepare('UPDATE products SET is_active = 0 WHERE id = ?');
+
+// Update stock_quantity by adding delta (can be negative for purchases)
+const adjustStockQuantity = db.prepare(`
+  UPDATE products
+  SET stock_quantity = MAX(0, stock_quantity + ?)
+  WHERE id = ?
+`);
+
+// Set stock_quantity to an exact value
+const setStockQuantity = db.prepare(`
+  UPDATE products SET stock_quantity = MAX(0, ?) WHERE id = ?
+`);
+
+// Increment sales_count (for real purchases)
+const incrementSalesCount = db.prepare(`
+  UPDATE products SET sales_count = sales_count + ? WHERE id = ?
+`);
+
+// Mark a product as "just sold" — resets staleness for the stale-product reminder feature
+const markProductSoldNow = db.prepare(`
+  UPDATE products SET last_sold_at = datetime('now') WHERE id = ?
+`);
+
+// ── STOCK (line items) ─────────────────────────────────────────────────────────
+
+const insertStockItem  = db.prepare('INSERT INTO stock (product_id, content) VALUES (?, ?)');
+const getAvailableStock = db.prepare('SELECT * FROM stock WHERE product_id = ? AND is_sold = 0 LIMIT ?');
+const getStockItems    = db.prepare('SELECT * FROM stock WHERE product_id = ? AND is_sold = 0 ORDER BY id');
+const getStockCount    = db.prepare('SELECT COUNT(*) AS cnt FROM stock WHERE product_id = ? AND is_sold = 0');
+const markStockSold    = db.prepare("UPDATE stock SET is_sold = 1, order_id = ?, sold_at = datetime('now') WHERE id = ?");
+const clearUnsoldStock = db.prepare('DELETE FROM stock WHERE product_id = ? AND is_sold = 0');
+const incrementSoldCount = db.prepare('UPDATE products SET sold_count = sold_count + ? WHERE id = ?');
+
+// ── ORDERS ────────────────────────────────────────────────────────────────────
+
+const insertOrder = db.prepare(`
+  INSERT INTO orders (user_id, product_id, quantity, email, total_price)
+  VALUES (@userId, @productId, @quantity, @email, @totalPrice)
+`);
+const getOrder = db.prepare(`
+  SELECT o.*, p.title AS product_title, p.price AS product_price,
+         u.username, u.first_name
+  FROM orders o
+  LEFT JOIN products p ON o.product_id = p.id
+  LEFT JOIN users u ON o.user_id = u.telegram_id
+  WHERE o.id = ?
+`);
+const getUserOrders = db.prepare(`
+  SELECT o.*, p.title AS product_title
+  FROM orders o LEFT JOIN products p ON o.product_id = p.id
+  WHERE o.user_id = ?
+  ORDER BY o.created_at DESC LIMIT 500
+`);
+const getAllOrders = db.prepare(`
+  SELECT o.*, p.title AS product_title, u.username
+  FROM orders o
+  LEFT JOIN products p ON o.product_id = p.id
+  LEFT JOIN users u ON o.user_id = u.telegram_id
+  ORDER BY o.created_at DESC LIMIT 50
+`);
+const updateOrderStatus = db.prepare('UPDATE orders SET status = ? WHERE id = ?');
+const completeOrder     = db.prepare(`
+  UPDATE orders
+  SET status = 'delivered', delivered_content = ?, payment_method = ?, paid_at = datetime('now')
+  WHERE id = ? AND status = 'pending'
+`);
+
+// ── DIGIPRO ORDER MIRROR (V167.8) ──────────────────────────────────────────────
+// DigiPro only ever moves wallet money (`transactions`); these mirror that
+// purchase into a normal, already-delivered order so it shows up for the
+// customer in "My Orders" and for the admin in Profit Reports — exactly like
+// any other product. `ref` is DigiPro's own purchase id, used to find and
+// cancel this same order if the code later turns out to be unissuable and the
+// charge is refunded.
+
+const getDigiProProduct = db.prepare(`
+  SELECT * FROM products WHERE is_digipro = 1 ORDER BY id LIMIT 1
+`);
+
+const _insertDigiProOrder = db.prepare(`
+  INSERT INTO orders (user_id, product_id, quantity, email, total_price, payment_method, status, delivered_content, source, paid_at)
+  VALUES (@userId, @productId, @quantity, '', @totalPrice, 'wallet', 'delivered', @note, 'digipro', datetime('now'))
+`);
+const _linkDigiProOrder = db.prepare('INSERT OR REPLACE INTO digipro_orders (ref, order_id) VALUES (?, ?)');
+
+/** Mirrors a completed DigiPro sale as a normal, delivered order. Returns the new order id. */
+function createDigiProOrder({ userId, productId, quantity, totalPrice, ref }) {
+  const note = 'Delivered via the activation bot — open it and use ORDER to view your code(s).';
+  const info = _insertDigiProOrder.run({ userId, productId, quantity, totalPrice, note });
+  const orderId = info.lastInsertRowid;
+  _linkDigiProOrder.run(ref, orderId);
+  incrementSalesCount.run(quantity, productId);
+  markProductSoldNow.run(productId);
+  return orderId;
+}
+
+const _digiProOrderIdForRef = db.prepare('SELECT order_id FROM digipro_orders WHERE ref = ?');
+
+// ── VERIF-BOT ORDER MIRROR (V167.35) ───────────────────────────────────────────
+// An order made in the Verif bot is mirrored here so it shows in the customer's
+// history. product_id must be a REAL product (FK is on) — pass the gateway
+// product's id (VERIF_PRODUCT_ID). Idempotent per the verif order ref.
+const _verifOrderIdForRef = db.prepare('SELECT order_id FROM verif_orders WHERE ref = ?');
+const _insertVerifOrder = db.prepare(`
+  INSERT INTO orders (user_id, product_id, quantity, email, total_price, payment_method, status, delivered_content, source, paid_at)
+  VALUES (@userId, @productId, 1, @email, @totalPrice, 'verif', @status, @note, 'verif', datetime('now'))
+`);
+const _linkVerifOrder = db.prepare('INSERT OR REPLACE INTO verif_orders (ref, order_id) VALUES (?, ?)');
+
+/**
+ * Mirror a Verif-bot order into the customer's history here. Idempotent per
+ * `ref`. Returns { ok, orderId, duplicate }. `status` is 'delivered' for a
+ * completed activation (default) or another string for a pending/failed one.
+ */
+function createVerifOrder({ userId, productId, email = '', totalPrice = 0, title = '', status = 'delivered', ref }) {
+  try {
+    const r = String(ref || '').trim();
+    if (!r) return { ok: false, error: 'no_ref' };
+    const existing = _verifOrderIdForRef.get(r);
+    if (existing) return { ok: true, orderId: existing.order_id, duplicate: true };
+    const pid = Number(productId);
+    if (!pid || !getProduct.get(pid)) return { ok: false, error: 'bad_product' };
+    const note = String(title || 'Verif-bot order').slice(0, 2000);
+    const info = _insertVerifOrder.run({
+      userId: Number(userId), productId: pid, email: String(email || ''),
+      totalPrice: Number(totalPrice) || 0, status: String(status || 'delivered'), note,
+    });
+    const orderId = info.lastInsertRowid;
+    _linkVerifOrder.run(r, orderId);
+    return { ok: true, orderId, duplicate: false };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+const _cancelOrder = db.prepare(`
+  UPDATE orders SET status = 'cancelled', delivered_content = ? WHERE id = ? AND status != 'cancelled'
+`);
+
+/** Cancels the order mirrored for `ref` (its DigiPro purchase was refunded). True if one was found. */
+function cancelDigiProOrder(ref, note) {
+  const row = _digiProOrderIdForRef.get(ref);
+  if (!row) return false;
+  _cancelOrder.run(note || 'Refunded — the activation bot could not issue a code; the amount was returned to your wallet.', row.order_id);
+  return true;
+}
+
+// ── TRANSACTIONS ──────────────────────────────────────────────────────────────
+
+const insertTransaction  = db.prepare(`
+  INSERT INTO transactions (user_id, type, amount, description, ref_id, order_id)
+  VALUES (@userId, @type, @amount, @description, @refId, @orderId)
+`);
+const isRefIdUsed        = db.prepare('SELECT id FROM transactions WHERE ref_id = ?');
+const getUserTransactions = db.prepare('SELECT * FROM transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 20');
+const getTransactionById = db.prepare('SELECT * FROM transactions WHERE id = ?');
+
+// ── NOWPAYMENTS ───────────────────────────────────────────────────────────────
+// Legacy — kept only for backward DB compatibility on Railway. Not used anywhere.
+
+const insertInvoice = db.prepare(`
+  INSERT INTO nowpayments_invoices
+    (telegram_user_id, order_id, amount, invoice_id, invoice_url, purpose, related_order_id)
+  VALUES
+    (@telegramUserId, @orderId, @amount, @invoiceId, @invoiceUrl, @purpose, @relatedOrderId)
+`);
+const getInvoiceByOrderId   = db.prepare('SELECT * FROM nowpayments_invoices WHERE order_id = ?');
+const getInvoiceByPaymentId = db.prepare('SELECT * FROM nowpayments_invoices WHERE payment_id = ?');
+const updateInvoice         = db.prepare(`
+  UPDATE nowpayments_invoices
+  SET payment_id = COALESCE(@paymentId, payment_id),
+      payment_status = COALESCE(@paymentStatus, payment_status),
+      updated_at = datetime('now')
+  WHERE order_id = @orderId
+`);
+const markInvoiceCredited = db.prepare(`
+  UPDATE nowpayments_invoices
+  SET credited = 1, payment_status = 'finished',
+      tx_hash = COALESCE(?, tx_hash), updated_at = datetime('now')
+  WHERE order_id = ? AND credited = 0
+`);
+const isInvoiceCredited = db.prepare('SELECT credited FROM nowpayments_invoices WHERE order_id = ?');
+
+// ── BEP20 DEPOSITS (manual USDT BEP20 + Etherscan V2) ─────────────────────────
+
+const insertBep20Deposit = db.prepare(`
+  INSERT INTO bep20_deposits (user_id, tx_hash, amount, currency, network, from_addr, to_addr, status)
+  VALUES (@userId, @txHash, @amount, @currency, @network, @fromAddr, @toAddr, @status)
+`);
+const getBep20DepositByHash = db.prepare(
+  'SELECT * FROM bep20_deposits WHERE LOWER(tx_hash) = LOWER(?)'
+);
+
+// Generic used-TxID table (Binance API verified deposits, TRC20 + BEP20)
+const insertUsedTxid = db.prepare(`
+  INSERT INTO used_txids (txid, user_id, amount, network, asset, address)
+  VALUES (@txid, @userId, @amount, @network, @asset, @address)
+`);
+const getUsedTxid = db.prepare('SELECT * FROM used_txids WHERE txid = ? COLLATE NOCASE');
+
+// CryptoBot invoices
+const insertCryptobotInvoice = db.prepare(`
+  INSERT INTO cryptobot_invoices (invoice_id, user_id, asset, amount, pay_url)
+  VALUES (@invoiceId, @userId, @asset, @amount, @payUrl)
+`);
+const getCryptobotInvoiceById = db.prepare('SELECT * FROM cryptobot_invoices WHERE invoice_id = ?');
+const markCryptobotPaid = db.prepare(`
+  UPDATE cryptobot_invoices
+  SET status = 'paid', credited = 1, paid_at = datetime('now')
+  WHERE invoice_id = ? AND credited = 0
+`);
+const getActiveCryptobotInvoicesForUser = db.prepare(`
+  SELECT * FROM cryptobot_invoices
+  WHERE user_id = ? AND status = 'active'
+  ORDER BY created_at DESC
+  LIMIT 5
+`);
+
+
+
+// ── PENDING PAYMENTS ──────────────────────────────────────────────────────────
+
+const insertPendingPayment = db.prepare(`
+  INSERT INTO pending_payments (user_id, amount, order_id, type)
+  VALUES (@userId, @amount, @orderId, @type)
+`);
+const updatePendingPayment = db.prepare('UPDATE pending_payments SET status = ?, ref_id = ? WHERE id = ?');
+const getPendingPayments   = db.prepare(`
+  SELECT pp.*, u.username, u.first_name
+  FROM pending_payments pp LEFT JOIN users u ON pp.user_id = u.telegram_id
+  WHERE pp.status = 'waiting' ORDER BY pp.created_at DESC
+`);
+
+// ── SUPPORT TICKETS ───────────────────────────────────────────────────────────
+
+const insertTicket  = db.prepare('INSERT INTO support_tickets (user_id, message) VALUES (?, ?)');
+const getTicket     = db.prepare('SELECT * FROM support_tickets WHERE id = ?');
+const replyTicket   = db.prepare(`
+  UPDATE support_tickets SET admin_reply = ?, status = 'closed', replied_at = datetime('now') WHERE id = ?
+`);
+const getOpenTickets = db.prepare(`
+  SELECT st.*, u.username, u.first_name
+  FROM support_tickets st LEFT JOIN users u ON st.user_id = u.telegram_id
+  WHERE st.status = 'open' ORDER BY st.created_at DESC
+`);
+
+// ── REFERRALS ─────────────────────────────────────────────────────────────────
+
+const insertReferral      = db.prepare('INSERT OR IGNORE INTO referrals (referrer_id, referred_id) VALUES (?, ?)');
+const getReferralByReferred = db.prepare('SELECT * FROM referrals WHERE referred_id = ?');
+const markReferralRewarded = db.prepare(`
+  UPDATE referrals SET reward_paid = 1, rewarded_at = datetime('now') WHERE referred_id = ?
+`);
+const getReferralStats = db.prepare(`
+  SELECT COUNT(*) AS total_referred, SUM(reward_paid) AS rewarded_count
+  FROM referrals WHERE referrer_id = ?
+`);
+
+// ── SETTINGS ──────────────────────────────────────────────────────────────────
+
+const getSetting = db.prepare('SELECT value FROM settings WHERE key = ?');
+const setSetting = db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)');
+
+// ── BACK-IN-STOCK NOTIFICATIONS ───────────────────────────────────────────────
+
+const subscribeBackInStock = db.prepare(`
+  INSERT OR IGNORE INTO back_in_stock_notifications (user_id, product_id) VALUES (?, ?)
+`);
+
+const isSubscribedBackInStock = db.prepare(`
+  SELECT id FROM back_in_stock_notifications WHERE user_id = ? AND product_id = ?
+`);
+
+const getBackInStockSubscribers = db.prepare(`
+  SELECT DISTINCT user_id FROM back_in_stock_notifications WHERE product_id = ?
+`);
+
+const clearBackInStockSubscriptions = db.prepare(`
+  DELETE FROM back_in_stock_notifications WHERE product_id = ?
+`);
+
+// ── STATISTICS ────────────────────────────────────────────────────────────────
+
+const getStats = () => ({
+  totalUsers:  db.prepare('SELECT COUNT(*) AS n FROM users').get().n,
+  newToday:    db.prepare("SELECT COUNT(*) AS n FROM users WHERE created_at >= date('now','-1 day')").get().n,
+  totalOrders: db.prepare('SELECT COUNT(*) AS n FROM orders').get().n,
+  delivered:   db.prepare("SELECT COUNT(*) AS n FROM orders WHERE status = 'delivered'").get().n,
+  pending:     db.prepare("SELECT COUNT(*) AS n FROM orders WHERE status = 'pending'").get().n,
+  revenue:     db.prepare("SELECT COALESCE(SUM(total_price),0) AS r FROM orders WHERE status='delivered'").get().r,
+  topProducts: db.prepare('SELECT title, sales_count, sold_count FROM products ORDER BY sales_count DESC LIMIT 5').all(),
+});
+
+// ── PROFIT STATISTICS ─────────────────────────────────────────────────────────
+
+// Profit = revenue - cost (cost = cost_price × quantity)
+const profitQuery = (whereClause) => `
+  SELECT
+    COALESCE(SUM(o.total_price), 0)                                            AS revenue,
+    COALESCE(SUM(COALESCE(p.cost_price, 0) * o.quantity), 0)                   AS cost,
+    COALESCE(SUM(o.total_price) - SUM(COALESCE(p.cost_price, 0) * o.quantity), 0) AS net_profit,
+    COUNT(*) AS orders_count
+  FROM orders o
+  LEFT JOIN products p ON o.product_id = p.id
+  WHERE o.status = 'delivered' AND ${whereClause}
+`;
+
+const getProfitToday = () =>
+  db.prepare(profitQuery("date(o.paid_at) = date('now')")).get();
+
+const getProfitLast7Days = () =>
+  db.prepare(profitQuery("o.paid_at >= datetime('now','-7 days')")).get();
+
+const getProfitThisMonth = () =>
+  db.prepare(profitQuery("strftime('%Y-%m', o.paid_at) = strftime('%Y-%m','now')")).get();
+
+const getProfitByDay = () =>
+  db.prepare(`
+    SELECT
+      date(o.paid_at) AS day,
+      COALESCE(SUM(o.total_price), 0) AS revenue,
+      COALESCE(SUM(COALESCE(p.cost_price, 0) * o.quantity), 0) AS cost,
+      COALESCE(SUM(o.total_price) - SUM(COALESCE(p.cost_price, 0) * o.quantity), 0) AS net_profit,
+      COUNT(*) AS orders_count
+    FROM orders o
+    LEFT JOIN products p ON o.product_id = p.id
+    WHERE o.status='delivered' AND o.paid_at IS NOT NULL
+    GROUP BY day
+    ORDER BY day DESC
+    LIMIT 30
+  `).all();
+
+// ── REFUNDS ───────────────────────────────────────────────────────────────────
+
+const insertRefund = db.prepare(`
+  INSERT INTO refunds (order_id, user_id, product_id, original_price, refund_amount, warranty_days, end_date)
+  VALUES (@orderId, @userId, @productId, @originalPrice, @refundAmount, @warrantyDays, @endDate)
+`);
+const getRefundByOrderId = db.prepare('SELECT * FROM refunds WHERE order_id = ?');
+
+// ── EMOJI LIBRARY ─────────────────────────────────────────────────────────────
+
+const insertEmoji = db.prepare(`
+  INSERT INTO emoji_library (name, emoji_id, fallback)
+  VALUES (?, ?, ?)
+`);
+const getAllEmojis = db.prepare('SELECT * FROM emoji_library ORDER BY name ASC');
+const getEmojiByName = db.prepare('SELECT * FROM emoji_library WHERE name = ?');
+const deleteEmojiById = db.prepare('DELETE FROM emoji_library WHERE id = ?');
+const getEmojiById = db.prepare('SELECT * FROM emoji_library WHERE id = ?');
+
+// ── PRE-ORDER PRODUCTS (customer-facing) ──────────────────────────────────────
+
+const getPreorderEnabledProducts = db.prepare(`
+  SELECT p.*
+  FROM products p
+  WHERE p.is_active = 1 AND p.preorder_enabled = 1
+  ORDER BY p.display_order ASC, p.id ASC
+`);
+
+// ── PREORDERS ─────────────────────────────────────────────────────────────────
+
+const insertPreorder = db.prepare(`
+  INSERT INTO preorders (order_id, user_id, product_id, quantity, email, total_paid, payment_method, status)
+  VALUES (@orderId, @userId, @productId, @quantity, @email, @totalPaid, @paymentMethod, 'reserved')
+`);
+
+const getAllPreorders = db.prepare(`
+  SELECT pr.*, p.title AS product_title, u.username, u.first_name
+  FROM preorders pr
+  LEFT JOIN products p ON pr.product_id = p.id
+  LEFT JOIN users u    ON pr.user_id    = u.telegram_id
+  ORDER BY pr.created_at DESC
+`);
+
+const getReservedPreordersByProduct = db.prepare(`
+  SELECT pr.*, u.username, u.first_name
+  FROM preorders pr
+  LEFT JOIN users u ON pr.user_id = u.telegram_id
+  WHERE pr.product_id = ? AND pr.status = 'reserved'
+  ORDER BY pr.created_at ASC
+`);
+
+const getPreorderById = db.prepare('SELECT * FROM preorders WHERE id = ?');
+
+const updatePreorderStatus = db.prepare(`
+  UPDATE preorders SET status = ?, delivered_content = ?, delivered_at = datetime('now')
+  WHERE id = ?
+`);
+
+const incrementPreorderCount = db.prepare(`
+  UPDATE products SET preorder_count = preorder_count + ? WHERE id = ?
+`);
+
+const getPreorderStats = db.prepare(`
+  SELECT
+    COUNT(*) AS total,
+    SUM(CASE WHEN status='reserved' THEN 1 ELSE 0 END)  AS reserved,
+    SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END) AS delivered,
+    COALESCE(SUM(total_paid), 0) AS total_revenue
+  FROM preorders
+`);
+
+// V167.18: reserved pre-orders whose pre-order product is LINKED (via
+// preorder_source_id) to a given "original" product. Used to auto-deliver them
+// from the original's fresh stock the moment it is restocked. FIFO order.
+const getLinkedReservedPreorders = db.prepare(`
+  SELECT pr.*, u.username, u.first_name, p.title AS product_title
+  FROM preorders pr
+  LEFT JOIN users u    ON pr.user_id = u.telegram_id
+  LEFT JOIN products p ON pr.product_id = p.id
+  WHERE p.preorder_source_id = ? AND pr.status = 'reserved'
+  ORDER BY pr.created_at ASC, pr.id ASC
+`);
+
+/**
+ * Auto-deliver the reserved pre-orders linked to `sourceProductId` from that
+ * product's own stock (the modern `items` store, with the legacy `stock` table
+ * as a fallback — the same two sources normal delivery uses). FIFO. Stops when
+ * the stock runs out, leaving the rest reserved. Each pre-order is fulfilled in
+ * its own transaction and re-checked as 'reserved' inside it, so a restock that
+ * races with a manual delivery can never deliver the same pre-order twice.
+ *
+ * Returns { delivered: [{preorder, content}], stoppedForStock: bool }. The
+ * caller sends the Telegram messages (this layer never touches Telegram).
+ */
+function autoFulfillPreordersFromSource(sourceProductId) {
+  const items = require('./items');
+  const pending = getLinkedReservedPreorders.all(sourceProductId);
+  const delivered = [];
+  let stoppedForStock = false;
+
+  for (const pr of pending) {
+    const qty = pr.quantity || 1;
+    const content = db.transaction(() => {
+      const cur = getPreorderById.get(pr.id);
+      if (!cur || cur.status !== 'reserved') return null; // already handled
+
+      const avail = items.getAvailableCount(sourceProductId);
+      let text;
+      if (avail > 0) {
+        if (avail < qty) return 'INSUFFICIENT';
+        const parts = [];
+        for (let i = 0; i < qty; i++) {
+          const part = items.deliverItemRaw(sourceProductId, cur.user_id, cur.order_id || null);
+          if (!part) return null;
+          parts.push(part);
+        }
+        text = parts.join('\n\n');
+      } else {
+        const stockItems = getAvailableStock.all(sourceProductId, qty);
+        if (stockItems.length < qty) return 'INSUFFICIENT';
+        for (const it of stockItems) markStockSold.run(cur.order_id || null, it.id);
+        text = stockItems.map((i) => i.content).join('\n');
+      }
+
+      updatePreorderStatus.run('delivered', text, pr.id);
+      incrementSoldCount.run(qty, sourceProductId);
+      incrementSalesCount.run(qty, sourceProductId);
+      adjustStockQuantity.run(-qty, sourceProductId);
+      markProductSoldNow.run(sourceProductId);
+      return text;
+    })();
+
+    if (content === 'INSUFFICIENT') { stoppedForStock = true; break; }
+    if (content == null) continue; // raced / already delivered
+    delivered.push({ preorder: pr, content });
+  }
+
+  return { delivered, stoppedForStock };
+}
+
+// ── V167.19: SAME-PRODUCT pre-orders (the inline model) ───────────────────────
+// Reserved pre-orders ARE for the product itself (product_id = the product that
+// went out of stock). When it is restocked, these are filled FIRST, FIFO, and
+// the remainder of the new stock stays as normal sellable stock.
+const getReservedPreordersFor = db.prepare(`
+  SELECT pr.*, u.username, u.first_name
+  FROM preorders pr
+  LEFT JOIN users u ON pr.user_id = u.telegram_id
+  WHERE pr.product_id = ? AND pr.status = 'reserved'
+  ORDER BY pr.created_at ASC, pr.id ASC
+`);
+const decrementPreorderCount = db.prepare(`
+  UPDATE products SET preorder_count = MAX(0, preorder_count - ?) WHERE id = ?
+`);
+
+/**
+ * Fill this product's own reserved pre-orders from its freshly-added stock,
+ * FIFO. Each is filled in its own transaction and re-checked as 'reserved'
+ * inside it (so a race can never deliver one twice). Frees the pre-order slot
+ * (preorder_count down) on delivery. Stops when stock runs out; the rest stay
+ * reserved. Returns { delivered:[{preorder,content}], stoppedForStock }.
+ */
+function autoFulfillPreordersForProduct(productId) {
+  const items = require('./items');
+  const pending = getReservedPreordersFor.all(productId);
+  const delivered = [];
+  let stoppedForStock = false;
+
+  for (const pr of pending) {
+    const qty = pr.quantity || 1;
+    const content = db.transaction(() => {
+      const cur = getPreorderById.get(pr.id);
+      if (!cur || cur.status !== 'reserved') return null;
+
+      const avail = items.getAvailableCount(productId);
+      let text;
+      if (avail > 0) {
+        if (avail < qty) return 'INSUFFICIENT';
+        const parts = [];
+        for (let i = 0; i < qty; i++) {
+          const part = items.deliverItemRaw(productId, cur.user_id, cur.order_id || null);
+          if (!part) return null;
+          parts.push(part);
+        }
+        text = parts.join('\n\n');
+      } else {
+        const stockItems = getAvailableStock.all(productId, qty);
+        if (stockItems.length < qty) return 'INSUFFICIENT';
+        for (const it of stockItems) markStockSold.run(cur.order_id || null, it.id);
+        text = stockItems.map((i) => i.content).join('\n');
+      }
+
+      updatePreorderStatus.run('delivered', text, pr.id);
+      decrementPreorderCount.run(qty, productId);  // free the slot
+      incrementSoldCount.run(qty, productId);
+      incrementSalesCount.run(qty, productId);
+      adjustStockQuantity.run(-qty, productId);
+      markProductSoldNow.run(productId);
+      return text;
+    })();
+
+    if (content === 'INSUFFICIENT') { stoppedForStock = true; break; }
+    if (content == null) continue;
+    delivered.push({ preorder: pr, content });
+  }
+  return { delivered, stoppedForStock };
+}
+
+// ── V167.19: "Out of Stock" category for uncategorised ("Other Products") ─────
+// A product with no category (category_id = 0) is auto-moved into a dedicated
+// "Out of Stock" category when it runs out, and moved back to Other Products
+// when restocked. Pre-order products are left in place (they stay visible with
+// the Pre-Order tag), and products already inside a real category are untouched.
+const OUT_OF_STOCK_CATEGORY = 'Out of Stock';
+
+function getCategoryByName(name) {
+  const want = String(name || '').trim().toLowerCase();
+  return cat_getAll.all().find((c) => String(c.name || '').trim().toLowerCase() === want) || null;
+}
+function getOrCreateOutOfStockCategory() {
+  let cat = getCategoryByName(OUT_OF_STOCK_CATEGORY);
+  if (cat) return cat;
+  cat_insert.run(OUT_OF_STOCK_CATEGORY, '❌', 998);
+  return getCategoryByName(OUT_OF_STOCK_CATEGORY);
+}
+
+/**
+ * Keep an "Other Products" item's category in step with its stock:
+ *   • uncategorised + out of stock + NOT a pre-order  → move to "Out of Stock"
+ *   • inside "Out of Stock" + back in stock           → move to Other Products
+ * Anything else (a real category, a pre-order item, paused sales) is left as-is.
+ * Returns 'parked' | 'restored' | null.
+ */
+function syncStockCategory(productId) {
+  const p = getProduct.get(productId);
+  if (!p) return null;
+  const stock = Number(p.stock_quantity) || 0;
+  const cat = Number(p.category_id) || 0;
+  const oos = getOrCreateOutOfStockCategory();
+  const oosId = oos ? oos.id : 0;
+
+  if (stock <= 0 && cat === 0 && Number(p.preorder_enabled) !== 1) {
+    cat_setProduct.run(oosId, productId);
+    return 'parked';
+  }
+  // Restore to Other Products when it has stock again OR it became a pre-order
+  // product (pre-orders must stay visible in Other Products, not hidden under
+  // "Out of Stock").
+  if (oosId && cat === oosId && (stock > 0 || Number(p.preorder_enabled) === 1)) {
+    cat_setProduct.run(0, productId);
+    return 'restored';
+  }
+  return null;
+}
+
+/**
+ * One-time (idempotent) sweep over every product, applying syncStockCategory.
+ * Run at startup so items that were already out of stock BEFORE this feature
+ * existed get parked under "Out of Stock" too, and anything wrongly parked but
+ * back in stock is restored. Safe to run on every boot. Returns a small tally.
+ */
+function syncAllStockCategories() {
+  const ids = db.prepare('SELECT id FROM products WHERE is_active = 1').all();
+  let parked = 0, restored = 0;
+  for (const { id } of ids) {
+    try {
+      const r = syncStockCategory(id);
+      if (r === 'parked') parked++;
+      else if (r === 'restored') restored++;
+    } catch (_) {}
+  }
+  return { parked, restored, scanned: ids.length };
+}
+
+// ── Compound helpers ──────────────────────────────────────────────────────────
+
+function upsertAndGetUser({ telegramId, username, firstName, lastName }) {
+  upsertUser.run({ telegramId, username, firstName, lastName });
+  return getUser.get(telegramId);
+}
+
+function addStockItems(productId, lines) {
+  let count = 0;
+  const insert = db.transaction((items) => {
+    for (const line of items) {
+      const trimmed = line.trim();
+      if (trimmed) { insertStockItem.run(productId, trimmed); count++; }
+    }
+  });
+  insert(lines);
+  return count;
+}
+
+/**
+ * Deliver an order atomically.
+ * Uses product_items table (key/account) when available items exist,
+ * falls back to legacy stock table otherwise.
+ * Returns delivered content string or null if no stock.
+ */
+/**
+ * Add an order's value to the buyer's rank counter.
+ *
+ * Reads the amount from the orders row rather than taking it as an argument:
+ * the callers each compute price differently (wallet, crypto, API, manual), and
+ * the stored total is the one figure that is definitely what the customer paid.
+ */
+function accrueRankSpend(orderId, userId) {
+  try {
+    if (!userId) return;
+    const o = db.prepare('SELECT total_price FROM orders WHERE id = ?').get(orderId);
+    const amount = Number(o?.total_price) || 0;
+    if (amount > 0) rankSpendAdd.run(amount, userId);
+  } catch (e) {
+    // Never let rank bookkeeping roll back a completed, paid-for delivery.
+  }
+}
+
+function deliverOrder(orderId, productId, quantity, paymentMethod, userId) {
+  const items = require('./items');
+
+  return db.transaction(() => {
+    // ── IDEMPOTENCY GUARD: check order is still pending inside the transaction ──
+    const orderCheck = db.prepare("SELECT status FROM orders WHERE id = ?").get(orderId);
+    if (!orderCheck || orderCheck.status !== 'pending') {
+      return null; // Already delivered or cancelled — abort
+    }
+
+    // ── Deliver using RAW statements (no nested transaction) ──
+    const availCount = items.getAvailableCount(productId);
+
+    let content;
+    if (availCount > 0) {
+      if (availCount < quantity) return null; // Not enough stock
+      const deliveredParts = [];
+      for (let i = 0; i < quantity; i++) {
+        const part = items.deliverItemRaw(productId, userId, orderId);
+        if (!part) return null;
+        deliveredParts.push(part);
+      }
+      content = deliveredParts.join('\n\n');
+    } else {
+      // Legacy fallback: use old stock table
+      const stockItems = getAvailableStock.all(productId, quantity);
+      if (stockItems.length < quantity) return null;
+      for (const item of stockItems) markStockSold.run(orderId, item.id);
+      content = stockItems.map((i) => i.content).join('\n');
+    }
+
+    // completeOrder now has WHERE status='pending' — second call returns 0 changes
+    const res = completeOrder.run(content, paymentMethod, orderId);
+    if (res.changes === 0) return null; // Lost the race — another payment beat us
+
+    // Rank accrual lives here, immediately after the row that can only change
+    // once. Every payment method funnels through completeOrder, so this is the
+    // single place that cannot miss a sale or count one twice.
+    accrueRankSpend(orderId, userId);
+
+    incrementSoldCount.run(quantity, productId);
+    incrementSalesCount.run(quantity, productId);
+    adjustStockQuantity.run(-quantity, productId);
+    markProductSoldNow.run(productId);
+    return content;
+  })();
+}
+
+// ── Atomic wallet-pay delivery: deliver + deduct balance in ONE transaction ────
+function deliverOrderAndChargeWallet(orderId, productId, quantity, userId, price) {
+  const items = require('./items');
+
+  return db.transaction(() => {
+    // ── IDEMPOTENCY GUARD ──
+    const orderCheck = db.prepare("SELECT status FROM orders WHERE id = ?").get(orderId);
+    if (!orderCheck || orderCheck.status !== 'pending') return { result: 'already_processed' };
+
+    // ── BALANCE CHECK inside transaction ──
+    const userRow = db.prepare("SELECT balance FROM users WHERE telegram_id = ?").get(userId);
+    const balance = userRow ? Number(userRow.balance) : 0;
+    const priceN  = Number(price);
+    if (!hasEnough(balance, priceN)) return { result: 'insufficient_balance', balance };
+
+    // ── Deliver items using RAW statements (no nested transaction) ──
+    // deliverItemRaw runs getAvailableItem + markItemSold directly inside THIS transaction
+    // This prevents nested-transaction conflicts when multiple users buy concurrently
+    const availCount = items.getAvailableCount(productId);
+    let content;
+    if (availCount > 0) {
+      if (availCount < quantity) return { result: 'out_of_stock' };
+      const deliveredParts = [];
+      for (let i = 0; i < quantity; i++) {
+        const part = items.deliverItemRaw(productId, userId, orderId);
+        if (!part) return { result: 'out_of_stock' };
+        deliveredParts.push(part);
+      }
+      content = deliveredParts.join('\n\n');
+    } else {
+      const stockItems = getAvailableStock.all(productId, quantity);
+      if (stockItems.length < quantity) return { result: 'out_of_stock' };
+      for (const item of stockItems) markStockSold.run(orderId, item.id);
+      content = stockItems.map((i) => i.content).join('\n');
+    }
+
+    const res = completeOrder.run(content, 'wallet', orderId);
+    if (res.changes === 0) return { result: 'already_processed' };
+
+    accrueRankSpend(orderId, userId);
+
+    // Deduct balance atomically in the same transaction
+    updateBalance.run(-priceN, userId);
+
+    incrementSoldCount.run(quantity, productId);
+    incrementSalesCount.run(quantity, productId);
+    adjustStockQuantity.run(-quantity, productId);
+    markProductSoldNow.run(productId);
+    return { result: 'ok', content };
+  })();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SPEND RANKS
+// ══════════════════════════════════════════════════════════════════════════════
+
+const rankTiersAll   = db.prepare('SELECT * FROM rank_tiers ORDER BY min_spend ASC, id ASC');
+const rankTierById   = db.prepare('SELECT * FROM rank_tiers WHERE id = ?');
+const rankTierInsert = db.prepare('INSERT INTO rank_tiers (name, emoji, min_spend, discount_pct) VALUES (?, ?, ?, ?)');
+const rankTierDelete = db.prepare('DELETE FROM rank_tiers WHERE id = ?');
+const rankSpendGet   = db.prepare('SELECT rank_spend, rank_started_at, is_vip FROM users WHERE telegram_id = ?');
+const rankSpendAdd   = db.prepare(`
+  UPDATE users
+  SET rank_spend = COALESCE(rank_spend, 0) + ?,
+      rank_started_at = COALESCE(rank_started_at, datetime('now'))
+  WHERE telegram_id = ?
+`);
+const rankSpendSet   = db.prepare('UPDATE users SET rank_spend = ? WHERE telegram_id = ?');
+
+/**
+ * Take a refunded amount back off the rank counter.
+ *
+ * Without this a refund is free rank: buy $600, reach GOLD, get the money back,
+ * keep the 5% for good. Repeat and the discount is unbounded. A refund reverses
+ * a sale, so it has to reverse everything the sale granted.
+ *
+ * MAX(0, …) because partial refunds, manual balance edits and old orders can
+ * combine to overshoot, and a negative counter would read as a debt the
+ * customer has to buy their way out of before ranking again.
+ */
+const rankSpendSubtract = db.prepare(`
+  UPDATE users
+  SET rank_spend = MAX(0, COALESCE(rank_spend, 0) - ?)
+  WHERE telegram_id = ?
+`);
+
+function rankSystemOn() {
+  return String(getSettingValue('rank_system_enabled', '1')) === '1';
+}
+
+function getSettingValue(key, fallback) {
+  const row = getSetting.get(key);
+  return row ? row.value : fallback;
+}
+
+/** The tier a given spend total falls into — the highest one it reaches. */
+function tierForSpend(spend, tiers) {
+  const list = tiers || rankTiersAll.all();
+  let current = null;
+  for (const t of list) {
+    if (Number(spend) + 1e-9 >= Number(t.min_spend)) current = t;
+  }
+  return current || list[0] || null;
+}
+
+/**
+ * Everything the UI needs about a customer's rank.
+ *
+ * `spend` is the counter that started at zero, NOT their lifetime total — see
+ * the V4 migration note in database/db.js for why those must stay separate.
+ */
+function getUserRank(userId) {
+  const tiers = rankTiersAll.all();
+  const row   = rankSpendGet.get(userId);
+  const spend = Number(row?.rank_spend) || 0;
+
+  const tier = tierForSpend(spend, tiers);
+  const next = tiers.find((t) => Number(t.min_spend) > spend) || null;
+
+  const tierPct   = Number(tier?.discount_pct) || 0;
+  const legacyPct = (row && row.is_vip === 1)
+    ? (parseFloat(getSettingValue('legacy_vip_discount_pct', '5')) || 0) : 0;
+
+  return {
+    spend,
+    tier,
+    next,
+    tiers,
+    isLegacyVip: !!(row && row.is_vip === 1),
+    tierPct,
+    legacyPct,
+    // The grandfather promise: a VIP never drops below what they had, but they
+    // still climb if their own spending earns them more.
+    discountPct: Math.max(tierPct, legacyPct),
+    remaining: next ? Math.max(0, Number(next.min_spend) - spend) : 0,
+  };
+}
+
+/**
+ * The discount percentage to apply to a customer's order.
+ * Returns 0 when the rank system is switched off AND they are not a legacy VIP.
+ */
+function resolveDiscountPct(userId) {
+  const row = rankSpendGet.get(userId);
+  const legacyPct = (row && row.is_vip === 1)
+    ? (parseFloat(getSettingValue('legacy_vip_discount_pct', '5')) || 0) : 0;
+  if (!rankSystemOn()) return legacyPct;
+  return getUserRank(userId).discountPct;
+}
+
+/**
+ * The discount a customer gets on THIS product: 0 when the owner excluded the product from
+ * the VIP / rank discount (products.no_rank_discount = 1), else their normal percentage.
+ * Bulk prices are not affected: they are the product's own price list, the same for everybody.
+ */
+function rankDiscountPctForProduct(userId, product) {
+  if (product && Number(product.no_rank_discount) === 1) return 0;
+  return resolveDiscountPct(userId);
+}
+
+/** Multiply a price by the customer's discount (pass `product` to honour its VIP exclusion). */
+function applyRankDiscount(userId, amount, product = null) {
+  const pct = product ? rankDiscountPctForProduct(userId, product) : resolveDiscountPct(userId);
+  if (!pct) return Number(amount);
+  return Number((Number(amount) * (1 - pct / 100)).toFixed(2));
+}
+
+/**
+ * Trace one TxID (or Binance transfer id) across every table that could mention
+ * it, and say what happened to the money.
+ *
+ * The point is to answer the three questions support actually gets asked, in
+ * one place: did it arrive, was it credited, and where did it go afterwards.
+ * Each of those lives in a different table, which is why "I sent it, check"
+ * used to mean opening five screens.
+ *
+ * The needle is matched case-insensitively and trimmed, because customers paste
+ * hashes with stray whitespace and mixed case constantly.
+ */
+function traceTxid(needle) {
+  const q = String(needle || '').trim();
+  if (!q) return null;
+  const like = `%${q}%`;
+
+  const safe = (fn, fallback = []) => { try { return fn(); } catch (e) { return fallback; } };
+
+  // 1. Credited deposits — the money arrived and the wallet went up.
+  const credited = safe(() => db.prepare(`
+    SELECT ut.*, u.username, u.first_name, u.balance
+    FROM used_txids ut LEFT JOIN users u ON ut.user_id = u.telegram_id
+    WHERE ut.txid LIKE ? COLLATE NOCASE
+  `).all(like));
+
+  // 2. The ledger entry written when it was credited, plus anything referencing it.
+  const ledger = safe(() => db.prepare(`
+    SELECT * FROM transactions WHERE ref_id LIKE ? COLLATE NOCASE
+    ORDER BY created_at DESC
+  `).all(like));
+
+  // 3. Seen by the watcher but not yet credited.
+  const pending = safe(() => db.prepare(`
+    SELECT * FROM pending_deposits WHERE txid LIKE ? COLLATE NOCASE
+  `).all(like));
+
+  // 4. Held for manual review (wrong amount, late, unknown sender…).
+  const review = safe(() => db.prepare(`
+    SELECT * FROM deposit_reviews WHERE txid LIKE ? COLLATE NOCASE
+  `).all(like));
+
+  // 5. Claimed against a unique-amount deposit intent.
+  const intents = safe(() => db.prepare(`
+    SELECT * FROM deposit_intents WHERE claimed_txid LIKE ? COLLATE NOCASE
+  `).all(like));
+
+  // 6. Taken back by an admin.
+  const reversals = safe(() => db.prepare(`
+    SELECT * FROM balance_reversals WHERE txid LIKE ? COLLATE NOCASE
+  `).all(like));
+
+  // 7. Used to pay for an order directly, rather than to top up.
+  const orders = safe(() => db.prepare(`
+    SELECT o.*, p.title AS product_title, u.username
+    FROM orders o
+    LEFT JOIN products p ON o.product_id = p.id
+    LEFT JOIN users u ON o.user_id = u.telegram_id
+    WHERE o.payment_proof LIKE ? COLLATE NOCASE
+    ORDER BY o.id DESC
+  `).all(like));
+
+  // 8. Payment-provider invoices (NOWPayments / CryptoBot).
+  const nowInv = safe(() => db.prepare(`
+    SELECT * FROM nowpayments_invoices
+    WHERE tx_hash LIKE ? COLLATE NOCASE OR payment_id LIKE ? COLLATE NOCASE
+       OR invoice_id LIKE ? COLLATE NOCASE OR order_id LIKE ? COLLATE NOCASE
+  `).all(like, like, like, like));
+
+  const cbInv = safe(() => db.prepare(`
+    SELECT * FROM cryptobot_invoices
+    WHERE invoice_id LIKE ? COLLATE NOCASE OR order_id LIKE ? COLLATE NOCASE
+  `).all(like, like));
+
+  // Whichever table matched, it names a user; that is the thread to pull.
+  const userId =
+    credited[0]?.user_id ?? pending[0]?.user_id ?? review[0]?.user_id ??
+    intents[0]?.user_id ?? reversals[0]?.user_id ?? orders[0]?.user_id ??
+    nowInv[0]?.telegram_user_id ?? cbInv[0]?.telegram_user_id ?? null;
+
+  /**
+   * What the payment was actually FOR.
+   *
+   * `used_txids` is written by two different flows — topping up a wallet, and
+   * paying for one order directly — because its job is replay protection, not
+   * bookkeeping. Reading a row there as "credited to wallet" was therefore
+   * wrong half the time: it reported money as sitting in the balance when it
+   * had gone straight into an order and never touched the wallet.
+   *
+   * The ledger settles it. A deposit writes a POSITIVE 'deposit' row; a direct
+   * order payment writes a NEGATIVE 'purchase' row, or none at all.
+   */
+  let purpose = 'unknown';
+  let paidOrder = null;
+
+  if (credited.length) {
+    const depositRow  = ledger.find((t) => t.type === 'deposit' && Number(t.amount) > 0);
+    const purchaseRow = ledger.find((t) => Number(t.amount) < 0);
+
+    if (depositRow) {
+      purpose = 'wallet_topup';
+    } else if (purchaseRow || orders.length) {
+      purpose = 'direct_order';
+      const oid = purchaseRow?.order_id || orders[0]?.id;
+      if (oid) {
+        paidOrder = safe(() => db.prepare(`
+          SELECT o.*, p.title AS product_title
+          FROM orders o LEFT JOIN products p ON o.product_id = p.id
+          WHERE o.id = ?
+        `).get(oid), null);
+      }
+    } else {
+      // In used_txids with no ledger trace either way — real, but unexplained.
+      purpose = 'recorded_only';
+    }
+  }
+
+  const user = userId ? safe(() => db.prepare(
+    'SELECT telegram_id, username, first_name, balance, is_vip, rank_spend FROM users WHERE telegram_id = ?'
+  ).get(userId), null) : null;
+
+  // What the customer did with the money AFTER it landed — the question a
+  // "did he already spend it?" dispute actually turns on.
+  // Only meaningful for a top-up: a direct order payment funded exactly one
+  // order, and listing later purchases beside it implies a link that is not there.
+  const spentAfter = (purpose === 'wallet_topup' && userId && credited[0]?.created_at) ? safe(() => db.prepare(`
+    SELECT o.id, o.total_price, o.status, o.created_at, o.payment_method, p.title AS product_title
+    FROM orders o LEFT JOIN products p ON o.product_id = p.id
+    WHERE o.user_id = ? AND o.created_at >= ?
+      AND o.status NOT IN ('cancelled', 'pending')
+    ORDER BY o.id DESC LIMIT 15
+  `).all(userId, credited[0].created_at)) : [];
+
+  const found = credited.length || ledger.length || pending.length || review.length ||
+                intents.length || reversals.length || orders.length ||
+                nowInv.length || cbInv.length;
+
+  /**
+   * The customer's ledger either side of this payment.
+   *
+   * "I deposited it and never used it" cannot be settled by looking at the
+   * payment alone — both sides agree the money was sent. What decides it is
+   * whether the balance ever went UP by that amount, and what happened next.
+   * A running total makes that readable at a glance instead of a pile of rows.
+   */
+  const when = credited[0]?.created_at || ledger[0]?.created_at || null;
+  const around = (userId && when) ? safe(() => db.prepare(`
+    SELECT id, type, amount, description, order_id, created_at
+    FROM transactions
+    WHERE user_id = ?
+      AND created_at BETWEEN datetime(?, '-2 hours') AND datetime(?, '+12 hours')
+    ORDER BY datetime(created_at) ASC, id ASC
+    LIMIT 25
+  `).all(userId, when, when)) : [];
+
+  /**
+   * Anomalies worth an admin's attention, stated rather than left to be noticed.
+   * A purchase row with no order behind it is the shape a genuine bug leaves.
+   */
+  const flags = [];
+  const orphan = ledger.find((t) => Number(t.amount) < 0 && !t.order_id);
+  if (orphan) flags.push('debit_without_order');
+  if (credited.length && !ledger.length) flags.push('no_ledger_entry');
+  if (purpose === 'direct_order' && paidOrder &&
+      Math.abs(Number(paidOrder.total_price) - Number(credited[0]?.amount || 0)) > 0.01) {
+    flags.push('amount_mismatch');
+  }
+
+  return { query: q, found: !!found, user, credited, ledger, pending, review,
+           intents, reversals, orders, nowInv, cbInv, spentAfter,
+           purpose, paidOrder, around, flags };
+}
+
+function payReferralReward(referredId, rewardAmount) {
+  return db.transaction(() => {
+    const referral = getReferralByReferred.get(referredId);
+    if (!referral || referral.reward_paid) return null;
+    if (!referralEarningAllowed(referral.referrer_id)) return null;     // V143: program off / person blocked
+
+    const referrerId = referral.referrer_id;
+    updateBalance.run(rewardAmount, referrerId);
+    insertTransaction.run({
+      userId: referrerId,
+      type: 'referral',
+      amount: rewardAmount,
+      description: `Referral reward for user ${referredId}`,
+      refId: null,
+      orderId: null,
+    });
+    markReferralRewarded.run(referredId);
+    return referrerId;
+  })();
+}
+
+// ── Referral master switch + per-person block (V143) ─────────────────────────
+// ONE place decides whether a referrer may earn: every earning path asks it.
+function referralProgramOn() {
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'referral_program_enabled'").get();
+  return !row || row.value !== '0';              // a missing row = on (as before this version)
+}
+function isReferralBlocked(userId) {
+  const row = db.prepare('SELECT referral_blocked FROM users WHERE telegram_id = ?').get(userId);
+  return !!(row && Number(row.referral_blocked) === 1);
+}
+/** May this referrer earn anything right now? (program on AND the person not blocked) */
+function referralEarningAllowed(referrerId) {
+  return referralProgramOn() && !isReferralBlocked(referrerId);
+}
+function setReferralBlocked(userId, blocked) {
+  return db.prepare('UPDATE users SET referral_blocked = ? WHERE telegram_id = ?').run(blocked ? 1 : 0, userId).changes > 0;
+}
+
+// ── CASHBACK REFERRAL — pays % of every purchase to referrer for life ────────
+const updateUserLanguage = db.prepare('UPDATE users SET language = ? WHERE telegram_id = ?');
+
+function payCashbackReferral(referredUserId, orderTotal, orderId) {
+  return db.transaction(() => {
+    // Check if cashback is enabled
+    const enabled = getSetting.get('referral_cashback_enabled')?.value;
+    if (enabled !== '1') return null;
+
+    // Check minimum order threshold (anti-fraud)
+    const minRow = getSetting.get('referral_min_order');
+    const minOrder = minRow ? parseFloat(minRow.value) : 5.0;
+    if (orderTotal < minOrder) return { skipped: 'below_minimum', minOrder };
+
+    // Get the cashback percentage (default 2%)
+    const pctRow = getSetting.get('referral_cashback_pct');
+    const pct = pctRow ? parseFloat(pctRow.value) : 2.0;
+    if (isNaN(pct) || pct <= 0) return null;
+
+    // Find the referrer
+    const referral = getReferralByReferred.get(referredUserId);
+    if (!referral) return null;
+    const referrerId = referral.referrer_id;
+    if (!referrerId || referrerId === referredUserId) return null;
+    if (!referralEarningAllowed(referrerId)) return null;               // V143: program off / person blocked
+
+    // Calculate cashback amount
+    const cashback = parseFloat(((orderTotal * pct) / 100).toFixed(2));
+    if (cashback < 0.01) return null;
+
+    // Credit referrer
+    updateBalance.run(cashback, referrerId);
+    insertTransaction.run({
+      userId: referrerId,
+      type: 'referral_cashback',
+      amount: cashback,
+      description: `${pct}% cashback from order #${orderId} by user ${referredUserId}`,
+      refId: null,
+      orderId,
+    });
+    return { referrerId, cashback, pct };
+  })();
+}
+
+// Referral cashback statistics for a user
+const getReferralCashbackStats = db.prepare(`
+  SELECT
+    (SELECT COUNT(*) FROM referrals WHERE referrer_id = ?) AS total_referrals,
+    (SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE user_id = ? AND type IN ('referral', 'referral_cashback')) AS total_earned
+`);
+
+// ── VIP ──────────────────────────────────────────────────────────────────────
+/**
+ * VIP is CLOSED. Nobody new can be granted it.
+ *
+ * The three call sites that used to unlock it are still there — referral
+ * milestones reached in the past can still fire — so the block lives here
+ * rather than at each one. A guard at the source cannot be forgotten by a
+ * fourth caller added later, which is exactly how a "removed" feature comes
+ * back.
+ *
+ * Existing holders are untouched: their discount was promised for life.
+ */
+const unlockVIPQuery = {
+  run: (userId) => {
+    try {
+      const logger = require('../utils/logger');
+      logger.info(`[VIP] grant blocked for ${userId} — the VIP system is closed`);
+    } catch (_) { /* logging must never break a purchase */ }
+    return { changes: 0 };
+  },
+};
+
+/** Revoke VIP. Used to undo grants that should never have happened. */
+const revokeVIPQuery = db.prepare(
+  'UPDATE users SET is_vip = 0, vip_unlocked_at = NULL WHERE telegram_id = ?'
+);
+
+/** VIP holders, newest first — so a recent batch can be reviewed and undone. */
+const listVIPsQuery = db.prepare(`
+  SELECT telegram_id, username, first_name, vip_unlocked_at, rank_spend
+  FROM users WHERE is_vip = 1
+  ORDER BY (vip_unlocked_at IS NULL), datetime(vip_unlocked_at) DESC
+`);
+const isVIPQuery = db.prepare('SELECT is_vip FROM users WHERE telegram_id = ?');
+const countVIPsQuery = db.prepare('SELECT COUNT(*) AS count FROM users WHERE is_vip = 1');
+const countReferralsForUser = db.prepare('SELECT COUNT(*) AS count FROM referrals WHERE referrer_id = ?');
+
+// Count referrals where at least one of the invited users has bought (paid order)
+const countReferralsWithPurchaseQuery = db.prepare(`
+  SELECT COUNT(DISTINCT r.referred_id) AS count
+  FROM referrals r
+  WHERE r.referrer_id = ?
+    AND EXISTS (
+      SELECT 1 FROM orders o
+      WHERE o.user_id = r.referred_id
+        AND o.status IN ('delivered', 'paid')
+    )
+`);
+
+// Has any invitee made any purchase?
+const hasAnyInviteePurchasedQuery = db.prepare(`
+  SELECT COUNT(*) AS count
+  FROM referrals r
+  WHERE r.referrer_id = ?
+    AND EXISTS (
+      SELECT 1 FROM orders o
+      WHERE o.user_id = r.referred_id
+        AND o.status IN ('delivered', 'paid')
+    )
+`);
+
+// ── REFUND REQUESTS ──────────────────────────────────────────────────────────
+const insertRefundRequest = db.prepare(`
+  INSERT INTO refund_requests (user_id, order_id, reason, amount, affected_account, photo_file_id, refund_method, crypto_network, wallet_address)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+const getUserRefundRequests = db.prepare(`
+  SELECT rr.*, p.title AS product_title, o.total_price, o.created_at AS order_date
+  FROM refund_requests rr
+  LEFT JOIN orders o ON o.id = rr.order_id
+  LEFT JOIN products p ON p.id = o.product_id
+  WHERE rr.user_id = ?
+  ORDER BY rr.id DESC LIMIT 20
+`);
+/**
+ * Sales broken down by hour of the day, in the shop's own timezone.
+ *
+ * Timestamps are stored in UTC, so a shop in UTC+1 reading them raw sees every
+ * peak an hour early — and a peak read an hour early is worse than none, since
+ * it points at the wrong time to post.
+ *
+ * @param {number} days   how far back to look
+ * @param {number} offset hours to add to UTC (Tunisia = 1)
+ */
+function salesByHour(days = 30, offset = 0) {
+  const rows = db.prepare(`
+    SELECT o.created_at, o.total_price
+    FROM orders o
+    WHERE o.status IN ('delivered', 'paid', 'completed')
+      AND o.created_at >= datetime('now', '-' || ? || ' days')
+  `).all(days);
+
+  const hours = Array.from({ length: 24 }, () => ({ count: 0, revenue: 0 }));
+  const dows  = Array.from({ length: 7 },  () => ({ count: 0, revenue: 0 }));
+
+  for (const r of rows) {
+    // SQLite writes "YYYY-MM-DD HH:MM:SS" with no zone marker; naming it UTC
+    // explicitly stops the server's own locale from shifting it a second time.
+    const t = new Date(`${String(r.created_at).replace(' ', 'T')}Z`);
+    if (isNaN(t.getTime())) continue;
+    const local = new Date(t.getTime() + offset * 3600000);
+
+    const h = local.getUTCHours();
+    const d = local.getUTCDay();
+    const amount = Number(r.total_price) || 0;
+
+    hours[h].count++;   hours[h].revenue += amount;
+    dows[d].count++;    dows[d].revenue  += amount;
+  }
+
+  return { hours, dows, total: rows.length,
+           revenue: rows.reduce((a, r) => a + (Number(r.total_price) || 0), 0) };
+}
+
+const getAllRefundRequests = db.prepare(`
+  SELECT rr.*, p.title AS product_title, o.total_price,
+    u.username AS username, u.first_name AS first_name
+  FROM refund_requests rr
+  LEFT JOIN orders o ON o.id = rr.order_id
+  LEFT JOIN products p ON p.id = o.product_id
+  LEFT JOIN users u ON u.telegram_id = rr.user_id
+  ORDER BY rr.id DESC
+`);
+const getRefundRequestById = db.prepare(`
+  SELECT rr.*, p.title AS product_title, o.total_price, o.created_at AS order_date
+  FROM refund_requests rr
+  LEFT JOIN orders o ON o.id = rr.order_id
+  LEFT JOIN products p ON p.id = o.product_id
+  WHERE rr.id = ?
+`);
+const getPendingRefundForOrder = db.prepare(`
+  SELECT * FROM refund_requests WHERE order_id = ? AND status = 'pending'
+`);
+const updateRefundRequestStatus = db.prepare(`
+  UPDATE refund_requests SET status = ?, admin_note = ?, amount = ?, method = ?, resolved_at = datetime('now')
+  WHERE id = ?
+`);
+
+
+// ═══ CATEGORIES ═══════════════════════════════════════
+const cat_getAll = db.prepare(`SELECT * FROM categories WHERE is_active=1 ORDER BY display_order ASC, id ASC`);
+const cat_getById = db.prepare(`SELECT * FROM categories WHERE id=?`);
+const cat_insert = db.prepare(`INSERT INTO categories (name, emoji, display_order) VALUES (?, ?, ?)`);
+const cat_update = db.prepare(`UPDATE categories SET name=?, emoji=?, display_order=? WHERE id=?`);
+const cat_delete = db.prepare(`DELETE FROM categories WHERE id=?`);
+const cat_getProducts = db.prepare(`
+  SELECT p.*, COALESCE(SUM(CASE WHEN i.status='available' THEN 1 ELSE 0 END), 0) AS stock_count
+  FROM products p
+  LEFT JOIN product_items i ON i.product_id = p.id
+  WHERE p.is_active=1 AND p.category_id=?
+  GROUP BY p.id
+  ORDER BY p.display_order ASC, p.id ASC
+`);
+const cat_setProduct = db.prepare(`UPDATE products SET category_id=? WHERE id=?`);
+const cat_resetProducts = db.prepare(`UPDATE products SET category_id=0 WHERE category_id=?`);
+
+
+// ═══ CHATGPT BUSINESS ═══════════════════════════════════
+const cgb_getAllCycles = db.prepare(`SELECT * FROM billing_cycles WHERE is_active=1 ORDER BY start_day ASC`);
+const cgb_insertCycle  = db.prepare(`INSERT INTO billing_cycles (start_day, end_day) VALUES (?, ?)`);
+const cgb_deleteCycle  = db.prepare(`DELETE FROM billing_cycles WHERE id=?`);
+const cgb_updateCycle  = db.prepare(`UPDATE billing_cycles SET start_day=?, end_day=? WHERE id=?`);
+const cgb_getCycleById = db.prepare(`SELECT * FROM billing_cycles WHERE id=?`);
+const cgb_setCycleTime = db.prepare(`UPDATE billing_cycles SET start_time=? WHERE id=?`);
+/**
+ * A subscription row is created the moment a payment METHOD is chosen, because
+ * the CryptoBot webhook arrives later and needs a row to attach to. So it
+ * starts as 'awaiting_payment' — a placeholder, not a seat.
+ *
+ * It used to start as 'pending', which is ALSO the status of a paid seat merely
+ * waiting for the admin to send the invite. The two were indistinguishable, so
+ * every abandoned checkout left behind a row that looked like a real
+ * subscription: tap Renew, tap Cancel, and the same email appeared again in the
+ * customer's list.
+ */
+const cgb_insertSub    = db.prepare(`
+  INSERT INTO chatgpt_subscriptions (order_id, user_id, email, start_date, end_date, days_remaining, base_price, extra_month, final_price, status)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'awaiting_payment')
+`);
+
+/** Promote a placeholder to a real seat once the money has arrived. */
+const cgb_markPaid = db.prepare(`
+  UPDATE chatgpt_subscriptions
+  SET status = 'pending', updated_at = datetime('now')
+  WHERE order_id = ? AND status = 'awaiting_payment'
+`);
+
+/** Drop the placeholder when a checkout is abandoned or cancelled. */
+const cgb_dropUnpaid = db.prepare(`
+  DELETE FROM chatgpt_subscriptions
+  WHERE order_id = ? AND status = 'awaiting_payment'
+`);
+const cgb_getSubByOrder = db.prepare(`SELECT * FROM chatgpt_subscriptions WHERE order_id=?`);
+const cgb_activateSub  = db.prepare(`UPDATE chatgpt_subscriptions SET status='active', updated_at=datetime('now') WHERE order_id=?`);
+// Used by the guard-bot success callback (see services/cgbGuard.js) to find
+// WHICH order an invited email belongs to. Most recent non-active row for
+// that email, case-insensitive — a real edge case (the same email with two
+// pending orders at once) picks the newer one; rare enough to accept, and
+// the admin still sees every callback logged either way.
+const cgb_getPendingSubByEmail = db.prepare(`
+  SELECT * FROM chatgpt_subscriptions
+  WHERE email = ? COLLATE NOCASE AND COALESCE(status, '') NOT IN ('active', 'cancelled')
+  ORDER BY id DESC LIMIT 1
+`);
+const cgb_saveAdminCard = db.prepare(`
+  INSERT INTO cgb_admin_cards (order_id, chat_id, message_id) VALUES (?, ?, ?)
+  ON CONFLICT(order_id) DO UPDATE SET chat_id=excluded.chat_id, message_id=excluded.message_id, created_at=datetime('now')
+`);
+const cgb_getAdminCard = db.prepare(`SELECT * FROM cgb_admin_cards WHERE order_id = ?`);
+const cgb_getActive    = db.prepare(`SELECT * FROM chatgpt_subscriptions WHERE status='active' ORDER BY end_date ASC`);
+const cgb_getExpiringSubs = db.prepare(`
+  SELECT cs.*, u.username, u.first_name 
+  FROM chatgpt_subscriptions cs
+  LEFT JOIN users u ON cs.user_id = u.telegram_id
+  WHERE cs.status='active' 
+  AND date(cs.end_date) <= date('now', '+' || ? || ' days')
+  AND date(cs.end_date) > date('now')
+`);
+const cgb_markNotified = (orderId, days) => {
+  const col = days === 3 ? 'notified_3d' : days === 1 ? 'notified_1d' : 'notified_0d';
+  return db.prepare(`UPDATE chatgpt_subscriptions SET ${col}=1 WHERE order_id=?`).run(orderId);
+};
+
+// ── Renewals ─────────────────────────────────────────────────────────────────
+
+/**
+ * A customer's live seats, soonest to expire first.
+ *
+ * 'pending' is included deliberately. A subscription is inserted as 'pending'
+ * and only flips to 'active' when an admin taps "notify customer" — but the
+ * customer has already PAID at insert time. Filtering to 'active' meant every
+ * seat whose invite had not been sent yet was invisible to its owner, so the
+ * whole renewals menu looked like it did nothing.
+ */
+const cgb_getUserSubs = db.prepare(`
+  SELECT * FROM chatgpt_subscriptions
+  WHERE user_id = ?
+    AND COALESCE(status, 'pending') IN ('active', 'pending')
+  ORDER BY date(end_date) ASC, id ASC
+`);
+
+const cgb_getSubById = db.prepare('SELECT * FROM chatgpt_subscriptions WHERE id = ?');
+
+const cgb_setRenewIntent = db.prepare(`
+  UPDATE chatgpt_subscriptions
+  SET renew_intent = ?, renew_set_at = datetime('now'), updated_at = datetime('now')
+  WHERE id = ?
+`);
+
+/**
+ * Seats that are due a reminder.
+ *
+ * `reminder_sent = 0` is what makes this safe to run on a timer: the scheduler
+ * can fire every hour, or twice after a restart, and each customer is still
+ * messaged exactly once. Seats whose owner already said "no" are skipped —
+ * nagging someone who declined is the fastest way to lose them.
+ */
+const cgb_getDueReminders = db.prepare(`
+  SELECT cs.*, u.username, u.first_name
+  FROM chatgpt_subscriptions cs
+  LEFT JOIN users u ON cs.user_id = u.telegram_id
+  WHERE COALESCE(cs.status, 'pending') IN ('active', 'pending')
+    AND COALESCE(cs.reminder_sent, 0) = 0
+    AND COALESCE(cs.renew_intent, '') <> 'no'
+    AND date(cs.end_date) <= date('now', '+' || ? || ' days')
+    AND date(cs.end_date) >= date('now')
+  ORDER BY date(cs.end_date) ASC
+`);
+
+const cgb_markReminded = db.prepare(`
+  UPDATE chatgpt_subscriptions SET reminder_sent = 1, updated_at = datetime('now') WHERE id = ?
+`);
+
+/** Seats whose owner has asked to be carried into the next cycle. */
+const cgb_getReserved = db.prepare(`
+  SELECT cs.*, u.username, u.first_name
+  FROM chatgpt_subscriptions cs
+  LEFT JOIN users u ON cs.user_id = u.telegram_id
+  WHERE COALESCE(cs.status, 'pending') IN ('active', 'pending')
+    AND cs.renew_intent = 'yes'
+  ORDER BY date(cs.end_date) ASC
+`);
+
+/**
+ * Renewals: seats created as a continuation of an earlier one.
+ *
+ * `renewed_from` is set only after a renewal is PAID, so this list is money
+ * received — not intentions. A seat someone said they would renew and never
+ * paid for does not appear here, which is the whole point of separating them.
+ */
+const cgb_getRenewals = db.prepare(`
+  SELECT cs.*,
+         u.username, u.first_name,
+         prev.email      AS prev_email,
+         prev.end_date   AS prev_end,
+         o.total_price   AS paid,
+         o.payment_method
+  FROM chatgpt_subscriptions cs
+  LEFT JOIN users u   ON cs.user_id      = u.telegram_id
+  LEFT JOIN chatgpt_subscriptions prev ON cs.renewed_from = prev.id
+  LEFT JOIN orders o  ON cs.order_id     = o.id
+  -- The status filter is what makes this a list of MONEY rather than clicks.
+  -- renewed_from is written when the payment method is chosen, so without it an
+  -- abandoned checkout would be reported as a completed renewal.
+  WHERE cs.renewed_from IS NOT NULL
+    AND COALESCE(cs.status, '') IN ('active', 'pending')
+  ORDER BY cs.id DESC
+  LIMIT ?
+`);
+
+/** Customers who said they would renew but have not paid yet. */
+const cgb_getPendingRenewals = db.prepare(`
+  SELECT cs.*, u.username, u.first_name
+  FROM chatgpt_subscriptions cs
+  LEFT JOIN users u ON cs.user_id = u.telegram_id
+  WHERE cs.renew_intent = 'yes'
+    AND COALESCE(cs.status, 'pending') IN ('active', 'pending')
+    -- "Not yet paid" means no PAID successor. An unpaid placeholder pointing at
+    -- this seat is precisely the case being reported, so it must not count as
+    -- one and quietly remove the customer from the chase list.
+    AND NOT EXISTS (
+      SELECT 1 FROM chatgpt_subscriptions nxt
+      WHERE nxt.renewed_from = cs.id
+        AND COALESCE(nxt.status, '') IN ('active', 'pending')
+    )
+  ORDER BY date(cs.end_date) ASC
+`);
+
+const cgb_setWorkspace = db.prepare('UPDATE chatgpt_subscriptions SET workspace = ? WHERE id = ?');
+const cgb_linkRenewal  = db.prepare('UPDATE chatgpt_subscriptions SET renewed_from = ? WHERE id = ?');
+
+
+// ═══ RESELLERS ═══════════════════════════════════════
+const rs_getAll = db.prepare(`SELECT * FROM resellers ORDER BY id DESC`);
+const rs_getById = db.prepare(`SELECT * FROM resellers WHERE id=?`);
+const rs_getByKey = db.prepare(`SELECT * FROM resellers WHERE api_key=? AND is_active=1`);
+const rs_insert = db.prepare(`INSERT INTO resellers (name, api_key) VALUES (?, ?)`);
+const rs_updateBalance = db.prepare(`UPDATE resellers SET balance = balance + ?, total_spent = total_spent + ?, orders_count = orders_count + ? WHERE id=?`);
+const rs_setBalance = db.prepare(`UPDATE resellers SET balance = balance + ? WHERE id=?`);
+const rs_toggle = db.prepare(`UPDATE resellers SET is_active = ? WHERE id=?`);
+const rs_delete = db.prepare(`DELETE FROM resellers WHERE id=?`);
+const rs_insertOrder = db.prepare(`
+  INSERT INTO reseller_orders (reseller_id, product_id, quantity, unit_price, total, delivered_items, status)
+  VALUES (?, ?, ?, ?, ?, ?, 'completed')
+`);
+const rs_getOrders = db.prepare(`
+  SELECT ro.*, p.title AS product_title FROM reseller_orders ro
+  LEFT JOIN products p ON ro.product_id = p.id
+  WHERE ro.reseller_id = ?
+  ORDER BY ro.id DESC LIMIT 100
+`);
+const rs_setProductWholesale = db.prepare(`UPDATE products SET wholesale_price = ? WHERE id = ?`);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V2 — ORDER HISTORY WITH DATE FILTERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Full history, newest first, no LIMIT. Pagination happens in the keyboard
+// layer so nothing is ever silently dropped by the query itself.
+const getUserOrdersAll = db.prepare(`
+  SELECT o.*, p.title AS product_title, p.delivery_type,
+         md.status AS manual_status
+  FROM orders o
+  LEFT JOIN products p          ON o.product_id = p.id
+  LEFT JOIN manual_deliveries md ON md.order_id = o.id
+  WHERE o.user_id = ?
+  ORDER BY datetime(o.created_at) DESC, o.id DESC
+`);
+
+// Same, restricted to a window. `sinceExpr`/`untilExpr` are SQLite datetime
+// modifiers supplied by the caller from a fixed whitelist (never user input).
+function getUserOrdersFiltered(userId, filter = 'all') {
+  const all = getUserOrdersAll.all(userId);
+  if (filter === 'all') return all;
+
+  const now = new Date();
+  let from = null;
+  let to   = null;
+
+  if (filter === '7d') {
+    from = new Date(now.getTime() - 7 * 24 * 3600 * 1000);
+  } else if (filter === '30d') {
+    from = new Date(now.getTime() - 30 * 24 * 3600 * 1000);
+  } else if (filter === 'this_month') {
+    from = new Date(now.getFullYear(), now.getMonth(), 1);
+  } else if (filter === 'last_month') {
+    from = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    to   = new Date(now.getFullYear(), now.getMonth(), 1);
+  } else {
+    return all;
+  }
+
+  return all.filter((o) => {
+    // created_at is stored as UTC "YYYY-MM-DD HH:MM:SS"
+    const raw = String(o.created_at || '').replace(' ', 'T');
+    const d = new Date(raw.endsWith('Z') ? raw : raw + 'Z');
+    if (isNaN(d.getTime())) return true; // never hide a row we can't parse
+    if (from && d < from) return false;
+    if (to   && d >= to)  return false;
+    return true;
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V2 — REFUND ELIGIBILITY
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Authoritative server-side check. Used by both the listing and the submit
+// handler, so a crafted callback can never open a request for a blocked item.
+function isProductRefundable(productId) {
+  const row = db.prepare('SELECT refund_enabled FROM products WHERE id = ?').get(productId);
+  if (!row) return false;
+  return Number(row.refund_enabled) === 1;
+}
+
+function isOrderRefundable(orderId) {
+  const row = db.prepare(`
+    SELECT o.status, o.product_id, p.refund_enabled
+    FROM orders o LEFT JOIN products p ON p.id = o.product_id
+    WHERE o.id = ?
+  `).get(orderId);
+  if (!row) return { ok: false, reason: 'not_found' };
+  if (row.status !== 'delivered') return { ok: false, reason: 'not_delivered' };
+  if (Number(row.refund_enabled) !== 1) return { ok: false, reason: 'not_eligible' };
+  return { ok: true };
+}
+
+// Delivered orders the customer is actually allowed to open a refund for.
+const getRefundableUserOrders = db.prepare(`
+  SELECT o.*, p.title AS product_title
+  FROM orders o
+  JOIN products p ON p.id = o.product_id
+  WHERE o.user_id = ?
+    AND o.status = 'delivered'
+    AND p.refund_enabled = 1
+  ORDER BY datetime(o.created_at) DESC, o.id DESC
+`);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V2 — MANUAL DELIVERY
+// ═══════════════════════════════════════════════════════════════════════════
+
+const md_insert = db.prepare(`
+  INSERT OR IGNORE INTO manual_deliveries
+    (order_id, user_id, product_id, quantity, email, total_paid, payment_method)
+  VALUES (@orderId, @userId, @productId, @quantity, @email, @totalPaid, @paymentMethod)
+`);
+const md_getByOrder = db.prepare('SELECT * FROM manual_deliveries WHERE order_id = ?');
+const md_getById    = db.prepare(`
+  SELECT md.*, p.title AS product_title, u.username, u.first_name
+  FROM manual_deliveries md
+  LEFT JOIN products p ON p.id = md.product_id
+  LEFT JOIN users u    ON u.telegram_id = md.user_id
+  WHERE md.id = ?
+`);
+const md_listAll = db.prepare(`
+  SELECT md.*, p.title AS product_title, u.username, u.first_name
+  FROM manual_deliveries md
+  LEFT JOIN products p ON p.id = md.product_id
+  LEFT JOIN users u    ON u.telegram_id = md.user_id
+  ORDER BY md.id DESC
+`);
+const md_countByStatus = db.prepare(`
+  SELECT status, COUNT(*) AS n FROM manual_deliveries GROUP BY status
+`);
+const md_setStatus = db.prepare(`
+  UPDATE manual_deliveries
+  SET status = ?, admin_note = COALESCE(?, admin_note), updated_at = datetime('now')
+  WHERE id = ?
+`);
+const md_markDelivered = db.prepare(`
+  UPDATE manual_deliveries
+  SET status = 'delivered', delivered_content = COALESCE(?, delivered_content),
+      delivered_at = datetime('now'), updated_at = datetime('now')
+  WHERE id = ? AND status != 'delivered'
+`);
+const md_markNotified = db.prepare(`
+  UPDATE manual_deliveries SET notified_at = datetime('now') WHERE id = ? AND notified_at IS NULL
+`);
+const md_markSeen = db.prepare(`
+  UPDATE manual_deliveries SET seen_at = datetime('now') WHERE id = ? AND seen_at IS NULL
+`);
+const md_userList = db.prepare(`
+  SELECT md.*, p.title AS product_title
+  FROM manual_deliveries md
+  LEFT JOIN products p ON p.id = md.product_id
+  WHERE md.user_id = ?
+  ORDER BY md.id DESC
+`);
+
+/**
+ * Atomically charge the wallet and open a manual-delivery task.
+ *
+ * Mirrors deliverOrderAndChargeWallet but deliberately does NOT touch
+ * product_items: manual products have no digital stock to hand out. Stock
+ * quantity is still decremented so the storefront count stays honest.
+ *
+ * Returns { result: 'ok' | 'already_processed' | 'insufficient_balance' }.
+ */
+function chargeWalletForManualOrder(orderId, productId, quantity, userId, price) {
+  return db.transaction(() => {
+    const orderCheck = db.prepare('SELECT status FROM orders WHERE id = ?').get(orderId);
+    if (!orderCheck || orderCheck.status !== 'pending') return { result: 'already_processed' };
+
+    const userRow = db.prepare('SELECT balance FROM users WHERE telegram_id = ?').get(userId);
+    const balance = userRow ? Number(userRow.balance) : 0;
+    const priceN  = Number(price);
+    if (!hasEnough(balance, priceN)) return { result: 'insufficient_balance', balance };
+
+    const res = db.prepare(`
+      UPDATE orders
+      SET status = 'awaiting_delivery', payment_method = 'wallet', paid_at = datetime('now')
+      WHERE id = ? AND status = 'pending'
+    `).run(orderId);
+    if (res.changes === 0) return { result: 'already_processed' };
+
+    updateBalance.run(-priceN, userId);
+    incrementSoldCount.run(quantity, productId);
+    incrementSalesCount.run(quantity, productId);
+    adjustStockQuantity.run(-quantity, productId);
+    markProductSoldNow.run(productId);
+    return { result: 'ok' };
+  })();
+}
+
+/**
+ * Same thing for externally-settled payments (USDT / Binance Pay / CryptoBot),
+ * where the money has already arrived and only the order state must move.
+ */
+function settleManualOrderExternal(orderId, productId, quantity, paymentMethod) {
+  return db.transaction(() => {
+    const orderCheck = db.prepare('SELECT status FROM orders WHERE id = ?').get(orderId);
+    if (!orderCheck || orderCheck.status !== 'pending') return { result: 'already_processed' };
+
+    const res = db.prepare(`
+      UPDATE orders
+      SET status = 'awaiting_delivery', payment_method = ?, paid_at = datetime('now')
+      WHERE id = ? AND status = 'pending'
+    `).run(paymentMethod, orderId);
+    if (res.changes === 0) return { result: 'already_processed' };
+
+    incrementSoldCount.run(quantity, productId);
+    incrementSalesCount.run(quantity, productId);
+    adjustStockQuantity.run(-quantity, productId);
+    markProductSoldNow.run(productId);
+    return { result: 'ok' };
+  })();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V2 — STOCK ALERT LATCHES
+// ═══════════════════════════════════════════════════════════════════════════
+
+const stock_setOosNotified = db.prepare('UPDATE products SET oos_notified = ? WHERE id = ?');
+const stock_setLowNotified = db.prepare('UPDATE products SET low_notified = ? WHERE id = ?');
+const stock_resetFlags     = db.prepare('UPDATE products SET oos_notified = 0, low_notified = 0 WHERE id = ?');
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V2 — SUPPORT THREADS (✓ / ✓✓ state + one-time welcome)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const th_ensure = db.prepare('INSERT OR IGNORE INTO support_threads (user_id) VALUES (?)');
+const th_get    = db.prepare('SELECT * FROM support_threads WHERE user_id = ?');
+const th_setWelcomed = db.prepare('UPDATE support_threads SET welcomed = 1 WHERE user_id = ?');
+const th_setStatusMsg = db.prepare(`
+  UPDATE support_threads
+  SET status_msg_id = ?, status_state = ?, pending_count = ?,
+      last_customer_msg_at = datetime('now')
+  WHERE user_id = ?
+`);
+const th_markRead = db.prepare(`
+  UPDATE support_threads
+  SET status_state = 'read', pending_count = 0, last_read_at = datetime('now')
+  WHERE user_id = ?
+`);
+
+const sm_markRead = db.prepare(`
+  UPDATE support_messages
+  SET is_read = 1, read_at = datetime('now')
+  WHERE user_id = ? AND direction = 'in' AND is_read = 0
+`);
+const sm_unreadTotal = db.prepare(`
+  SELECT COUNT(DISTINCT user_id) AS n FROM support_messages WHERE direction = 'in' AND is_read = 0
+`);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V2 — ADMIN NOTIFICATION CENTRE
+// ═══════════════════════════════════════════════════════════════════════════
+
+// INSERT OR IGNORE + UNIQUE(dedupe_key) = the same event is stored exactly once,
+// no matter how many times the producing code path runs.
+const an_insert = db.prepare(`
+  INSERT OR IGNORE INTO admin_notifications (type, title, body, ref_type, ref_id, dedupe_key)
+  VALUES (@type, @title, @body, @refType, @refId, @dedupeKey)
+`);
+const an_list = db.prepare(`
+  SELECT * FROM admin_notifications ORDER BY id DESC LIMIT ? OFFSET ?
+`);
+const an_listUnread = db.prepare(`
+  SELECT * FROM admin_notifications WHERE is_read = 0 ORDER BY id DESC LIMIT ? OFFSET ?
+`);
+const an_countAll    = db.prepare('SELECT COUNT(*) AS n FROM admin_notifications');
+const an_countUnread = db.prepare('SELECT COUNT(*) AS n FROM admin_notifications WHERE is_read = 0');
+const an_get         = db.prepare('SELECT * FROM admin_notifications WHERE id = ?');
+const an_markRead    = db.prepare("UPDATE admin_notifications SET is_read = 1, read_at = datetime('now') WHERE id = ?");
+const an_markAllRead = db.prepare("UPDATE admin_notifications SET is_read = 1, read_at = datetime('now') WHERE is_read = 0");
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V3 — DEPOSIT INTENTS (amount reservation)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const nodeCrypto = require('crypto');
+
+const di_insert = db.prepare(`
+  INSERT INTO deposit_intents (user_id, network, base_amount, unique_amount, created_ms, expires_ms)
+  VALUES (?, ?, ?, ?, ?, ?)
+`);
+const di_expireStale = db.prepare(`
+  UPDATE deposit_intents SET status = 'expired'
+  WHERE status = 'open' AND expires_ms < ?
+`);
+const di_openForUser = db.prepare(`
+  SELECT * FROM deposit_intents
+  WHERE user_id = ? AND status = 'open' AND expires_ms >= ?
+  ORDER BY id DESC
+`);
+const di_findOpenByAmount = db.prepare(`
+  SELECT * FROM deposit_intents
+  WHERE status = 'open' AND network = ? AND expires_ms >= ?
+    AND ABS(unique_amount - ?) < 0.0000021
+  ORDER BY id ASC LIMIT 1
+`);
+const di_claim = db.prepare(`
+  UPDATE deposit_intents
+  SET status = 'claimed', claimed_txid = ?, claimed_at = datetime('now')
+  WHERE id = ? AND status = 'open'
+`);
+const di_cancel = db.prepare(`
+  UPDATE deposit_intents SET status = 'cancelled' WHERE id = ? AND status = 'open'
+`);
+const di_get = db.prepare('SELECT * FROM deposit_intents WHERE id = ?');
+
+/**
+ * Reserve a unique deposit amount for a user.
+ *
+ * The suffix is drawn with crypto.randomInt so it cannot be guessed, and the
+ * partial UNIQUE index on (network, unique_amount) WHERE status='open'
+ * guarantees no two live reservations ever collide. On collision we simply
+ * draw again.
+ *
+ * The suffix is under 10 cents in practice and is credited to the customer's wallet in full.
+ *
+ * @returns {object|null} the created intent row
+ */
+function createDepositIntent(userId, network, baseAmount, ttlMinutes) {
+  const now = Date.now();
+  di_expireStale.run(now); // housekeeping: retire anything past its deadline
+
+  const ttl = (Number(ttlMinutes) > 0 ? Number(ttlMinutes) : 60) * 60 * 1000;
+  const base = Number(Number(baseAmount).toFixed(2));
+
+  // V135/V136 — SMALL suffixes first. V132 used .01–.99, and "10.27" for a $10
+  // top-up felt like a lot to customers (even though the extra is credited).
+  // The identifier now stays under 10 cents in practice:
+  //   1) 10.01 … 10.09            one cent digit           (9 values)
+  //   2) 10.011 … 10.099          under 10 cents, 3 dec.   (81 values, never a
+  //                               multiple of 10, so it can't read as tier 1)
+  //   3) 10.101 … 10.999          only if 1) and 2) are all reserved at once
+  // Never "29.000350" again (that run of zeros was the original complaint).
+  // The partial UNIQUE index on (network, unique_amount) still guarantees no
+  // two open reservations share a figure; the extra is credited in full.
+  const tryInsert = (unique) => {
+    try {
+      const res = di_insert.run(userId, network, base, unique, now, now + ttl);
+      return di_get.get(res.lastInsertRowid);
+    } catch (e) {
+      if (!String(e.message).includes('UNIQUE')) throw e;
+      return null;
+    }
+  };
+  const shuffled = (arr) => { for (let i = arr.length - 1; i > 0; i--) { const j = nodeCrypto.randomInt(0, i + 1); [arr[i], arr[j]] = [arr[j], arr[i]]; } return arr; };
+  // V136 — "two zeros" (owner's choice): 10.003. Under a cent extra.
+  const notRound = (v, scale) => Math.round(v * scale) % 10 !== 0;
+  const tiers = [
+    shuffled(Array.from({ length: 9 }, (_, i) => (i + 1) / 1000)),                                              // .001–.009
+    shuffled(Array.from({ length: 89 }, (_, i) => (i + 11) / 10000).filter((v) => notRound(v, 10000))),          // .0011–.0099
+    shuffled(Array.from({ length: 89 }, (_, i) => (i + 11) / 1000).filter((v) => notRound(v, 1000))),            // .011–.099 (rare)
+    shuffled(Array.from({ length: 899 }, (_, i) => (i + 101) / 1000).filter((v) => notRound(v, 1000))),          // .101–.999 (last resort)
+  ];
+  for (const tier of tiers) {
+    for (const suffix of tier) {
+      const row = tryInsert(Number((base + suffix).toFixed(4)));
+      if (row) return row;
+    }
+  }
+  return null; // astronomically unlikely
+}
+
+/** Live reservations belonging to a user. */
+function getOpenIntents(userId) {
+  const now = Date.now();
+  di_expireStale.run(now);
+  return di_openForUser.all(userId, now);
+}
+
+/** Find the live reservation an incoming deposit belongs to, if any. */
+function findIntentForDeposit(network, amount) {
+  const now = Date.now();
+  di_expireStale.run(now);
+  return di_findOpenByAmount.get(network, now, Number(amount));
+}
+
+const di_allOpen = db.prepare(`SELECT * FROM deposit_intents WHERE status = 'open' AND expires_ms >= ? ORDER BY id`);
+const di_findRecentByAmount = db.prepare(`
+  SELECT * FROM deposit_intents
+  WHERE status IN ('open','expired') AND network = ? AND expires_ms >= ?
+    AND ABS(unique_amount - ?) < 0.0000021
+  ORDER BY (status = 'open') DESC, id DESC LIMIT 1
+`);
+const di_claimRecent = db.prepare(`
+  UPDATE deposit_intents SET status = 'claimed', claimed_txid = ?, claimed_at = datetime('now')
+  WHERE id = ? AND status IN ('open','expired')
+`);
+const di_recentClaimedForUser = db.prepare(`
+  SELECT * FROM deposit_intents WHERE user_id = ? AND status = 'claimed'
+    AND claimed_at >= datetime('now', '-3 hours') ORDER BY id DESC LIMIT 1
+`);
+
+/** Every live reservation — the deposit watcher scans only while there are some. */
+function listOpenIntents() {
+  const now = Date.now();
+  di_expireStale.run(now);
+  return di_allOpen.all(now);
+}
+
+/**
+ * For the automatic watcher: a live reservation, or one that expired less
+ * than `graceMs` ago (a customer who paid at minute 29 and whose transfer
+ * Binance booked at minute 35 must still be credited). A live one wins.
+ */
+function findIntentForDepositRecent(network, amount, graceMs = 45 * 60 * 1000) {
+  const now = Date.now();
+  di_expireStale.run(now);
+  return di_findRecentByAmount.get(network, now - graceMs, Number(amount));
+}
+
+const claimDepositIntent  = (id, txid) => di_claim.run(txid, id).changes > 0;
+const claimDepositIntentRecent = (id, txid) => di_claimRecent.run(txid, id).changes > 0;
+const recentClaimedIntentForUser = (userId) => di_recentClaimedForUser.get(userId);
+const cancelDepositIntent = (id) => di_cancel.run(id).changes > 0;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V3 — DEPOSIT REVIEW QUEUE (unmatched deposits, admin-approved only)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const dr_insert = db.prepare(`
+  INSERT OR IGNORE INTO deposit_reviews
+    (txid, user_id, amount, network, address, insert_time, reason)
+  VALUES (@txid, @userId, @amount, @network, @address, @insertTime, @reason)
+`);
+const dr_get      = db.prepare('SELECT * FROM deposit_reviews WHERE id = ?');
+const dr_byTxid   = db.prepare('SELECT * FROM deposit_reviews WHERE txid = ? COLLATE NOCASE');
+const dr_list     = db.prepare("SELECT * FROM deposit_reviews WHERE status = ? ORDER BY id DESC LIMIT ? OFFSET ?");
+const dr_count    = db.prepare('SELECT COUNT(*) AS n FROM deposit_reviews WHERE status = ?');
+const dr_resolve  = db.prepare(`
+  UPDATE deposit_reviews
+  SET status = ?, admin_note = ?, admin_id = ?, resolved_at = datetime('now')
+  WHERE id = ? AND status = 'pending'
+`);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V3 — BALANCE REVERSAL (claw back a fraudulent credit)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const rev_insert = db.prepare(`
+  INSERT INTO balance_reversals
+    (user_id, amount, txid, reason, admin_id, balance_before, balance_after)
+  VALUES (?, ?, ?, ?, ?, ?, ?)
+`);
+const rev_list = db.prepare('SELECT * FROM balance_reversals ORDER BY id DESC LIMIT ?');
+
+/**
+ * Remove a credited amount from a user's wallet and record it.
+ *
+ * The balance is allowed to go negative on purpose: if the thief already spent
+ * the money, the debt stays visible instead of silently vanishing.
+ */
+function reverseDeposit({ userId, amount, txid = null, reason = '', adminId = null }) {
+  return db.transaction(() => {
+    const before = Number(db.prepare('SELECT balance FROM users WHERE telegram_id = ?').get(userId)?.balance || 0);
+    const amt = Number(amount);
+    db.prepare('UPDATE users SET balance = balance - ? WHERE telegram_id = ?').run(amt, userId);
+    const after = Number(db.prepare('SELECT balance FROM users WHERE telegram_id = ?').get(userId)?.balance || 0);
+
+    db.prepare(`
+      INSERT INTO transactions (user_id, type, amount, description, ref_id)
+      VALUES (?, 'reversal', ?, ?, ?)
+    `).run(userId, -amt, `Deposit reversed: ${reason || 'fraud'}`, txid);
+
+    rev_insert.run(userId, amt, txid, reason, adminId, before, after);
+    return { before, after, amount: amt };
+  })();
+}
+
+/**
+ * Cancel every open order belonging to one user, in a single transaction.
+ *
+ * Used as a fraud response. Two things make this different from a normal
+ * per-order cancel:
+ *
+ *  • `refund` defaults to FALSE. Money taken from a fraudster's wallet is not
+ *    handed back — the funds were stolen to begin with.
+ *  • Stock is genuinely restored. A paid manual order had `stock_quantity`
+ *    decremented and the sold/sales counters incremented; all three are undone,
+ *    otherwise a fraud wave silently destroys the inventory numbers.
+ *
+ * Orders already `delivered` are left untouched — the goods are gone and
+ * rewriting history would corrupt the accounting. They are counted and
+ * reported so the admin knows the real exposure.
+ *
+ * @returns {object} summary of what happened
+ */
+function cancelAllUserOrders(userId, { refund = false } = {}) {
+  return db.transaction(() => {
+    const orders = db.prepare(`
+      SELECT o.*, p.title AS ptitle
+      FROM orders o LEFT JOIN products p ON p.id = o.product_id
+      WHERE o.user_id = ?
+    `).all(userId);
+
+    const out = {
+      cancelledPending: 0,
+      cancelledPaid:    0,
+      manualCancelled:  0,
+      refunded:         0,
+      stockRestored:    0,
+      delivered:        0,
+      preordersFreed:   0,
+    };
+
+    for (const o of orders) {
+      if (o.status === 'delivered') { out.delivered++; continue; }
+      if (o.status === 'cancelled')  continue;
+
+      // 'awaiting_delivery' means the customer already paid but nothing was
+      // handed over, so the inventory reservation has to be given back.
+      const wasPaid = o.status === 'awaiting_delivery';
+
+      db.prepare("UPDATE orders SET status = 'cancelled' WHERE id = ?").run(o.id);
+
+      if (wasPaid) {
+        out.cancelledPaid++;
+        adjustStockQuantity.run(o.quantity, o.product_id);      // give stock back
+        db.prepare('UPDATE products SET sold_count = MAX(0, sold_count - ?) WHERE id = ?')
+          .run(o.quantity, o.product_id);
+        db.prepare('UPDATE products SET sales_count = MAX(0, sales_count - ?) WHERE id = ?')
+          .run(o.quantity, o.product_id);
+        out.stockRestored += o.quantity;
+
+        if (refund) {
+          updateBalance.run(Number(o.total_price), userId);
+          out.refunded += Number(o.total_price);
+        }
+      } else {
+        out.cancelledPending++;
+      }
+
+      // Close any manual-delivery task attached to the order.
+      const upd = db.prepare(`
+        UPDATE manual_deliveries
+        SET status = 'cancelled',
+            admin_note = 'Cancelled — fraud response',
+            updated_at = datetime('now')
+        WHERE order_id = ? AND status NOT IN ('delivered', 'cancelled')
+      `).run(o.id);
+      if (upd.changes > 0) out.manualCancelled++;
+    }
+
+    // Reject the user's outstanding refund requests: a fraudster must not be
+    // able to cash stolen credit out to an external wallet.
+    const ref = db.prepare(`
+      UPDATE refund_requests
+      SET status = 'rejected',
+          admin_note = 'Rejected — fraud response',
+          resolved_at = datetime('now')
+      WHERE user_id = ? AND status = 'pending'
+    `).run(userId);
+    out.refundRequestsRejected = ref.changes;
+
+    // Release any deposit reservations they are holding.
+    const di = db.prepare(`
+      UPDATE deposit_intents SET status = 'cancelled' WHERE user_id = ? AND status = 'open'
+    `).run(userId);
+    out.reservationsReleased = di.changes;
+
+    out.total = orders.length;
+    return out;
+  })();
+}
+
+/** Preview the effect of cancelAllUserOrders without changing anything. */
+function previewCancelAllUserOrders(userId) {
+  const rows = db.prepare(`
+    SELECT status, COUNT(*) AS n, COALESCE(SUM(total_price), 0) AS sum
+    FROM orders WHERE user_id = ? GROUP BY status
+  `).all(userId);
+  const out = { pending: 0, awaiting: 0, delivered: 0, cancelled: 0, paidValue: 0, total: 0 };
+  for (const r of rows) {
+    if (r.status === 'pending')            out.pending   = r.n;
+    else if (r.status === 'awaiting_delivery') { out.awaiting = r.n; out.paidValue = r.sum; }
+    else if (r.status === 'delivered')     out.delivered = r.n;
+    else if (r.status === 'cancelled')     out.cancelled = r.n;
+    out.total += r.n;
+  }
+  out.pendingRefunds = db.prepare(
+    "SELECT COUNT(*) AS n FROM refund_requests WHERE user_id = ? AND status = 'pending'"
+  ).get(userId).n;
+  return out;
+}
+
+/**
+ * Compare money the way the user sees it.
+ *
+ * Balances are shown rounded to cents, but the old check was
+ * `balance < price - 0.001`. A stored balance of 0.9989 displays as $1.00 yet
+ * fails against a $1.00 price, so the customer reads "Balance: $1.00 /
+ * Required: $1.00 — Insufficient balance" and cannot buy anything.
+ *
+ * Comparing whole cents restores the invariant the interface promises:
+ * if the two displayed figures are equal, the purchase goes through.
+ */
+function hasEnough(balance, price) {
+  return Math.round(Number(balance) * 100) >= Math.round(Number(price) * 100);
+}
+
+/**
+ * Erase what a customer can still SEE of their past purchases.
+ *
+ * Cancelling orders does not stop a fraudster re-opening "My Orders" and
+ * reading the keys that were already delivered to them. This wipes
+ * `delivered_content` so the product details are gone from their side.
+ *
+ * The order rows themselves are kept by default: they are your sales record,
+ * and deleting them would silently distort revenue and stock statistics.
+ * Pass `hardDelete: true` only if you truly want no trace at all.
+ *
+ * @returns {object} what was removed
+ */
+function purgeUserOrderData(userId, { hardDelete = false } = {}) {
+  return db.transaction(() => {
+    const out = { contentWiped: 0, ordersDeleted: 0, manualWiped: 0, kept: 0 };
+
+    const withContent = db.prepare(`
+      SELECT COUNT(*) AS n FROM orders
+      WHERE user_id = ? AND delivered_content IS NOT NULL AND delivered_content != ''
+    `).get(userId).n;
+
+    db.prepare(`
+      UPDATE orders SET delivered_content = NULL
+      WHERE user_id = ? AND delivered_content IS NOT NULL
+    `).run(userId);
+    out.contentWiped = withContent;
+
+    // The same content is mirrored on manual-delivery tasks.
+    const md = db.prepare(`
+      UPDATE manual_deliveries SET delivered_content = NULL
+      WHERE user_id = ? AND delivered_content IS NOT NULL
+    `).run(userId);
+    out.manualWiped = md.changes;
+
+    if (hardDelete) {
+      // Detach the tasks first so nothing points at a row that is about to go.
+      db.prepare('DELETE FROM manual_deliveries WHERE user_id = ?').run(userId);
+      const del = db.prepare('DELETE FROM orders WHERE user_id = ?').run(userId);
+      out.ordersDeleted = del.changes;
+    } else {
+      out.kept = db.prepare('SELECT COUNT(*) AS n FROM orders WHERE user_id = ?').get(userId).n;
+    }
+
+    return out;
+  })();
+}
+
+/** Preview for the purge screen. */
+function previewPurge(userId) {
+  const total = db.prepare('SELECT COUNT(*) AS n FROM orders WHERE user_id = ?').get(userId).n;
+  const withContent = db.prepare(`
+    SELECT COUNT(*) AS n FROM orders
+    WHERE user_id = ? AND delivered_content IS NOT NULL AND delivered_content != ''
+  `).get(userId).n;
+  return { total, withContent };
+}
+
+// ── Atomic preorder: balance check + deduction in one transaction ─────────────
+function chargeWalletForPreorder(userId, amount) {
+  return db.transaction(() => {
+    const userRow = db.prepare("SELECT balance FROM users WHERE telegram_id = ?").get(userId);
+    const balance = userRow ? Number(userRow.balance) : 0;
+    if (!hasEnough(balance, amount)) return { ok: false, balance };
+    updateBalance.run(-amount, userId);
+    return { ok: true };
+  })();
+}
+
+/**
+ * Charge a wallet and write the matching transaction row, atomically.
+ *
+ * The ChatGPT Business bot runs as a separate process against the same database
+ * file, so a read-then-write pair from there could interleave with a purchase in
+ * the main bot and spend the same dollar twice. Wrapping the check, the debit
+ * and the ledger entry in one SQLite transaction closes that window regardless
+ * of which bot is calling.
+ *
+ * @returns {{ok:boolean, balance:number, reason?:string}} `balance` is what the
+ *          user has left on success, or what they actually had on failure.
+ */
+function chargeWallet(userId, amount, meta = {}) {
+  return db.transaction(() => {
+    const row = db.prepare('SELECT balance FROM users WHERE telegram_id = ?').get(userId);
+    if (!row) return { ok: false, balance: 0, reason: 'no_account' };
+
+    const balance = Number(row.balance) || 0;
+    if (!hasEnough(balance, amount)) return { ok: false, balance, reason: 'insufficient' };
+
+    updateBalance.run(-amount, userId);
+    insertTransaction.run({
+      userId,
+      type:        meta.type        || 'purchase',
+      amount:      -Math.abs(Number(amount)),
+      description: meta.description || 'Wallet payment',
+      refId:       meta.refId       || null,
+      orderId:     meta.orderId     || null,
+    });
+
+    const after = db.prepare('SELECT balance FROM users WHERE telegram_id = ?').get(userId);
+    return { ok: true, balance: Number(after?.balance) || 0 };
+  })();
+}
+
+/** Refund a wallet charge — used when an order cannot be completed after payment. */
+function refundWallet(userId, amount, meta = {}) {
+  return db.transaction(() => {
+    updateBalance.run(Math.abs(Number(amount)), userId);
+    insertTransaction.run({
+      userId,
+      type:        meta.type        || 'refund',
+      amount:      Math.abs(Number(amount)),
+      description: meta.description || 'Wallet refund',
+      refId:       meta.refId       || null,
+      orderId:     meta.orderId     || null,
+    });
+    const after = db.prepare('SELECT balance FROM users WHERE telegram_id = ?').get(userId);
+    return { ok: true, balance: Number(after?.balance) || 0 };
+  })();
+}
+
+module.exports = {
+  // Users
+  upsertAndGetUser,
+  getUser:      (id)    => getUser.get(id),
+  getUserByUsername: (username) => getUserByUsername.get(username.replace(/^@/, '')),
+  getAllUsers:   ()      => getAllUsers.all(),
+  setUserLanguage: (id, lang) => updateUserLanguage.run(lang, id),
+  getUserLanguage: (id) => {
+    const u = getUser.get(id);
+    return (u && u.language) ? u.language : 'en';
+  },
+  searchUsers: (query) => {
+    const q = `%${String(query).toLowerCase()}%`;
+    return searchUsers.all(q, q, q, q);
+  },
+  updateBalance:(id, a) => updateBalance.run(a, id),
+  banUser:      (id, b) => banUser.run(b ? 1 : 0, id),
+
+  // Products
+  // Every product leaves the database already re-priced for today, so no screen
+  // has to remember to do it — and none of them can disagree about the price.
+  getAllActiveProducts: () => getAllActiveProducts.all().map((p) => subPricing.applySubscriptionPricing(p)),
+  getStaleProducts: (thresholdDays, cooldownHours) => getStaleProducts.all(thresholdDays, cooldownHours),
+  markStaleReminderSent: (productId) => markStaleReminderSent.run(productId),
+  // ─── Resellers ───
+  getAllResellers:     () => rs_getAll.all(),
+  getResellerById:     (id) => rs_getById.get(id),
+  getResellerByApiKey: (key) => rs_getByKey.get(key),
+  createReseller:      (name, apiKey) => rs_insert.run(name, apiKey),
+  addResellerBalance:  (id, amount) => rs_setBalance.run(amount, id),
+  chargeReseller:      (id, amount) => rs_updateBalance.run(-amount, amount, 1, id),
+  toggleReseller:      (id, val) => rs_toggle.run(val, id),
+  deleteReseller:      (id) => rs_delete.run(id),
+  createResellerOrder: (rid, pid, qty, unit, total, items) => rs_insertOrder.run(rid, pid, qty, unit, total, items),
+  getResellerOrders:   (id) => rs_getOrders.all(id),
+  setWholesalePrice:   (productId, price) => rs_setProductWholesale.run(price, productId),
+
+  // ─── ChatGPT Business ───
+  getBillingCycles:    () => cgb_getAllCycles.all(),
+  addBillingCycle:     (s, e) => cgb_insertCycle.run(s, e),
+  removeBillingCycle:  (id) => cgb_deleteCycle.run(id),
+  updateBillingCycle:  (id, s, e) => cgb_updateCycle.run(s, e, id),
+  setBillingCycleStartTime: (id, t) => cgb_setCycleTime.run(t, id),
+  getBillingCycleById: (id) => cgb_getCycleById.get(id),
+  getBillingCycle:     (id) => cgb_getCycleById.get(id),
+  // Returns the new row id so a renewal can be linked to the seat it replaces.
+  createCgbSubscription: (orderId, userId, email, start, end, days, base, extra, final) =>
+    cgb_insertSub.run(orderId, userId, email, start, end, days, base, extra, final).lastInsertRowid,
+  getCgbSubscriptionByOrder: (orderId) => cgb_getSubByOrder.get(orderId),
+  getPendingCgbSubscriptionByEmail: (email) => cgb_getPendingSubByEmail.get(String(email || '').trim()),
+  saveCgbAdminCard: (orderId, chatId, messageId) => cgb_saveAdminCard.run(orderId, chatId, messageId),
+  getCgbAdminCard: (orderId) => cgb_getAdminCard.get(orderId),
+  activateCgbSubscription: (orderId) => cgb_activateSub.run(orderId),
+  markCgbSubscriptionPaid: (orderId) => cgb_markPaid.run(orderId).changes,
+  dropUnpaidCgbSubscription: (orderId) => cgb_dropUnpaid.run(orderId).changes,
+  getActiveCgbSubs: () => cgb_getActive.all(),
+  getExpiringCgbSubs: (days) => cgb_getExpiringSubs.all(days),
+
+  // ── CGB per-customer pricing ──
+  getCgbUserPrice: (userId) => {
+    try {
+      const r = db.prepare('SELECT * FROM cgb_user_prices WHERE user_id = ?').get(userId);
+      return r || null;
+    } catch (e) { return null; }
+  },
+  setCgbUserPrice: (userId, price, note, adminId) =>
+    db.prepare(`
+      INSERT INTO cgb_user_prices (user_id, monthly_price, note, created_by)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET
+        monthly_price = excluded.monthly_price,
+        note          = excluded.note,
+        updated_at    = datetime('now')
+    `).run(userId, Number(price), note || null, adminId || null).changes,
+  deleteCgbUserPrice: (userId) =>
+    db.prepare('DELETE FROM cgb_user_prices WHERE user_id = ?').run(userId).changes,
+  listCgbUserPrices: () =>
+    db.prepare(`
+      SELECT cp.*, u.username, u.first_name
+      FROM cgb_user_prices cp
+      LEFT JOIN users u ON cp.user_id = u.telegram_id
+      ORDER BY cp.updated_at DESC
+    `).all(),
+
+  // ── CGB renewals ──
+  getCgbSubsByUser:   (userId) => cgb_getUserSubs.all(userId),
+  getCgbSubById:      (id) => cgb_getSubById.get(id),
+  setCgbRenewIntent:  (id, intent) => cgb_setRenewIntent.run(intent, id).changes,
+  getCgbDueReminders: (days) => cgb_getDueReminders.all(days),
+  markCgbReminded:    (id) => cgb_markReminded.run(id).changes,
+  getCgbReserved:     () => cgb_getReserved.all(),
+  getCgbRenewals:     (limit = 20) => cgb_getRenewals.all(limit),
+
+  /**
+   * Seats paid for but whose period has not started yet.
+   *
+   * These are the ones that must NOT be activated: the customer is still using
+   * their current seat, and switching them over early cuts short days they have
+   * already paid for.
+   */
+  getCgbScheduled: () => {
+    try {
+      return db.prepare(`
+        SELECT cs.*, u.username, u.first_name,
+               prev.end_date AS prev_end
+        FROM chatgpt_subscriptions cs
+        LEFT JOIN users u ON cs.user_id = u.telegram_id
+        LEFT JOIN chatgpt_subscriptions prev ON cs.renewed_from = prev.id
+        WHERE COALESCE(cs.status, '') IN ('active', 'pending')
+          AND date(cs.start_date) > date('now')
+        ORDER BY date(cs.start_date) ASC
+      `).all();
+    } catch (e) { return []; }
+  },
+
+  /** Seats whose paid period has begun but are still waiting on activation. */
+  getCgbDueNow: () => {
+    try {
+      return db.prepare(`
+        SELECT cs.*, u.username, u.first_name
+        FROM chatgpt_subscriptions cs
+        LEFT JOIN users u ON cs.user_id = u.telegram_id
+        WHERE COALESCE(cs.status, '') = 'pending'
+          AND date(cs.start_date) <= date('now')
+        ORDER BY date(cs.start_date) ASC
+      `).all();
+    } catch (e) { return []; }
+  },
+  getCgbPendingRenewals: () => cgb_getPendingRenewals.all(),
+  setCgbWorkspace:    (id, ws) => cgb_setWorkspace.run(ws, id).changes,
+  linkCgbRenewal:     (prevId, newId) => cgb_linkRenewal.run(prevId, newId).changes,
+  markCgbNotified: cgb_markNotified,
+  getCgbStats: () => ({
+    total:        db.prepare(`SELECT COUNT(*) AS n FROM chatgpt_subscriptions`).get().n,
+    active:       db.prepare(`SELECT COUNT(*) AS n FROM chatgpt_subscriptions WHERE status='active'`).get().n,
+    pending:      db.prepare(`SELECT COUNT(*) AS n FROM chatgpt_subscriptions WHERE status='pending'`).get().n,
+
+    // All-time revenue = every subscription that was created (payment happened to reach this point)
+    // We count ALL subscriptions regardless of order.status because old orders got stuck
+    // at 'pending' due to the webhook bug — a chatgpt_subscriptions row = money was received.
+    // Cancelled (refunded) seats are not revenue.
+    totalRevenue: db.prepare(`
+      SELECT COALESCE(SUM(final_price), 0) AS n FROM chatgpt_subscriptions
+      WHERE COALESCE(status, '') != 'cancelled'
+    `).get().n,
+
+    // This month revenue
+    revenueThisMonth: db.prepare(`
+      SELECT COALESCE(SUM(final_price), 0) AS n FROM chatgpt_subscriptions
+      WHERE strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')
+        AND COALESCE(status, '') != 'cancelled'
+    `).get().n,
+
+    // Expiring within 7 days (active subs)
+    expiringSoon: db.prepare(`
+      SELECT COUNT(*) AS n FROM chatgpt_subscriptions
+      WHERE status = 'active'
+        AND date(end_date) BETWEEN date('now') AND date('now', '+7 days')
+    `).get().n,
+
+    // Pending = created but not yet activated by admin (awaiting manual activation)
+    awaitingActivation: db.prepare(`
+      SELECT COUNT(*) AS n FROM chatgpt_subscriptions WHERE status = 'pending'
+    `).get().n,
+
+    // Last 10 orders for overview
+    recentOrders: db.prepare(`
+      SELECT cs.order_id, cs.email, cs.final_price, cs.status,
+             cs.end_date, cs.created_at, o.payment_method
+      FROM chatgpt_subscriptions cs
+      LEFT JOIN orders o ON o.id = cs.order_id
+      ORDER BY cs.created_at DESC LIMIT 10
+    `).all(),
+  }),
+
+  // ─── Categories ───
+  getAllCategories:    ()                       => cat_getAll.all(),
+  getCategoryById:     (id)                     => cat_getById.get(id),
+  createCategory:      (name, emoji, order)     => cat_insert.run(name, emoji || '', order || 999),
+  updateCategoryRow:   (id, name, emoji, order) => cat_update.run(name, emoji || '', order || 999, id),
+  deleteCategory:      (id) => { cat_resetProducts.run(id); return cat_delete.run(id); },
+  getProductsByCategory: (catId) => cat_getProducts.all(catId).map((p) => subPricing.applySubscriptionPricing(p)),
+  /** Untouched row — for editing, where the stored price is what matters. */
+  getProductRaw:       (id) => getProduct.get(id),
+  setProductCategory:  (productId, catId)       => cat_setProduct.run(catId, productId),
+  getAllProductsForSorting: () => getAllProductsForSorting.all(),
+
+  /**
+   * The products of ONE customer-visible list, in the order they appear there.
+   * @param {number|null} categoryId  null → the "📦 Other Products" group
+   */
+  getProductsForSorting: (categoryId = null) =>
+    (categoryId == null || categoryId === 0)
+      ? getUncategorizedForSorting.all()
+      : getCategoryForSorting.all(categoryId),
+
+  // Same ordering, but carrying the fields a picker needs. getAllProductsForSorting
+  // returns only (id, title, display_order, is_active) — no price — so a picker
+  // built on it would show $0.00 for every product.
+  getAllProductsBrief: () => db.prepare(`
+    SELECT id, title, price, is_active, stock_quantity
+    FROM products
+    ORDER BY display_order ASC, id ASC
+  `).all(),
+
+  // Preorders
+  // Emoji Library
+  addEmoji: (name, emojiId, fallback = '🎁') => {
+    try { return insertEmoji.run(name, emojiId, fallback); }
+    catch (e) { return null; }
+  },
+  getAllEmojis: () => getAllEmojis.all(),
+  getEmojiByName: (name) => getEmojiByName.get(name),
+  getEmojiById: (id) => getEmojiById.get(id),
+  deleteEmoji: (id) => deleteEmojiById.run(id),
+
+  getPreorderEnabledProducts: () => getPreorderEnabledProducts.all(),
+  createPreorder: (data) => insertPreorder.run(data),
+  getAllPreorders: () => getAllPreorders.all(),
+  getReservedPreordersByProduct: (productId) => getReservedPreordersByProduct.all(productId),
+  getLinkedReservedPreorders: (sourceProductId) => getLinkedReservedPreorders.all(sourceProductId),
+  autoFulfillPreordersFromSource,
+  autoFulfillPreordersForProduct,
+  getOrCreateOutOfStockCategory,
+  getCategoryByName,
+  syncStockCategory,
+  syncAllStockCategories,
+  // V167.25: true if any active product is currently in pre-order mode
+  // (enabled, out of stock, and with at least one free slot).
+  hasActivePreorders: () => {
+    try {
+      const row = db.prepare(`
+        SELECT COUNT(*) AS n FROM products
+        WHERE is_active = 1 AND preorder_enabled = 1
+          AND COALESCE(stock_quantity, 0) <= 0
+          AND COALESCE(preorder_max, 0) > COALESCE(preorder_count, 0)
+      `).get();
+      return (row && row.n > 0);
+    } catch (_) { return false; }
+  },
+  getPreorderById: (id) => getPreorderById.get(id),
+  markPreorderDelivered: (id, content) => updatePreorderStatus.run('delivered', content, id),
+  markPreorderRefunded: (id) => updatePreorderStatus.run('refunded', null, id),
+  incrementPreorderCount: (productId, qty) => incrementPreorderCount.run(qty, productId),
+  getPreorderStats: () => getPreorderStats.get(),
+  setDisplayOrder: (id, order) => updateDisplayOrder.run(order, id),
+  getProduct:          (id) => subPricing.applySubscriptionPricing(getProduct.get(id)),
+  insertProduct: (data) => {
+    const res = insertProduct.run({
+      ...data,
+      stockQuantity: data.stockQuantity || 0,
+      salesCount:    data.salesCount    || 0,
+    });
+    return res.lastInsertRowid;
+  },
+  updateProduct: (id, field, value) => {
+    const allowed = [
+      'title','description','price','warranty',
+      'requires_email','image_file_id','is_active',
+      'stock_quantity','sales_count',
+      'bulk_min_qty','bulk_discount','instruction','display_order',
+      'preorder_enabled','preorder_max','preorder_count',
+      'cost_price','premium_emoji_id','no_rank_discount',
+      ...TIER_COLUMNS,
+      'wholesale_price','category_id',
+      // V2
+      'refund_enabled','delivery_type','low_stock_threshold',
+      // V7 — time-limited products and unlimited stock
+      'sub_end_date','sub_price_per_day','sub_min_price','sub_base_title',
+      'sub_min_days','unlimited_stock','sales_paused',
+      // V167.14 — DigiVerify wallet-top-up link; V167.18 — pre-order source link
+      'newbot_linked','preorder_source_id','preorder_price',
+      // V167.24 — per-product panel name (email tracking)
+      'panel_name',
+      // V167.34 — featured product + verif-bot bridge + doorway link
+      'is_featured','verif_linked','link_url',
+    ];
+    if (!allowed.includes(field)) throw new Error(`Field ${field} not allowed`);
+    db.prepare(`UPDATE products SET ${field} = ? WHERE id = ?`).run(value, id);
+
+    // A title change is the only way an icon is set, so this is where it gets
+    // captured. Doing it here rather than at each call site means a flow added
+    // later cannot forget to back it up.
+    if (field === 'title') {
+      try { require('../utils/emojiBackup').remember(id, value); } catch (_) {}
+    }
+  },
+
+  /** Alias — several handlers call it by this name. */
+  updateProductField: (id, field, value) => module.exports.updateProduct(id, field, value),
+  softDeleteProduct: (id) => softDeleteProduct.run(id),
+
+  /**
+   * Permanently delete a product and everything tied to it that is safe to
+   * remove: its stock (both the modern product_items store and the legacy
+   * stock table) and any pending pre-orders. Past ORDERS are kept, so sales
+   * history and revenue stay intact. Returns the number of product rows
+   * removed (0 if the id did not exist).
+   */
+  hardDeleteProduct: (id) => {
+    const pid = Number(id);
+    return db.transaction(() => {
+      try { db.prepare('DELETE FROM product_items WHERE product_id = ?').run(pid); } catch (_) {}
+      try { db.prepare('DELETE FROM stock WHERE product_id = ?').run(pid); } catch (_) {}
+      try { db.prepare("DELETE FROM preorders WHERE product_id = ? AND status = 'reserved'").run(pid); } catch (_) {}
+      const res = db.prepare('DELETE FROM products WHERE id = ?').run(pid);
+      return res.changes;
+    })();
+  },
+
+  // Stock quantity (numeric counter on products)
+  adjustStockQuantity: (id, delta) => {
+    const before = getProduct.get(id);
+    adjustStockQuantity.run(delta, id);
+    const after = getProduct.get(id);
+    return { before: before?.stock_quantity || 0, after: after?.stock_quantity || 0 };
+  },
+  setStockQuantity: (id, qty) => {
+    setStockQuantity.run(Math.max(0, qty), id);
+    return getProduct.get(id)?.stock_quantity || 0;
+  },
+  setSalesCount: (id, count) => {
+    db.prepare('UPDATE products SET sales_count = MAX(0, ?) WHERE id = ?').run(count, id);
+  },
+
+  // Stock (line items)
+  addStockItems,
+  getAvailableStock: (id, qty) => getAvailableStock.all(id, qty),
+  getStockItems:     (id)      => getStockItems.all(id),
+  getStockCount:     (id)      => getStockCount.get(id).cnt,
+  clearUnsoldStock:  (id)      => clearUnsoldStock.run(id),
+
+  // Orders
+  createOrder: (data) => {
+    const res = insertOrder.run(data);
+    return res.lastInsertRowid;
+  },
+  getOrder:         (id) => getOrder.get(id),
+  getUserOrders:    (id) => getUserOrders.all(id),
+  getAllOrders:      ()  => getAllOrders.all(),
+  updateOrderStatus:(id, status) => updateOrderStatus.run(status, id),
+  getDigiProProduct: () => getDigiProProduct.get(),
+  createDigiProOrder,
+  createVerifOrder,
+  cancelDigiProOrder,
+  deliverOrder,
+  deliverOrderAndChargeWallet,
+  chargeWalletForPreorder,
+
+  traceTxid,
+  salesByHour,
+
+  /**
+   * Stock grouped into the batches it was added in.
+   *
+   * Items carry the minute they were inserted, and a paste of 500 lands in one
+   * transaction — so a gap in `created_at` is a real boundary between uploads.
+   * Grouping by it turns "24910 items ever" into the question actually being
+   * asked: the 500 added on Tuesday, where did those go?
+   *
+   * Two minutes of tolerance, because a very large paste can straddle a minute.
+   */
+  stockBatches: (productId, limit = 20) => {
+    const rows = db.prepare(`
+      SELECT id, status, order_id, sold_to_user_id, created_at, sold_at, supplier, unit_cost
+      FROM product_items
+      WHERE product_id = ?
+      ORDER BY datetime(created_at) ASC, id ASC
+    `).all(productId);
+    if (!rows.length) return [];
+
+    const batches = [];
+    let cur = null;
+    const GAP_MS = 2 * 60 * 1000;
+
+    for (const r of rows) {
+      const t = new Date(String(r.created_at).replace(' ', 'T') + 'Z').getTime();
+      if (!cur || (t - cur.lastMs) > GAP_MS) {
+        cur = {
+          added_at: r.created_at, lastMs: t, supplier: r.supplier,
+          unit_cost: r.unit_cost,
+          total: 0, available: 0, sold: 0,
+          first_id: r.id, last_id: r.id,
+          buyers: new Map(),
+          // Revenue is summed from the ORDERS the units belong to, never from
+          // the product's current price: a product repriced since the batch was
+          // sold would otherwise rewrite history.
+          revenue: 0,
+          countedOrders: new Set(),
+        };
+        batches.push(cur);
+      }
+      cur.lastMs = t;
+      cur.last_id = r.id;
+      cur.total++;
+
+      if (r.status === 'available') cur.available++;
+      else if (r.status === 'sold') {
+        cur.sold++;
+        // No per-item order lookup here. It ran one query per unit — tens of
+        // thousands of them on a busy product — to answer a question this
+        // screen does not ask. "Does stock add up?" covers that, once.
+        if (r.sold_to_user_id) {
+          const k = String(r.sold_to_user_id);
+          cur.buyers.set(k, (cur.buyers.get(k) || 0) + 1);
+        }
+
+        // Per unit, from the order it was part of. An order covering several
+        // units of this batch must not be counted once per unit, so the unit
+        // price is used rather than the order total.
+        if (r.order_id) {
+          const o = db.prepare(
+            "SELECT total_price, quantity FROM orders WHERE id = ? AND status NOT IN ('cancelled','pending')"
+          ).get(r.order_id);
+          if (o && Number(o.quantity) > 0) {
+            cur.revenue += Number(o.total_price) / Number(o.quantity);
+          }
+        }
+      }
+    }
+
+    // Newest batch first — the one just added is the one being asked about.
+    return batches.reverse().slice(0, limit).map((b) => {
+      const top = [...b.buyers.entries()].sort((x, y) => y[1] - x[1]).slice(0, 5);
+      const names = top.map(([uid, n]) => {
+        const u = db.prepare('SELECT username, first_name FROM users WHERE telegram_id = ?').get(uid);
+        return { user_id: uid, units: n, username: u?.username, first_name: u?.first_name };
+      });
+      const unitCost = (b.unit_cost === null || b.unit_cost === undefined)
+        ? null : Number(b.unit_cost);
+
+      // Cost is charged for the WHOLE batch — money already spent, whether the
+      // units sold or not. Counting only the sold ones would show a profit on a
+      // batch that has not yet earned back what it cost.
+      const spent    = unitCost === null ? null : Number((unitCost * b.total).toFixed(2));
+      const revenue  = Number(b.revenue.toFixed(2));
+      const costSold = unitCost === null ? null : Number((unitCost * b.sold).toFixed(2));
+
+      return {
+        added_at: b.added_at, supplier: b.supplier,
+        total: b.total, available: b.available, sold: b.sold,
+        buyers: names, distinct_buyers: b.buyers.size,
+        unit_cost: unitCost,
+        revenue,
+        spent,
+        // Profit so far: what the sold units earned minus what those same units
+        // cost. Kept separate from the batch's break-even position below.
+        profit_so_far: costSold === null ? null : Number((revenue - costSold).toFixed(2)),
+        // Where the batch stands overall, including stock still unsold.
+        net_vs_spend:  spent === null ? null : Number((revenue - spent).toFixed(2)),
+      };
+    });
+  },
+
+  /**
+   * Does the stock add up?
+   *
+   * Answers the question totals cannot: were the units that left actually sold,
+   * or did some simply disappear. Three independent records are compared —
+   * items added, items marked sold, and order quantities — and any gap between
+   * them is the thing worth investigating.
+   *
+   * Items are counted rather than trusted from the counter, because
+   * `stock_quantity` is a number anyone can overwrite by hand while the item
+   * rows are written one per unit and carry who took each one.
+   */
+  stockReconcile: (productId) => {
+    const p = db.prepare('SELECT id, title, stock_quantity FROM products WHERE id = ?').get(productId);
+    if (!p) return null;
+
+    const items = db.prepare(`
+      SELECT
+        COUNT(*)                                                   AS total_added,
+        SUM(CASE WHEN status = 'available' THEN 1 ELSE 0 END)      AS available,
+        SUM(CASE WHEN status = 'sold'      THEN 1 ELSE 0 END)      AS sold,
+        SUM(CASE WHEN status = 'sold' AND order_id IS NULL THEN 1 ELSE 0 END) AS sold_no_order,
+        SUM(CASE WHEN status NOT IN ('available','sold') THEN 1 ELSE 0 END)   AS other_status,
+        MIN(created_at)                                            AS first_added,
+        MAX(created_at)                                            AS last_added
+      FROM product_items WHERE product_id = ?
+    `).get(productId) || {};
+
+    const orders = db.prepare(`
+      SELECT COUNT(*) AS n, COALESCE(SUM(quantity), 0) AS units,
+             COALESCE(SUM(total_price), 0) AS revenue
+      FROM orders
+      WHERE product_id = ? AND status NOT IN ('cancelled', 'pending')
+    `).get(productId) || {};
+
+    // Items whose sale points at an order that no longer exists, or was
+    // cancelled — a unit consumed without a sale standing behind it.
+    const orphans = db.prepare(`
+      SELECT COUNT(*) AS n FROM product_items pi
+      WHERE pi.product_id = ? AND pi.status = 'sold'
+        AND (pi.order_id IS NULL
+             OR NOT EXISTS (SELECT 1 FROM orders o
+                            WHERE o.id = pi.order_id
+                              AND o.status NOT IN ('cancelled', 'pending')))
+    `).get(productId)?.n || 0;
+
+    const soldItems  = Number(items.sold) || 0;
+    const orderUnits = Number(orders.units) || 0;
+    const available  = Number(items.available) || 0;
+    const counter    = Number(p.stock_quantity) || 0;
+
+    return {
+      product: p,
+      counter,
+      items: {
+        added: Number(items.total_added) || 0,
+        available,
+        sold: soldItems,
+        other: Number(items.other_status) || 0,
+        first_added: items.first_added,
+        last_added: items.last_added,
+      },
+      orders: {
+        count: Number(orders.n) || 0,
+        units: orderUnits,
+        revenue: Number(orders.revenue) || 0,
+      },
+      gaps: {
+        // Sold items with no valid order behind them.
+        orphan_items: orphans,
+        // Counter disagreeing with the item rows: the counter was edited, or
+        // the product is sold without items (manual delivery).
+        counter_vs_items: counter - available,
+        // Orders that consumed no item, or items consumed by no order.
+        orders_vs_items: orderUnits - soldItems,
+      },
+    };
+  },
+
+  /**
+   * Everything bought through the API: who, how much, and of what.
+   *
+   * Reads orders.source, which is stamped when the order is created. The
+   * earlier approach — treating every order from a key holder as an API sale —
+   * was wrong both ways round: a reseller who also buys inside the bot had
+   * those purchases miscounted, and issuing a key relabelled that customer's
+   * entire history.
+   *
+   * Orders placed before the column existed default to 'bot', so figures start
+   * from the day this shipped rather than pretending to know the past.
+   */
+  apiSales: (days = 30) => {
+    const rows = db.prepare(`
+      SELECT o.id, o.user_id, o.product_id, o.quantity, o.total_price,
+             o.status, o.created_at,
+             p.title AS product_title,
+             u.username, u.first_name
+      FROM orders o
+      LEFT JOIN products p ON p.id = o.product_id
+      LEFT JOIN users    u ON u.telegram_id = o.user_id
+      WHERE COALESCE(o.source, 'bot') = 'api'
+        AND o.created_at >= datetime('now', '-' || ? || ' days')
+        AND o.status NOT IN ('cancelled', 'pending')
+      ORDER BY datetime(o.created_at) DESC, o.id DESC
+    `).all(days);
+
+    const buyers = new Map();
+    const products = new Map();
+    let units = 0, revenue = 0;
+
+    for (const r of rows) {
+      const qty = Number(r.quantity) || 0;
+      const amt = Number(r.total_price) || 0;
+      units += qty; revenue += amt;
+
+      const bk = String(r.user_id);
+      if (!buyers.has(bk)) {
+        buyers.set(bk, { user_id: r.user_id, username: r.username,
+                         first_name: r.first_name, units: 0, spent: 0,
+                         orders: 0, last: r.created_at });
+      }
+      const b = buyers.get(bk);
+      b.units += qty; b.spent += amt; b.orders++;
+
+      const pk = String(r.product_id);
+      if (!products.has(pk)) {
+        products.set(pk, { product_id: r.product_id, title: r.product_title, units: 0, revenue: 0 });
+      }
+      const pr = products.get(pk);
+      pr.units += qty; pr.revenue += amt;
+    }
+
+    return {
+      days, units, revenue, orders: rows.length,
+      recent: rows.slice(0, 12),
+      buyers:   [...buyers.values()].sort((a, b) => b.units - a.units),
+      products: [...products.values()].sort((a, b) => b.units - a.units),
+    };
+  },
+
+  /**
+   * Where a product's stock went, and who took it.
+   *
+   * Built for the question "the stock is gone and I do not know how". Totals
+   * alone cannot answer it — one buyer taking fifty units and fifty buyers
+   * taking one each are the same number and completely different situations —
+   * so the buyers are listed, biggest first.
+   */
+  stockAudit: (productId, days = 7) => {
+    const rows = db.prepare(`
+      SELECT o.id, o.user_id, o.quantity, o.total_price, o.status,
+             o.payment_method, o.created_at, COALESCE(o.source, 'bot') AS source,
+             u.username, u.first_name
+      FROM orders o
+      LEFT JOIN users u ON u.telegram_id = o.user_id
+      WHERE o.product_id = ?
+        AND o.created_at >= datetime('now', '-' || ? || ' days')
+        AND o.status NOT IN ('cancelled', 'pending')
+      ORDER BY datetime(o.created_at) DESC, o.id DESC
+    `).all(productId, days);
+
+    const byBuyer = new Map();
+    let units = 0, revenue = 0;
+    for (const r of rows) {
+      const q = Number(r.quantity) || 0;
+      units += q;
+      revenue += Number(r.total_price) || 0;
+      const k = String(r.user_id);
+      if (!byBuyer.has(k)) {
+        byBuyer.set(k, {
+          user_id: r.user_id, username: r.username, first_name: r.first_name,
+          units: 0, spent: 0, orders: 0, last: r.created_at,
+        });
+      }
+      const b = byBuyer.get(k);
+      b.units += q; b.spent += Number(r.total_price) || 0; b.orders++;
+      // Counted per ORDER, not per buyer: the same customer can use both the
+      // bot and the API, and lumping them together hides exactly that.
+      if (r.source === 'api') b.api_units = (b.api_units || 0) + q;
+    }
+
+    return {
+      units, revenue, orders: rows.length,
+      recent: rows.slice(0, 15),
+      buyers: [...byBuyer.values()]
+        .map((b) => ({ ...b, api_units: b.api_units || 0, via_api: (b.api_units || 0) > 0 }))
+        .sort((a, b) => b.units - a.units),
+    };
+  },
+
+  // ── Spend ranks ──
+  getUserRank,
+  resolveDiscountPct,
+  rankDiscountPctForProduct,
+  applyRankDiscount,
+  getRankTiers:   () => rankTiersAll.all(),
+  getRankTier:    (id) => rankTierById.get(id),
+  addRankTier:    (name, emoji, minSpend, pct) => rankTierInsert.run(name, emoji, minSpend, pct).lastInsertRowid,
+  deleteRankTier: (id) => rankTierDelete.run(id).changes,
+  updateRankTier: (id, field, value) => {
+    // Whitelisted rather than interpolated: `field` reaches here from a
+    // callback_data string, and an unchecked name would be SQL injection.
+    const allowed = ['name', 'emoji', 'min_spend', 'discount_pct'];
+    if (!allowed.includes(field)) throw new Error(`Invalid rank field: ${field}`);
+    return db.prepare(`UPDATE rank_tiers SET ${field} = ? WHERE id = ?`).run(value, id).changes;
+  },
+  setRankSpend:   (userId, amount) => rankSpendSet.run(Number(amount) || 0, userId).changes,
+  addRankSpend:   (userId, amount) => rankSpendAdd.run(Number(amount) || 0, userId).changes,
+
+  /**
+   * Reverse a sale's rank credit. Returns what the customer's rank was before
+   * and after, so the admin can be told when a refund actually demotes someone.
+   */
+  reduceRankSpend: (userId, amount) => {
+    const before = getUserRank(userId);
+    rankSpendSubtract.run(Math.abs(Number(amount) || 0), userId);
+    const after = getUserRank(userId);
+    return {
+      before: before.tier?.name || null,
+      after:  after.tier?.name || null,
+      demoted: (before.tier?.id || null) !== (after.tier?.id || null),
+      spend: after.spend,
+    };
+  },
+  chargeWallet,
+  refundWallet,
+
+  // Transactions
+  addTransaction:    (data) => insertTransaction.run(data),
+  isRefIdUsed:       (ref)  => !!isRefIdUsed.get(ref),
+  getUserTransactions:(id)  => getUserTransactions.all(id),
+  getTransactionById: (id) => getTransactionById.get(id),
+
+  // VIP
+  unlockVIP: (userId) => unlockVIPQuery.run(userId),
+  revokeVIP: (userId) => revokeVIPQuery.run(userId).changes,
+  listVIPs:  () => listVIPsQuery.all(),
+  /**
+   * VIPs granted since a date — the ones handed out by mistake while the system
+   * was still open. Rows with no timestamp are old grants and are left alone.
+   */
+  vipsGrantedSince: (isoDate) => db.prepare(`
+    SELECT telegram_id, username, first_name, vip_unlocked_at
+    FROM users
+    WHERE is_vip = 1 AND vip_unlocked_at IS NOT NULL
+      AND datetime(vip_unlocked_at) >= datetime(?)
+    ORDER BY datetime(vip_unlocked_at) DESC
+  `).all(isoDate),
+  isVIP: (userId) => {
+    const r = isVIPQuery.get(userId);
+    return r && r.is_vip === 1;
+  },
+  countVIPs: () => countVIPsQuery.get().count,
+  countReferrals: (userId) => countReferralsForUser.get(userId).count,
+  countReferralsWithPurchase: (userId) => countReferralsWithPurchaseQuery.get(userId).count,
+  hasAnyInviteePurchased: (userId) => hasAnyInviteePurchasedQuery.get(userId).count > 0,
+
+  // Refund Requests
+  addRefundRequest: (data) => insertRefundRequest.run(
+    data.userId, data.orderId, data.reason || '', data.amount || 0,
+    data.affectedAccount || null, data.photoFileId || null,
+    data.refundMethod || null, data.cryptoNetwork || null, data.walletAddress || null
+  ),
+  getUserRefundRequests: (userId) => getUserRefundRequests.all(userId),
+  getAllRefundRequests: () => getAllRefundRequests.all(),
+  getRefundRequestById: (id) => getRefundRequestById.get(id),
+  getPendingRefundForOrder: (orderId) => getPendingRefundForOrder.get(orderId),
+  updateRefundRequest: (id, status, note, amount, method) =>
+    updateRefundRequestStatus.run(status, note || null, amount || 0, method || null, id),
+
+  // NOWPayments (legacy, kept for DB compat — not used in code)
+  saveInvoice: (data) => {
+    const res = insertInvoice.run({
+      ...data,
+      purpose:        data.purpose        || 'wallet_topup',
+      relatedOrderId: data.relatedOrderId || null,
+    });
+    return res.lastInsertRowid;
+  },
+  getInvoiceByOrderId:   (id) => getInvoiceByOrderId.get(id),
+  getInvoiceByPaymentId: (id) => getInvoiceByPaymentId.get(id),
+  updateInvoice: (orderId, paymentId, paymentStatus) =>
+    updateInvoice.run({ orderId, paymentId, paymentStatus }),
+  markInvoiceCredited: (orderId, txHash) =>
+    markInvoiceCredited.run(txHash || null, orderId),
+  isInvoiceCredited: (orderId) => {
+    const row = isInvoiceCredited.get(orderId);
+    return row ? row.credited === 1 : false;
+  },
+
+  // BEP20 deposits (legacy table, kept for compatibility)
+  isBep20TxUsed: (txHash) => !!getBep20DepositByHash.get(txHash),
+  saveBep20Deposit: (data) => {
+    const res = insertBep20Deposit.run({
+      currency: 'USDT',
+      network:  'BEP20',
+      status:   'completed',
+      fromAddr: null,
+      toAddr:   null,
+      ...data,
+    });
+    return res.lastInsertRowid;
+  },
+
+  // Generic used-TxID checks (Binance verified deposits — TRC20 + BEP20 + Binance Pay)
+  // V146: an off-chain id counts as used in ANY of its spellings (418351948005 · Off-chain Transfer 418351948005 …).
+  isTxidUsed: (txid) => txidAlternates(txid).some((x) => !!getUsedTxid.get(x)),
+  saveUsedTxid: (data) => {
+    const res = insertUsedTxid.run({
+      asset:   'USDT',
+      address: null,
+      ...data,
+      txid:    normalizeTxidInput(data.txid),       // an off-chain id is always stored in Binance's spelling
+    });
+    return res.lastInsertRowid;
+  },
+
+  // CryptoBot invoices
+  saveCryptobotInvoice: (data) => {
+    const res = insertCryptobotInvoice.run(data);
+    return res.lastInsertRowid;
+  },
+  getCryptobotInvoice: (invoiceId) => getCryptobotInvoiceById.get(invoiceId),
+  markCryptobotInvoicePaid: (invoiceId) => {
+    const res = markCryptobotPaid.run(invoiceId);
+    return res.changes > 0; // true if it was the first time we mark as paid
+  },
+  getActiveCryptobotInvoices: (userId) => getActiveCryptobotInvoicesForUser.all(userId),
+
+
+  // Pending payments
+  createPendingPayment: (data) => {
+    const res = insertPendingPayment.run(data);
+    return res.lastInsertRowid;
+  },
+  updatePendingPayment: (id, status, refId) => updatePendingPayment.run(status, refId, id),
+  getPendingPayments:   () => getPendingPayments.all(),
+
+  // Support
+  createTicket:  (userId, message) => { const r = insertTicket.run(userId, message); return r.lastInsertRowid; },
+  getTicket:     (id)              => getTicket.get(id),
+  replyTicket:   (id, reply)       => replyTicket.run(reply, id),
+  getOpenTickets:()                => getOpenTickets.all(),
+
+  // Referrals
+  recordReferral: (referrerId, referredId) => {
+    if (referrerId === referredId) return { success: false, reason: 'self_referral' };
+    // Check if referred user already has any orders or activity (fraud prevention)
+    const existing = db.prepare('SELECT * FROM referrals WHERE referred_id = ?').get(referredId);
+    if (existing) return { success: false, reason: 'already_referred' };
+    // Check if referrer exists
+    const referrer = getUser.get(referrerId);
+    if (!referrer) return { success: false, reason: 'referrer_not_found' };
+    const result = insertReferral.run(referrerId, referredId);
+    if (result.changes === 0) return { success: false, reason: 'duplicate' };
+    return { success: true, referrerId, referredId };
+  },
+  payReferralReward,
+  payCashbackReferral,
+  referralProgramOn,
+  isReferralBlocked,
+  referralEarningAllowed,
+  setReferralBlocked,
+  getReferralStats: (userId) => {
+    const row = getReferralStats.get(userId);
+    return { totalReferred: row.total_referred || 0, rewardedCount: row.rewarded_count || 0 };
+  },
+
+  // Settings
+  getSetting: (key, defaultVal = '') => {
+    const row = getSetting.get(key);
+    return row ? row.value : defaultVal;
+  },
+  setSetting: (key, value) => setSetting.run(key, String(value)),
+
+  // Back-in-stock notifications
+  subscribeBackInStock:  (userId, productId) => subscribeBackInStock.run(userId, productId),
+  isSubscribedBackInStock: (userId, productId) => !!isSubscribedBackInStock.get(userId, productId),
+  getBackInStockSubscribers:  (productId) => getBackInStockSubscribers.all(productId).map((r) => r.user_id),
+  clearBackInStockSubscriptions: (productId) => clearBackInStockSubscriptions.run(productId),
+
+  // Stats
+  getStats,
+  getProfitToday,
+  getProfitLast7Days,
+  getProfitThisMonth,
+  getProfitByDay,
+
+  // Refunds
+  createRefund: (data) => { insertRefund.run(data); },
+  getRefundByOrderId: (orderId) => getRefundByOrderId.get(orderId),
+
+  // Delete single stock item by id
+  deleteStockItem: (stockId) => db.prepare('DELETE FROM stock WHERE id = ?').run(stockId),
+  getStockItemById: (stockId) => db.prepare('SELECT * FROM stock WHERE id = ?').get(stockId),
+
+  // ═══ V2: order history ═══
+  getUserOrdersAll:      (userId)          => getUserOrdersAll.all(userId),
+  getUserOrdersFiltered,
+
+  // ═══ V2: refund eligibility ═══
+  isProductRefundable,
+  isOrderRefundable,
+  getRefundableUserOrders: (userId) => getRefundableUserOrders.all(userId),
+
+  // ═══ V2: manual delivery ═══
+  createManualDelivery: (data) => {
+    const res = md_insert.run({
+      email:         null,
+      paymentMethod: null,
+      ...data,
+    });
+    // changes === 0 → a task for this order already existed (duplicate guard)
+    return { created: res.changes > 0, row: md_getByOrder.get(data.orderId) };
+  },
+  getManualDeliveryByOrder: (orderId) => md_getByOrder.get(orderId),
+  getManualDelivery:        (id)      => md_getById.get(id),
+  getAllManualDeliveries:   ()        => md_listAll.all(),
+  getUserManualDeliveries:  (userId)  => md_userList.all(userId),
+  getManualDeliveryCounts:  () => {
+    const out = { pending: 0, processing: 0, delivered: 0, cancelled: 0, total: 0, unseen: 0 };
+    for (const r of md_countByStatus.all()) {
+      if (out[r.status] !== undefined) out[r.status] = r.n;
+      out.total += r.n;
+    }
+    out.unseen = db.prepare(
+      "SELECT COUNT(*) AS n FROM manual_deliveries WHERE seen_at IS NULL AND status = 'pending'"
+    ).get().n;
+    return out;
+  },
+  setManualDeliveryStatus:  (id, status, note = null) => md_setStatus.run(status, note, id),
+  markManualDelivered:      (id, content = null) => md_markDelivered.run(content, id).changes > 0,
+  setManualDeliveryMsg:     (id, msgId, botId) => db.prepare('UPDATE manual_deliveries SET delivery_msg_id = ?, delivery_bot_id = ? WHERE id = ?').run(msgId, botId, id),
+  /** Undo a delivery: wipe the content everywhere and reopen the task. */
+  recallManualDelivery:     (id) => db.transaction(() => {
+    const t = db.prepare('SELECT * FROM manual_deliveries WHERE id = ?').get(id);
+    if (!t || t.status !== 'delivered') return false;
+    db.prepare(`UPDATE manual_deliveries SET status='processing', delivered_content=NULL, delivered_at=NULL,
+                delivery_msg_id=NULL, delivery_bot_id=NULL, recalled_at=datetime('now'), updated_at=datetime('now') WHERE id=?`).run(id);
+    db.prepare(`UPDATE orders SET status='pending', delivered_content=NULL WHERE id=?`).run(t.order_id);
+    return true;
+  })(),
+  markManualNotified:       (id) => md_markNotified.run(id).changes > 0,
+  markManualSeen:           (id) => md_markSeen.run(id),
+  chargeWalletForManualOrder,
+  settleManualOrderExternal,
+
+  /**
+   * Products that are out of stock RIGHT NOW.
+   *
+   * Read live from the products table rather than from stored notifications,
+   * so the list cannot drift: the moment stock is added the product simply
+   * stops matching the query and disappears. No cleanup, no stale rows.
+   */
+  getOutOfStockProducts: () => db.prepare(`
+    SELECT id, title, price, stock_quantity, sales_count, is_active, last_sold_at
+    FROM products
+    WHERE COALESCE(stock_quantity, 0) <= 0 AND is_active = 1
+    ORDER BY COALESCE(last_sold_at, created_at) DESC, id DESC
+  `).all(),
+
+  countOutOfStockProducts: () => db.prepare(
+    'SELECT COUNT(*) AS n FROM products WHERE COALESCE(stock_quantity,0) <= 0 AND is_active = 1'
+  ).get().n,
+
+  countPendingRefundRequests: () => db.prepare(
+    "SELECT COUNT(*) AS n FROM refund_requests WHERE status = 'pending'"
+  ).get().n,
+
+  // NOTE: `orders` has no product_title column — the title lives on `products`
+  // and must be reached through orders.product_id. Selecting o.product_title
+  // made SQLite throw "no such column", which broke the whole Refunds screen
+  // while the counter (a separate query) kept working.
+  listPendingRefundRequests: (limit, offset) => db.prepare(`
+    SELECT r.*, u.username, u.first_name,
+           p.title AS product_title,
+           o.quantity, o.total_price, o.status AS order_status
+    FROM refund_requests r
+    LEFT JOIN users    u ON u.telegram_id = r.user_id
+    LEFT JOIN orders   o ON o.id = r.order_id
+    LEFT JOIN products p ON p.id = o.product_id
+    WHERE r.status = 'pending'
+    ORDER BY r.id DESC LIMIT ? OFFSET ?
+  `).all(limit, offset),
+
+  /**
+   * Everything held in customer wallets right now.
+   *
+   * This is a LIABILITY, not income: the money has already been paid to you,
+   * but the customers have not spent it yet and can still buy with it or ask
+   * for it back. Worth watching alongside profit.
+   */
+  getWalletTreasury: () => {
+    const totals = db.prepare(`
+      SELECT
+        COALESCE(SUM(balance), 0)                              AS total,
+        COUNT(*)                                               AS users_total,
+        COUNT(CASE WHEN balance >  0.004 THEN 1 END)           AS users_funded,
+        COUNT(CASE WHEN balance <  -0.004 THEN 1 END)          AS users_negative,
+        COALESCE(SUM(CASE WHEN balance < 0 THEN balance END),0) AS negative_total,
+        COALESCE(MAX(balance), 0)                              AS largest
+      FROM users
+    `).get();
+
+    // Lifetime flows. 'deposit' and 'refund' add money, purchases remove it.
+    const flows = db.prepare(`
+      SELECT
+        COALESCE(SUM(CASE WHEN amount > 0 THEN amount END), 0) AS credited,
+        COALESCE(SUM(CASE WHEN amount < 0 THEN -amount END), 0) AS spent
+      FROM transactions
+      WHERE status = 'completed' OR status IS NULL
+    `).get();
+
+    const byType = db.prepare(`
+      SELECT type,
+             COUNT(*) AS n,
+             COALESCE(SUM(amount), 0) AS sum
+      FROM transactions
+      WHERE status = 'completed' OR status IS NULL
+      GROUP BY type
+      ORDER BY ABS(SUM(amount)) DESC
+    `).all();
+
+    let resellers = { count: 0, total: 0 };
+    try {
+      resellers = db.prepare(`
+        SELECT COUNT(*) AS count, COALESCE(SUM(balance), 0) AS total
+        FROM resellers WHERE is_active = 1
+      `).get();
+    } catch (e) { /* table may not exist on older installs */ }
+
+    return {
+      total:          Number(totals.total) || 0,
+      usersTotal:     totals.users_total,
+      usersFunded:    totals.users_funded,
+      usersNegative:  totals.users_negative,
+      negativeTotal:  Number(totals.negative_total) || 0,
+      largest:        Number(totals.largest) || 0,
+      credited:       Number(flows.credited) || 0,
+      spent:          Number(flows.spent) || 0,
+      byType,
+      resellerCount:  resellers.count || 0,
+      resellerTotal:  Number(resellers.total) || 0,
+    };
+  },
+
+  /** Biggest wallet holders, for the same screen. */
+  getTopWallets: (limit = 10) => db.prepare(`
+    SELECT telegram_id, username, first_name, balance
+    FROM users
+    WHERE balance > 0.004
+    ORDER BY balance DESC
+    LIMIT ?
+  `).all(limit),
+
+  // ═══ Self-service API keys ═══
+
+  /** The key for a user, creating one on first request. */
+  getOrCreateApiKey: (userId) => {
+    const existing = db.prepare('SELECT * FROM api_keys WHERE user_id = ?').get(userId);
+    if (existing) return existing;
+    const key = 'sk_' + require('crypto').randomBytes(24).toString('hex');
+    db.prepare('INSERT INTO api_keys (api_key, user_id) VALUES (?, ?)').run(key, userId);
+    return db.prepare('SELECT * FROM api_keys WHERE user_id = ?').get(userId);
+  },
+
+  /** Replace a key — used when a customer thinks theirs leaked. */
+  regenerateApiKey: (userId) => {
+    const key = 'sk_' + require('crypto').randomBytes(24).toString('hex');
+    db.prepare('DELETE FROM api_keys WHERE user_id = ?').run(userId);
+    db.prepare('INSERT INTO api_keys (api_key, user_id) VALUES (?, ?)').run(key, userId);
+    return db.prepare('SELECT * FROM api_keys WHERE user_id = ?').get(userId);
+  },
+
+  getApiKey: (userId) => db.prepare('SELECT * FROM api_keys WHERE user_id = ?').get(userId),
+
+  /** Resolve a key to its owner. Returns null for unknown or disabled keys. */
+  resolveApiKey: (key) => db.prepare(
+    "SELECT * FROM api_keys WHERE api_key = ? AND is_active = 1"
+  ).get(String(key || '')),
+
+  touchApiKey: (key) => db.prepare(
+    "UPDATE api_keys SET requests = requests + 1, last_used_at = datetime('now') WHERE api_key = ?"
+  ).run(key),
+
+  setApiKeyActive: (userId, active) => db.prepare(
+    'UPDATE api_keys SET is_active = ? WHERE user_id = ?'
+  ).run(active ? 1 : 0, userId),
+
+  // ═══ Per-customer pricing ═══
+
+  /**
+   * The customer's live allowance for one product.
+   *
+   * `remaining` is derived from the usage ledger rather than a stored counter,
+   * so it can never drift: cancelled or replayed orders simply are not in the
+   * ledger. A qty_limit of 0 means unlimited.
+   *
+   * @returns {null|{price, limit, used, remaining, unlimited, note}}
+   */
+  getCustomerAllowance: (userId, productId, quantity = null) => {
+    // A special price can START from a quantity ("from 10 units"): it applies only to an order of at
+    // least that many, and of several such steps the highest one reached wins. Until V146 the
+    // minimum was stored but never read, so every special price applied from one unit.
+    // Callers that have no quantity (a status screen, the post-purchase note) get the lowest step.
+    const rows = db.prepare(`
+      SELECT price, qty_limit, note, min_qty FROM customer_prices
+      WHERE user_id = ? AND product_id = ?
+      ORDER BY min_qty ASC
+    `).all(userId, productId);
+    if (!rows.length) return null;
+    let row = rows[0];
+    if (quantity != null) {
+      const q = Math.max(1, Number(quantity) || 1);
+      row = [...rows].reverse().find((r) => Number(r.min_qty) <= q);
+      if (!row) return null;                    // below every minimum: the normal price
+    }
+
+    const used = db.prepare(`
+      SELECT COALESCE(SUM(units), 0) AS n FROM customer_price_usage
+      WHERE user_id = ? AND product_id = ?
+    `).get(userId, productId).n;
+
+    const limit = Number(row.qty_limit) || 0;
+    return {
+      price: Number(row.price),
+      minQty: Math.max(1, Number(row.min_qty) || 1),
+      limit,
+      used,
+      unlimited: limit === 0,
+      remaining: limit === 0 ? Infinity : Math.max(0, limit - used),
+      note: row.note,
+    };
+  },
+
+  /**
+   * Work out what this customer actually pays for `quantity` units.
+   *
+   * The allowance covers the first N units only; anything beyond it falls back
+   * to the normal price (including the product's own bulk tiers). So an
+   * allowance of 20 at $1.00 on a $2.00 product means 25 units cost
+   * 20x$1.00 + 5x$2.00 = $30.00, and the next order is at the normal price.
+   *
+   * @returns {{total, unitPrice, specialUnits, specialPrice, normalUnits,
+   *            normalUnitPrice, hasAllowance, remainingAfter}}
+   */
+  resolveCustomerPricing: (userId, product, quantity) => {
+    const { calcOrderPrice } = require('../utils/format');
+    const qty = Math.max(1, Number(quantity) || 1);
+    const normal = calcOrderPrice(product, qty);
+
+    const allowance = module.exports.getCustomerAllowance(userId, product.id, qty);
+    if (!allowance) {
+      return {
+        total: normal.total, unitPrice: normal.unitPrice,
+        specialUnits: 0, specialPrice: 0,
+        normalUnits: qty, normalUnitPrice: normal.unitPrice,
+        hasAllowance: false, remainingAfter: 0,
+        discount: normal.discount, discountApplied: normal.discountApplied,
+        // This customer HAS a special price, just not for so few units: tell them where it starts.
+        nextTier: module.exports.getNextCustomerTier(userId, product.id, qty),
+      };
+    }
+
+    const specialUnits = allowance.unlimited ? qty : Math.min(qty, allowance.remaining);
+    const normalUnits  = qty - specialUnits;
+
+    // Price the leftover units on their own, so bulk tiers are judged on the
+    // quantity actually bought at the normal price — not on the whole order.
+    const leftover = normalUnits > 0 ? calcOrderPrice(product, normalUnits) : { total: 0, unitPrice: Number(product.price) };
+    const total = Number((specialUnits * allowance.price + leftover.total).toFixed(6));
+
+    return {
+      total,
+      unitPrice: Number((total / qty).toFixed(6)),
+      specialUnits,
+      specialPrice: allowance.price,
+      normalUnits,
+      normalUnitPrice: leftover.unitPrice,
+      hasAllowance: true,
+      unlimited: allowance.unlimited,
+      remainingAfter: allowance.unlimited ? Infinity : allowance.remaining - specialUnits,
+      discount: 0, discountApplied: false,
+      minQty: allowance.minQty,
+    };
+  },
+
+  /** The smallest step of this customer's special price that a bigger order than `quantity` would reach. */
+  getNextCustomerTier: (userId, productId, quantity = 1) => {
+    const q = Math.max(1, Number(quantity) || 1);
+    const row = db.prepare(`
+      SELECT price, min_qty FROM customer_prices
+      WHERE user_id = ? AND product_id = ? AND min_qty > ?
+      ORDER BY min_qty ASC LIMIT 1
+    `).get(userId, productId, q);
+    return row ? { minQty: Number(row.min_qty), price: Number(row.price) } : null;
+  },
+
+  /**
+   * Record that an order consumed part of the allowance.
+   *
+   * Called only after payment succeeds — an abandoned order must not eat the
+   * customer's allowance. INSERT OR IGNORE on the order_id primary key makes it
+   * safe to call more than once for the same order.
+   */
+  consumeCustomerAllowance: (orderId, userId, productId, units) => {
+    if (!units || units <= 0) return false;
+    const res = db.prepare(`
+      INSERT OR IGNORE INTO customer_price_usage (order_id, user_id, product_id, units)
+      VALUES (?, ?, ?, ?)
+    `).run(orderId, userId, productId, units);
+    return res.changes > 0;
+  },
+
+  /** Give the allowance back when an order is cancelled or refunded. */
+  releaseCustomerAllowance: (orderId) =>
+    db.prepare('DELETE FROM customer_price_usage WHERE order_id = ?').run(orderId).changes > 0,
+
+
+  /**
+   * The price THIS customer pays for THIS product.
+   *
+   * Every price shown or charged must go through here, otherwise a customer
+   * could be quoted their special price and then billed the public one.
+   */
+  getEffectivePrice: (userId, productId, fallbackPrice) => {
+    const row = db.prepare(
+      'SELECT price FROM customer_prices WHERE user_id = ? AND product_id = ?'
+    ).get(userId, productId);
+    return row ? Number(row.price) : Number(fallbackPrice);
+  },
+
+  /**
+   * Return the product as THIS customer sees it.
+   *
+   * A negotiated price overrides the public price and also switches off the
+   * bulk tiers: the agreed figure is the agreed figure, whatever the quantity.
+   * Because every screen and the checkout all read `product.price`, swapping it
+   * here means the quoted price and the charged price can never diverge.
+   */
+  /**
+   * The product as this customer sees it on a listing or detail screen.
+   *
+   * Display only — the charged total comes from resolveCustomerPricing, which
+   * splits an order across the allowance and the normal price. Here the special
+   * price is shown while any allowance is left, and the public price once it is
+   * used up, so the screen never advertises a price the customer can no longer get.
+   */
+  productForCustomer: (userId, product, quantity = 1) => {
+    if (!product || !userId) return product;
+    const allowance = module.exports.getCustomerAllowance(userId, product.id, quantity);
+    if (!allowance || allowance.remaining <= 0) {
+      // A special price that starts from more units is not shown as THE price (it would be false for
+      // one unit) but the customer is told it exists.
+      const next = allowance ? null : module.exports.getNextCustomerTier(userId, product.id, quantity);
+      return next ? { ...product, customFrom: next } : product;
+    }
+    return {
+      ...product,
+      price: allowance.price,
+      publicPrice: Number(product.price),
+      hasCustomPrice: true,
+      allowanceRemaining: allowance.remaining,
+      allowanceUnlimited: allowance.unlimited,
+      customMinQty: allowance.minQty,
+      bulk_tier1_qty: 0, bulk_tier1_price: 0,
+      bulk_tier2_qty: 0, bulk_tier2_price: 0,
+      bulk_tier3_qty: 0, bulk_tier3_price: 0,
+      ...Object.fromEntries(TIER_COLUMNS.filter((c) => !/^bulk_tier[123]_/.test(c)).map((c) => [c, 0])),
+      bulk_min_qty: 0, bulk_discount: 0,
+    };
+  },
+
+  hasCustomPrice: (userId, productId) => !!db.prepare(
+    'SELECT 1 FROM customer_prices WHERE user_id = ? AND product_id = ?'
+  ).get(userId, productId),
+
+  setCustomerPrice: ({ userId, productId, price, note = null, adminId = null, minQty = 1, qtyLimit = 0 }) =>
+    db.prepare(`
+      INSERT INTO customer_prices (user_id, product_id, price, note, created_by, min_qty, qty_limit)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(user_id, product_id, min_qty) DO UPDATE SET
+        price = excluded.price,
+        note = excluded.note,
+        qty_limit = excluded.qty_limit,
+        updated_at = datetime('now')
+    `).run(userId, productId, Number(price), note, adminId,
+           Math.max(1, Number(minQty) || 1), Math.max(0, Number(qtyLimit) || 0)),
+
+  /**
+   * Change a special price in place — price, the quantity it starts from, the unit limit, the note.
+   * The starting quantity is part of the key, so moving it onto a step that already exists is refused
+   * rather than silently merging the two.
+   * @returns {{ok:boolean, reason?:string, before?:object, after?:object}}
+   */
+  updateCustomerPrice: ({ userId, productId, oldMinQty, price, minQty, qtyLimit, note }) => {
+    const before = db.prepare('SELECT * FROM customer_prices WHERE user_id = ? AND product_id = ? AND min_qty = ?')
+      .get(userId, productId, oldMinQty);
+    if (!before) return { ok: false, reason: 'that special price no longer exists' };
+    const newMin = Math.max(1, Number(minQty) || 1);
+    if (newMin !== Number(before.min_qty)
+        && db.prepare('SELECT 1 FROM customer_prices WHERE user_id = ? AND product_id = ? AND min_qty = ?').get(userId, productId, newMin)) {
+      return { ok: false, reason: `a special price from ${newMin} units already exists for this product — edit or delete that one first` };
+    }
+    const newPrice = Number(price);
+    if (!Number.isFinite(newPrice) || newPrice < 0) return { ok: false, reason: 'invalid price' };
+    db.prepare(`UPDATE customer_prices SET price = ?, min_qty = ?, qty_limit = ?, note = ?, updated_at = datetime('now')
+                WHERE user_id = ? AND product_id = ? AND min_qty = ?`)
+      .run(newPrice, newMin, Math.max(0, Number(qtyLimit) || 0), note == null ? null : String(note), userId, productId, oldMinQty);
+    const after = db.prepare('SELECT * FROM customer_prices WHERE user_id = ? AND product_id = ? AND min_qty = ?').get(userId, productId, newMin);
+    return { ok: true, before, after };
+  },
+
+  // minQty null removes every tier for that product.
+  removeCustomerPrice: (userId, productId, minQty = null) => (
+    minQty == null
+      ? db.prepare('DELETE FROM customer_prices WHERE user_id = ? AND product_id = ?')
+          .run(userId, productId).changes
+      : db.prepare('DELETE FROM customer_prices WHERE user_id = ? AND product_id = ? AND min_qty = ?')
+          .run(userId, productId, minQty).changes
+  ),
+
+  listCustomerPrices: (userId) => db.prepare(`
+    SELECT cp.*, p.title, p.price AS public_price
+    FROM customer_prices cp
+    LEFT JOIN products p ON p.id = cp.product_id
+    WHERE cp.user_id = ?
+    ORDER BY cp.product_id ASC, cp.min_qty ASC
+  `).all(userId),
+
+  listPricesForProduct: (productId) => db.prepare(`
+    SELECT cp.*, u.username, u.first_name
+    FROM customer_prices cp
+    LEFT JOIN users u ON u.telegram_id = cp.user_id
+    WHERE cp.product_id = ?
+    ORDER BY cp.id DESC
+  `).all(productId),
+
+  countCustomerPrices: (userId) => db.prepare(
+    'SELECT COUNT(*) AS n FROM customer_prices WHERE user_id = ?'
+  ).get(userId).n,
+
+  // ═══ V2: stock alert latches ═══
+  deleteStockNotifications: (productId) => db.prepare(`
+    DELETE FROM admin_notifications
+    WHERE type IN ('stock_out','stock_low') AND ref_type = 'product' AND ref_id = ?
+  `).run(String(productId)).changes,
+
+  setOosNotified: (id, v) => stock_setOosNotified.run(v ? 1 : 0, id),
+  setLowNotified: (id, v) => stock_setLowNotified.run(v ? 1 : 0, id),
+  resetStockAlertFlags: (id) => stock_resetFlags.run(id),
+
+  // ═══ V2: support threads ═══
+  // ── V161: replacement stock + requests ──────────────────────────────────
+  // V161.1: move N items from a PRODUCT's sale stock into the replacement pool (sale stock drops by N).
+  replFillFromProduct: (productId, kind, count, byUser) => {
+    const take = Math.max(0, parseInt(count, 10) || 0);
+    if (!take) return { moved: 0, reason: 'count must be at least 1' };
+    const fb = module.exports.replPriceState(kind);   // fallback for old items uploaded without a COST
+    const tx = db.transaction(() => {
+      const items = db.prepare(
+        "SELECT id, raw_content, unit_cost FROM product_items WHERE product_id = ? AND status = 'available' ORDER BY id LIMIT ?"
+      ).all(productId, take);
+      // V165: the price comes from the COST typed when the stock was uploaded (one batch per cost)
+      const batches = new Map();
+      let moved = 0, skipped = 0;
+      for (const it of items) {
+        let cost = Number(it.unit_cost) > 0 ? Number(it.unit_cost) : (fb.ready ? fb.price : 0);
+        if (!(cost > 0)) { skipped++; continue; }
+        const claimed = db.prepare("UPDATE product_items SET status = 'moved_to_replacement', sold_at = datetime('now') WHERE id = ? AND status = 'available'").run(it.id).changes;
+        if (!claimed) continue;
+        let batchId = batches.get(cost);
+        if (!batchId) {
+          batchId = db.prepare("INSERT INTO replacement_batches (kind, source, price, qty, created_by) VALUES (?, 'sale_stock', ?, 0, ?)").run(kind, cost, byUser || null).lastInsertRowid;
+          batches.set(cost, batchId);
+        }
+        db.prepare("INSERT INTO replacement_stock (kind, link, added_by, cost, batch_id) VALUES (?, ?, ?, ?, ?)").run(kind, String(it.raw_content).trim(), byUser, cost, batchId);
+        db.prepare("UPDATE replacement_batches SET qty = qty + 1 WHERE id = ?").run(batchId);
+        moved++;
+      }
+      if (moved) {
+        if (fb.ready && skipped === 0) module.exports.setSetting(`repl_price_ready_${kind}`, '0');
+        db.prepare("UPDATE products SET stock_quantity = MAX(0, stock_quantity - ?) WHERE id = ?").run(moved, productId);
+      }
+      const list = [...batches.entries()].map(([price, id]) => ({ price, batchId: id }));
+      return { moved, skipped, noPrice: moved === 0 && skipped > 0, batchId: list[0] ? list[0].batchId : null, price: list[0] ? list[0].price : 0, batches: list };
+    });
+    return tx();
+  },
+  productAvailableCount: (productId) =>
+    db.prepare("SELECT COUNT(*) n FROM product_items WHERE product_id = ? AND status = 'available'").get(productId).n,
+
+  /** V165: add links by hand. One call = one batch with ONE price. Refuses when no price was set for this stock. */
+  replAddLinks: (kind, links, addedBy) => {
+    const list = (links || []).map((l) => String(l).trim()).filter(Boolean);
+    if (!list.length) return { added: 0, reason: 'no links' };
+    const pr = module.exports.replPriceState(kind);
+    if (!pr.ready) return { added: 0, noPrice: true, lastPrice: pr.price };
+    const tx = db.transaction(() => {
+      const batchId = db.prepare("INSERT INTO replacement_batches (kind, source, price, qty, created_by) VALUES (?, 'manual', ?, ?, ?)")
+        .run(kind, pr.price, list.length, addedBy || null).lastInsertRowid;
+      for (const l of list) db.prepare("INSERT INTO replacement_stock (kind, link, added_by, cost, batch_id) VALUES (?, ?, ?, ?, ?)").run(kind, l, addedBy, pr.price, batchId);
+      module.exports.setSetting(`repl_price_ready_${kind}`, '0');
+      return { added: list.length, batchId, price: pr.price };
+    });
+    return tx();
+  },
+  // V164: "used" and "unclaimed" only count links used SINCE the last reset (archived = 0), with their value.
+  replStockCounts: () => db.prepare(
+    `SELECT kind, SUM(status='available') AS available,
+            SUM(status='used' AND archived=0) AS used,
+            SUM(status='used' AND claimed=0 AND archived=0) AS unclaimed,
+            COALESCE(SUM(CASE WHEN status='used' AND archived=0 THEN cost END),0) AS used_amount,
+            COALESCE(SUM(CASE WHEN status='used' AND claimed=0 AND archived=0 THEN cost END),0) AS unclaimed_amount,
+            COALESCE(SUM(CASE WHEN status='available' THEN cost END),0) AS available_amount,
+            SUM(status='used') AS total_used,
+            COALESCE(SUM(CASE WHEN status='used' THEN cost END),0) AS total_amount
+     FROM replacement_stock GROUP BY kind`).all(),
+  /** The price that will be stamped on the NEXT stock, and whether it has been set for it (one-shot, mandatory). */
+  replPriceState: (kind) => {
+    const v = parseFloat(String(module.exports.getSetting(`repl_unit_price_${kind}`, '0')));
+    const price = Number.isFinite(v) && v > 0 ? v : 0;
+    const ready = price > 0 && String(module.exports.getSetting(`repl_price_ready_${kind}`, '0')) === '1';
+    return { price, ready };
+  },
+  /** Last price that was set (display only). */
+  replUnitPrice: (kind) => module.exports.replPriceState(kind).price,
+  /** Set the price of the NEXT stock to be added. It is used once: the next add consumes it, then a new price is needed. */
+  replSetUnitPrice: (kind, price) => {
+    const p = Math.max(0, Number(price) || 0);
+    if (!(p > 0)) return { price: 0, ok: false };
+    module.exports.setSetting(`repl_unit_price_${kind}`, String(p));
+    module.exports.setSetting(`repl_price_ready_${kind}`, '1');
+    return { price: p, ok: true };
+  },
+  /** The newest batch (the "current stock"). null when only old unbatched links exist. */
+  replCurrentBatch: (kind) => db.prepare("SELECT * FROM replacement_batches WHERE kind=? ORDER BY id DESC LIMIT 1").get(kind) || null,
+  /** Re-price the CURRENT stock (the newest batch): every link of it still counted gets the new cost. */
+  replPriceCurrentStock: (kind, price) => {
+    const p = Number(price);
+    if (!(p > 0)) return { ok: false };
+    const tx = db.transaction(() => {
+      const b = module.exports.replCurrentBatch(kind);
+      if (b) {
+        db.prepare("UPDATE replacement_batches SET price=? WHERE id=?").run(p, b.id);
+        const n = db.prepare("UPDATE replacement_stock SET cost=? WHERE batch_id=? AND archived=0").run(p, b.id).changes;
+        return { ok: true, batchId: b.id, links: n, price: p };
+      }
+      const n = db.prepare("UPDATE replacement_stock SET cost=? WHERE kind=? AND batch_id IS NULL AND archived=0").run(p, kind).changes;
+      return { ok: true, batchId: null, links: n, price: p };
+    });
+    return tx();
+  },
+  /** Batches with how many links are left / used (since the last reset). Legacy links appear as batch 0. */
+  replBatches: (kind, limit = 8) => {
+    const rows = db.prepare(
+      `SELECT b.id, b.source, b.price, b.qty, b.created_at,
+              SUM(s.status='available') AS available, SUM(s.status='used' AND s.archived=0) AS used
+       FROM replacement_batches b LEFT JOIN replacement_stock s ON s.batch_id=b.id
+       WHERE b.kind=? GROUP BY b.id ORDER BY b.id DESC LIMIT ?`).all(kind, limit);
+    const old = db.prepare(
+      `SELECT COUNT(*) n, SUM(status='available') available, SUM(status='used' AND archived=0) used,
+              COALESCE(MAX(cost),0) price FROM replacement_stock WHERE kind=? AND batch_id IS NULL`).get(kind);
+    if (old && old.n) rows.push({ id: 0, source: 'earlier', price: old.price, qty: old.n, created_at: null, available: old.available || 0, used: old.used || 0 });
+    return rows;
+  },
+  replBatchOf: (batchId) => batchId ? db.prepare("SELECT * FROM replacement_batches WHERE id=?").get(batchId) : null,
+  /** Start counting from scratch: used links so far are archived (never deleted), and the links count + price(s) are logged. */
+  replResetAccount: (kind, adminId) => {
+    const tx = db.transaction(() => {
+      const c = module.exports.replStockCounts().find((x) => x.kind === kind) || {};
+      const groups = db.prepare(
+        `SELECT batch_id, cost AS price, COUNT(*) AS n, SUM(cost) AS amount FROM replacement_stock
+         WHERE kind=? AND status='used' AND archived=0 GROUP BY batch_id, cost ORDER BY batch_id`).all(kind);
+      const breakdown = groups.map((g) => ({ batch: g.batch_id || 0, price: g.price, count: g.n, amount: g.amount }));
+      const used = c.used || 0, amount = c.used_amount || 0;
+      const out = { used, unclaimed: c.unclaimed || 0, amount, unitPrice: used ? amount / used : 0, breakdown };
+      db.prepare("UPDATE replacement_stock SET archived=1 WHERE kind=? AND status='used' AND archived=0").run(kind);
+      db.prepare("INSERT INTO replacement_resets (kind, reset_by, used, unclaimed, amount, unit_price, breakdown) VALUES (?,?,?,?,?,?,?)")
+        .run(kind, adminId || null, out.used, out.unclaimed, out.amount, out.unitPrice, JSON.stringify(breakdown));
+      return out;
+    });
+    return tx();
+  },
+  /** Used links since the last reset grouped by batch and price: what a Reset would record. */
+  replUsedBreakdown: (kind) => db.prepare(
+    `SELECT batch_id AS batch, cost AS price, COUNT(*) AS count, SUM(cost) AS amount FROM replacement_stock
+     WHERE kind=? AND status='used' AND archived=0 GROUP BY batch_id, cost ORDER BY batch_id`).all(kind)
+    .map((g) => ({ ...g, batch: g.batch || 0 })),
+  /** V166 calculator: links given as compensation in a period, grouped by their price. period: today | d7 | d30 | reset | all */
+  replUsedByPeriod: (kind, period) => {
+    const where = { today: "AND used_at >= datetime('now','start of day')", d7: "AND used_at >= datetime('now','-7 days')",
+      d30: "AND used_at >= datetime('now','-30 days')", reset: 'AND archived=0', all: '' }[period] ?? 'AND archived=0';
+    return db.prepare(
+      `SELECT cost AS price, COUNT(*) AS n, COALESCE(SUM(cost),0) AS amount,
+              SUM(CASE WHEN claimed=0 AND archived=0 THEN 1 ELSE 0 END) AS unclaimed,
+              COALESCE(SUM(CASE WHEN claimed=0 AND archived=0 THEN cost END),0) AS unclaimed_amount
+       FROM replacement_stock WHERE kind=? AND status='used' ${where} GROUP BY cost ORDER BY cost DESC`).all(kind);
+  },
+  replResets: (kind, limit = 5) => db.prepare("SELECT * FROM replacement_resets WHERE kind=? ORDER BY id DESC LIMIT ?").all(kind, limit)
+    .map((r) => ({ ...r, breakdown: (() => { try { return JSON.parse(r.breakdown || '[]'); } catch (_) { return []; } })() })),
+  replAvailableCount: (kind) => db.prepare("SELECT COUNT(*) n FROM replacement_stock WHERE kind=? AND status='available'").get(kind).n,
+  replTakeOne: (kind, requestId) => {
+    const row = db.prepare("SELECT id, link, batch_id, cost FROM replacement_stock WHERE kind=? AND status='available' ORDER BY id LIMIT 1").get(kind);
+    if (!row) return null;
+    const changed = db.prepare("UPDATE replacement_stock SET status='used', used_for=?, used_at=datetime('now') WHERE id=? AND status='available'").run(requestId, row.id).changes;
+    return changed ? row : null;   // null if someone grabbed it first
+  },
+  replListStock: (kind, status, limit = 30) =>
+    db.prepare("SELECT * FROM replacement_stock WHERE kind=? AND status=? ORDER BY id DESC LIMIT ?").all(kind, status, limit),
+  replDeleteStock: (id) => db.prepare("DELETE FROM replacement_stock WHERE id=? AND status='available'").run(id).changes,
+  replUnclaimed: (kind) => db.prepare("SELECT * FROM replacement_stock WHERE kind=? AND status='used' AND claimed=0 AND archived=0 ORDER BY used_at").all(kind),
+  replClaimAll: (kind) => db.prepare("UPDATE replacement_stock SET claimed=1, claimed_at=datetime('now') WHERE kind=? AND status='used' AND claimed=0 AND archived=0").run(kind).changes,
+
+  // V161.4: check an order belongs to this customer and is still within the warranty window (hours from purchase).
+  replCheckOrder: (orderId, userId, warrantyHours = 24) => {
+    const o = db.prepare("SELECT id, user_id, created_at, status FROM orders WHERE id = ?").get(orderId);
+    if (!o) return { ok: false, reason: 'not_found' };
+    if (String(o.user_id) !== String(userId)) return { ok: false, reason: 'not_yours' };
+    const ageMs = Date.now() - new Date(String(o.created_at).replace(' ', 'T') + 'Z').getTime();
+    const hours = ageMs / 3600000;
+    if (hours > warrantyHours) return { ok: false, reason: 'expired', hours: Math.floor(hours), created_at: o.created_at };
+    return { ok: true, order: o, hoursLeft: Math.max(0, Math.round(warrantyHours - hours)) };
+  },
+
+  replCreateRequest: (userId, username, kind, badLink, reason, detail) =>
+    db.prepare("INSERT INTO replacement_requests (user_id, username, kind, bad_link, reason, detail) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(userId, username || null, kind, badLink || null, reason || null, detail || null).lastInsertRowid,
+  replGetRequest: (id) => db.prepare("SELECT * FROM replacement_requests WHERE id=?").get(id),
+  replPendingRequests: (limit = 30) => db.prepare("SELECT * FROM replacement_requests WHERE status='pending' ORDER BY created_at LIMIT ?").all(limit),
+  replPendingCount: () => db.prepare("SELECT COUNT(*) n FROM replacement_requests WHERE status='pending'").get().n,
+  replOpenRequestForUser: (userId, kind) => db.prepare("SELECT * FROM replacement_requests WHERE user_id=? AND kind=? AND status='pending' ORDER BY id DESC LIMIT 1").get(userId, kind),
+  replSetRequest: (id, fields) => {
+    const allow = ['status', 'stock_id', 'sent_link', 'handled_by', 'handled_at', 'bad_link', 'reason', 'detail', 'order_id'];
+    const sets = Object.keys(fields).filter((k) => allow.includes(k));
+    if (!sets.length) return;
+    db.prepare(`UPDATE replacement_requests SET ${sets.map((k) => `${k}=?`).join(', ')} WHERE id=?`).run(...sets.map((k) => fields[k]), id);
+  },
+
+  ensureSupportThread: (userId) => { th_ensure.run(userId); return th_get.get(userId); },
+  getSupportThread:    (userId) => th_get.get(userId),
+  markSupportWelcomed: (userId) => th_setWelcomed.run(userId),
+  setSupportStatusMsg: (userId, msgId, state, pending) =>
+    th_setStatusMsg.run(msgId, state, pending, userId),
+  markSupportThreadRead: (userId) => {
+    sm_markRead.run(userId);
+    th_markRead.run(userId);
+  },
+  getSupportUnreadThreads: () => sm_unreadTotal.get().n,
+
+  // ═══ V2: admin notification centre ═══
+  addAdminNotification: (data) => {
+    const res = an_insert.run({
+      body:    null,
+      refType: null,
+      refId:   null,
+      ...data,
+    });
+    return res.changes > 0; // false → duplicate, already recorded
+  },
+  getAdminNotifications: (limit, offset, unreadOnly = false) =>
+    (unreadOnly ? an_listUnread : an_list).all(limit, offset),
+  getAdminNotification:      (id) => an_get.get(id),
+  // Filter the inbox by type — used by the Support Bot's Stock Alerts section.
+  // The type list is built by the caller from a fixed whitelist, never input.
+  getNotificationsByType: (types, limit, offset) => {
+    const marks = types.map(() => '?').join(',');
+    return db.prepare(
+      `SELECT * FROM admin_notifications WHERE type IN (${marks}) ORDER BY id DESC LIMIT ? OFFSET ?`
+    ).all(...types, limit, offset);
+  },
+  countNotificationsByType: (types, unreadOnly = false) => {
+    const marks = types.map(() => '?').join(',');
+    return db.prepare(
+      `SELECT COUNT(*) AS n FROM admin_notifications WHERE type IN (${marks})` +
+      (unreadOnly ? ' AND is_read = 0' : '')
+    ).get(...types).n;
+  },
+  countAdminNotifications:   ()   => an_countAll.get().n,
+  countUnreadNotifications:  ()   => an_countUnread.get().n,
+  markNotificationRead:      (id) => an_markRead.run(id),
+  markAllNotificationsRead:  ()   => an_markAllRead.run().changes,
+
+  cancelAllUserOrders,
+  previewCancelAllUserOrders,
+  purgeUserOrderData,
+  previewPurge,
+
+  // ═══ Pending (uncredited) deposits ═══
+  recordPendingDeposit: (d) => db.prepare(`
+    INSERT INTO pending_deposits (txid, user_id, amount, network, insert_time)
+    VALUES (@txid, @userId, @amount, @network, @insertTime)
+    ON CONFLICT(txid) DO UPDATE SET
+      attempts  = attempts + 1,
+      last_seen = datetime('now')
+  `).run({ amount: null, network: null, insertTime: null, ...d }),
+
+  clearPendingDeposit: (txid) =>
+    db.prepare('DELETE FROM pending_deposits WHERE txid = ? COLLATE NOCASE').run(txid),
+
+  listPendingDeposits: () => db.prepare(`
+    SELECT pd.*, u.username, u.first_name
+    FROM pending_deposits pd
+    LEFT JOIN users u ON u.telegram_id = pd.user_id
+    ORDER BY pd.last_seen DESC
+  `).all(),
+
+  countPendingDeposits: () =>
+    db.prepare('SELECT COUNT(*) AS n FROM pending_deposits').get().n,
+
+  getPendingDeposit: (txid) =>
+    db.prepare('SELECT * FROM pending_deposits WHERE txid = ? COLLATE NOCASE').get(txid),
+
+  // ═══ V3: deposit security ═══
+  createDepositIntent,
+  listOpenIntents,
+  findIntentForDepositRecent,
+  claimDepositIntentRecent,
+  recentClaimedIntentForUser,
+  getOpenIntents,
+  findIntentForDeposit,
+  claimDepositIntent,
+  cancelDepositIntent,
+  getDepositIntent: (id) => di_get.get(id),
+
+  addDepositReview: (data) => {
+    const res = dr_insert.run({ address: null, insertTime: null, reason: null, ...data });
+    return { created: res.changes > 0, row: dr_byTxid.get(data.txid) };
+  },
+  getDepositReview:        (id) => dr_get.get(id),
+  getDepositReviewByTxid:  (txid) => dr_byTxid.get(txid),
+  listDepositReviews:      (status, limit, offset) => dr_list.all(status, limit, offset),
+  countDepositReviews:     (status) => dr_count.get(status).n,
+  resolveDepositReview:    (id, status, note, adminId) =>
+    dr_resolve.run(status, note, adminId, id).changes > 0,
+
+  reverseDeposit,
+  listReversals: (limit = 20) => rev_list.all(limit),
+
+  // Raw db
+  db,
+};
